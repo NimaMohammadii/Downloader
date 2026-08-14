@@ -38,22 +38,21 @@ npm install
 npm run types
 ```
 
-## Configure secrets
+## Configure secret
 
-Never commit the bot token.
+Only the Telegram bot token needs to be stored as a Cloudflare Secret:
 
 ```bash
 npx wrangler secret put BOT_TOKEN
-npx wrangler secret put WEBHOOK_SECRET
 ```
 
-For `WEBHOOK_SECRET`, use a random value containing only letters, numbers, `_` or `-`.
+The Telegram webhook verification secret is intentionally hardcoded in `src/index.ts` as:
 
-Example generator:
-
-```bash
-openssl rand -hex 32
+```text
+dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1
 ```
+
+Because this repository is public, this webhook value is not confidential. Do not hardcode the Telegram Bot Token.
 
 ## Deploy to Cloudflare
 
@@ -83,19 +82,18 @@ Expected response:
 
 ## Set the Telegram webhook
 
-Set these in your terminal for the command only:
+Set the bot token in your terminal for the command only:
 
 ```bash
 export BOT_TOKEN='YOUR_TELEGRAM_BOT_TOKEN'
-export WEBHOOK_SECRET='THE_SAME_SECRET_YOU_PUT_IN_CLOUDFLARE'
 ```
 
-Then register the webhook:
+Then register the webhook using the same hardcoded secret expected by the Worker:
 
 ```bash
 curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" \
   --data-urlencode "url=https://downloader.vexaagent.workers.dev/telegram/webhook" \
-  --data-urlencode "secret_token=${WEBHOOK_SECRET}" \
+  --data-urlencode "secret_token=dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1" \
   --data-urlencode 'allowed_updates=["message"]'
 ```
 
