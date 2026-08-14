@@ -7,7 +7,6 @@ import {
 
 type Env = {
   BOT_TOKEN: string;
-  WEBHOOK_SECRET?: string;
   DOWNLOAD_WORKFLOW: Workflow<DownloadJob>;
   DOWNLOADER_CONTAINER: DurableObjectNamespace<DownloaderContainer>;
 };
@@ -43,6 +42,7 @@ type ContainerResult = {
 };
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
+const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
 
 export class DownloaderContainer extends Container {
   defaultPort = 8080;
@@ -184,10 +184,7 @@ function extractYouTubeUrl(text: string): string | null {
 }
 
 async function handleTelegramWebhook(request: Request, env: Env): Promise<Response> {
-  if (
-    env.WEBHOOK_SECRET &&
-    request.headers.get("x-telegram-bot-api-secret-token") !== env.WEBHOOK_SECRET
-  ) {
+  if (request.headers.get("x-telegram-bot-api-secret-token") !== WEBHOOK_SECRET) {
     return new Response("Forbidden", { status: 403 });
   }
 
