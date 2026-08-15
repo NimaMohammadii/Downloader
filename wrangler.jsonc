@@ -8,28 +8,6 @@
   "observability": {
     "enabled": true
   },
-  "containers": [
-    {
-      "class_name": "DownloaderContainer",
-      "image": "./Dockerfile",
-      "max_instances": 20,
-      "instance_type": "standard-1"
-    }
-  ],
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "DOWNLOADER_CONTAINER",
-        "class_name": "DownloaderContainer"
-      }
-    ]
-  },
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_sqlite_classes": ["DownloaderContainer"]
-    }
-  ],
   "workflows": [
     {
       "name": "youtube-downloads",
