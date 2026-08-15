@@ -53,6 +53,9 @@ const PHOTO_LIMIT = 4_800_000;
 const CHROME_PUBLIC_UA =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 
+const INSTAGRAPI_PUBLIC_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/11.1.2 Safari/605.1.15";
+
 const IG_IPHONE_PUBLIC_UA =
   "Instagram 273.0.0.16.70 (iPhone15,2; iOS 17_5_1; en_US; en-US; scale=3.00; 1290x2796; 470085518)";
 
@@ -149,13 +152,8 @@ function fullCookieHeader(jar: CookieJar): string {
 }
 
 function instagrapiCookieHeader(jar: CookieJar): string {
-  return ["sessionid", "ds_user_id"]
-    .map((name) => {
-      const value = jar.get(name);
-      return value ? `${name}=${value}` : "";
-    })
-    .filter(Boolean)
-    .join("; ");
+  const session = jar.get("sessionid")?.trim();
+  return session ? `sessionid=${session}` : "";
 }
 
 function absorbInstagramState(headers: Headers, jar: CookieJar): void {
@@ -358,9 +356,10 @@ async function resolveViaInstagrapiStoryHash(userId: string, jar: CookieJar): Pr
   url.searchParams.set("variables", variables);
 
   const variants: Array<[string, string, boolean]> = [
-    ["chrome136", CHROME_PUBLIC_UA, false],
-    ["iphone-ig", IG_IPHONE_PUBLIC_UA, false],
-    ["iphone-ig-appid", IG_IPHONE_PUBLIC_UA, true],
+    ["instagrapi-default", INSTAGRAPI_PUBLIC_UA, false],
+    ["chrome136-header-only", CHROME_PUBLIC_UA, false],
+    ["iphone-ig-header-only", IG_IPHONE_PUBLIC_UA, false],
+    ["iphone-ig-appid-fallback", IG_IPHONE_PUBLIC_UA, true],
   ];
 
   for (const [variant, userAgent, withAppId] of variants) {
@@ -384,10 +383,14 @@ async function resolveViaInstagrapiStoryHash(userId: string, jar: CookieJar): Pr
       const body = await readJsonResponse(response);
       const data = body?.data || body;
       const reel = findReel(data, userId);
-      console.log("instagram instagrapi story hash", {
+      console.warn("instagram instagrapi story hash", {
         variant,
         status: response.status,
+        contentType: response.headers.get("content-type") || "",
         apiStatus: typeof body?.status === "string" ? body.status : null,
+        message: typeof body?.message === "string" ? body.message.slice(0, 120) : null,
+        hasData: Boolean(body?.data),
+        topKeys: body && typeof body === "object" ? Object.keys(body).slice(0, 8) : [],
         found: Boolean(reel),
         itemCount: Array.isArray(reel?.items) ? reel.items.length : 0,
         errorCount: Array.isArray(body?.errors) ? body.errors.length : 0,
@@ -418,13 +421,17 @@ async function resolveViaWebReelsMedia(reelKey: string, jar: CookieJar): Promise
     );
     absorbInstagramState(response.headers, jar);
     if (!response.ok) {
-      console.warn("instagram story reels_media rejected", { status: response.status, reelKey });
+      console.warn("instagram story reels_media rejected", {
+        status: response.status,
+        reelKey,
+        redirectedTo: response.headers.get("location") || null,
+      });
       await response.body?.cancel().catch(() => undefined);
       return null;
     }
     const body = await readJsonResponse(response);
     const reel = findReel(body, reelKey);
-    console.log("instagram story reels_media", {
+    console.warn("instagram story reels_media", {
       status: response.status,
       found: Boolean(reel),
       itemCount: Array.isArray(reel?.items) ? reel.items.length : 0,
@@ -492,7 +499,7 @@ async function resolveViaCobaltStory(userId: string, jar: CookieJar): Promise<an
     absorbInstagramState(response.headers, jar);
     const data = response.ok ? await readJsonResponse(response) : null;
     const reel = findReel(data, userId);
-    console.log("instagram cobalt story fallback", {
+    console.warn("instagram cobalt story fallback", {
       status: response.status,
       found: Boolean(reel),
       itemCount: Array.isArray(reel?.items) ? reel.items.length : 0,
@@ -589,23 +596,22 @@ function selectItems(reel: any, storyId: string | null): any[] {
 
 async function resolveStoryMedia(target: StoryTarget, env: Env): Promise<MediaCandidate[]> {
   if (!env.INSTAGRAM_SESSIONID?.trim()) throw new Error("INSTAGRAM_STORY_SESSION_REQUIRED");
-  const jar = sessionJar(env);
 
   let reel: any | null = null;
   let storyId: string | null = null;
 
   if (target.kind === "highlight") {
     const key = `highlight:${target.highlightId}`;
-    reel = await resolveViaWebReelsMedia(key, jar);
+    reel = await resolveViaWebReelsMedia(key, sessionJar(env));
     if (!reel) throw new Error("INSTAGRAM_STORY_LOGIN_REQUIRED");
   } else {
     storyId = target.storyId;
-    const userId = await resolveUserId(target, jar);
+    const userId = await resolveUserId(target, sessionJar(env));
     if (!userId) throw new Error("INSTAGRAM_STORY_USER_NOT_FOUND");
 
-    reel = await resolveViaInstagrapiStoryHash(userId, new Map(jar));
-    if (!reel) reel = await resolveViaWebReelsMedia(userId, new Map(jar));
-    if (!reel) reel = await resolveViaCobaltStory(userId, new Map(jar));
+    reel = await resolveViaInstagrapiStoryHash(userId, sessionJar(env));
+    if (!reel) reel = await resolveViaWebReelsMedia(userId, sessionJar(env));
+    if (!reel) reel = await resolveViaCobaltStory(userId, sessionJar(env));
     if (!reel) throw new Error("INSTAGRAM_STORY_LOGIN_REQUIRED");
   }
 
@@ -712,7 +718,7 @@ async function handleStoryWebhook(
     }
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    console.error("instagram story v12 failed", { target: target.kind, detail });
+    console.error("instagram story v13 failed", { target: target.kind, detail });
     const text = friendlyStoryError(detail);
     if (statusMessageId) {
       await safeTelegramCall(env.BOT_TOKEN, "editMessageText", {
@@ -741,7 +747,7 @@ export default {
         ok: true,
         service: "telegram-instagram-downloader",
         mode: "cloudflare-only",
-        resolver: "instagram-v12-instagrapi-story-hash",
+        resolver: "instagram-v13-instagrapi-exact-public-session",
         botConfigured: Boolean(env.BOT_TOKEN),
         instagramSessionConfigured: Boolean(env.INSTAGRAM_SESSIONID?.trim()),
       });
