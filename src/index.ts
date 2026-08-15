@@ -1,4 +1,4 @@
-import { Container, getContainer } from "@cloudflare/containers";
+import { Innertube } from "youtubei.js/cf-worker";
 import {
   WorkflowEntrypoint,
   type WorkflowEvent,
@@ -8,14 +8,14 @@ import {
 type Env = {
   BOT_TOKEN: string;
   DOWNLOAD_WORKFLOW: Workflow<DownloadJob>;
-  DOWNLOADER_CONTAINER: DurableObjectNamespace<DownloaderContainer>;
 };
 
 type DownloadJob = {
   id: string;
   chatId: number;
   requestMessageId: number;
-  url: string;
+  videoId: string;
+  sourceUrl: string;
 };
 
 type TelegramMessage = {
@@ -36,19 +36,20 @@ type TelegramApiResponse<T> = {
   description?: string;
 };
 
-type ContainerResult = {
-  ok: boolean;
-  message?: string;
+type ResolvedVideo = {
+  title: string;
+  duration: number | null;
+  itag: number;
+  height: number | null;
+  size: number | null;
+  canSendByTelegramUrl: boolean;
 };
 
-const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
-
-export class DownloaderContainer extends Container {
-  defaultPort = 8080;
-  sleepAfter = "2m";
-  enableInternet = true;
-}
+const BASE_URL = "https://downloader.vexaagent.workers.dev";
+const TELEGRAM_REMOTE_FILE_LIMIT = 18_500_000;
+const MEDIA_LINK_TTL_SECONDS = 60 * 60;
+const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 
 export class DownloadWorkflow extends WorkflowEntrypoint<Env, DownloadJob> {
   async run(event: WorkflowEvent<DownloadJob>, step: WorkflowStep) {
@@ -57,7 +58,7 @@ export class DownloadWorkflow extends WorkflowEntrypoint<Env, DownloadJob> {
 
     try {
       statusMessageId = await step.do(
-        "show download status",
+        "show status",
         {
           retries: { limit: 3, delay: "2 seconds", backoff: "linear" },
           timeout: "1 minute",
@@ -68,7 +69,7 @@ export class DownloadWorkflow extends WorkflowEntrypoint<Env, DownloadJob> {
             "sendMessage",
             {
               chat_id: job.chatId,
-              text: "⏳ لینک گرفتم، دارم آماده‌ش می‌کنم…",
+              text: "⏳ لینک گرفتم، دارم ویدیو رو آماده می‌کنم…",
               reply_parameters: { message_id: job.requestMessageId },
             },
           );
@@ -76,57 +77,167 @@ export class DownloadWorkflow extends WorkflowEntrypoint<Env, DownloadJob> {
         },
       );
 
-      await step.do(
-        "download and send video",
+      const video = await step.do(
+        "resolve youtube stream",
         {
-          // A retry after a partial Telegram upload could duplicate a video part,
-          // so the end-to-end media step is intentionally single-attempt.
+          retries: { limit: 2, delay: "3 seconds", backoff: "linear" },
+          timeout: "2 minutes",
+        },
+        async (): Promise<ResolvedVideo> => {
+          const youtube = await Innertube.create();
+          const info = await youtube.getBasicInfo(job.videoId);
+
+          if (info.basic_info.is_private) {
+            throw new Error("PRIVATE_VIDEO");
+          }
+          if (info.basic_info.is_live || info.basic_info.is_upcoming) {
+            throw new Error("LIVE_VIDEO");
+          }
+
+          const formats: Array<{
+            itag: number;
+            height: number | null;
+            size: number | null;
+            bitrate: number;
+          }> = [];
+          const seen = new Set<number>();
+
+          for (const quality of ["720p", "480p", "360p", "best"]) {
+            try {
+              const format = info.chooseFormat({
+                type: "video+audio",
+                quality,
+                format: "mp4",
+              });
+
+              const itag = Number(format.itag);
+              if (!Number.isFinite(itag) || seen.has(itag)) continue;
+              seen.add(itag);
+
+              const rawSize = Number(format.content_length);
+              formats.push({
+                itag,
+                height: Number.isFinite(Number(format.height)) ? Number(format.height) : null,
+                size: Number.isFinite(rawSize) && rawSize > 0 ? rawSize : null,
+                bitrate: Number.isFinite(Number(format.bitrate)) ? Number(format.bitrate) : 0,
+              });
+            } catch {
+              // Exact quality may not exist as a pre-muxed audio+video MP4.
+            }
+          }
+
+          if (!formats.length) {
+            throw new Error("NO_MUXED_FORMAT");
+          }
+
+          formats.sort((a, b) => {
+            const heightDiff = (b.height ?? 0) - (a.height ?? 0);
+            return heightDiff || b.bitrate - a.bitrate;
+          });
+
+          const telegramCandidate = formats.find(
+            (format) => format.size !== null && format.size <= TELEGRAM_REMOTE_FILE_LIMIT,
+          );
+          const selected = telegramCandidate ?? formats[0];
+
+          return {
+            title: (info.basic_info.title || "YouTube video").trim(),
+            duration: Number.isFinite(Number(info.basic_info.duration))
+              ? Number(info.basic_info.duration)
+              : null,
+            itag: selected.itag,
+            height: selected.height,
+            size: selected.size,
+            canSendByTelegramUrl: Boolean(telegramCandidate),
+          };
+        },
+      );
+
+      const mediaUrl = await step.do(
+        "create secure media link",
+        { timeout: "1 minute", retries: { limit: 1, delay: "1 second", backoff: "constant" } },
+        async () => createSignedMediaUrl(this.env.BOT_TOKEN, job.videoId, video.itag),
+      );
+
+      await step.do(
+        "deliver video",
+        {
           retries: { limit: 1, delay: "1 second", backoff: "constant" },
           timeout: "2 hours",
         },
         async () => {
-          const container = getContainer(this.env.DOWNLOADER_CONTAINER, job.id);
-          const response = await container.fetch(
-            new Request("http://container/download", {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({
-                ...job,
-                statusMessageId,
-                botToken: this.env.BOT_TOKEN,
-              }),
-            }),
-          );
+          if (video.canSendByTelegramUrl) {
+            try {
+              await telegramCall(this.env.BOT_TOKEN, "sendVideo", {
+                chat_id: job.chatId,
+                video: mediaUrl,
+                caption: video.title.slice(0, 1024),
+                supports_streaming: true,
+                ...(video.duration ? { duration: Math.round(video.duration) } : {}),
+                reply_parameters: { message_id: job.requestMessageId },
+              });
 
-          if (!response.ok) {
-            throw new Error(`Container returned HTTP ${response.status}`);
+              if (statusMessageId) {
+                await safeTelegramCall(this.env.BOT_TOKEN, "deleteMessage", {
+                  chat_id: job.chatId,
+                  message_id: statusMessageId,
+                });
+              }
+              return true;
+            } catch (error) {
+              console.warn("Telegram remote video fetch failed; falling back to link", error);
+            }
           }
 
-          const result = await response.json<ContainerResult>();
-          return result;
+          const quality = video.height ? `${video.height}p` : "best available";
+          const sizeText = video.size ? ` • ${formatBytes(video.size)}` : "";
+          const text = `✅ آماده‌ست\n${video.title}\n\nکیفیت: ${quality}${sizeText}\nبرای دانلود روی دکمه بزن 👇`;
+
+          if (statusMessageId) {
+            await telegramCall(this.env.BOT_TOKEN, "editMessageText", {
+              chat_id: job.chatId,
+              message_id: statusMessageId,
+              text,
+              reply_markup: {
+                inline_keyboard: [[{ text: "⬇️ دانلود ویدیو", url: mediaUrl }]],
+              },
+            });
+          } else {
+            await telegramCall(this.env.BOT_TOKEN, "sendMessage", {
+              chat_id: job.chatId,
+              text,
+              reply_parameters: { message_id: job.requestMessageId },
+              reply_markup: {
+                inline_keyboard: [[{ text: "⬇️ دانلود ویدیو", url: mediaUrl }]],
+              },
+            });
+          }
+
+          return true;
         },
       );
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       console.error("download workflow failed", { jobId: job.id, detail });
 
+      const friendly = friendlyError(detail);
       await step.do(
-        "notify unexpected failure",
+        "show failure",
         {
-          retries: { limit: 3, delay: "3 seconds", backoff: "linear" },
+          retries: { limit: 2, delay: "2 seconds", backoff: "linear" },
           timeout: "1 minute",
         },
         async () => {
           if (statusMessageId) {
-            await telegramCall(this.env.BOT_TOKEN, "editMessageText", {
+            await safeTelegramCall(this.env.BOT_TOKEN, "editMessageText", {
               chat_id: job.chatId,
               message_id: statusMessageId,
-              text: "❌ دانلود انجام نشد. یک‌بار دیگه لینک رو بفرست.",
+              text: friendly,
             });
           } else {
-            await telegramCall(this.env.BOT_TOKEN, "sendMessage", {
+            await safeTelegramCall(this.env.BOT_TOKEN, "sendMessage", {
               chat_id: job.chatId,
-              text: "❌ دانلود انجام نشد. یک‌بار دیگه لینک رو بفرست.",
+              text: friendly,
               reply_parameters: { message_id: job.requestMessageId },
             });
           }
@@ -156,27 +267,46 @@ async function telegramCall<T = unknown>(
   return data.result as T;
 }
 
-function extractYouTubeUrl(text: string): string | null {
+async function safeTelegramCall(
+  token: string,
+  method: string,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  try {
+    await telegramCall(token, method, payload);
+  } catch (error) {
+    console.warn(`Telegram ${method} failed`, error);
+  }
+}
+
+function extractYouTubeVideo(text: string): { url: string; videoId: string } | null {
   const matches = text.match(/https?:\/\/[^\s<>"']+/gi) ?? [];
 
   for (const raw of matches) {
     const candidate = raw.replace(/[),.!?\]}]+$/g, "");
-
     try {
       const url = new URL(candidate);
       const host = url.hostname.toLowerCase().replace(/^www\./, "");
-      const isYouTube =
-        host === "youtu.be" ||
-        host === "youtube.com" ||
-        host.endsWith(".youtube.com") ||
-        host === "youtube-nocookie.com" ||
-        host.endsWith(".youtube-nocookie.com");
+      let videoId: string | null = null;
 
-      if (isYouTube && (url.protocol === "https:" || url.protocol === "http:")) {
-        return url.toString();
+      if (host === "youtu.be") {
+        videoId = url.pathname.split("/").filter(Boolean)[0] ?? null;
+      } else if (host === "youtube.com" || host.endsWith(".youtube.com")) {
+        if (url.pathname === "/watch") {
+          videoId = url.searchParams.get("v");
+        } else {
+          const parts = url.pathname.split("/").filter(Boolean);
+          if (["shorts", "embed", "live", "v"].includes(parts[0] || "")) {
+            videoId = parts[1] ?? null;
+          }
+        }
+      }
+
+      if (videoId && /^[A-Za-z0-9_-]{11}$/.test(videoId)) {
+        return { url: url.toString(), videoId };
       }
     } catch {
-      // Ignore malformed URLs and continue searching the message.
+      // Continue to the next URL in the Telegram message.
     }
   }
 
@@ -196,25 +326,22 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
   }
 
   const message = update.message;
-  if (!message) {
-    return Response.json({ ok: true });
-  }
+  if (!message) return Response.json({ ok: true });
 
   const text = (message.text || message.caption || "").trim();
-
   if (text === "/start" || text.startsWith("/start ")) {
     await telegramCall(env.BOT_TOKEN, "sendMessage", {
       chat_id: message.chat.id,
-      text: "لینک ویدیوی YouTube یا Shorts رو بفرست؛ خودم دانلودش می‌کنم و همین‌جا می‌فرستم. ⚡️",
+      text: "لینک YouTube یا Shorts رو بفرست؛ برات آماده‌ش می‌کنم ⚡️",
     });
     return Response.json({ ok: true });
   }
 
-  const youtubeUrl = extractYouTubeUrl(text);
-  if (!youtubeUrl) {
+  const youtube = extractYouTubeVideo(text);
+  if (!youtube) {
     await telegramCall(env.BOT_TOKEN, "sendMessage", {
       chat_id: message.chat.id,
-      text: "یه لینک معتبر YouTube برام بفرست 👇",
+      text: "یه لینک معتبر YouTube یا Shorts بفرست 👇",
       reply_parameters: { message_id: message.message_id },
     });
     return Response.json({ ok: true });
@@ -225,7 +352,8 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
     id: workflowId,
     chatId: message.chat.id,
     requestMessageId: message.message_id,
-    url: youtubeUrl,
+    videoId: youtube.videoId,
+    sourceUrl: youtube.url,
   };
 
   try {
@@ -238,8 +366,6 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
       },
     });
   } catch (error) {
-    // Telegram retries webhooks when it does not receive a successful response.
-    // Reusing update_id as the Workflow ID makes duplicate updates idempotent.
     const detail = error instanceof Error ? error.message : String(error);
     if (!detail.toLowerCase().includes("already")) {
       console.error("failed to create workflow", { workflowId, detail });
@@ -248,6 +374,130 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
   }
 
   return Response.json({ ok: true });
+}
+
+async function handleMedia(request: Request, env: Env, url: URL): Promise<Response> {
+  const parts = url.pathname.split("/").filter(Boolean);
+  const videoId = parts[1] || "";
+  const itag = Number(url.searchParams.get("itag"));
+  const expires = Number(url.searchParams.get("exp"));
+  const signature = url.searchParams.get("sig") || "";
+
+  if (!/^[A-Za-z0-9_-]{11}$/.test(videoId) || !Number.isInteger(itag)) {
+    return new Response("Bad media link", { status: 400 });
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  if (!Number.isFinite(expires) || expires < now || expires > now + MEDIA_LINK_TTL_SECONDS + 120) {
+    return new Response("Media link expired", { status: 403 });
+  }
+
+  const expected = await signMediaToken(env.BOT_TOKEN, `${videoId}.${itag}.${expires}`);
+  if (!constantTimeEqual(signature, expected)) {
+    return new Response("Forbidden", { status: 403 });
+  }
+
+  try {
+    const youtube = await Innertube.create();
+    const format = await youtube.getStreamingData(videoId, { itag });
+    if (!format.url) return new Response("Stream unavailable", { status: 404 });
+
+    const upstreamHeaders = new Headers();
+    const range = request.headers.get("range");
+    if (range) upstreamHeaders.set("range", range);
+
+    const upstream = await fetch(format.url, {
+      method: request.method === "HEAD" ? "HEAD" : "GET",
+      headers: upstreamHeaders,
+      redirect: "follow",
+    });
+
+    if (!upstream.ok && upstream.status !== 206) {
+      return new Response("YouTube stream failed", { status: 502 });
+    }
+
+    const headers = new Headers();
+    for (const name of [
+      "content-length",
+      "content-range",
+      "accept-ranges",
+      "etag",
+      "last-modified",
+    ]) {
+      const value = upstream.headers.get(name);
+      if (value) headers.set(name, value);
+    }
+
+    const mime = upstream.headers.get("content-type") ||
+      String(format.mime_type || "video/mp4").split(";")[0];
+    headers.set("content-type", mime);
+    headers.set("cache-control", "private, no-store");
+    headers.set("content-disposition", `attachment; filename="youtube-${videoId}.mp4"`);
+
+    return new Response(request.method === "HEAD" ? null : upstream.body, {
+      status: upstream.status,
+      headers,
+    });
+  } catch (error) {
+    console.error("media proxy failed", { videoId, itag, error });
+    return new Response("Media unavailable", { status: 502 });
+  }
+}
+
+async function createSignedMediaUrl(token: string, videoId: string, itag: number): Promise<string> {
+  const expires = Math.floor(Date.now() / 1000) + MEDIA_LINK_TTL_SECONDS;
+  const payload = `${videoId}.${itag}.${expires}`;
+  const signature = await signMediaToken(token, payload);
+  const url = new URL(`${BASE_URL}/media/${videoId}`);
+  url.searchParams.set("itag", String(itag));
+  url.searchParams.set("exp", String(expires));
+  url.searchParams.set("sig", signature);
+  return url.toString();
+}
+
+async function signMediaToken(secret: string, value: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signed = await crypto.subtle.sign("HMAC", key, encoder.encode(value));
+  const bytes = new Uint8Array(signed);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return mismatch === 0;
+}
+
+function formatBytes(bytes: number): string {
+  const mb = bytes / 1_000_000;
+  return `${mb < 10 ? mb.toFixed(1) : mb.toFixed(0)} MB`;
+}
+
+function friendlyError(detail: string): string {
+  const value = detail.toLowerCase();
+  if (value.includes("private_video") || value.includes("private")) {
+    return "❌ این ویدیو Private هست و قابل دانلود نیست.";
+  }
+  if (value.includes("live_video") || value.includes("live")) {
+    return "❌ دانلود Live فعلاً پشتیبانی نمی‌شه.";
+  }
+  if (value.includes("no_muxed_format")) {
+    return "❌ این ویدیو فرمت آماده‌ی مناسب نداره. یه ویدیوی دیگه امتحان کن.";
+  }
+  if (value.includes("unavailable") || value.includes("playability")) {
+    return "❌ این ویدیو در دسترس نیست یا محدود شده.";
+  }
+  return "❌ نتونستم این ویدیو رو آماده کنم. یک‌بار دیگه لینک رو بفرست.";
 }
 
 export default {
@@ -259,7 +509,9 @@ export default {
         JSON.stringify({
           ok: true,
           service: "telegram-youtube-downloader",
+          mode: "worker-streaming",
           domain: "downloader.vexaagent.workers.dev",
+          botConfigured: Boolean(env.BOT_TOKEN),
         }),
         { headers: JSON_HEADERS },
       );
@@ -271,6 +523,10 @@ export default {
 
     if (request.method === "POST" && url.pathname === "/telegram/webhook") {
       return handleTelegramWebhook(request, env);
+    }
+
+    if ((request.method === "GET" || request.method === "HEAD") && url.pathname.startsWith("/media/")) {
+      return handleMedia(request, env, url);
     }
 
     return new Response("Not Found", { status: 404 });
