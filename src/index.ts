@@ -37,31 +37,38 @@ type MediaCandidate = {
   height: number;
 };
 
-type ResolvedMedia = MediaCandidate & {
-  size: number | null;
-};
-
+type ResolvedMedia = MediaCandidate & { size: number | null };
 type CookieJar = Map<string, string>;
 
-type IgJsonResult = {
+type FetchJsonResult = {
   data: any | null;
   status: number;
-  authRedirect: boolean;
+  redirectedTo: string | null;
 };
 
 const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
 const BASE_URL = "https://downloader.vexaagent.workers.dev";
-const IG_APP_ID = "936619743392459";
-const IG_ASBD_ID = "359341";
-const IG_GRAPHQL_DOC_ID = "27130156389949648";
-const IG_GRAPHQL_FRIENDLY_NAME = "PolarisLoggedOutDesktopWWWPostRootContentQuery";
+const WEB_APP_ID = "936619743392459";
+const IOS_APP_ID = "124024574287414";
+const WEB_ASBD_ID = "129477";
+const LEGACY_ASBD_ID = "359341";
+const INSTALOADER_POST_DOC_ID = "27128499623469141";
+const COBALT_POST_DOC_ID = "8845758582119845";
+const COBALT_POST_FRIENDLY_NAME = "PolarisPostActionLoadPostQueryQuery";
+const LEGACY_POST_DOC_ID = "27130156389949648";
+const LEGACY_POST_FRIENDLY_NAME = "PolarisLoggedOutDesktopWWWPostRootContentQuery";
 const MEDIA_LINK_TTL_SECONDS = 10 * 60;
 const TELEGRAM_VIDEO_URL_LIMIT = 19_000_000;
 const TELEGRAM_PHOTO_URL_LIMIT = 4_800_000;
 const IG_SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
-const BROWSER_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+
+// Current defaults used by maintained Instagram downloaders. Web and mobile
+// requests intentionally use different identities instead of one hard-coded UA.
+const WEB_UA =
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
+const IOS_UA =
+  "Instagram 361.0.0.35.82 (iPad13,8; iOS 18_0; en_US; en-US; scale=2.00; 2048x2732; 674117118) AppleWebKit/420+";
 
 async function telegramCall<T = unknown>(
   token: string,
@@ -73,10 +80,8 @@ async function telegramCall<T = unknown>(
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload),
   });
-  const data = await response.json<TelegramApiResponse<T>>();
-  if (!response.ok || !data.ok) {
-    throw new Error(data.description || `Telegram ${method} failed`);
-  }
+  const data = (await response.json()) as TelegramApiResponse<T>;
+  if (!response.ok || !data.ok) throw new Error(data.description || `Telegram ${method} failed`);
   return data.result as T;
 }
 
@@ -127,7 +132,7 @@ function parseInstagramTarget(text: string): InstagramTarget | null {
         }
       }
     } catch {
-      // Try the next URL.
+      // Try next URL.
     }
   }
   return null;
@@ -154,13 +159,17 @@ function secretCookies(env: Env): CookieJar {
         const possibleUserId = decodeURIComponent(session).split(":")[0];
         if (/^\d+$/.test(possibleUserId)) jar.set("ds_user_id", possibleUserId);
       } catch {
-        // The session cookie can stay percent-encoded.
+        // Keep encoded value untouched.
       }
     }
   }
   if (env.INSTAGRAM_CSRFTOKEN?.trim()) jar.set("csrftoken", env.INSTAGRAM_CSRFTOKEN.trim());
   if (env.INSTAGRAM_DS_USER_ID?.trim()) jar.set("ds_user_id", env.INSTAGRAM_DS_USER_ID.trim());
   return jar;
+}
+
+function cloneJar(jar: CookieJar): CookieJar {
+  return new Map(jar);
 }
 
 function cookieHeader(jar: CookieJar): string | null {
@@ -178,38 +187,20 @@ function absorbSetCookies(headers: Headers, jar: CookieJar): void {
     if (!value) continue;
     const first = /^\s*([A-Za-z0-9_]+)=([^;]*)/.exec(value);
     if (first?.[1]) jar.set(first[1], first[2] || "");
-    for (const name of ["csrftoken", "mid", "ig_did", "datr", "dpr", "wd"]) {
+    for (const name of ["csrftoken", "mid", "ig_did", "datr", "dpr", "wd", "ig_nrcb", "rur"]) {
       const match = new RegExp(`(?:^|[,;]\\s*)${name}=([^;,\\s]+)`, "i").exec(value);
       if (match?.[1]) jar.set(name, match[1]);
     }
   }
 }
 
-function browserHeaders(jar: CookieJar, referer = "https://www.instagram.com/"): Headers {
-  const headers = new Headers({
-    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "accept-language": "en-US,en;q=0.9",
-    "cache-control": "no-cache",
-    pragma: "no-cache",
-    referer,
-    "user-agent": BROWSER_UA,
-    "upgrade-insecure-requests": "1",
-  });
-  const cookie = cookieHeader(jar);
-  if (cookie) headers.set("cookie", cookie);
-  return headers;
-}
-
-function apiHeaders(jar: CookieJar, referer: string): Headers {
+function webHeaders(jar: CookieJar, referer = "https://www.instagram.com/"): Headers {
   const headers = new Headers({
     accept: "*/*",
-    "accept-language": "en-US,en;q=0.9",
-    origin: "https://www.instagram.com",
+    "accept-language": "en-US,en;q=0.8",
     referer,
-    "user-agent": BROWSER_UA,
-    "x-asbd-id": IG_ASBD_ID,
-    "x-ig-app-id": IG_APP_ID,
-    "x-ig-www-claim": "0",
+    "user-agent": WEB_UA,
+    "x-ig-app-id": WEB_APP_ID,
   });
   const cookie = cookieHeader(jar);
   if (cookie) headers.set("cookie", cookie);
@@ -218,12 +209,37 @@ function apiHeaders(jar: CookieJar, referer: string): Headers {
   return headers;
 }
 
-function mediaHeaders(range?: string | null): Headers {
+function browserHeaders(jar: CookieJar, referer = "https://www.instagram.com/"): Headers {
+  const headers = webHeaders(jar, referer);
+  headers.set("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8");
+  headers.set("upgrade-insecure-requests", "1");
+  return headers;
+}
+
+function mobileHeaders(jar: CookieJar): Headers {
   const headers = new Headers({
     accept: "*/*",
-    referer: "https://www.instagram.com/",
-    "user-agent": BROWSER_UA,
+    "accept-language": "en-US",
+    "user-agent": IOS_UA,
+    "x-ads-opt-out": "1",
+    "x-fb-client-ip": "True",
+    "x-fb-connection-type": "wifi",
+    "x-fb-http-engine": "Liger",
+    "x-fb-server-cluster": "True",
+    "x-ig-app-id": IOS_APP_ID,
+    "x-ig-app-locale": "en-US",
+    "x-ig-connection-type": "WiFi",
+    "x-ig-device-locale": "en-US",
+    "x-ig-mapped-locale": "en-US",
+    "x-ig-www-claim": "0",
   });
+  const cookie = cookieHeader(jar);
+  if (cookie) headers.set("cookie", cookie);
+  return headers;
+}
+
+function mediaHeaders(range?: string | null): Headers {
+  const headers = new Headers({ accept: "*/*", referer: "https://www.instagram.com/" });
   if (range) headers.set("range", range);
   return headers;
 }
@@ -248,90 +264,9 @@ function isAuthRedirect(location: URL | null): boolean {
   );
 }
 
-async function instagramJsonWithJar(
-  url: string,
-  jar: CookieJar,
-  referer = "https://www.instagram.com/",
-): Promise<IgJsonResult> {
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      headers: apiHeaders(jar, referer),
-      redirect: "manual",
-    });
-  } catch (error) {
-    console.warn("instagram api fetch failed", {
-      path: new URL(url).pathname,
-      detail: error instanceof Error ? error.message : String(error),
-    });
-    return { data: null, status: 0, authRedirect: false };
-  }
-
-  absorbSetCookies(response.headers, jar);
-  const location = redirectLocation(response, url);
-  if (location) {
-    const authRedirect = isAuthRedirect(location);
-    console.warn("instagram api redirected", {
-      path: new URL(url).pathname,
-      status: response.status,
-      to: location.pathname,
-      authRedirect,
-    });
-    await response.body?.cancel().catch(() => undefined);
-    return { data: null, status: response.status, authRedirect };
-  }
-
-  if (!response.ok) {
-    console.warn("instagram api failed", { path: new URL(url).pathname, status: response.status });
-    await response.body?.cancel().catch(() => undefined);
-    return { data: null, status: response.status, authRedirect: false };
-  }
-
-  try {
-    return { data: await response.json(), status: response.status, authRedirect: false };
-  } catch {
-    return { data: null, status: response.status, authRedirect: false };
-  }
-}
-
-async function instagramPage(
-  url: string,
-  jar: CookieJar,
-  referer = "https://www.instagram.com/",
-): Promise<{ html: string | null; status: number; authRedirect: boolean }> {
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      headers: browserHeaders(jar, referer),
-      redirect: "manual",
-    });
-  } catch (error) {
-    console.warn("instagram page fetch failed", {
-      path: new URL(url).pathname,
-      detail: error instanceof Error ? error.message : String(error),
-    });
-    return { html: null, status: 0, authRedirect: false };
-  }
-
-  absorbSetCookies(response.headers, jar);
-  const location = redirectLocation(response, url);
-  if (location) {
-    const authRedirect = isAuthRedirect(location);
-    console.warn("instagram page redirected", {
-      path: new URL(url).pathname,
-      status: response.status,
-      to: location.pathname,
-      authRedirect,
-    });
-    await response.body?.cancel().catch(() => undefined);
-    return { html: null, status: response.status, authRedirect };
-  }
-
-  if (!response.ok) {
-    await response.body?.cancel().catch(() => undefined);
-    return { html: null, status: response.status, authRedirect: false };
-  }
-  return { html: await response.text(), status: response.status, authRedirect: false };
+function throwForInstagramStatus(status: number): void {
+  if (status === 429) throw new Error("INSTAGRAM_RATE_LIMIT_429");
+  if (status === 403) throw new Error("INSTAGRAM_ACCESS_403");
 }
 
 function numberOrZero(value: unknown): number {
@@ -358,9 +293,12 @@ function candidatesFromProduct(product: any): MediaCandidate[][] {
       continue;
     }
 
-    const images = Array.isArray(node?.image_versions2?.candidates)
-      ? node.image_versions2.candidates
-      : [];
+    if (typeof node?.video_url === "string" && node.video_url.startsWith("https://")) {
+      groups.push([{ kind: "video", url: node.video_url, width: numberOrZero(node.width), height: numberOrZero(node.height) }]);
+      continue;
+    }
+
+    const images = Array.isArray(node?.image_versions2?.candidates) ? node.image_versions2.candidates : [];
     const imageCandidates = images
       .filter((item: any) => typeof item?.url === "string" && item.url.startsWith("https://"))
       .map((item: any) => ({
@@ -369,9 +307,48 @@ function candidatesFromProduct(product: any): MediaCandidate[][] {
         width: numberOrZero(item.width),
         height: numberOrZero(item.height),
       }));
-    if (imageCandidates.length) groups.push(imageCandidates);
+    if (imageCandidates.length) {
+      groups.push(imageCandidates);
+      continue;
+    }
+
+    const displayUrl = node?.display_url || node?.display_src;
+    if (typeof displayUrl === "string" && displayUrl.startsWith("https://")) {
+      groups.push([{ kind: "photo", url: displayUrl, width: numberOrZero(node.width), height: numberOrZero(node.height) }]);
+    }
   }
+
   return groups;
+}
+
+function firstCandidateGroups(value: unknown, depth = 0): MediaCandidate[][] {
+  if (depth > 18 || value === null || typeof value !== "object") return [];
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const groups = firstCandidateGroups(item, depth + 1);
+      if (groups.length) return groups;
+    }
+    return [];
+  }
+
+  const object = value as Record<string, any>;
+  for (const key of ["xdt_shortcode_media", "shortcode_media", "xig_polaris_media", "if_not_gated_logged_out"]) {
+    if (object[key] && typeof object[key] === "object") {
+      const groups = candidatesFromProduct(object[key]);
+      if (groups.length) return groups;
+    }
+  }
+
+  if (object.video_versions || object.image_versions2 || object.video_url || object.carousel_media) {
+    const groups = candidatesFromProduct(object);
+    if (groups.length) return groups;
+  }
+
+  for (const child of Object.values(object)) {
+    const groups = firstCandidateGroups(child, depth + 1);
+    if (groups.length) return groups;
+  }
+  return [];
 }
 
 function decodeEscapedUrl(value: string): string | null {
@@ -383,15 +360,15 @@ function decodeEscapedUrl(value: string): string | null {
   return decoded.startsWith("https://") ? decoded : null;
 }
 
-function candidatesFromHtml(html: string): MediaCandidate[][] {
+function candidatesFromHtmlMeta(html: string): MediaCandidate[][] {
   const found: MediaCandidate[] = [];
-  const patterns = [
+  const videoPatterns = [
     /["']video_url["']\s*:\s*["']([^"']+)["']/gi,
     /["']contentUrl["']\s*:\s*["']([^"']+)["']/gi,
     /<meta[^>]+property=["']og:video(?::url)?["'][^>]+content=["']([^"']+)["'][^>]*>/gi,
     /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:video(?::url)?["'][^>]*>/gi,
   ];
-  for (const pattern of patterns) {
+  for (const pattern of videoPatterns) {
     for (const match of html.matchAll(pattern)) {
       const url = decodeEscapedUrl(match[1] || "");
       if (url) found.push({ kind: "video", url, width: 0, height: 0 });
@@ -401,46 +378,6 @@ function candidatesFromHtml(html: string): MediaCandidate[][] {
   return unique.map((item) => [item]);
 }
 
-function findPolarisMedia(value: unknown, depth = 0): any | null {
-  if (depth > 16 || value === null || typeof value !== "object") return null;
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const found = findPolarisMedia(item, depth + 1);
-      if (found) return found;
-    }
-    return null;
-  }
-
-  const object = value as Record<string, unknown>;
-  const direct = object.xig_polaris_media;
-  if (direct && typeof direct === "object") return direct;
-
-  for (const child of Object.values(object)) {
-    const found = findPolarisMedia(child, depth + 1);
-    if (found) return found;
-  }
-  return null;
-}
-
-function candidatesFromRelayHtml(html: string): MediaCandidate[][] {
-  const pattern = /<script\b[^>]*\bdata-sjs(?:=["'][^"']*["'])?[^>]*>([\s\S]*?)<\/script>/gi;
-  for (const match of html.matchAll(pattern)) {
-    const raw = match[1] || "";
-    if (!raw.includes("xig_polaris_media")) continue;
-    try {
-      const parsed = JSON.parse(raw);
-      const media = findPolarisMedia(parsed);
-      const product = media?.if_not_gated_logged_out || media;
-      if (!product) continue;
-      const groups = candidatesFromProduct(product);
-      if (groups.length) return groups;
-    } catch {
-      // Try the next Relay data script.
-    }
-  }
-  return [];
-}
-
 function extractLsdToken(html: string): string | null {
   const eqmc = /<script\b[^>]*\bid=["']__eqmc["'][^>]*>([\s\S]*?)<\/script>/i.exec(html);
   if (eqmc?.[1]) {
@@ -448,180 +385,439 @@ function extractLsdToken(html: string): string | null {
       const parsed = JSON.parse(eqmc[1]);
       if (typeof parsed?.l === "string" && parsed.l) return parsed.l;
     } catch {
-      // Continue with the normal LSD pattern.
+      // Continue.
     }
   }
-  const match = /\["LSD",\[\],\{"token":"([^"]+)"/i.exec(html);
-  return match?.[1] || null;
+  return /\["LSD",\[\],\{"token":"([^"]+)"/i.exec(html)?.[1] || null;
 }
 
-function throwForInstagramStatus(status: number): void {
-  if (status === 429) throw new Error("INSTAGRAM_RATE_LIMIT_429");
-  if (status === 403) throw new Error("INSTAGRAM_ACCESS_403");
+function extractCsrfFromHtml(html: string): string | null {
+  return (
+    /"csrf_token":"([^"]+)"/.exec(html)?.[1] ||
+    /\["InstagramSecurityConfig",\[\],\{"csrf_token":"([^"]+)"/.exec(html)?.[1] ||
+    null
+  );
 }
 
-async function resolvePostViaWeb(
-  target: Extract<InstagramTarget, { kind: "post" }>,
-  mediaId: string,
+async function fetchJson(
+  url: string,
+  headers: Headers,
   jar: CookieJar,
-): Promise<MediaCandidate[][] | null> {
-  const page = await instagramPage(target.url, jar, "https://www.instagram.com/");
-  throwForInstagramStatus(page.status);
-  if (page.authRedirect) return null;
-
-  let lsd: string | null = null;
-  if (page.html) {
-    const direct = candidatesFromHtml(page.html);
-    if (direct.length) return direct;
-
-    const relay = candidatesFromRelayHtml(page.html);
-    if (relay.length) {
-      console.log("instagram media resolved from relay html");
-      return relay;
-    }
-    lsd = extractLsdToken(page.html);
-  }
-
-  if (!lsd) {
-    const home = await instagramPage("https://www.instagram.com/", jar);
-    throwForInstagramStatus(home.status);
-    if (home.authRedirect) return null;
-    lsd = home.html ? extractLsdToken(home.html) : null;
-  }
-
-  if (!lsd) return null;
-
-  const rulingUrl = new URL("https://www.instagram.com/api/v1/web/get_ruling_for_content/");
-  rulingUrl.searchParams.set("content_type", "MEDIA");
-  rulingUrl.searchParams.set("target_id", mediaId);
-  const ruling = await instagramJsonWithJar(rulingUrl.toString(), jar, target.url);
-  throwForInstagramStatus(ruling.status);
-
-  const body = new URLSearchParams({
-    lsd,
-    fb_api_caller_class: "RelayModern",
-    fb_api_req_friendly_name: IG_GRAPHQL_FRIENDLY_NAME,
-    server_timestamps: "true",
-    variables: JSON.stringify({ media_id: mediaId }),
-    doc_id: IG_GRAPHQL_DOC_ID,
-  });
-  const headers = apiHeaders(jar, target.url);
-  headers.set("content-type", "application/x-www-form-urlencoded");
-  headers.set("x-fb-friendly-name", IG_GRAPHQL_FRIENDLY_NAME);
-  headers.set("x-fb-lsd", lsd);
-  headers.set("x-requested-with", "XMLHttpRequest");
-
+  init: { method?: string; body?: string } = {},
+): Promise<FetchJsonResult> {
   let response: Response;
   try {
-    response = await fetch("https://www.instagram.com/api/graphql", {
-      method: "POST",
+    response = await fetch(url, {
+      method: init.method || "GET",
       headers,
-      body: body.toString(),
+      body: init.body,
       redirect: "manual",
     });
-  } catch {
-    return null;
+  } catch (error) {
+    console.warn("instagram fetch failed", {
+      path: new URL(url).pathname,
+      detail: error instanceof Error ? error.message : String(error),
+    });
+    return { data: null, status: 0, redirectedTo: null };
   }
+
   absorbSetCookies(response.headers, jar);
-  const location = redirectLocation(response, "https://www.instagram.com/api/graphql");
+  const location = redirectLocation(response, url);
   if (location) {
-    console.warn("instagram graphql redirected", {
+    console.warn("instagram request redirected", {
+      path: new URL(url).pathname,
       status: response.status,
       to: location.pathname,
       authenticated: jar.has("sessionid"),
     });
     await response.body?.cancel().catch(() => undefined);
-    return null;
+    return { data: null, status: response.status, redirectedTo: location.pathname };
   }
+
   throwForInstagramStatus(response.status);
   if (!response.ok) {
+    console.warn("instagram request failed", { path: new URL(url).pathname, status: response.status });
     await response.body?.cancel().catch(() => undefined);
-    return null;
+    return { data: null, status: response.status, redirectedTo: null };
   }
 
   try {
-    const data = await response.json<any>();
-    const media = data?.data?.xig_polaris_media;
-    const product = media?.if_not_gated_logged_out || media;
-    if (!product) return null;
-    const groups = candidatesFromProduct(product);
-    return groups.length ? groups : null;
+    return { data: await response.json(), status: response.status, redirectedTo: null };
+  } catch {
+    return { data: null, status: response.status, redirectedTo: null };
+  }
+}
+
+async function fetchHtml(
+  url: string,
+  headers: Headers,
+  jar: CookieJar,
+): Promise<{ html: string | null; status: number; redirectedTo: string | null }> {
+  let response: Response;
+  try {
+    response = await fetch(url, { headers, redirect: "manual" });
+  } catch (error) {
+    console.warn("instagram html fetch failed", {
+      path: new URL(url).pathname,
+      detail: error instanceof Error ? error.message : String(error),
+    });
+    return { html: null, status: 0, redirectedTo: null };
+  }
+
+  absorbSetCookies(response.headers, jar);
+  const location = redirectLocation(response, url);
+  if (location) {
+    console.warn("instagram html redirected", {
+      path: new URL(url).pathname,
+      status: response.status,
+      to: location.pathname,
+      authenticated: jar.has("sessionid"),
+    });
+    await response.body?.cancel().catch(() => undefined);
+    return { html: null, status: response.status, redirectedTo: location.pathname };
+  }
+
+  throwForInstagramStatus(response.status);
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => undefined);
+    return { html: null, status: response.status, redirectedTo: null };
+  }
+  return { html: await response.text(), status: response.status, redirectedTo: null };
+}
+
+async function ensureWebCsrf(jar: CookieJar): Promise<{ html: string | null; ok: boolean }> {
+  if (jar.get("csrftoken")) return { html: null, ok: true };
+  const home = await fetchHtml("https://www.instagram.com/", browserHeaders(jar), jar);
+  if (home.redirectedTo && isAuthRedirect(new URL(home.redirectedTo, "https://www.instagram.com"))) {
+    return { html: home.html, ok: false };
+  }
+  if (home.html && !jar.get("csrftoken")) {
+    const csrf = extractCsrfFromHtml(home.html);
+    if (csrf) jar.set("csrftoken", csrf);
+  }
+  return { html: home.html, ok: Boolean(home.status === 200) };
+}
+
+async function resolveViaOembedMobile(
+  target: Extract<InstagramTarget, { kind: "post" }>,
+  jar: CookieJar,
+): Promise<MediaCandidate[][] | null> {
+  const oembedUrl = new URL("https://i.instagram.com/api/v1/oembed/");
+  oembedUrl.searchParams.set("url", `https://www.instagram.com/p/${target.shortcode}/`);
+
+  const oembed = await fetchJson(oembedUrl.toString(), mobileHeaders(jar), jar);
+  let mediaId = String(oembed.data?.media_id || "").match(/^\d+/)?.[0] || "";
+  if (!mediaId) mediaId = shortcodeToMediaId(target.shortcode);
+
+  const media = await fetchJson(
+    `https://i.instagram.com/api/v1/media/${mediaId}/info/`,
+    mobileHeaders(jar),
+    jar,
+  );
+  const product = media.data?.items?.[0];
+  if (!product) return null;
+
+  const groups = candidatesFromProduct(product);
+  if (groups.length) {
+    console.log("instagram resolver success", { resolver: "mobile-api", authenticated: jar.has("sessionid") });
+    return groups;
+  }
+  return null;
+}
+
+async function resolveViaInstaloaderGraphql(
+  target: Extract<InstagramTarget, { kind: "post" }>,
+  jar: CookieJar,
+): Promise<MediaCandidate[][] | null> {
+  const session = await ensureWebCsrf(jar);
+  if (!session.ok) return null;
+
+  const headers = webHeaders(jar, target.url);
+  headers.set("content-type", "application/x-www-form-urlencoded");
+  const csrf = jar.get("csrftoken");
+  if (csrf) headers.set("x-csrftoken", csrf);
+
+  const body = new URLSearchParams({
+    variables: JSON.stringify({
+      shortcode: target.shortcode,
+      __relay_internal__pv__PolarisAIGMMediaWebLabelEnabledrelayprovider: false,
+    }),
+    doc_id: INSTALOADER_POST_DOC_ID,
+    server_timestamps: "true",
+  }).toString();
+
+  const response = await fetchJson(
+    "https://www.instagram.com/graphql/query",
+    headers,
+    jar,
+    { method: "POST", body },
+  );
+  const product = response.data?.data?.xdt_api__v1__media__shortcode__web_info?.items?.[0];
+  if (!product) return null;
+
+  const groups = candidatesFromProduct(product);
+  if (groups.length) {
+    console.log("instagram resolver success", { resolver: "graphql-web-info", authenticated: jar.has("sessionid") });
+    return groups;
+  }
+  return null;
+}
+
+async function resolveViaCobaltGraphql(
+  target: Extract<InstagramTarget, { kind: "post" }>,
+  jar: CookieJar,
+): Promise<MediaCandidate[][] | null> {
+  const page = await fetchHtml(
+    `https://www.instagram.com/p/${target.shortcode}/`,
+    browserHeaders(jar),
+    jar,
+  );
+  if (!page.html || page.redirectedTo) return null;
+
+  const lsd = extractLsdToken(page.html);
+  if (!lsd) return null;
+  if (!jar.get("csrftoken")) {
+    const csrf = extractCsrfFromHtml(page.html);
+    if (csrf) jar.set("csrftoken", csrf);
+  }
+
+  const headers = webHeaders(jar, target.url);
+  headers.set("content-type", "application/x-www-form-urlencoded");
+  headers.set("x-fb-friendly-name", COBALT_POST_FRIENDLY_NAME);
+  headers.set("x-fb-lsd", lsd);
+  headers.set("x-requested-with", "XMLHttpRequest");
+  headers.set("x-asbd-id", WEB_ASBD_ID);
+  const csrf = jar.get("csrftoken");
+  if (csrf) headers.set("x-csrftoken", csrf);
+
+  const body = new URLSearchParams({
+    lsd,
+    fb_api_caller_class: "RelayModern",
+    fb_api_req_friendly_name: COBALT_POST_FRIENDLY_NAME,
+    variables: JSON.stringify({
+      shortcode: target.shortcode,
+      fetch_tagged_user_count: null,
+      hoisted_comment_id: null,
+      hoisted_reply_id: null,
+    }),
+    server_timestamps: "true",
+    doc_id: COBALT_POST_DOC_ID,
+  }).toString();
+
+  const response = await fetchJson(
+    "https://www.instagram.com/graphql/query",
+    headers,
+    jar,
+    { method: "POST", body },
+  );
+  const groups = firstCandidateGroups(response.data?.data);
+  if (groups.length) {
+    console.log("instagram resolver success", { resolver: "graphql-post-action", authenticated: jar.has("sessionid") });
+    return groups;
+  }
+  return null;
+}
+
+function parseEmbedContext(html: string): any | null {
+  const match = /"init",\[\],\[(.*?)\]\],/s.exec(html);
+  if (!match?.[1]) return null;
+  try {
+    const init = JSON.parse(match[1]);
+    if (!init?.contextJSON || typeof init.contextJSON !== "string") return null;
+    return JSON.parse(init.contextJSON);
   } catch {
     return null;
   }
 }
 
-async function checkSessionWeb(jar: CookieJar): Promise<boolean> {
-  const page = await instagramPage("https://www.instagram.com/accounts/edit/", jar);
-  throwForInstagramStatus(page.status);
-  const valid = page.status === 200 && !page.authRedirect;
-  console.warn("instagram session web check", {
-    status: page.status,
-    authRedirect: page.authRedirect,
-    valid,
-  });
-  return valid;
+async function resolveViaEmbed(
+  target: Extract<InstagramTarget, { kind: "post" }>,
+  jar: CookieJar,
+): Promise<MediaCandidate[][] | null> {
+  const url = `https://www.instagram.com/p/${target.shortcode}/embed/captioned/`;
+  const page = await fetchHtml(url, browserHeaders(jar), jar);
+  if (!page.html || page.redirectedTo) return null;
+
+  const context = parseEmbedContext(page.html);
+  const fromContext = firstCandidateGroups(context);
+  if (fromContext.length) {
+    console.log("instagram resolver success", { resolver: "embed-context", authenticated: jar.has("sessionid") });
+    return fromContext;
+  }
+
+  const fromMeta = candidatesFromHtmlMeta(page.html);
+  if (fromMeta.length) {
+    console.log("instagram resolver success", { resolver: "embed-meta", authenticated: jar.has("sessionid") });
+    return fromMeta;
+  }
+  return null;
+}
+
+async function resolveViaLegacyGraphql(
+  target: Extract<InstagramTarget, { kind: "post" }>,
+  mediaId: string,
+  jar: CookieJar,
+): Promise<MediaCandidate[][] | null> {
+  const session = await ensureWebCsrf(jar);
+  if (!session.ok) return null;
+
+  let lsd = session.html ? extractLsdToken(session.html) : null;
+  if (!lsd) {
+    const page = await fetchHtml(target.url, browserHeaders(jar), jar);
+    if (page.redirectedTo || !page.html) return null;
+    const direct = candidatesFromHtmlMeta(page.html);
+    if (direct.length) return direct;
+    const nested = firstCandidateGroups(safeJsonScripts(page.html));
+    if (nested.length) return nested;
+    lsd = extractLsdToken(page.html);
+  }
+  if (!lsd) return null;
+
+  const headers = webHeaders(jar, target.url);
+  headers.set("content-type", "application/x-www-form-urlencoded");
+  headers.set("x-fb-friendly-name", LEGACY_POST_FRIENDLY_NAME);
+  headers.set("x-fb-lsd", lsd);
+  headers.set("x-requested-with", "XMLHttpRequest");
+  headers.set("x-asbd-id", LEGACY_ASBD_ID);
+
+  const body = new URLSearchParams({
+    lsd,
+    fb_api_caller_class: "RelayModern",
+    fb_api_req_friendly_name: LEGACY_POST_FRIENDLY_NAME,
+    server_timestamps: "true",
+    variables: JSON.stringify({ media_id: mediaId }),
+    doc_id: LEGACY_POST_DOC_ID,
+  }).toString();
+
+  const response = await fetchJson(
+    "https://www.instagram.com/api/graphql",
+    headers,
+    jar,
+    { method: "POST", body },
+  );
+  const media = response.data?.data?.xig_polaris_media;
+  const product = media?.if_not_gated_logged_out || media;
+  const groups = product ? candidatesFromProduct(product) : [];
+  if (groups.length) {
+    console.log("instagram resolver success", { resolver: "legacy-graphql", authenticated: jar.has("sessionid") });
+    return groups;
+  }
+  return null;
+}
+
+function safeJsonScripts(html: string): unknown[] {
+  const values: unknown[] = [];
+  const pattern = /<script\b[^>]*\bdata-sjs(?:=["'][^"']*["'])?[^>]*>([\s\S]*?)<\/script>/gi;
+  for (const match of html.matchAll(pattern)) {
+    const raw = match[1] || "";
+    if (!raw.includes("video") && !raw.includes("xig_polaris_media")) continue;
+    try {
+      values.push(JSON.parse(raw));
+    } catch {
+      // Ignore malformed script.
+    }
+  }
+  return values;
+}
+
+async function resolveAuthenticatedMediaInfo(
+  target: Extract<InstagramTarget, { kind: "post" }>,
+  mediaId: string,
+  jar: CookieJar,
+): Promise<MediaCandidate[][] | null> {
+  const headers = webHeaders(jar, target.url);
+  headers.set("origin", "https://www.instagram.com");
+  headers.set("x-asbd-id", LEGACY_ASBD_ID);
+  headers.set("x-ig-www-claim", "0");
+
+  const response = await fetchJson(
+    `https://www.instagram.com/api/v1/media/${mediaId}/info/`,
+    headers,
+    jar,
+  );
+  if (response.redirectedTo && isAuthRedirect(new URL(response.redirectedTo, "https://www.instagram.com"))) {
+    return null;
+  }
+  const product = response.data?.items?.[0];
+  if (!product) return null;
+  const groups = candidatesFromProduct(product);
+  if (groups.length) {
+    console.log("instagram resolver success", { resolver: "authenticated-media-info" });
+    return groups;
+  }
+  return null;
+}
+
+async function tryPublicResolvers(
+  target: Extract<InstagramTarget, { kind: "post" }>,
+  jar: CookieJar,
+): Promise<MediaCandidate[][] | null> {
+  const mediaId = shortcodeToMediaId(target.shortcode);
+  const resolvers: Array<[string, () => Promise<MediaCandidate[][] | null>]> = [
+    ["mobile-api", () => resolveViaOembedMobile(target, cloneJar(jar))],
+    ["graphql-web-info", () => resolveViaInstaloaderGraphql(target, cloneJar(jar))],
+    ["graphql-post-action", () => resolveViaCobaltGraphql(target, cloneJar(jar))],
+    ["embed", () => resolveViaEmbed(target, cloneJar(jar))],
+    ["legacy-graphql", () => resolveViaLegacyGraphql(target, mediaId, cloneJar(jar))],
+  ];
+
+  for (const [name, run] of resolvers) {
+    try {
+      const result = await run();
+      if (result?.length) return result;
+      console.warn("instagram resolver empty", { resolver: name, authenticated: jar.has("sessionid") });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.warn("instagram resolver failed", { resolver: name, authenticated: jar.has("sessionid"), detail });
+      if (detail === "INSTAGRAM_RATE_LIMIT_429") throw error;
+    }
+  }
+  return null;
 }
 
 async function resolvePost(
   target: Extract<InstagramTarget, { kind: "post" }>,
   env: Env,
 ): Promise<MediaCandidate[][]> {
-  const mediaId = shortcodeToMediaId(target.shortcode);
-  const hasSession = Boolean(env.INSTAGRAM_SESSIONID?.trim());
+  // Public Reel/post first: do not let a rejected account session poison anonymous extraction.
+  const anonymous = await tryPublicResolvers(target, new Map());
+  if (anonymous?.length) return anonymous;
 
-  if (hasSession) {
-    const jar = secretCookies(env);
-    const api = await instagramJsonWithJar(
-      `https://www.instagram.com/api/v1/media/${mediaId}/info/`,
-      jar,
-      target.url,
-    );
-    throwForInstagramStatus(api.status);
+  if (env.INSTAGRAM_SESSIONID?.trim()) {
+    const sessionJar = secretCookies(env);
 
-    const product = api.data?.items?.[0];
-    if (product) {
-      const groups = candidatesFromProduct(product);
-      if (groups.length) return groups;
-    }
+    const withSession = await tryPublicResolvers(target, sessionJar);
+    if (withSession?.length) return withSession;
 
-    let webSessionValid = true;
-    if (api.authRedirect) {
-      webSessionValid = await checkSessionWeb(jar);
-    }
-
-    if (!api.authRedirect || webSessionValid) {
-      const webGroups = await resolvePostViaWeb(target, mediaId, jar);
-      if (webGroups?.length) return webGroups;
-    }
-
-    // Match yt-dlp behavior: once an authenticated API request is rejected,
-    // do the logged-out fallback with a clean cookie jar rather than the rejected session.
-    const anonymousGroups = await resolvePostViaWeb(target, mediaId, new Map());
-    if (anonymousGroups?.length) return anonymousGroups;
-
-    if (api.authRedirect && !webSessionValid) {
-      throw new Error("INSTAGRAM_SESSION_REJECTED");
-    }
-    if (api.authRedirect && webSessionValid) {
-      throw new Error("INSTAGRAM_SESSION_API_BLOCKED");
-    }
-    throw new Error("INSTAGRAM_SESSION_NO_MEDIA");
+    const mediaId = shortcodeToMediaId(target.shortcode);
+    const authenticatedInfo = await resolveAuthenticatedMediaInfo(target, mediaId, cloneJar(sessionJar));
+    if (authenticatedInfo?.length) return authenticatedInfo;
   }
 
-  const groups = await resolvePostViaWeb(target, mediaId, new Map());
-  if (groups?.length) return groups;
-  throw new Error("INSTAGRAM_ANONYMOUS_EMPTY_MEDIA");
+  throw new Error("INSTAGRAM_ALL_RESOLVERS_FAILED");
+}
+
+async function instagramJsonWithJar(
+  url: string,
+  jar: CookieJar,
+  referer = "https://www.instagram.com/",
+): Promise<{ data: any | null; status: number; authRedirect: boolean }> {
+  const headers = webHeaders(jar, referer);
+  headers.set("origin", "https://www.instagram.com");
+  headers.set("x-asbd-id", LEGACY_ASBD_ID);
+  headers.set("x-ig-www-claim", "0");
+  const result = await fetchJson(url, headers, jar);
+  const authRedirect = Boolean(
+    result.redirectedTo && isAuthRedirect(new URL(result.redirectedTo, "https://www.instagram.com")),
+  );
+  return { data: result.data, status: result.status, authRedirect };
 }
 
 async function resolveStory(
   target: Extract<InstagramTarget, { kind: "story" | "highlight" }>,
   env: Env,
 ): Promise<MediaCandidate[][]> {
-  if (!env.INSTAGRAM_SESSIONID?.trim()) {
-    throw new Error("INSTAGRAM_STORY_SESSION_REQUIRED");
-  }
-
+  if (!env.INSTAGRAM_SESSIONID?.trim()) throw new Error("INSTAGRAM_STORY_SESSION_REQUIRED");
   const jar = secretCookies(env);
 
   let reelKey: string;
@@ -668,25 +864,18 @@ async function resolveStory(
 
 async function probeSize(url: string): Promise<number | null> {
   try {
-    const head = await fetch(url, {
-      method: "HEAD",
-      headers: mediaHeaders(),
-      redirect: "follow",
-    });
+    const head = await fetch(url, { method: "HEAD", headers: mediaHeaders(), redirect: "follow" });
     if (head.ok) {
       const size = Number(head.headers.get("content-length"));
       if (Number.isSafeInteger(size) && size > 0) return size;
     }
     await head.body?.cancel().catch(() => undefined);
   } catch {
-    // Some Instagram CDN hosts reject HEAD.
+    // Some CDN hosts reject HEAD.
   }
 
   try {
-    const response = await fetch(url, {
-      headers: mediaHeaders("bytes=0-0"),
-      redirect: "follow",
-    });
+    const response = await fetch(url, { headers: mediaHeaders("bytes=0-0"), redirect: "follow" });
     const range = response.headers.get("content-range") || "";
     const match = /\/(\d+)$/.exec(range);
     const size = match ? Number(match[1]) : Number(response.headers.get("content-length"));
@@ -788,14 +977,7 @@ async function handleMediaProxy(request: Request, env: Env, url: URL): Promise<R
   }
 
   const responseHeaders = new Headers();
-  for (const name of [
-    "content-type",
-    "content-length",
-    "content-range",
-    "accept-ranges",
-    "etag",
-    "last-modified",
-  ]) {
+  for (const name of ["content-type", "content-length", "content-range", "accept-ranges", "etag", "last-modified"]) {
     const value = upstream.headers.get(name);
     if (value) responseHeaders.set(name, value);
   }
@@ -810,9 +992,7 @@ async function handleMediaProxy(request: Request, env: Env, url: URL): Promise<R
 }
 
 async function resolveTarget(target: InstagramTarget, env: Env): Promise<ResolvedMedia[]> {
-  const groups = target.kind === "post"
-    ? await resolvePost(target, env)
-    : await resolveStory(target, env);
+  const groups = target.kind === "post" ? await resolvePost(target, env) : await resolveStory(target, env);
   const resolved: ResolvedMedia[] = [];
   for (const group of groups.slice(0, 10)) resolved.push(await chooseCandidate(group));
   return resolved;
@@ -820,29 +1000,23 @@ async function resolveTarget(target: InstagramTarget, env: Env): Promise<Resolve
 
 function friendlyError(detail: string): string {
   const value = detail.toLowerCase();
-  if (value.includes("session_api_blocked")) {
-    return "❌ Session روی Web معتبره، ولی Instagram درخواست API از Cloudflare رو می‌بنده. لاگ جدید رو بفرست.";
+  if (value.includes("all_resolvers_failed")) {
+    return "❌ Instagram از همه‌ی مسیرهای دانلود جواب قابل استفاده نداد. لاگ resolverها رو بفرست.";
   }
   if (value.includes("session_rejected")) {
-    return "❌ Instagram این Session رو از سمت Cloudflare قبول نکرد. لاگ جدید رو بفرست؛ دوباره Cookie عوض نکن.";
-  }
-  if (value.includes("session_no_media")) {
-    return "❌ Session وصل شده، ولی Instagram برای این Reel فایل ویدیو برنگردوند.";
+    return "❌ Session اینستاگرام برای این محتوا معتبر شناخته نشد.";
   }
   if (value.includes("rate_limit_429")) {
-    return "❌ Instagram فعلاً این IP رو محدود کرده (429). چند دقیقه بعد دوباره امتحان کن.";
+    return "❌ Instagram فعلاً درخواست‌های این سرور رو محدود کرده (429).";
   }
   if (value.includes("access_403")) {
-    return "❌ Instagram درخواست سرور رو رد کرد (403).";
+    return "❌ Instagram یکی از مسیرهای دانلود رو با 403 بست؛ مسیرهای بعدی هم جواب ندادن.";
   }
   if (value.includes("story_session_required")) {
     return "❌ برای دانلود Story باید Session اینستاگرام به Cloudflare وصل باشه.";
   }
   if (value.includes("story_login_required") || value.includes("login_required")) {
-    return "❌ Instagram برای این محتوا لاگین می‌خواد یا Session فعلی معتبر نیست.";
-  }
-  if (value.includes("anonymous_empty_media")) {
-    return "❌ Instagram این Reel رو برای سرور بدون Session محدود کرده.";
+    return "❌ Instagram برای این محتوا لاگین معتبر می‌خواد.";
   }
   if (value.includes("story_expired")) {
     return "❌ این Story دیگه در دسترس نیست یا منقضی شده.";
@@ -853,9 +1027,7 @@ function friendlyError(detail: string): string {
   if (value.includes("wrong file identifier/http url specified") || value.includes("failed to get http url content")) {
     return "❌ فایل پیدا شد، ولی Telegram نتونست اون رو از Worker بگیره.";
   }
-  if (value.includes("no_media")) {
-    return "❌ توی این لینک فایل قابل دانلود پیدا نکردم.";
-  }
+  if (value.includes("no_media")) return "❌ توی این لینک فایل قابل دانلود پیدا نکردم.";
   return `❌ دانلود Instagram شکست خورد: ${detail.slice(0, 140)}`;
 }
 
@@ -866,7 +1038,7 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
 
   let update: TelegramUpdate;
   try {
-    update = await request.json<TelegramUpdate>();
+    update = (await request.json()) as TelegramUpdate;
   } catch {
     return new Response("Bad Request", { status: 400 });
   }
@@ -968,7 +1140,7 @@ export default {
           ok: true,
           service: "telegram-instagram-downloader",
           mode: "cloudflare-only",
-          resolver: "instagram-session-v3-relay",
+          resolver: "instagram-multistrategy-v4",
           botConfigured: Boolean(env.BOT_TOKEN),
           instagramSessionConfigured: Boolean(env.INSTAGRAM_SESSIONID?.trim()),
         }),
