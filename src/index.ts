@@ -58,6 +58,7 @@ const COBALT_POST_FRIENDLY_NAME = "PolarisPostActionLoadPostQueryQuery";
 const LEGACY_POST_DOC_ID = "27130156389949648";
 const LEGACY_POST_FRIENDLY_NAME = "PolarisLoggedOutDesktopWWWPostRootContentQuery";
 const STORY_GRAPHQL_DOC_ID = "25317500907894419";
+const IG_WWW_CLAIM_STATE_KEY = "__ig_www_claim";
 const MEDIA_LINK_TTL_SECONDS = 10 * 60;
 const TELEGRAM_VIDEO_URL_LIMIT = 19_000_000;
 const TELEGRAM_PHOTO_URL_LIMIT = 4_800_000;
@@ -172,11 +173,16 @@ function cloneJar(jar: CookieJar): CookieJar {
 }
 
 function cookieHeader(jar: CookieJar): string | null {
-  if (!jar.size) return null;
-  return Array.from(jar.entries(), ([name, value]) => `${name}=${value}`).join("; ");
+  const cookies = Array.from(jar.entries())
+    .filter(([name]) => name !== IG_WWW_CLAIM_STATE_KEY)
+    .map(([name, value]) => `${name}=${value}`);
+  return cookies.length ? cookies.join("; ") : null;
 }
 
 function absorbSetCookies(headers: Headers, jar: CookieJar): void {
+  const wwwClaim = headers.get("x-ig-set-www-claim")?.trim();
+  if (wwwClaim) jar.set(IG_WWW_CLAIM_STATE_KEY, wwwClaim);
+
   const extended = headers as Headers & { getSetCookie?: () => string[] };
   const values = typeof extended.getSetCookie === "function"
     ? extended.getSetCookie()
@@ -200,6 +206,7 @@ function webHeaders(jar: CookieJar, referer = "https://www.instagram.com/"): Hea
     referer,
     "user-agent": WEB_UA,
     "x-ig-app-id": WEB_APP_ID,
+    "x-ig-www-claim": jar.get(IG_WWW_CLAIM_STATE_KEY) || "0",
   });
   const cookie = cookieHeader(jar);
   if (cookie) headers.set("cookie", cookie);
@@ -230,7 +237,7 @@ function mobileHeaders(jar: CookieJar): Headers {
     "x-ig-connection-type": "WiFi",
     "x-ig-device-locale": "en-US",
     "x-ig-mapped-locale": "en-US",
-    "x-ig-www-claim": "0",
+    "x-ig-www-claim": jar.get(IG_WWW_CLAIM_STATE_KEY) || "0",
   });
   const cookie = cookieHeader(jar);
   if (cookie) headers.set("cookie", cookie);
@@ -748,7 +755,7 @@ async function resolveAuthenticatedMediaInfo(
   const headers = webHeaders(jar, target.url);
   headers.set("origin", "https://www.instagram.com");
   headers.set("x-asbd-id", LEGACY_ASBD_ID);
-  headers.set("x-ig-www-claim", "0");
+  headers.set("x-ig-www-claim", jar.get(IG_WWW_CLAIM_STATE_KEY) || "0");
 
   const response = await fetchJson(
     `https://www.instagram.com/api/v1/media/${mediaId}/info/`,
@@ -824,7 +831,7 @@ async function instagramJsonWithJar(
   const headers = webHeaders(jar, referer);
   headers.set("origin", "https://www.instagram.com");
   headers.set("x-asbd-id", LEGACY_ASBD_ID);
-  headers.set("x-ig-www-claim", "0");
+  headers.set("x-ig-www-claim", jar.get(IG_WWW_CLAIM_STATE_KEY) || "0");
   const result = await fetchJson(url, headers, jar);
   const authRedirect = Boolean(
     result.redirectedTo && isAuthRedirect(new URL(result.redirectedTo, "https://www.instagram.com")),
@@ -852,6 +859,11 @@ function extractUserIdFromHtml(html: string, username: string): string | null {
   return null;
 }
 
+function userIdFromApiUser(user: any): string | null {
+  const id = String(user?.pk || user?.id || user?.profile_id || "");
+  return /^\d+$/.test(id) ? id : null;
+}
+
 async function resolveStoryUserId(
   target: Extract<InstagramTarget, { kind: "story" }>,
   jar: CookieJar,
@@ -876,6 +888,46 @@ async function resolveStoryUserId(
   }
 
   try {
+    const usernameInfo = await fetchJson(
+      `https://i.instagram.com/api/v1/users/${encodeURIComponent(target.username)}/usernameinfo/`,
+      mobileHeaders(jar),
+      jar,
+    );
+    const id = userIdFromApiUser(usernameInfo.data?.user);
+    if (id) {
+      console.log("instagram story user resolved", { resolver: "mobile-usernameinfo" });
+      return id;
+    }
+  } catch (error) {
+    console.warn("instagram story user resolver failed", {
+      resolver: "mobile-usernameinfo",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  try {
+    const mobileSearch = await fetchJson(
+      `https://i.instagram.com/api/v1/users/search/?q=${encodeURIComponent(target.username)}&count=20`,
+      mobileHeaders(jar),
+      jar,
+    );
+    const users = Array.isArray(mobileSearch.data?.users) ? mobileSearch.data.users : [];
+    const match = users.find(
+      (user: any) => String(user?.username || "").toLowerCase() === target.username.toLowerCase(),
+    );
+    const id = userIdFromApiUser(match);
+    if (id) {
+      console.log("instagram story user resolved", { resolver: "mobile-users-search" });
+      return id;
+    }
+  } catch (error) {
+    console.warn("instagram story user resolver failed", {
+      resolver: "mobile-users-search",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  try {
     const search = await fetchJson(
       `https://www.instagram.com/web/search/topsearch/?query=${encodeURIComponent(target.username)}`,
       webHeaders(jar, profileUrl),
@@ -885,8 +937,8 @@ async function resolveStoryUserId(
     const match = users.find(
       (entry: any) => String(entry?.user?.username || "").toLowerCase() === target.username.toLowerCase(),
     );
-    const id = String(match?.user?.pk || match?.user?.id || "");
-    if (/^\d+$/.test(id)) {
+    const id = userIdFromApiUser(match?.user);
+    if (id) {
       console.log("instagram story user resolved", { resolver: "topsearch" });
       return id;
     }
@@ -903,8 +955,8 @@ async function resolveStoryUserId(
       jar,
       target.url,
     );
-    const id = String(profile.data?.data?.user?.id || profile.data?.data?.user?.pk || profile.data?.user?.pk || "");
-    if (/^\d+$/.test(id)) {
+    const id = userIdFromApiUser(profile.data?.data?.user || profile.data?.user);
+    if (id) {
       console.log("instagram story user resolved", { resolver: "web-profile-info" });
       return id;
     }
@@ -915,6 +967,52 @@ async function resolveStoryUserId(
     });
   }
 
+  return null;
+}
+
+async function resolveStoryDirectMedia(
+  storyId: string,
+  referer: string,
+  jar: CookieJar,
+): Promise<MediaCandidate[][] | null> {
+  const resolvers: Array<[string, () => Promise<any | null>]> = [
+    ["story-direct-web", async () => {
+      const result = await instagramJsonWithJar(
+        `https://www.instagram.com/api/v1/media/${encodeURIComponent(storyId)}/info/`,
+        jar,
+        referer,
+      );
+      if (result.authRedirect) return null;
+      return result.data?.items?.[0] || null;
+    }],
+    ["story-direct-mobile", async () => {
+      const result = await fetchJson(
+        `https://i.instagram.com/api/v1/media/${encodeURIComponent(storyId)}/info/`,
+        mobileHeaders(jar),
+        jar,
+      );
+      return result.data?.items?.[0] || null;
+    }],
+  ];
+
+  for (const [name, run] of resolvers) {
+    try {
+      const product = await run();
+      if (!product) {
+        console.warn("instagram story direct resolver empty", { resolver: name, storyId });
+        continue;
+      }
+      const groups = candidatesFromProduct(product);
+      if (groups.length) {
+        console.log("instagram story resolver success", { resolver: name, count: groups.length });
+        return groups;
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.warn("instagram story direct resolver failed", { resolver: name, storyId, detail });
+      if (detail === "INSTAGRAM_RATE_LIMIT_429") throw error;
+    }
+  }
   return null;
 }
 
@@ -1007,7 +1105,13 @@ async function resolveStory(
     reelKey = `highlight:${target.highlightId}`;
   } else {
     exactStoryId = target.storyId;
-    const userId = await resolveStoryUserId(target, cloneJar(baseJar));
+
+    if (exactStoryId) {
+      const directGroups = await resolveStoryDirectMedia(exactStoryId, target.url, baseJar);
+      if (directGroups?.length) return directGroups;
+    }
+
+    const userId = await resolveStoryUserId(target, baseJar);
     if (!userId) throw new Error("INSTAGRAM_STORY_USER_NOT_FOUND");
     reelKey = userId;
   }
@@ -1334,7 +1438,7 @@ export default {
           ok: true,
           service: "telegram-instagram-downloader",
           mode: "cloudflare-only",
-          resolver: "instagram-multistrategy-v5-story-carousel",
+          resolver: "instagram-multistrategy-v6-story-state",
           botConfigured: Boolean(env.BOT_TOKEN),
           instagramSessionConfigured: Boolean(env.INSTAGRAM_SESSIONID?.trim()),
         }),
