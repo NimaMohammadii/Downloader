@@ -17,12 +17,5 @@
       "tag": "v2",
       "deleted_classes": ["DownloaderContainer"]
     }
-  ],
-  "workflows": [
-    {
-      "name": "youtube-downloads",
-      "binding": "DOWNLOAD_WORKFLOW",
-      "class_name": "DownloadWorkflow"
-    }
   ]
 }
