@@ -972,16 +972,37 @@ async function resolvePost(
   throw new Error("INSTAGRAM_ALL_RESOLVERS_FAILED");
 }
 
-async function instagramJsonWithJar(
+function randomCsrfToken(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+function storySessionJar(env: Env): CookieJar {
+  const jar = secretCookies(env);
+  if (!jar.get("csrftoken")) jar.set("csrftoken", randomCsrfToken());
+  return jar;
+}
+
+function storyWebHeaders(jar: CookieJar, referer = "https://www.instagram.com/"): Headers {
+  const headers = webHeaders(jar, referer);
+  headers.set("x-asbd-id", WEB_ASBD_ID);
+  headers.set("x-requested-with", "XMLHttpRequest");
+  headers.set("sec-fetch-dest", "empty");
+  headers.set("sec-fetch-mode", "cors");
+  headers.set("sec-fetch-site", "same-origin");
+  headers.set("x-ig-www-claim", jar.get(IG_WWW_CLAIM_STATE_KEY) || "0");
+  const csrf = jar.get("csrftoken");
+  if (csrf) headers.set("x-csrftoken", csrf);
+  return headers;
+}
+
+async function instagramStoryJson(
   url: string,
   jar: CookieJar,
   referer = "https://www.instagram.com/",
 ): Promise<{ data: any | null; status: number; authRedirect: boolean }> {
-  const headers = webHeaders(jar, referer);
-  headers.set("origin", "https://www.instagram.com");
-  headers.set("x-asbd-id", LEGACY_ASBD_ID);
-  headers.set("x-ig-www-claim", jar.get(IG_WWW_CLAIM_STATE_KEY) || "0");
-  const result = await fetchJson(url, headers, jar);
+  const result = await fetchJson(url, storyWebHeaders(jar, referer), jar);
   const authRedirect = Boolean(
     result.redirectedTo && isAuthRedirect(new URL(result.redirectedTo, "https://www.instagram.com")),
   );
@@ -1017,119 +1038,64 @@ async function resolveStoryUserId(
   target: Extract<InstagramTarget, { kind: "story" }>,
   jar: CookieJar,
 ): Promise<string | null> {
-  try {
-    const privateInfo = await fetchJson(
-      `https://i.instagram.com/api/v1/users/${encodeURIComponent(target.username)}/usernameinfo/`,
-      privateMobileHeaders(jar),
-      jar,
-    );
-    const id = userIdFromApiUser(privateInfo.data?.user);
-    if (id) {
-      console.log("instagram story user resolved", { resolver: "private-usernameinfo" });
-      return id;
-    }
-  } catch (error) {
-    console.warn("instagram story user resolver failed", {
-      resolver: "private-usernameinfo",
-      detail: error instanceof Error ? error.message : String(error),
-    });
-  }
-
-  const storyPage = await fetchHtml(target.url, browserHeaders(jar), jar);
-  if (storyPage.html) {
-    const id = extractUserIdFromHtml(storyPage.html, target.username);
-    if (id) {
-      console.log("instagram story user resolved", { resolver: "story-html" });
-      return id;
-    }
-  }
-
   const profileUrl = `https://www.instagram.com/${encodeURIComponent(target.username)}/`;
-  const profilePage = await fetchHtml(profileUrl, browserHeaders(jar), jar);
-  if (profilePage.html) {
-    const id = extractUserIdFromHtml(profilePage.html, target.username);
-    if (id) {
-      console.log("instagram story user resolved", { resolver: "profile-html" });
-      return id;
-    }
-  }
 
   try {
-    const usernameInfo = await fetchJson(
-      `https://i.instagram.com/api/v1/users/${encodeURIComponent(target.username)}/usernameinfo/`,
-      mobileHeaders(jar),
-      jar,
-    );
-    const id = userIdFromApiUser(usernameInfo.data?.user);
-    if (id) {
-      console.log("instagram story user resolved", { resolver: "mobile-usernameinfo" });
-      return id;
-    }
-  } catch (error) {
-    console.warn("instagram story user resolver failed", {
-      resolver: "mobile-usernameinfo",
-      detail: error instanceof Error ? error.message : String(error),
-    });
-  }
-
-  try {
-    const mobileSearch = await fetchJson(
-      `https://i.instagram.com/api/v1/users/search/?q=${encodeURIComponent(target.username)}&count=20`,
-      mobileHeaders(jar),
-      jar,
-    );
-    const users = Array.isArray(mobileSearch.data?.users) ? mobileSearch.data.users : [];
-    const match = users.find(
-      (user: any) => String(user?.username || "").toLowerCase() === target.username.toLowerCase(),
-    );
-    const id = userIdFromApiUser(match);
-    if (id) {
-      console.log("instagram story user resolved", { resolver: "mobile-users-search" });
-      return id;
-    }
-  } catch (error) {
-    console.warn("instagram story user resolver failed", {
-      resolver: "mobile-users-search",
-      detail: error instanceof Error ? error.message : String(error),
-    });
-  }
-
-  try {
-    const search = await fetchJson(
+    const search = await instagramStoryJson(
       `https://www.instagram.com/web/search/topsearch/?query=${encodeURIComponent(target.username)}`,
-      webHeaders(jar, profileUrl),
       jar,
+      "https://www.instagram.com/",
     );
-    const users = Array.isArray(search.data?.users) ? search.data.users : [];
-    const match = users.find(
-      (entry: any) => String(entry?.user?.username || "").toLowerCase() === target.username.toLowerCase(),
-    );
-    const id = userIdFromApiUser(match?.user);
-    if (id) {
-      console.log("instagram story user resolved", { resolver: "topsearch" });
-      return id;
+    if (!search.authRedirect) {
+      const users = Array.isArray(search.data?.users) ? search.data.users : [];
+      const match = users.find(
+        (entry: any) => String(entry?.user?.username || "").toLowerCase() === target.username.toLowerCase(),
+      );
+      const id = userIdFromApiUser(match?.user);
+      if (id) {
+        console.log("instagram story user resolved", { resolver: "web-topsearch" });
+        return id;
+      }
     }
   } catch (error) {
     console.warn("instagram story user resolver failed", {
-      resolver: "topsearch",
+      resolver: "web-topsearch",
       detail: error instanceof Error ? error.message : String(error),
     });
   }
 
   try {
-    const profile = await instagramJsonWithJar(
+    const profile = await instagramStoryJson(
       `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(target.username)}`,
       jar,
-      target.url,
+      profileUrl,
     );
-    const id = userIdFromApiUser(profile.data?.data?.user || profile.data?.user);
-    if (id) {
-      console.log("instagram story user resolved", { resolver: "web-profile-info" });
-      return id;
+    if (!profile.authRedirect) {
+      const id = userIdFromApiUser(profile.data?.data?.user || profile.data?.user);
+      if (id) {
+        console.log("instagram story user resolved", { resolver: "web-profile-info" });
+        return id;
+      }
     }
   } catch (error) {
     console.warn("instagram story user resolver failed", {
       resolver: "web-profile-info",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  try {
+    const profilePage = await fetchHtml(profileUrl, browserHeaders(jar), jar);
+    if (profilePage.html) {
+      const id = extractUserIdFromHtml(profilePage.html, target.username);
+      if (id) {
+        console.log("instagram story user resolved", { resolver: "profile-html-fallback" });
+        return id;
+      }
+    }
+  } catch (error) {
+    console.warn("instagram story user resolver failed", {
+      resolver: "profile-html-fallback",
       detail: error instanceof Error ? error.message : String(error),
     });
   }
@@ -1142,51 +1108,34 @@ async function resolveStoryDirectMedia(
   referer: string,
   jar: CookieJar,
 ): Promise<MediaCandidate[][] | null> {
-  const resolvers: Array<[string, () => Promise<any | null>]> = [
-    ["story-direct-private", async () => {
-      const result = await fetchJson(
-        `https://i.instagram.com/api/v1/media/${encodeURIComponent(storyId)}/info/`,
-        privateMobileHeaders(jar),
-        jar,
-      );
-      return result.data?.items?.[0] || null;
-    }],
-    ["story-direct-web", async () => {
-      const result = await instagramJsonWithJar(
-        `https://www.instagram.com/api/v1/media/${encodeURIComponent(storyId)}/info/`,
-        jar,
-        referer,
-      );
-      if (result.authRedirect) return null;
-      return result.data?.items?.[0] || null;
-    }],
-    ["story-direct-mobile", async () => {
-      const result = await fetchJson(
-        `https://i.instagram.com/api/v1/media/${encodeURIComponent(storyId)}/info/`,
-        mobileHeaders(jar),
-        jar,
-      );
-      return result.data?.items?.[0] || null;
-    }],
-  ];
-
-  for (const [name, run] of resolvers) {
-    try {
-      const product = await run();
-      if (!product) {
-        console.warn("instagram story direct resolver empty", { resolver: name, storyId });
-        continue;
-      }
-      const groups = candidatesFromProduct(product);
-      if (groups.length) {
-        console.log("instagram story resolver success", { resolver: name, count: groups.length });
-        return groups;
-      }
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      console.warn("instagram story direct resolver failed", { resolver: name, storyId, detail });
-      if (detail === "INSTAGRAM_RATE_LIMIT_429") throw error;
+  try {
+    const result = await instagramStoryJson(
+      `https://www.instagram.com/api/v1/media/${encodeURIComponent(storyId)}/info/`,
+      jar,
+      referer,
+    );
+    if (result.authRedirect) {
+      console.warn("instagram story direct resolver auth redirect", { resolver: "story-direct-web", storyId });
+      return null;
     }
+    const product = result.data?.items?.[0];
+    if (!product) {
+      console.warn("instagram story direct resolver empty", {
+        resolver: "story-direct-web",
+        storyId,
+        status: result.status,
+      });
+      return null;
+    }
+    const groups = candidatesFromProduct(product);
+    if (groups.length) {
+      console.log("instagram story resolver success", { resolver: "story-direct-web", count: groups.length });
+      return groups;
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.warn("instagram story direct resolver failed", { resolver: "story-direct-web", storyId, detail });
+    if (detail === "INSTAGRAM_RATE_LIMIT_429") throw error;
   }
   return null;
 }
@@ -1208,75 +1157,29 @@ function findStoryReel(data: any, reelKey: string): any | null {
   return null;
 }
 
-async function resolveStoryViaPrivateUserFeed(
-  userId: string,
-  jar: CookieJar,
-): Promise<any | null> {
-  const query = new URLSearchParams({
-    supported_capabilities_new: JSON.stringify(PRIVATE_SUPPORTED_CAPABILITIES),
-  });
-  const userPath = encodeURIComponent(userId);
-  const endpoints: Array<[string, string, () => Headers]> = [
-    [
-      "private-reel-media",
-      `https://i.instagram.com/api/v1/feed/user/${userPath}/reel_media/?${query.toString()}`,
-      () => privateMobileHeaders(jar),
-    ],
-    [
-      "private-story",
-      `https://i.instagram.com/api/v1/feed/user/${userPath}/story/?${query.toString()}`,
-      () => privateMobileHeaders(jar),
-    ],
-    [
-      "web-reel-media",
-      `https://www.instagram.com/api/v1/feed/user/${userPath}/reel_media/`,
-      () => {
-        const headers = webHeaders(jar, "https://www.instagram.com/");
-        headers.set("x-asbd-id", LEGACY_ASBD_ID);
-        return headers;
-      },
-    ],
-  ];
-
-  for (const [name, url, makeHeaders] of endpoints) {
-    const result = await fetchJson(url, makeHeaders(), jar);
-    const reel =
-      result.data?.reel ||
-      findStoryReel(result.data, userId) ||
-      (Array.isArray(result.data?.items) ? result.data : null);
-    if (reel && typeof reel === "object") {
-      console.log("instagram story user feed success", { resolver: name, userId });
-      return reel;
-    }
-    console.warn("instagram story user feed empty", { resolver: name, userId, status: result.status });
-  }
-  return null;
-}
-
 async function resolveStoryViaWebRest(
   reelKey: string,
   referer: string,
   jar: CookieJar,
 ): Promise<any | null> {
-  const result = await instagramJsonWithJar(
+  const result = await instagramStoryJson(
     `https://www.instagram.com/api/v1/feed/reels_media/?reel_ids=${encodeURIComponent(reelKey)}`,
     jar,
     referer,
   );
-  if (result.authRedirect) return null;
-  return findStoryReel(result.data, reelKey);
-}
-
-async function resolveStoryViaMobileRest(
-  reelKey: string,
-  jar: CookieJar,
-): Promise<any | null> {
-  const result = await fetchJson(
-    `https://i.instagram.com/api/v1/feed/reels_media/?reel_ids=${encodeURIComponent(reelKey)}`,
-    privateMobileHeaders(jar),
-    jar,
-  );
-  return findStoryReel(result.data, reelKey);
+  if (result.authRedirect) {
+    console.warn("instagram story web session rejected", {
+      resolver: "story-web-rest",
+      reelKey,
+      status: result.status,
+    });
+    return null;
+  }
+  const reel = findStoryReel(result.data, reelKey);
+  if (!reel) {
+    console.warn("instagram story web rest empty", { reelKey, status: result.status });
+  }
+  return reel;
 }
 
 async function resolveStoryViaGraphql(
@@ -1289,10 +1192,9 @@ async function resolveStoryViaGraphql(
   const dtsg = extractDtsgToken(home.html);
   if (!dtsg) return null;
 
-  const headers = webHeaders(jar, referer);
+  const headers = storyWebHeaders(jar, referer);
   headers.set("content-type", "application/x-www-form-urlencoded");
   headers.set("origin", "https://www.instagram.com");
-  headers.set("x-asbd-id", WEB_ASBD_ID);
 
   const body = new URLSearchParams({
     fb_dtsg: dtsg,
@@ -1316,8 +1218,9 @@ async function resolveStory(
   env: Env,
 ): Promise<MediaCandidate[][]> {
   if (!env.INSTAGRAM_SESSIONID?.trim()) throw new Error("INSTAGRAM_STORY_SESSION_REQUIRED");
-  const baseJar = secretCookies(env);
 
+  // Story uses a browser-session-only jar. Do not pass it through the private/mobile emulation paths.
+  const baseJar = storySessionJar(env);
   let reelKey: string;
   let exactStoryId: string | null = null;
 
@@ -1336,17 +1239,10 @@ async function resolveStory(
     reelKey = userId;
   }
 
-  const resolvers: Array<[string, () => Promise<any | null>]> = [];
-  if (target.kind === "story") {
-    resolvers.push(
-      ["story-private-user-reel-media", () => resolveStoryViaPrivateUserFeed(reelKey, baseJar)],
-      ["story-private-reels-media", () => resolveStoryViaMobileRest(reelKey, baseJar)],
-    );
-  }
-  resolvers.push(
-    ["story-web-rest", () => resolveStoryViaWebRest(reelKey, target.url, cloneJar(baseJar))],
-    ["story-graphql", () => resolveStoryViaGraphql(reelKey, target.url, cloneJar(baseJar))],
-  );
+  const resolvers: Array<[string, () => Promise<any | null>]> = [
+    ["story-web-rest", () => resolveStoryViaWebRest(reelKey, target.url, baseJar)],
+    ["story-graphql-fallback", () => resolveStoryViaGraphql(reelKey, target.url, cloneJar(baseJar))],
+  ];
 
   let sawReel = false;
   for (const [name, run] of resolvers) {
@@ -1664,7 +1560,7 @@ export default {
           ok: true,
           service: "telegram-instagram-downloader",
           mode: "cloudflare-only",
-          resolver: "instagram-multistrategy-v9-story-reel-media",
+          resolver: "instagram-multistrategy-v10-clean-web-story-session",
           botConfigured: Boolean(env.BOT_TOKEN),
           instagramSessionConfigured: Boolean(env.INSTAGRAM_SESSIONID?.trim()),
           instagramMidConfigured: Boolean(env.INSTAGRAM_MID?.trim()),
