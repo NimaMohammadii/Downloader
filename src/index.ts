@@ -61,6 +61,7 @@ const COBALT_POST_FRIENDLY_NAME = "PolarisPostActionLoadPostQueryQuery";
 const LEGACY_POST_DOC_ID = "27130156389949648";
 const LEGACY_POST_FRIENDLY_NAME = "PolarisLoggedOutDesktopWWWPostRootContentQuery";
 const STORY_GRAPHQL_DOC_ID = "25317500907894419";
+const STORY_PUBLIC_QUERY_HASH = "303a4ae99711322310f25250d988f3b7";
 const IG_WWW_CLAIM_STATE_KEY = "__ig_www_claim";
 const PRIVATE_BLOKS_VERSION_ID = "7189b949425f9bf80ea8bd880cf5a3080b292d9b1c4b38a18d112f7c4b71e7a8";
 const MEDIA_LINK_TTL_SECONDS = 10 * 60;
@@ -974,11 +975,19 @@ async function resolvePost(
 
 function cobaltStoryHeaders(jar: CookieJar): Headers {
   const headers = new Headers({
+    accept: "*/*",
+    "accept-language": "en-US,en;q=0.9",
+    referer: "https://www.instagram.com/",
     "user-agent": WEB_UA,
     "sec-gpc": "1",
     "sec-fetch-site": "same-origin",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-dest": "empty",
+    "x-requested-with": "XMLHttpRequest",
     "x-ig-app-id": WEB_APP_ID,
+    "x-asbd-id": WEB_ASBD_ID,
     "x-ig-www-claim": jar.get(IG_WWW_CLAIM_STATE_KEY) || "0",
+    priority: "u=1, i",
   });
   const csrf = jar.get("csrftoken");
   if (csrf) headers.set("x-csrftoken", csrf);
@@ -1093,6 +1102,7 @@ async function cobaltStoryUserId(
     console.log("instagram cobalt story user resolved", {
       resolver: "web-profile-info",
       status: profile.status,
+      authenticated: jar.has("sessionid"),
     });
     return profileId;
   }
@@ -1110,11 +1120,13 @@ async function cobaltStoryUserId(
     console.log("instagram cobalt story user resolved", {
       resolver: "topsearch-fallback",
       status: search.status,
+      authenticated: jar.has("sessionid"),
     });
     return searchId;
   }
 
   console.warn("instagram cobalt story user unresolved", {
+    authenticated: jar.has("sessionid"),
     profileStatus: profile.status,
     profileFinalPath: profile.finalPath,
     searchStatus: search.status,
@@ -1138,6 +1150,58 @@ function findStoryReel(data: any, reelKey: string): any | null {
     if (value.length === 1) return value[0];
   }
   return null;
+}
+
+async function instagrapiStoryGraphql(userId: string, jar: CookieJar): Promise<any | null> {
+  const url = new URL("https://www.instagram.com/graphql/query/");
+  url.searchParams.set("query_hash", STORY_PUBLIC_QUERY_HASH);
+  url.searchParams.set(
+    "variables",
+    JSON.stringify({ reel_ids: [userId], precomposed_overlay: false }),
+  );
+
+  const result = await fetchJson(url.toString(), cobaltStoryHeaders(jar), jar);
+  if (result.redirectedTo) {
+    console.warn("instagram story public graphql redirected", {
+      status: result.status,
+      to: result.redirectedTo,
+      userId,
+    });
+    return null;
+  }
+
+  const payload = result.data?.data || result.data;
+  const reel = findStoryReel(payload, userId);
+  console.log("instagram story public graphql", {
+    status: result.status,
+    apiStatus: result.data?.status || null,
+    found: Boolean(reel),
+    itemCount: Array.isArray(reel?.items) ? reel.items.length : 0,
+  });
+  return reel;
+}
+
+async function galleryDlStoryRest(reelKey: string, jar: CookieJar): Promise<any | null> {
+  const result = await fetchJson(
+    `https://www.instagram.com/api/v1/feed/reels_media/?reel_ids=${encodeURIComponent(reelKey)}`,
+    cobaltStoryHeaders(jar),
+    jar,
+  );
+  if (result.redirectedTo) {
+    console.warn("instagram story web rest redirected", {
+      status: result.status,
+      to: result.redirectedTo,
+      reelKey,
+    });
+    return null;
+  }
+  const reel = findStoryReel(result.data, reelKey);
+  console.log("instagram story web rest", {
+    status: result.status,
+    found: Boolean(reel),
+    itemCount: Array.isArray(reel?.items) ? reel.items.length : 0,
+  });
+  return reel;
 }
 
 async function cobaltStoryGraphql(userId: string, jar: CookieJar): Promise<any | null> {
@@ -1204,29 +1268,72 @@ async function resolveStory(
 
   if (target.kind === "highlight") {
     const reelKey = `highlight:${target.highlightId}`;
-    const reel = await cobaltHighlightRest(reelKey, jar);
-    if (!reel) throw new Error("INSTAGRAM_STORY_LOGIN_REQUIRED");
-    const groups = mediaGroupsFromStoryReel(reel, null);
-    if (groups.length) {
-      console.log("instagram story resolver success", { resolver: "cobalt-highlight-rest", count: groups.length });
-      return groups;
+    const resolvers: Array<[string, () => Promise<any | null>]> = [
+      ["gallery-dl-highlight-rest", () => galleryDlStoryRest(reelKey, jar)],
+      ["cobalt-highlight-rest", () => cobaltHighlightRest(reelKey, jar)],
+    ];
+    for (const [name, run] of resolvers) {
+      try {
+        const reel = await run();
+        if (!reel) continue;
+        const groups = mediaGroupsFromStoryReel(reel, null);
+        if (groups.length) {
+          console.log("instagram story resolver success", { resolver: name, count: groups.length });
+          return groups;
+        }
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.warn("instagram story resolver failed", { resolver: name, detail });
+        if (detail === "INSTAGRAM_RATE_LIMIT_429") throw error;
+      }
     }
     throw new Error("INSTAGRAM_STORY_LOGIN_REQUIRED");
   }
 
-  const userId = await cobaltStoryUserId(target, jar);
+  let userId: string | null = null;
+  try {
+    userId = await cobaltStoryUserId(target, new Map());
+  } catch (error) {
+    console.warn("instagram story anonymous user resolver failed", {
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+  if (!userId) userId = await cobaltStoryUserId(target, jar);
   if (!userId) throw new Error("INSTAGRAM_STORY_USER_NOT_FOUND");
 
-  const reel = await cobaltStoryGraphql(userId, jar);
-  if (!reel) throw new Error("INSTAGRAM_STORY_LOGIN_REQUIRED");
+  const resolvers: Array<[string, () => Promise<any | null>]> = [
+    ["instagrapi-public-graphql", () => instagrapiStoryGraphql(userId!, jar)],
+    ["gallery-dl-web-rest", () => galleryDlStoryRest(userId!, jar)],
+    ["cobalt-story-graphql", () => cobaltStoryGraphql(userId!, jar)],
+  ];
 
-  const groups = mediaGroupsFromStoryReel(reel, target.storyId);
-  if (groups.length) {
-    console.log("instagram story resolver success", { resolver: "cobalt-story-graphql", count: groups.length });
-    return groups;
+  let sawReel = false;
+  for (const [name, run] of resolvers) {
+    try {
+      const reel = await run();
+      if (!reel) {
+        console.warn("instagram story resolver empty", { resolver: name, userId });
+        continue;
+      }
+      sawReel = true;
+      const groups = mediaGroupsFromStoryReel(reel, target.storyId);
+      if (groups.length) {
+        console.log("instagram story resolver success", { resolver: name, count: groups.length });
+        return groups;
+      }
+      console.warn("instagram story resolver missing item", {
+        resolver: name,
+        userId,
+        storyId: target.storyId,
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.warn("instagram story resolver failed", { resolver: name, userId, detail });
+      if (detail === "INSTAGRAM_RATE_LIMIT_429") throw error;
+    }
   }
 
-  if (target.storyId) throw new Error("INSTAGRAM_STORY_EXPIRED");
+  if (sawReel && target.storyId) throw new Error("INSTAGRAM_STORY_EXPIRED");
   throw new Error("INSTAGRAM_STORY_LOGIN_REQUIRED");
 }
 
@@ -1511,7 +1618,7 @@ export default {
           ok: true,
           service: "telegram-instagram-downloader",
           mode: "cloudflare-only",
-          resolver: "instagram-multistrategy-v11-cobalt-story-graphql",
+          resolver: "instagram-multistrategy-v12-public-story-graphql",
           botConfigured: Boolean(env.BOT_TOKEN),
           instagramSessionConfigured: Boolean(env.INSTAGRAM_SESSIONID?.trim()),
           instagramMidConfigured: Boolean(env.INSTAGRAM_MID?.trim()),
