@@ -52,6 +52,7 @@ const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
 const BASE_URL = "https://downloader.vexaagent.workers.dev";
 const WEB_APP_ID = "936619743392459";
 const IOS_APP_ID = "124024574287414";
+const PRIVATE_APP_ID = "567067343352427";
 const WEB_ASBD_ID = "129477";
 const LEGACY_ASBD_ID = "359341";
 const INSTALOADER_POST_DOC_ID = "27128499623469141";
@@ -61,16 +62,29 @@ const LEGACY_POST_DOC_ID = "27130156389949648";
 const LEGACY_POST_FRIENDLY_NAME = "PolarisLoggedOutDesktopWWWPostRootContentQuery";
 const STORY_GRAPHQL_DOC_ID = "25317500907894419";
 const IG_WWW_CLAIM_STATE_KEY = "__ig_www_claim";
+const PRIVATE_BLOKS_VERSION_ID = "7189b949425f9bf80ea8bd880cf5a3080b292d9b1c4b38a18d112f7c4b71e7a8";
 const MEDIA_LINK_TTL_SECONDS = 10 * 60;
 const TELEGRAM_VIDEO_URL_LIMIT = 19_000_000;
 const TELEGRAM_PHOTO_URL_LIMIT = 4_800_000;
 const IG_SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 
+const PRIVATE_SUPPORTED_CAPABILITIES = [
+  {
+    value: "119.0,120.0,121.0,122.0,123.0,124.0,125.0,126.0,127.0,128.0,129.0,130.0,131.0,132.0,133.0,134.0,135.0,136.0,137.0,138.0,139.0,140.0,141.0,142.0",
+    name: "SUPPORTED_SDK_VERSIONS",
+  },
+  { value: "14", name: "FACE_TRACKER_VERSION" },
+  { value: "ETC2_COMPRESSION", name: "COMPRESSION" },
+  { value: "gyroscope_enabled", name: "gyroscope" },
+];
+
 const WEB_UA =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
 const IOS_UA =
   "Instagram 361.0.0.35.82 (iPad13,8; iOS 18_0; en_US; en-US; scale=2.00; 2048x2732; 674117118) AppleWebKit/420+";
+const PRIVATE_UA =
+  "Instagram 428.0.0.47.67 Android (34/14; 480dpi; 1344x2992; Google/google; Pixel 8 Pro; husky; husky; en_US; 961145276)";
 
 async function telegramCall<T = unknown>(
   token: string,
@@ -183,9 +197,27 @@ function cookieHeader(jar: CookieJar): string | null {
   return cookies.length ? cookies.join("; ") : null;
 }
 
+function decodePrivateAuthorization(value: string, jar: CookieJar): void {
+  const prefix = "Bearer IGT:2:";
+  if (!value.startsWith(prefix)) return;
+  try {
+    const parsed = JSON.parse(atob(value.slice(prefix.length)));
+    if (typeof parsed?.sessionid === "string" && parsed.sessionid) jar.set("sessionid", parsed.sessionid);
+    if (/^\d+$/.test(String(parsed?.ds_user_id || ""))) jar.set("ds_user_id", String(parsed.ds_user_id));
+  } catch {
+    // Ignore malformed or changed authorization payloads.
+  }
+}
+
 function absorbSetCookies(headers: Headers, jar: CookieJar): void {
   const wwwClaim = headers.get("x-ig-set-www-claim")?.trim();
   if (wwwClaim) jar.set(IG_WWW_CLAIM_STATE_KEY, wwwClaim);
+
+  const xMid = headers.get("ig-set-x-mid")?.trim();
+  if (xMid) jar.set("mid", xMid);
+
+  const authorization = headers.get("ig-set-authorization")?.trim();
+  if (authorization) decodePrivateAuthorization(authorization, jar);
 
   const extended = headers as Headers & { getSetCookie?: () => string[] };
   const values = typeof extended.getSetCookie === "function"
@@ -245,6 +277,111 @@ function mobileHeaders(jar: CookieJar): Headers {
   });
   const cookie = cookieHeader(jar);
   if (cookie) headers.set("cookie", cookie);
+  return headers;
+}
+
+function privateAuthParts(jar: CookieJar): { userId: string; sessionId: string } | null {
+  const sessionId = jar.get("sessionid")?.trim() || "";
+  let userId = jar.get("ds_user_id")?.trim() || "";
+  if (!userId && sessionId) {
+    try {
+      userId = decodeURIComponent(sessionId).match(/^\d+/)?.[0] || sessionId.match(/^\d+/)?.[0] || "";
+    } catch {
+      userId = sessionId.match(/^\d+/)?.[0] || "";
+    }
+  }
+  if (!sessionId || !/^\d+$/.test(userId)) return null;
+  return { userId, sessionId };
+}
+
+function privateAuthorization(jar: CookieJar): string | null {
+  const auth = privateAuthParts(jar);
+  if (!auth) return null;
+  const payload = JSON.stringify({
+    ds_user_id: auth.userId,
+    sessionid: auth.sessionId,
+    should_use_header_over_cookies: true,
+  });
+  return `Bearer IGT:2:${btoa(payload)}`;
+}
+
+function stableHex(seed: string, length: number): string {
+  let state = 0x811c9dc5;
+  let output = "";
+  for (let round = 0; output.length < length; round++) {
+    state ^= round + 0x9e3779b9;
+    for (let index = 0; index < seed.length; index++) {
+      state ^= seed.charCodeAt(index) + index;
+      state = Math.imul(state, 0x01000193);
+      state ^= state >>> 13;
+    }
+    output += (state >>> 0).toString(16).padStart(8, "0");
+  }
+  return output.slice(0, length);
+}
+
+function stableUuid(seed: string): string {
+  const chars = stableHex(seed, 32).split("");
+  chars[12] = "4";
+  chars[16] = ((parseInt(chars[16], 16) & 0x3) | 0x8).toString(16);
+  const hex = chars.join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function privateMobileHeaders(jar: CookieJar): Headers {
+  const auth = privateAuthParts(jar);
+  const userId = auth?.userId || "0";
+  const deviceUuid = stableUuid(`ig-device:${userId}`);
+  const familyUuid = stableUuid(`ig-family:${userId}`);
+  const androidId = `android-${stableHex(`ig-android:${userId}`, 16)}`;
+  const bandwidth = (2500 + Math.random() * 500).toFixed(3);
+  const totalBytes = String(Math.floor(5_000_000 + Math.random() * 85_000_000));
+  const totalTime = String(Math.floor(2_000 + Math.random() * 7_000));
+
+  const headers = new Headers({
+    accept: "*/*",
+    "accept-language": "en-US",
+    "user-agent": PRIVATE_UA,
+    "x-ig-app-locale": "en_US",
+    "x-ig-device-locale": "en_US",
+    "x-ig-mapped-locale": "en_US",
+    "x-pigeon-session-id": `UFS-${crypto.randomUUID()}-1`,
+    "x-pigeon-rawclienttime": (Date.now() / 1000).toFixed(3),
+    "x-ig-bandwidth-speed-kbps": bandwidth,
+    "x-ig-bandwidth-totalbytes-b": totalBytes,
+    "x-ig-bandwidth-totaltime-ms": totalTime,
+    "x-ig-app-startup-country": "US",
+    "x-bloks-version-id": PRIVATE_BLOKS_VERSION_ID,
+    "x-bloks-is-layout-rtl": "false",
+    "x-bloks-is-panorama-enabled": "true",
+    "x-ig-www-claim": jar.get(IG_WWW_CLAIM_STATE_KEY) || "0",
+    "x-ig-device-id": deviceUuid,
+    "x-ig-family-device-id": familyUuid,
+    "x-ig-android-id": androidId,
+    "x-ig-timezone-offset": "0",
+    "x-ig-connection-type": "WIFI",
+    "x-ig-capabilities": "3brTv10=",
+    "x-ig-app-id": PRIVATE_APP_ID,
+    priority: "u=3",
+    "x-fb-http-engine": "Tigon/MNS/TCP",
+    "x-tigon-is-retry": "False",
+    "x-zero-balance": "INIT",
+    "x-zero-state": "unknown",
+    "zero-http-network-interface": "wifi",
+    "x-fb-client-ip": "True",
+    "x-fb-server-cluster": "True",
+    "ig-intended-user-id": userId,
+    "ig-u-ds-user-id": userId,
+  });
+
+  const authorization = privateAuthorization(jar);
+  if (authorization) headers.set("authorization", authorization);
+  const cookie = cookieHeader(jar);
+  if (cookie) headers.set("cookie", cookie);
+  const csrf = jar.get("csrftoken");
+  if (csrf) headers.set("x-csrftoken", csrf);
+  const mid = jar.get("mid");
+  if (mid) headers.set("x-mid", mid);
   return headers;
 }
 
@@ -872,6 +1009,24 @@ async function resolveStoryUserId(
   target: Extract<InstagramTarget, { kind: "story" }>,
   jar: CookieJar,
 ): Promise<string | null> {
+  try {
+    const privateInfo = await fetchJson(
+      `https://i.instagram.com/api/v1/users/${encodeURIComponent(target.username)}/usernameinfo/`,
+      privateMobileHeaders(jar),
+      jar,
+    );
+    const id = userIdFromApiUser(privateInfo.data?.user);
+    if (id) {
+      console.log("instagram story user resolved", { resolver: "private-usernameinfo" });
+      return id;
+    }
+  } catch (error) {
+    console.warn("instagram story user resolver failed", {
+      resolver: "private-usernameinfo",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+
   const storyPage = await fetchHtml(target.url, browserHeaders(jar), jar);
   if (storyPage.html) {
     const id = extractUserIdFromHtml(storyPage.html, target.username);
@@ -980,6 +1135,14 @@ async function resolveStoryDirectMedia(
   jar: CookieJar,
 ): Promise<MediaCandidate[][] | null> {
   const resolvers: Array<[string, () => Promise<any | null>]> = [
+    ["story-direct-private", async () => {
+      const result = await fetchJson(
+        `https://i.instagram.com/api/v1/media/${encodeURIComponent(storyId)}/info/`,
+        privateMobileHeaders(jar),
+        jar,
+      );
+      return result.data?.items?.[0] || null;
+    }],
     ["story-direct-web", async () => {
       const result = await instagramJsonWithJar(
         `https://www.instagram.com/api/v1/media/${encodeURIComponent(storyId)}/info/`,
@@ -1037,6 +1200,22 @@ function findStoryReel(data: any, reelKey: string): any | null {
   return null;
 }
 
+async function resolveStoryViaPrivateUserFeed(
+  userId: string,
+  jar: CookieJar,
+): Promise<any | null> {
+  const query = new URLSearchParams({
+    supported_capabilities_new: JSON.stringify(PRIVATE_SUPPORTED_CAPABILITIES),
+  });
+  const result = await fetchJson(
+    `https://i.instagram.com/api/v1/feed/user/${encodeURIComponent(userId)}/story/?${query.toString()}`,
+    privateMobileHeaders(jar),
+    jar,
+  );
+  const reel = result.data?.reel;
+  return reel && typeof reel === "object" ? reel : null;
+}
+
 async function resolveStoryViaWebRest(
   reelKey: string,
   referer: string,
@@ -1057,7 +1236,7 @@ async function resolveStoryViaMobileRest(
 ): Promise<any | null> {
   const result = await fetchJson(
     `https://i.instagram.com/api/v1/feed/reels_media/?reel_ids=${encodeURIComponent(reelKey)}`,
-    mobileHeaders(jar),
+    privateMobileHeaders(jar),
     jar,
   );
   return findStoryReel(result.data, reelKey);
@@ -1120,11 +1299,17 @@ async function resolveStory(
     reelKey = userId;
   }
 
-  const resolvers: Array<[string, () => Promise<any | null>]> = [
+  const resolvers: Array<[string, () => Promise<any | null>]> = [];
+  if (target.kind === "story") {
+    resolvers.push(
+      ["story-private-user-feed", () => resolveStoryViaPrivateUserFeed(reelKey, baseJar)],
+      ["story-private-reels-media", () => resolveStoryViaMobileRest(reelKey, baseJar)],
+    );
+  }
+  resolvers.push(
     ["story-web-rest", () => resolveStoryViaWebRest(reelKey, target.url, cloneJar(baseJar))],
-    ["story-mobile-rest", () => resolveStoryViaMobileRest(reelKey, cloneJar(baseJar))],
     ["story-graphql", () => resolveStoryViaGraphql(reelKey, target.url, cloneJar(baseJar))],
-  ];
+  );
 
   let sawReel = false;
   for (const [name, run] of resolvers) {
@@ -1442,7 +1627,7 @@ export default {
           ok: true,
           service: "telegram-instagram-downloader",
           mode: "cloudflare-only",
-          resolver: "instagram-multistrategy-v7-full-cookie-jar",
+          resolver: "instagram-multistrategy-v8-private-story-auth",
           botConfigured: Boolean(env.BOT_TOKEN),
           instagramSessionConfigured: Boolean(env.INSTAGRAM_SESSIONID?.trim()),
           instagramMidConfigured: Boolean(env.INSTAGRAM_MID?.trim()),
