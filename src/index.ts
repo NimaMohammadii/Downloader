@@ -219,6 +219,12 @@ function absorbSetCookies(headers: Headers, jar: CookieJar): void {
   const authorization = headers.get("ig-set-authorization")?.trim();
   if (authorization) decodePrivateAuthorization(authorization, jar);
 
+  const routedRur = headers.get("ig-set-ig-u-rur")?.trim();
+  if (routedRur) jar.set("rur", routedRur);
+
+  const routedUserId = headers.get("ig-set-ig-u-ds-user-id")?.trim();
+  if (routedUserId && /^\d+$/.test(routedUserId)) jar.set("ds_user_id", routedUserId);
+
   const extended = headers as Headers & { getSetCookie?: () => string[] };
   const values = typeof extended.getSetCookie === "function"
     ? extended.getSetCookie()
@@ -382,6 +388,8 @@ function privateMobileHeaders(jar: CookieJar): Headers {
   if (csrf) headers.set("x-csrftoken", csrf);
   const mid = jar.get("mid");
   if (mid) headers.set("x-mid", mid);
+  const rur = jar.get("rur");
+  if (rur) headers.set("ig-u-rur", rur);
   return headers;
 }
 
@@ -1207,13 +1215,42 @@ async function resolveStoryViaPrivateUserFeed(
   const query = new URLSearchParams({
     supported_capabilities_new: JSON.stringify(PRIVATE_SUPPORTED_CAPABILITIES),
   });
-  const result = await fetchJson(
-    `https://i.instagram.com/api/v1/feed/user/${encodeURIComponent(userId)}/story/?${query.toString()}`,
-    privateMobileHeaders(jar),
-    jar,
-  );
-  const reel = result.data?.reel;
-  return reel && typeof reel === "object" ? reel : null;
+  const userPath = encodeURIComponent(userId);
+  const endpoints: Array<[string, string, () => Headers]> = [
+    [
+      "private-reel-media",
+      `https://i.instagram.com/api/v1/feed/user/${userPath}/reel_media/?${query.toString()}`,
+      () => privateMobileHeaders(jar),
+    ],
+    [
+      "private-story",
+      `https://i.instagram.com/api/v1/feed/user/${userPath}/story/?${query.toString()}`,
+      () => privateMobileHeaders(jar),
+    ],
+    [
+      "web-reel-media",
+      `https://www.instagram.com/api/v1/feed/user/${userPath}/reel_media/`,
+      () => {
+        const headers = webHeaders(jar, "https://www.instagram.com/");
+        headers.set("x-asbd-id", LEGACY_ASBD_ID);
+        return headers;
+      },
+    ],
+  ];
+
+  for (const [name, url, makeHeaders] of endpoints) {
+    const result = await fetchJson(url, makeHeaders(), jar);
+    const reel =
+      result.data?.reel ||
+      findStoryReel(result.data, userId) ||
+      (Array.isArray(result.data?.items) ? result.data : null);
+    if (reel && typeof reel === "object") {
+      console.log("instagram story user feed success", { resolver: name, userId });
+      return reel;
+    }
+    console.warn("instagram story user feed empty", { resolver: name, userId, status: result.status });
+  }
+  return null;
 }
 
 async function resolveStoryViaWebRest(
@@ -1302,7 +1339,7 @@ async function resolveStory(
   const resolvers: Array<[string, () => Promise<any | null>]> = [];
   if (target.kind === "story") {
     resolvers.push(
-      ["story-private-user-feed", () => resolveStoryViaPrivateUserFeed(reelKey, baseJar)],
+      ["story-private-user-reel-media", () => resolveStoryViaPrivateUserFeed(reelKey, baseJar)],
       ["story-private-reels-media", () => resolveStoryViaMobileRest(reelKey, baseJar)],
     );
   }
@@ -1627,7 +1664,7 @@ export default {
           ok: true,
           service: "telegram-instagram-downloader",
           mode: "cloudflare-only",
-          resolver: "instagram-multistrategy-v8-private-story-auth",
+          resolver: "instagram-multistrategy-v9-story-reel-media",
           botConfigured: Boolean(env.BOT_TOKEN),
           instagramSessionConfigured: Boolean(env.INSTAGRAM_SESSIONID?.trim()),
           instagramMidConfigured: Boolean(env.INSTAGRAM_MID?.trim()),
