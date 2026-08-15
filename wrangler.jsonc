@@ -8,6 +8,16 @@
   "observability": {
     "enabled": true
   },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["DownloaderContainer"]
+    },
+    {
+      "tag": "v2",
+      "deleted_classes": ["DownloaderContainer"]
+    }
+  ],
   "workflows": [
     {
       "name": "youtube-downloads",
