@@ -57,14 +57,13 @@ const COBALT_POST_DOC_ID = "8845758582119845";
 const COBALT_POST_FRIENDLY_NAME = "PolarisPostActionLoadPostQueryQuery";
 const LEGACY_POST_DOC_ID = "27130156389949648";
 const LEGACY_POST_FRIENDLY_NAME = "PolarisLoggedOutDesktopWWWPostRootContentQuery";
+const STORY_GRAPHQL_DOC_ID = "25317500907894419";
 const MEDIA_LINK_TTL_SECONDS = 10 * 60;
 const TELEGRAM_VIDEO_URL_LIMIT = 19_000_000;
 const TELEGRAM_PHOTO_URL_LIMIT = 4_800_000;
 const IG_SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 
-// Current defaults used by maintained Instagram downloaders. Web and mobile
-// requests intentionally use different identities instead of one hard-coded UA.
 const WEB_UA =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
 const IOS_UA =
@@ -275,7 +274,14 @@ function numberOrZero(value: unknown): number {
 }
 
 function candidatesFromProduct(product: any): MediaCandidate[][] {
-  const nodes = Array.isArray(product?.carousel_media) ? product.carousel_media : [product];
+  const legacyNodes = Array.isArray(product?.edge_sidecar_to_children?.edges)
+    ? product.edge_sidecar_to_children.edges.map((edge: any) => edge?.node).filter(Boolean)
+    : [];
+  const nodes = Array.isArray(product?.carousel_media)
+    ? product.carousel_media
+    : legacyNodes.length
+      ? legacyNodes
+      : [product];
   const groups: MediaCandidate[][] = [];
 
   for (const node of nodes) {
@@ -339,7 +345,13 @@ function firstCandidateGroups(value: unknown, depth = 0): MediaCandidate[][] {
     }
   }
 
-  if (object.video_versions || object.image_versions2 || object.video_url || object.carousel_media) {
+  if (
+    object.video_versions ||
+    object.image_versions2 ||
+    object.video_url ||
+    object.carousel_media ||
+    object.edge_sidecar_to_children
+  ) {
     const groups = candidatesFromProduct(object);
     if (groups.length) return groups;
   }
@@ -395,6 +407,14 @@ function extractCsrfFromHtml(html: string): string | null {
   return (
     /"csrf_token":"([^"]+)"/.exec(html)?.[1] ||
     /\["InstagramSecurityConfig",\[\],\{"csrf_token":"([^"]+)"/.exec(html)?.[1] ||
+    null
+  );
+}
+
+function extractDtsgToken(html: string): string | null {
+  return (
+    /"dtsg":\{"token":"([^"]+)"/.exec(html)?.[1] ||
+    /\["DTSGInitialData",\[\],\{"token":"([^"]+)"/.exec(html)?.[1] ||
     null
   );
 }
@@ -779,7 +799,6 @@ async function resolvePost(
   target: Extract<InstagramTarget, { kind: "post" }>,
   env: Env,
 ): Promise<MediaCandidate[][]> {
-  // Public Reel/post first: do not let a rejected account session poison anonymous extraction.
   const anonymous = await tryPublicResolvers(target, new Map());
   if (anonymous?.length) return anonymous;
 
@@ -813,12 +832,173 @@ async function instagramJsonWithJar(
   return { data: result.data, status: result.status, authRedirect };
 }
 
+function regexEscape(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractUserIdFromHtml(html: string, username: string): string | null {
+  const escaped = regexEscape(username);
+  const patterns = [
+    new RegExp(`"pk":"?(\\d+)"?[^{}]{0,1200}"username":"${escaped}"`, "i"),
+    new RegExp(`"username":"${escaped}"[^{}]{0,1200}"pk":"?(\\d+)"?`, "i"),
+    new RegExp(`"id":"?(\\d+)"?[^{}]{0,1200}"username":"${escaped}"`, "i"),
+    new RegExp(`"username":"${escaped}"[^{}]{0,1200}"id":"?(\\d+)"?`, "i"),
+    /"profile_id":"(\d+)"/i,
+  ];
+  for (const pattern of patterns) {
+    const value = pattern.exec(html)?.[1];
+    if (value && /^\d+$/.test(value)) return value;
+  }
+  return null;
+}
+
+async function resolveStoryUserId(
+  target: Extract<InstagramTarget, { kind: "story" }>,
+  jar: CookieJar,
+): Promise<string | null> {
+  const storyPage = await fetchHtml(target.url, browserHeaders(jar), jar);
+  if (storyPage.html) {
+    const id = extractUserIdFromHtml(storyPage.html, target.username);
+    if (id) {
+      console.log("instagram story user resolved", { resolver: "story-html" });
+      return id;
+    }
+  }
+
+  const profileUrl = `https://www.instagram.com/${encodeURIComponent(target.username)}/`;
+  const profilePage = await fetchHtml(profileUrl, browserHeaders(jar), jar);
+  if (profilePage.html) {
+    const id = extractUserIdFromHtml(profilePage.html, target.username);
+    if (id) {
+      console.log("instagram story user resolved", { resolver: "profile-html" });
+      return id;
+    }
+  }
+
+  try {
+    const search = await fetchJson(
+      `https://www.instagram.com/web/search/topsearch/?query=${encodeURIComponent(target.username)}`,
+      webHeaders(jar, profileUrl),
+      jar,
+    );
+    const users = Array.isArray(search.data?.users) ? search.data.users : [];
+    const match = users.find(
+      (entry: any) => String(entry?.user?.username || "").toLowerCase() === target.username.toLowerCase(),
+    );
+    const id = String(match?.user?.pk || match?.user?.id || "");
+    if (/^\d+$/.test(id)) {
+      console.log("instagram story user resolved", { resolver: "topsearch" });
+      return id;
+    }
+  } catch (error) {
+    console.warn("instagram story user resolver failed", {
+      resolver: "topsearch",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  try {
+    const profile = await instagramJsonWithJar(
+      `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(target.username)}`,
+      jar,
+      target.url,
+    );
+    const id = String(profile.data?.data?.user?.id || profile.data?.data?.user?.pk || profile.data?.user?.pk || "");
+    if (/^\d+$/.test(id)) {
+      console.log("instagram story user resolved", { resolver: "web-profile-info" });
+      return id;
+    }
+  } catch (error) {
+    console.warn("instagram story user resolver failed", {
+      resolver: "web-profile-info",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  return null;
+}
+
+function findStoryReel(data: any, reelKey: string): any | null {
+  const direct = data?.reels?.[reelKey];
+  if (direct && typeof direct === "object") return direct;
+
+  const arrays = [
+    data?.reels_media,
+    data?.data?.xdt_api__v1__feed__reels_media?.reels_media,
+  ];
+  for (const value of arrays) {
+    if (!Array.isArray(value)) continue;
+    const exact = value.find((reel: any) => String(reel?.id || reel?.pk || "") === reelKey);
+    if (exact) return exact;
+    if (value.length === 1) return value[0];
+  }
+  return null;
+}
+
+async function resolveStoryViaWebRest(
+  reelKey: string,
+  referer: string,
+  jar: CookieJar,
+): Promise<any | null> {
+  const result = await instagramJsonWithJar(
+    `https://www.instagram.com/api/v1/feed/reels_media/?reel_ids=${encodeURIComponent(reelKey)}`,
+    jar,
+    referer,
+  );
+  if (result.authRedirect) return null;
+  return findStoryReel(result.data, reelKey);
+}
+
+async function resolveStoryViaMobileRest(
+  reelKey: string,
+  jar: CookieJar,
+): Promise<any | null> {
+  const result = await fetchJson(
+    `https://i.instagram.com/api/v1/feed/reels_media/?reel_ids=${encodeURIComponent(reelKey)}`,
+    mobileHeaders(jar),
+    jar,
+  );
+  return findStoryReel(result.data, reelKey);
+}
+
+async function resolveStoryViaGraphql(
+  reelKey: string,
+  referer: string,
+  jar: CookieJar,
+): Promise<any | null> {
+  const home = await fetchHtml("https://www.instagram.com/", browserHeaders(jar), jar);
+  if (!home.html || home.redirectedTo) return null;
+  const dtsg = extractDtsgToken(home.html);
+  if (!dtsg) return null;
+
+  const headers = webHeaders(jar, referer);
+  headers.set("content-type", "application/x-www-form-urlencoded");
+  headers.set("origin", "https://www.instagram.com");
+  headers.set("x-asbd-id", WEB_ASBD_ID);
+
+  const body = new URLSearchParams({
+    fb_dtsg: dtsg,
+    jazoest: "26438",
+    variables: JSON.stringify({ reel_ids_arr: [reelKey] }),
+    server_timestamps: "true",
+    doc_id: STORY_GRAPHQL_DOC_ID,
+  }).toString();
+
+  const result = await fetchJson(
+    "https://www.instagram.com/api/graphql/",
+    headers,
+    jar,
+    { method: "POST", body },
+  );
+  return findStoryReel(result.data, reelKey);
+}
+
 async function resolveStory(
   target: Extract<InstagramTarget, { kind: "story" | "highlight" }>,
   env: Env,
 ): Promise<MediaCandidate[][]> {
   if (!env.INSTAGRAM_SESSIONID?.trim()) throw new Error("INSTAGRAM_STORY_SESSION_REQUIRED");
-  const jar = secretCookies(env);
+  const baseJar = secretCookies(env);
 
   let reelKey: string;
   let exactStoryId: string | null = null;
@@ -827,39 +1007,50 @@ async function resolveStory(
     reelKey = `highlight:${target.highlightId}`;
   } else {
     exactStoryId = target.storyId;
-    const profile = await instagramJsonWithJar(
-      `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(target.username)}`,
-      jar,
-      target.url,
-    );
-    throwForInstagramStatus(profile.status);
-    if (profile.authRedirect) throw new Error("INSTAGRAM_SESSION_REJECTED");
-    const userId = String(profile.data?.data?.user?.id || profile.data?.user?.pk || "");
-    if (!/^\d+$/.test(userId)) throw new Error("INSTAGRAM_STORY_USER_NOT_FOUND");
+    const userId = await resolveStoryUserId(target, cloneJar(baseJar));
+    if (!userId) throw new Error("INSTAGRAM_STORY_USER_NOT_FOUND");
     reelKey = userId;
   }
 
-  const response = await instagramJsonWithJar(
-    `https://www.instagram.com/api/v1/feed/reels_media/?reel_ids=${encodeURIComponent(reelKey)}`,
-    jar,
-    target.url,
-  );
-  throwForInstagramStatus(response.status);
-  if (response.authRedirect) throw new Error("INSTAGRAM_SESSION_REJECTED");
+  const resolvers: Array<[string, () => Promise<any | null>]> = [
+    ["story-web-rest", () => resolveStoryViaWebRest(reelKey, target.url, cloneJar(baseJar))],
+    ["story-mobile-rest", () => resolveStoryViaMobileRest(reelKey, cloneJar(baseJar))],
+    ["story-graphql", () => resolveStoryViaGraphql(reelKey, target.url, cloneJar(baseJar))],
+  ];
 
-  const reel = response.data?.reels?.[reelKey];
-  const items = Array.isArray(reel?.items) ? reel.items : [];
-  if (!items.length) throw new Error("INSTAGRAM_STORY_LOGIN_REQUIRED");
+  let sawReel = false;
+  for (const [name, run] of resolvers) {
+    try {
+      const reel = await run();
+      if (!reel) {
+        console.warn("instagram story resolver empty", { resolver: name, reelKey });
+        continue;
+      }
+      sawReel = true;
+      const items = Array.isArray(reel?.items) ? reel.items : [];
+      const selectedItems = exactStoryId
+        ? items.filter((item: any) => String(item?.pk || item?.id || "").split("_")[0] === exactStoryId)
+        : items;
+      if (!selectedItems.length) {
+        console.warn("instagram story resolver missing item", { resolver: name, reelKey, exactStoryId });
+        continue;
+      }
 
-  const selectedItems = exactStoryId
-    ? items.filter((item: any) => String(item?.pk || item?.id || "").split("_")[0] === exactStoryId)
-    : items;
-  if (!selectedItems.length) throw new Error("INSTAGRAM_STORY_EXPIRED");
+      const groups: MediaCandidate[][] = [];
+      for (const item of selectedItems) groups.push(...candidatesFromProduct(item));
+      if (groups.length) {
+        console.log("instagram story resolver success", { resolver: name, count: groups.length });
+        return groups;
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.warn("instagram story resolver failed", { resolver: name, reelKey, detail });
+      if (detail === "INSTAGRAM_RATE_LIMIT_429") throw error;
+    }
+  }
 
-  const groups: MediaCandidate[][] = [];
-  for (const item of selectedItems) groups.push(...candidatesFromProduct(item));
-  if (!groups.length) throw new Error("INSTAGRAM_NO_MEDIA");
-  return groups;
+  if (sawReel && exactStoryId) throw new Error("INSTAGRAM_STORY_EXPIRED");
+  throw new Error("INSTAGRAM_STORY_LOGIN_REQUIRED");
 }
 
 async function probeSize(url: string): Promise<number | null> {
@@ -994,7 +1185,7 @@ async function handleMediaProxy(request: Request, env: Env, url: URL): Promise<R
 async function resolveTarget(target: InstagramTarget, env: Env): Promise<ResolvedMedia[]> {
   const groups = target.kind === "post" ? await resolvePost(target, env) : await resolveStory(target, env);
   const resolved: ResolvedMedia[] = [];
-  for (const group of groups.slice(0, 10)) resolved.push(await chooseCandidate(group));
+  for (const group of groups) resolved.push(await chooseCandidate(group));
   return resolved;
 }
 
@@ -1015,8 +1206,11 @@ function friendlyError(detail: string): string {
   if (value.includes("story_session_required")) {
     return "❌ برای دانلود Story باید Session اینستاگرام به Cloudflare وصل باشه.";
   }
+  if (value.includes("story_user_not_found")) {
+    return "❌ نتونستم شناسه‌ی این اکانت رو برای Story پیدا کنم. لاگ story user resolver رو بفرست.";
+  }
   if (value.includes("story_login_required") || value.includes("login_required")) {
-    return "❌ Instagram برای این محتوا لاگین معتبر می‌خواد.";
+    return "❌ Instagram برای این Story/Highlight لاگین معتبر می‌خواد یا همه‌ی مسیرهای Session رو رد کرده.";
   }
   if (value.includes("story_expired")) {
     return "❌ این Story دیگه در دسترس نیست یا منقضی شده.";
@@ -1140,7 +1334,7 @@ export default {
           ok: true,
           service: "telegram-instagram-downloader",
           mode: "cloudflare-only",
-          resolver: "instagram-multistrategy-v4",
+          resolver: "instagram-multistrategy-v5-story-carousel",
           botConfigured: Boolean(env.BOT_TOKEN),
           instagramSessionConfigured: Boolean(env.INSTAGRAM_SESSIONID?.trim()),
         }),
