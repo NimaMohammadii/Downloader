@@ -29,6 +29,7 @@ type PlayerFormat = {
   height?: number;
   contentLength?: string;
   audioQuality?: string;
+  drmFamilies?: string[];
 };
 
 type PlayerResponse = {
@@ -46,11 +47,29 @@ type PlayerResponse = {
   };
 };
 
+type YoutubeClient = {
+  key: "VISIONOS" | "ANDROID_VR";
+  name: string;
+  version: string;
+  clientId: string;
+  userAgent: string;
+  context: Record<string, string | number>;
+};
+
 type SelectedFormat = {
+  itag: number;
   url: string;
   mime: string;
   size: number;
   height: number | null;
+  bitrate: number;
+};
+
+type ResolvedMedia = {
+  client: YoutubeClient;
+  format: SelectedFormat;
+  title: string;
+  duration: number | null;
 };
 
 const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
@@ -59,16 +78,41 @@ const MEDIA_LINK_TTL_SECONDS = 10 * 60;
 const TELEGRAM_URL_FILE_LIMIT = 19_000_000;
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 
-const ANDROID_VR = {
+const VISIONOS: YoutubeClient = {
+  key: "VISIONOS",
+  name: "VISIONOS",
+  version: "1.02",
+  clientId: "101",
+  userAgent:
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+  context: {
+    deviceMake: "Apple",
+    deviceModel: "RealityDevice17,1",
+    osName: "visionOS",
+    osVersion: "26.5.23O471",
+    platform: "MOBILE",
+  },
+};
+
+const ANDROID_VR: YoutubeClient = {
+  key: "ANDROID_VR",
   name: "ANDROID_VR",
   version: "1.65.10",
   clientId: "28",
-  sdkVersion: 32,
-  deviceMake: "Oculus",
-  deviceModel: "Quest 3",
   userAgent:
     "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
-} as const;
+  context: {
+    androidSdkVersion: 32,
+    deviceMake: "Oculus",
+    deviceModel: "Quest 3",
+    osName: "Android",
+    osVersion: "12L",
+    platform: "MOBILE",
+    clientFormFactor: "SMALL_FORM_FACTOR",
+  },
+};
+
+const YOUTUBE_CLIENTS: YoutubeClient[] = [VISIONOS, ANDROID_VR];
 
 async function telegramCall<T = unknown>(
   token: string,
@@ -135,32 +179,36 @@ function extractYouTubeVideo(text: string): { url: string; videoId: string } | n
   return null;
 }
 
-async function fetchPlayer(videoId: string): Promise<PlayerResponse> {
+function youtubeStreamHeaders(client: YoutubeClient): Headers {
+  return new Headers({
+    accept: "*/*",
+    origin: "https://www.youtube.com",
+    referer: "https://www.youtube.com/",
+    "user-agent": client.userAgent,
+  });
+}
+
+async function fetchPlayer(videoId: string, client: YoutubeClient): Promise<PlayerResponse> {
   const response = await fetch(
-    "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+    "https://www.youtube.com/youtubei/v1/player?prettyPrint=false&alt=json",
     {
       method: "POST",
       headers: {
         "content-type": "application/json",
         accept: "*/*",
         origin: "https://www.youtube.com",
-        referer: "https://www.youtube.com/",
-        "user-agent": ANDROID_VR.userAgent,
-        "x-youtube-client-name": ANDROID_VR.clientId,
-        "x-youtube-client-version": ANDROID_VR.version,
+        "user-agent": client.userAgent,
+        "x-youtube-client-name": client.clientId,
+        "x-youtube-client-version": client.version,
       },
       body: JSON.stringify({
         context: {
           client: {
             hl: "en",
             gl: "US",
-            clientName: ANDROID_VR.name,
-            clientVersion: ANDROID_VR.version,
-            androidSdkVersion: ANDROID_VR.sdkVersion,
-            deviceMake: ANDROID_VR.deviceMake,
-            deviceModel: ANDROID_VR.deviceModel,
-            osName: "Android",
-            osVersion: "12L",
+            clientName: client.name,
+            clientVersion: client.version,
+            ...client.context,
           },
         },
         videoId,
@@ -176,14 +224,14 @@ async function fetchPlayer(videoId: string): Promise<PlayerResponse> {
   );
 
   if (!response.ok) {
-    throw new Error(`YOUTUBE_PLAYER_HTTP_${response.status}`);
+    throw new Error(`${client.key}_PLAYER_HTTP_${response.status}`);
   }
 
   const player = await response.json<PlayerResponse>();
   const status = player.playabilityStatus?.status || "UNKNOWN";
   if (status !== "OK") {
     const reason = player.playabilityStatus?.reason || status;
-    throw new Error(`YOUTUBE_PLAYABILITY:${status}:${reason}`);
+    throw new Error(`${client.key}_PLAYABILITY:${status}:${reason}`);
   }
   if (player.videoDetails?.isLiveContent) {
     throw new Error("LIVE_VIDEO");
@@ -194,18 +242,23 @@ async function fetchPlayer(videoId: string): Promise<PlayerResponse> {
 
 function chooseTelegramFormat(player: PlayerResponse): SelectedFormat {
   const formats = player.streamingData?.formats ?? [];
-  const candidates: Array<SelectedFormat & { bitrate: number }> = [];
+  const candidates: SelectedFormat[] = [];
 
   for (const format of formats) {
     if (!format.url) continue;
+    if (format.drmFamilies?.length) continue;
+
     const mime = String(format.mimeType || "").toLowerCase();
     if (!mime.startsWith("video/mp4")) continue;
     if (!format.audioQuality) continue;
 
+    const itag = Number(format.itag);
     const size = Number(format.contentLength);
+    if (!Number.isInteger(itag)) continue;
     if (!Number.isSafeInteger(size) || size <= 0 || size > TELEGRAM_URL_FILE_LIMIT) continue;
 
     candidates.push({
+      itag,
       url: format.url,
       mime: String(format.mimeType || "video/mp4").split(";")[0],
       size,
@@ -224,6 +277,70 @@ function chooseTelegramFormat(player: PlayerResponse): SelectedFormat {
   });
 
   return candidates[0];
+}
+
+async function probeYoutubeStream(format: SelectedFormat, client: YoutubeClient): Promise<void> {
+  const probeUrl = new URL(format.url);
+  probeUrl.searchParams.set("range", "0-1023");
+
+  const response = await fetch(probeUrl.toString(), {
+    method: "GET",
+    headers: youtubeStreamHeaders(client),
+    redirect: "follow",
+  });
+
+  if (!response.ok && response.status !== 206) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new Error(`${client.key}_GVS_HTTP_${response.status}`);
+  }
+
+  await response.body?.cancel().catch(() => undefined);
+}
+
+async function resolvePlayableMedia(videoId: string): Promise<ResolvedMedia> {
+  const failures: string[] = [];
+
+  for (const client of YOUTUBE_CLIENTS) {
+    try {
+      const player = await fetchPlayer(videoId, client);
+      const format = chooseTelegramFormat(player);
+      await probeYoutubeStream(format, client);
+
+      console.log("youtube media resolved", {
+        videoId,
+        client: client.key,
+        itag: format.itag,
+        height: format.height,
+        size: format.size,
+      });
+
+      return {
+        client,
+        format,
+        title: (player.videoDetails?.title || "YouTube video").trim(),
+        duration: Number.isFinite(Number(player.videoDetails?.lengthSeconds))
+          ? Number(player.videoDetails?.lengthSeconds)
+          : null,
+      };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      if (detail === "LIVE_VIDEO") throw error;
+      failures.push(detail);
+      console.warn("youtube client failed", { videoId, client: client.key, detail });
+    }
+  }
+
+  throw new Error(`YOUTUBE_ALL_CLIENTS_FAILED:${failures.join(" | ")}`);
+}
+
+function parseTelegramRange(rangeHeader: string | null): { start: number; end: string } | null {
+  if (!rangeHeader) return null;
+  const match = /^bytes=(\d+)-(\d*)$/i.exec(rangeHeader.trim());
+  if (!match) return null;
+
+  const start = Number(match[1]);
+  if (!Number.isSafeInteger(start) || start < 0) return null;
+  return { start, end: match[2] || "" };
 }
 
 async function createSignedMediaUrl(token: string, videoId: string): Promise<string> {
@@ -302,11 +419,18 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
     });
     statusMessageId = status.message_id;
 
+    // Resolve and actually probe the Google Video stream before asking Telegram to fetch it.
+    // This catches YouTube client / PO-token / GVS failures instead of hiding them behind
+    // Telegram's generic "failed to get HTTP URL content" message.
+    const resolved = await resolvePlayableMedia(youtube.videoId);
     const mediaUrl = await createSignedMediaUrl(env.BOT_TOKEN, youtube.videoId);
+
     await telegramCall(env.BOT_TOKEN, "sendVideo", {
       chat_id: message.chat.id,
       video: mediaUrl,
+      caption: resolved.title.slice(0, 1024),
       supports_streaming: true,
+      ...(resolved.duration ? { duration: Math.round(resolved.duration) } : {}),
       reply_parameters: { message_id: message.message_id },
     });
 
@@ -359,8 +483,8 @@ async function handleMedia(request: Request, env: Env, url: URL): Promise<Respon
   }
 
   try {
-    const player = await fetchPlayer(videoId);
-    const selected = chooseTelegramFormat(player);
+    const resolved = await resolvePlayableMedia(videoId);
+    const selected = resolved.format;
 
     const headers = new Headers({
       "content-type": selected.mime,
@@ -374,24 +498,25 @@ async function handleMedia(request: Request, env: Env, url: URL): Promise<Respon
       return new Response(null, { status: 200, headers });
     }
 
-    const upstreamHeaders = new Headers({
-      accept: "*/*",
-      origin: "https://www.youtube.com",
-      referer: "https://www.youtube.com/",
-      "user-agent": ANDROID_VR.userAgent,
-    });
-    const range = request.headers.get("range");
-    if (range) upstreamHeaders.set("range", range);
+    const upstreamUrl = new URL(selected.url);
+    const telegramRange = parseTelegramRange(request.headers.get("range"));
+    if (telegramRange) {
+      upstreamUrl.searchParams.set("range", `${telegramRange.start}-${telegramRange.end}`);
+    }
 
-    const upstream = await fetch(selected.url, {
+    const upstream = await fetch(upstreamUrl.toString(), {
       method: "GET",
-      headers: upstreamHeaders,
+      headers: youtubeStreamHeaders(resolved.client),
       redirect: "follow",
     });
 
     if (!upstream.ok && upstream.status !== 206) {
-      console.error("youtube stream fetch failed", { videoId, status: upstream.status });
-      return new Response("YouTube stream unavailable", { status: 502 });
+      console.error("youtube stream fetch failed", {
+        videoId,
+        client: resolved.client.key,
+        status: upstream.status,
+      });
+      return new Response(`YouTube stream unavailable: ${upstream.status}`, { status: 502 });
     }
 
     const responseHeaders = new Headers(headers);
@@ -416,19 +541,36 @@ async function handleMedia(request: Request, env: Env, url: URL): Promise<Respon
     if (detail.includes("LIVE_VIDEO")) {
       return new Response("Live video unsupported", { status: 422 });
     }
-    return new Response("Media unavailable", { status: 502 });
+    return new Response(`Media unavailable: ${detail.slice(0, 160)}`, { status: 502 });
   }
 }
 
 function friendlyError(detail: string): string {
   const value = detail.toLowerCase();
-  if (value.includes("wrong file identifier/http url specified") || value.includes("failed to get http url content")) {
-    return "❌ نتونستم فایل این ویدیو رو از YouTube بگیرم. یه لینک دیگه امتحان کن.";
+
+  if (value.includes("live_video")) {
+    return "❌ دانلود Live فعلاً پشتیبانی نمی‌شه.";
+  }
+  if (value.includes("no_telegram_url_format")) {
+    return "❌ نسخه‌ی MP4 مناسب برای ارسال مستقیم داخل تلگرام پیدا نشد یا حجمش بیشتر از 20MB بود.";
+  }
+  if (value.includes("gvs_http_403")) {
+    return "❌ YouTube استریم این ویدیو رو برای سرور Cloudflare با خطای 403 بسته. این محدودیت خود YouTube هست.";
+  }
+  if (value.includes("youtube_all_clients_failed")) {
+    return "❌ YouTube به هیچ‌کدوم از مسیرهای مستقیم اجازه‌ی گرفتن این ویدیو رو نداد.";
+  }
+  if (
+    value.includes("wrong file identifier/http url specified") ||
+    value.includes("failed to get http url content")
+  ) {
+    return "❌ استریم از YouTube تست شد ولی Telegram نتونست فایل رو از Worker دریافت کنه.";
   }
   if (value.includes("too big") || value.includes("file is too big")) {
     return "❌ این ویدیو برای ارسال مستقیم داخل تلگرام زیادی حجیمه.";
   }
-  return "❌ نتونستم این ویدیو رو دانلود کنم. یه لینک دیگه امتحان کن.";
+
+  return "❌ دانلود ویدیو انجام نشد. خطای دقیق توی لاگ Cloudflare ثبت شد.";
 }
 
 export default {
@@ -440,9 +582,10 @@ export default {
         JSON.stringify({
           ok: true,
           service: "telegram-youtube-downloader",
-          mode: "free-worker-direct-stream",
+          mode: "free-worker-direct-stream-v2",
           domain: "downloader.vexaagent.workers.dev",
           botConfigured: Boolean(env.BOT_TOKEN),
+          youtubeClients: YOUTUBE_CLIENTS.map((client) => client.key),
         }),
         { headers: JSON_HEADERS },
       );
