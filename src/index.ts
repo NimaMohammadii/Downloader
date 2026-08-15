@@ -36,19 +36,30 @@ type TelegramApiResponse<T> = {
   description?: string;
 };
 
+type YoutubeClient = "ANDROID_VR" | "IOS" | "WEB" | "ANDROID";
+
 type ResolvedVideo = {
   title: string;
   duration: number | null;
   itag: number;
   height: number | null;
   size: number | null;
+  client: YoutubeClient;
   canSendByTelegramUrl: boolean;
+};
+
+type CandidateFormat = {
+  itag: number;
+  height: number | null;
+  size: number | null;
+  bitrate: number;
 };
 
 const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
 const BASE_URL = "https://downloader.vexaagent.workers.dev";
 const TELEGRAM_REMOTE_FILE_LIMIT = 18_500_000;
 const MEDIA_LINK_TTL_SECONDS = 60 * 60;
+const YOUTUBE_CLIENTS: YoutubeClient[] = ["ANDROID_VR", "IOS", "WEB", "ANDROID"];
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 
 export class DownloadWorkflow extends WorkflowEntrypoint<Env, DownloadJob> {
@@ -83,80 +94,18 @@ export class DownloadWorkflow extends WorkflowEntrypoint<Env, DownloadJob> {
           retries: { limit: 2, delay: "3 seconds", backoff: "linear" },
           timeout: "2 minutes",
         },
-        async (): Promise<ResolvedVideo> => {
-          const youtube = await Innertube.create();
-          const info = await youtube.getBasicInfo(job.videoId);
-
-          if (info.basic_info.is_private) {
-            throw new Error("PRIVATE_VIDEO");
-          }
-          if (info.basic_info.is_live || info.basic_info.is_upcoming) {
-            throw new Error("LIVE_VIDEO");
-          }
-
-          const formats: Array<{
-            itag: number;
-            height: number | null;
-            size: number | null;
-            bitrate: number;
-          }> = [];
-          const seen = new Set<number>();
-
-          for (const quality of ["720p", "480p", "360p", "best"]) {
-            try {
-              const format = info.chooseFormat({
-                type: "video+audio",
-                quality,
-                format: "mp4",
-              });
-
-              const itag = Number(format.itag);
-              if (!Number.isFinite(itag) || seen.has(itag)) continue;
-              seen.add(itag);
-
-              const rawSize = Number(format.content_length);
-              formats.push({
-                itag,
-                height: Number.isFinite(Number(format.height)) ? Number(format.height) : null,
-                size: Number.isFinite(rawSize) && rawSize > 0 ? rawSize : null,
-                bitrate: Number.isFinite(Number(format.bitrate)) ? Number(format.bitrate) : 0,
-              });
-            } catch {
-              // Exact quality may not exist as a pre-muxed audio+video MP4.
-            }
-          }
-
-          if (!formats.length) {
-            throw new Error("NO_MUXED_FORMAT");
-          }
-
-          formats.sort((a, b) => {
-            const heightDiff = (b.height ?? 0) - (a.height ?? 0);
-            return heightDiff || b.bitrate - a.bitrate;
-          });
-
-          const telegramCandidate = formats.find(
-            (format) => format.size !== null && format.size <= TELEGRAM_REMOTE_FILE_LIMIT,
-          );
-          const selected = telegramCandidate ?? formats[0];
-
-          return {
-            title: (info.basic_info.title || "YouTube video").trim(),
-            duration: Number.isFinite(Number(info.basic_info.duration))
-              ? Number(info.basic_info.duration)
-              : null,
-            itag: selected.itag,
-            height: selected.height,
-            size: selected.size,
-            canSendByTelegramUrl: Boolean(telegramCandidate),
-          };
-        },
+        async (): Promise<ResolvedVideo> => resolveYoutubeVideo(job.videoId),
       );
 
       const mediaUrl = await step.do(
         "create secure media link",
         { timeout: "1 minute", retries: { limit: 1, delay: "1 second", backoff: "constant" } },
-        async () => createSignedMediaUrl(this.env.BOT_TOKEN, job.videoId, video.itag),
+        async () => createSignedMediaUrl(
+          this.env.BOT_TOKEN,
+          job.videoId,
+          video.itag,
+          video.client,
+        ),
       );
 
       await step.do(
@@ -246,6 +195,101 @@ export class DownloadWorkflow extends WorkflowEntrypoint<Env, DownloadJob> {
       );
     }
   }
+}
+
+async function resolveYoutubeVideo(videoId: string): Promise<ResolvedVideo> {
+  const youtube = await Innertube.create();
+  const failures: string[] = [];
+
+  for (const client of YOUTUBE_CLIENTS) {
+    try {
+      const info = await youtube.getBasicInfo(videoId, { client });
+
+      if (info.basic_info.is_private) {
+        throw new Error("PRIVATE_VIDEO");
+      }
+      if (info.basic_info.is_live || info.basic_info.is_upcoming) {
+        throw new Error("LIVE_VIDEO");
+      }
+
+      const formats = collectMuxedFormats(info);
+      if (!formats.length) {
+        throw new Error("NO_MUXED_FORMAT");
+      }
+
+      const preferredFormats = formats.some((format) => (format.height ?? 0) <= 720)
+        ? formats.filter((format) => (format.height ?? 0) <= 720)
+        : formats;
+
+      preferredFormats.sort((a, b) => {
+        const heightDiff = (b.height ?? 0) - (a.height ?? 0);
+        return heightDiff || b.bitrate - a.bitrate;
+      });
+
+      const telegramCandidate = preferredFormats.find(
+        (format) => format.size !== null && format.size <= TELEGRAM_REMOTE_FILE_LIMIT,
+      );
+      const selected = telegramCandidate ?? preferredFormats[0];
+
+      console.log("youtube stream resolved", {
+        videoId,
+        client,
+        itag: selected.itag,
+        height: selected.height,
+        size: selected.size,
+      });
+
+      return {
+        title: (info.basic_info.title || "YouTube video").trim(),
+        duration: Number.isFinite(Number(info.basic_info.duration))
+          ? Number(info.basic_info.duration)
+          : null,
+        itag: selected.itag,
+        height: selected.height,
+        size: selected.size,
+        client,
+        canSendByTelegramUrl: Boolean(telegramCandidate),
+      };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      if (detail === "PRIVATE_VIDEO" || detail === "LIVE_VIDEO") throw error;
+      failures.push(`${client}: ${detail}`);
+      console.warn("youtube client failed", { videoId, client, detail });
+    }
+  }
+
+  throw new Error(`YOUTUBE_CLIENTS_FAILED | ${failures.join(" | ")}`);
+}
+
+function collectMuxedFormats(info: any): CandidateFormat[] {
+  const allFormats = [
+    ...(info.streaming_data?.formats ?? []),
+    ...(info.streaming_data?.adaptive_formats ?? []),
+  ];
+  const seen = new Set<number>();
+  const formats: CandidateFormat[] = [];
+
+  for (const format of allFormats) {
+    if (!format?.has_audio || !format?.has_video) continue;
+    if (!String(format.mime_type || "").toLowerCase().includes("video/mp4")) continue;
+
+    const itag = Number(format.itag);
+    if (!Number.isInteger(itag) || seen.has(itag)) continue;
+    seen.add(itag);
+
+    const rawSize = Number(format.content_length);
+    const rawHeight = Number(format.height);
+    const rawBitrate = Number(format.bitrate);
+
+    formats.push({
+      itag,
+      height: Number.isFinite(rawHeight) && rawHeight > 0 ? rawHeight : null,
+      size: Number.isFinite(rawSize) && rawSize > 0 ? rawSize : null,
+      bitrate: Number.isFinite(rawBitrate) ? rawBitrate : 0,
+    });
+  }
+
+  return formats;
 }
 
 async function telegramCall<T = unknown>(
@@ -376,14 +420,69 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
   return Response.json({ ok: true });
 }
 
+async function resolveMediaInfo(videoId: string, itag: number, preferredClient: YoutubeClient) {
+  const youtube = await Innertube.create();
+  const clients = [preferredClient, ...YOUTUBE_CLIENTS.filter((client) => client !== preferredClient)];
+  const failures: string[] = [];
+
+  for (const client of clients) {
+    try {
+      const info = await youtube.getBasicInfo(videoId, { client });
+      const allFormats = [
+        ...(info.streaming_data?.formats ?? []),
+        ...(info.streaming_data?.adaptive_formats ?? []),
+      ];
+      const format = allFormats.find((candidate: any) => Number(candidate?.itag) === itag);
+      if (!format) throw new Error(`ITAG_${itag}_MISSING`);
+      if (!format.has_audio || !format.has_video) throw new Error("FORMAT_NOT_MUXED");
+      return { info, format, client };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      failures.push(`${client}: ${detail}`);
+      console.warn("media client failed", { videoId, itag, client, detail });
+    }
+  }
+
+  throw new Error(`MEDIA_CLIENTS_FAILED | ${failures.join(" | ")}`);
+}
+
+function parseRangeHeader(rangeHeader: string | null, totalSize: number | null) {
+  if (!rangeHeader) return null;
+  const match = /^bytes=(\d+)-(\d*)$/i.exec(rangeHeader.trim());
+  if (!match) return undefined;
+
+  const start = Number(match[1]);
+  const requestedEnd = match[2] ? Number(match[2]) : null;
+  if (!Number.isSafeInteger(start) || start < 0) return undefined;
+
+  const end = requestedEnd !== null
+    ? requestedEnd
+    : totalSize !== null
+      ? totalSize - 1
+      : start + 10 * 1024 * 1024 - 1;
+
+  if (!Number.isSafeInteger(end) || end < start) return undefined;
+  if (totalSize !== null && start >= totalSize) return undefined;
+
+  return {
+    start,
+    end: totalSize !== null ? Math.min(end, totalSize - 1) : end,
+  };
+}
+
 async function handleMedia(request: Request, env: Env, url: URL): Promise<Response> {
   const parts = url.pathname.split("/").filter(Boolean);
   const videoId = parts[1] || "";
   const itag = Number(url.searchParams.get("itag"));
+  const client = url.searchParams.get("client") as YoutubeClient;
   const expires = Number(url.searchParams.get("exp"));
   const signature = url.searchParams.get("sig") || "";
 
-  if (!/^[A-Za-z0-9_-]{11}$/.test(videoId) || !Number.isInteger(itag)) {
+  if (
+    !/^[A-Za-z0-9_-]{11}$/.test(videoId) ||
+    !Number.isInteger(itag) ||
+    !YOUTUBE_CLIENTS.includes(client)
+  ) {
     return new Response("Bad media link", { status: 400 });
   }
 
@@ -392,64 +491,72 @@ async function handleMedia(request: Request, env: Env, url: URL): Promise<Respon
     return new Response("Media link expired", { status: 403 });
   }
 
-  const expected = await signMediaToken(env.BOT_TOKEN, `${videoId}.${itag}.${expires}`);
+  const expected = await signMediaToken(env.BOT_TOKEN, `${videoId}.${itag}.${client}.${expires}`);
   if (!constantTimeEqual(signature, expected)) {
     return new Response("Forbidden", { status: 403 });
   }
 
   try {
-    const youtube = await Innertube.create();
-    const format = await youtube.getStreamingData(videoId, { itag });
-    if (!format.url) return new Response("Stream unavailable", { status: 404 });
+    const { info, format } = await resolveMediaInfo(videoId, itag, client);
+    const rawSize = Number(format.content_length);
+    const totalSize = Number.isFinite(rawSize) && rawSize > 0 ? rawSize : null;
+    const mime = String(format.mime_type || "video/mp4").split(";")[0];
+    const range = parseRangeHeader(request.headers.get("range"), totalSize);
 
-    const upstreamHeaders = new Headers();
-    const range = request.headers.get("range");
-    if (range) upstreamHeaders.set("range", range);
-
-    const upstream = await fetch(format.url, {
-      method: request.method === "HEAD" ? "HEAD" : "GET",
-      headers: upstreamHeaders,
-      redirect: "follow",
-    });
-
-    if (!upstream.ok && upstream.status !== 206) {
-      return new Response("YouTube stream failed", { status: 502 });
+    if (range === undefined) {
+      return new Response("Range Not Satisfiable", {
+        status: 416,
+        headers: totalSize !== null ? { "content-range": `bytes */${totalSize}` } : undefined,
+      });
     }
 
     const headers = new Headers();
-    for (const name of [
-      "content-length",
-      "content-range",
-      "accept-ranges",
-      "etag",
-      "last-modified",
-    ]) {
-      const value = upstream.headers.get(name);
-      if (value) headers.set(name, value);
-    }
-
-    const mime = upstream.headers.get("content-type") ||
-      String(format.mime_type || "video/mp4").split(";")[0];
     headers.set("content-type", mime);
     headers.set("cache-control", "private, no-store");
+    headers.set("accept-ranges", "bytes");
     headers.set("content-disposition", `attachment; filename="youtube-${videoId}.mp4"`);
 
-    return new Response(request.method === "HEAD" ? null : upstream.body, {
-      status: upstream.status,
-      headers,
-    });
+    if (request.method === "HEAD") {
+      if (totalSize !== null) headers.set("content-length", String(totalSize));
+      return new Response(null, { status: 200, headers });
+    }
+
+    if (range) {
+      const contentLength = range.end - range.start + 1;
+      headers.set("content-length", String(contentLength));
+      if (totalSize !== null) {
+        headers.set("content-range", `bytes ${range.start}-${range.end}/${totalSize}`);
+      }
+
+      const stream = await info.download({
+        itag,
+        range: { start: range.start, end: range.end },
+      });
+      return new Response(stream, { status: 206, headers });
+    }
+
+    if (totalSize !== null) headers.set("content-length", String(totalSize));
+    const stream = await info.download({ itag });
+    return new Response(stream, { status: 200, headers });
   } catch (error) {
-    console.error("media proxy failed", { videoId, itag, error });
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error("media proxy failed", { videoId, itag, client, detail });
     return new Response("Media unavailable", { status: 502 });
   }
 }
 
-async function createSignedMediaUrl(token: string, videoId: string, itag: number): Promise<string> {
+async function createSignedMediaUrl(
+  token: string,
+  videoId: string,
+  itag: number,
+  client: YoutubeClient,
+): Promise<string> {
   const expires = Math.floor(Date.now() / 1000) + MEDIA_LINK_TTL_SECONDS;
-  const payload = `${videoId}.${itag}.${expires}`;
+  const payload = `${videoId}.${itag}.${client}.${expires}`;
   const signature = await signMediaToken(token, payload);
   const url = new URL(`${BASE_URL}/media/${videoId}`);
   url.searchParams.set("itag", String(itag));
+  url.searchParams.set("client", client);
   url.searchParams.set("exp", String(expires));
   url.searchParams.set("sig", signature);
   return url.toString();
@@ -491,11 +598,14 @@ function friendlyError(detail: string): string {
   if (value.includes("live_video") || value.includes("live")) {
     return "❌ دانلود Live فعلاً پشتیبانی نمی‌شه.";
   }
-  if (value.includes("no_muxed_format")) {
-    return "❌ این ویدیو فرمت آماده‌ی مناسب نداره. یه ویدیوی دیگه امتحان کن.";
+  if (value.includes("login_required") || value.includes("sign in")) {
+    return "❌ یوتیوب برای این ویدیو ورود به حساب می‌خواد و فعلاً قابل دانلود نیست.";
   }
   if (value.includes("unavailable") || value.includes("playability")) {
     return "❌ این ویدیو در دسترس نیست یا محدود شده.";
+  }
+  if (value.includes("youtube_clients_failed") || value.includes("no_muxed_format")) {
+    return "❌ یوتیوب فعلاً استریم قابل دانلود این ویدیو رو به سرور نداد. یه لینک دیگه امتحان کن.";
   }
   return "❌ نتونستم این ویدیو رو آماده کنم. یک‌بار دیگه لینک رو بفرست.";
 }
