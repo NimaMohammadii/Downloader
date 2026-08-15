@@ -48,12 +48,13 @@ type PlayerResponse = {
 };
 
 type YoutubeClient = {
-  key: "VISIONOS" | "ANDROID_VR";
+  key: "ANDROID_VR" | "TV" | "WEB_EMBEDDED" | "VISIONOS";
   name: string;
   version: string;
   clientId: string;
   userAgent: string;
   context: Record<string, string | number>;
+  thirdParty?: Record<string, string>;
 };
 
 type SelectedFormat = {
@@ -78,22 +79,6 @@ const MEDIA_LINK_TTL_SECONDS = 10 * 60;
 const TELEGRAM_URL_FILE_LIMIT = 19_000_000;
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 
-const VISIONOS: YoutubeClient = {
-  key: "VISIONOS",
-  name: "VISIONOS",
-  version: "1.02",
-  clientId: "101",
-  userAgent:
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
-  context: {
-    deviceMake: "Apple",
-    deviceModel: "RealityDevice17,1",
-    osName: "visionOS",
-    osVersion: "26.5.23O471",
-    platform: "MOBILE",
-  },
-};
-
 const ANDROID_VR: YoutubeClient = {
   key: "ANDROID_VR",
   name: "ANDROID_VR",
@@ -112,7 +97,47 @@ const ANDROID_VR: YoutubeClient = {
   },
 };
 
-const YOUTUBE_CLIENTS: YoutubeClient[] = [VISIONOS, ANDROID_VR];
+const TV: YoutubeClient = {
+  key: "TV",
+  name: "TVHTML5",
+  version: "7.20260311.12.00",
+  clientId: "7",
+  userAgent: "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
+  context: {},
+};
+
+const WEB_EMBEDDED: YoutubeClient = {
+  key: "WEB_EMBEDDED",
+  name: "WEB_EMBEDDED_PLAYER",
+  version: "1.20260206.01.00",
+  clientId: "56",
+  userAgent:
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+  context: {
+    clientScreen: "EMBED",
+  },
+  thirdParty: {
+    embedUrl: "https://www.google.com/",
+  },
+};
+
+const VISIONOS: YoutubeClient = {
+  key: "VISIONOS",
+  name: "VISIONOS",
+  version: "1.02",
+  clientId: "101",
+  userAgent:
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+  context: {
+    deviceMake: "Apple",
+    deviceModel: "RealityDevice17,1",
+    osName: "visionOS",
+    osVersion: "26.5.23O471",
+    platform: "MOBILE",
+  },
+};
+
+const YOUTUBE_CLIENTS: YoutubeClient[] = [ANDROID_VR, TV, WEB_EMBEDDED, VISIONOS];
 
 async function telegramCall<T = unknown>(
   token: string,
@@ -210,6 +235,7 @@ async function fetchPlayer(videoId: string, client: YoutubeClient): Promise<Play
             clientVersion: client.version,
             ...client.context,
           },
+          ...(client.thirdParty ? { thirdParty: client.thirdParty } : {}),
         },
         videoId,
         contentCheckOk: true,
@@ -419,9 +445,6 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
     });
     statusMessageId = status.message_id;
 
-    // Resolve and actually probe the Google Video stream before asking Telegram to fetch it.
-    // This catches YouTube client / PO-token / GVS failures instead of hiding them behind
-    // Telegram's generic "failed to get HTTP URL content" message.
     const resolved = await resolvePlayableMedia(youtube.videoId);
     const mediaUrl = await createSignedMediaUrl(env.BOT_TOKEN, youtube.videoId);
 
@@ -555,10 +578,10 @@ function friendlyError(detail: string): string {
     return "❌ نسخه‌ی MP4 مناسب برای ارسال مستقیم داخل تلگرام پیدا نشد یا حجمش بیشتر از 20MB بود.";
   }
   if (value.includes("gvs_http_403")) {
-    return "❌ YouTube استریم این ویدیو رو برای سرور Cloudflare با خطای 403 بسته. این محدودیت خود YouTube هست.";
+    return "❌ YouTube استریم این ویدیو رو برای IP کلادفلر با خطای 403 بسته.";
   }
   if (value.includes("youtube_all_clients_failed")) {
-    return "❌ YouTube به هیچ‌کدوم از مسیرهای مستقیم اجازه‌ی گرفتن این ویدیو رو نداد.";
+    return "❌ همه‌ی مسیرهای مستقیم YouTube روی IP فعلی Cloudflare رد شدن. این معمولاً محدودیت IP دیتاسنتری YouTube هست.";
   }
   if (
     value.includes("wrong file identifier/http url specified") ||
@@ -582,7 +605,7 @@ export default {
         JSON.stringify({
           ok: true,
           service: "telegram-youtube-downloader",
-          mode: "free-worker-direct-stream-v2",
+          mode: "free-worker-direct-stream-v3",
           domain: "downloader.vexaagent.workers.dev",
           botConfigured: Boolean(env.BOT_TOKEN),
           youtubeClients: YOUTUBE_CLIENTS.map((client) => client.key),
