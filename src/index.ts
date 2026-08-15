@@ -241,7 +241,11 @@ function redirectLocation(response: Response, requestUrl: string): URL | null {
 
 function isAuthRedirect(location: URL | null): boolean {
   if (!location) return false;
-  return location.pathname.startsWith("/accounts/login") || location.pathname.startsWith("/challenge");
+  return (
+    location.pathname.startsWith("/accounts/login") ||
+    location.pathname.startsWith("/challenge") ||
+    location.pathname === "/"
+  );
 }
 
 async function instagramJsonWithJar(
@@ -266,7 +270,7 @@ async function instagramJsonWithJar(
   absorbSetCookies(response.headers, jar);
   const location = redirectLocation(response, url);
   if (location) {
-    const authRedirect = isAuthRedirect(location) || location.pathname === "/";
+    const authRedirect = isAuthRedirect(location);
     console.warn("instagram api redirected", {
       path: new URL(url).pathname,
       status: response.status,
@@ -397,6 +401,46 @@ function candidatesFromHtml(html: string): MediaCandidate[][] {
   return unique.map((item) => [item]);
 }
 
+function findPolarisMedia(value: unknown, depth = 0): any | null {
+  if (depth > 16 || value === null || typeof value !== "object") return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findPolarisMedia(item, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  const object = value as Record<string, unknown>;
+  const direct = object.xig_polaris_media;
+  if (direct && typeof direct === "object") return direct;
+
+  for (const child of Object.values(object)) {
+    const found = findPolarisMedia(child, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+function candidatesFromRelayHtml(html: string): MediaCandidate[][] {
+  const pattern = /<script\b[^>]*\bdata-sjs(?:=["'][^"']*["'])?[^>]*>([\s\S]*?)<\/script>/gi;
+  for (const match of html.matchAll(pattern)) {
+    const raw = match[1] || "";
+    if (!raw.includes("xig_polaris_media")) continue;
+    try {
+      const parsed = JSON.parse(raw);
+      const media = findPolarisMedia(parsed);
+      const product = media?.if_not_gated_logged_out || media;
+      if (!product) continue;
+      const groups = candidatesFromProduct(product);
+      if (groups.length) return groups;
+    } catch {
+      // Try the next Relay data script.
+    }
+  }
+  return [];
+}
+
 function extractLsdToken(html: string): string | null {
   const eqmc = /<script\b[^>]*\bid=["']__eqmc["'][^>]*>([\s\S]*?)<\/script>/i.exec(html);
   if (eqmc?.[1]) {
@@ -421,19 +465,28 @@ async function resolvePostViaWeb(
   mediaId: string,
   jar: CookieJar,
 ): Promise<MediaCandidate[][] | null> {
-  const home = await instagramPage("https://www.instagram.com/", jar);
-  throwForInstagramStatus(home.status);
-  if (home.authRedirect) return null;
-
-  let lsd = home.html ? extractLsdToken(home.html) : null;
-
   const page = await instagramPage(target.url, jar, "https://www.instagram.com/");
   throwForInstagramStatus(page.status);
   if (page.authRedirect) return null;
+
+  let lsd: string | null = null;
   if (page.html) {
     const direct = candidatesFromHtml(page.html);
     if (direct.length) return direct;
-    lsd ||= extractLsdToken(page.html);
+
+    const relay = candidatesFromRelayHtml(page.html);
+    if (relay.length) {
+      console.log("instagram media resolved from relay html");
+      return relay;
+    }
+    lsd = extractLsdToken(page.html);
+  }
+
+  if (!lsd) {
+    const home = await instagramPage("https://www.instagram.com/", jar);
+    throwForInstagramStatus(home.status);
+    if (home.authRedirect) return null;
+    lsd = home.html ? extractLsdToken(home.html) : null;
   }
 
   if (!lsd) return null;
@@ -475,6 +528,7 @@ async function resolvePostViaWeb(
     console.warn("instagram graphql redirected", {
       status: response.status,
       to: location.pathname,
+      authenticated: jar.has("sessionid"),
     });
     await response.body?.cancel().catch(() => undefined);
     return null;
@@ -497,6 +551,18 @@ async function resolvePostViaWeb(
   }
 }
 
+async function checkSessionWeb(jar: CookieJar): Promise<boolean> {
+  const page = await instagramPage("https://www.instagram.com/accounts/edit/", jar);
+  throwForInstagramStatus(page.status);
+  const valid = page.status === 200 && !page.authRedirect;
+  console.warn("instagram session web check", {
+    status: page.status,
+    authRedirect: page.authRedirect,
+    valid,
+  });
+  return valid;
+}
+
 async function resolvePost(
   target: Extract<InstagramTarget, { kind: "post" }>,
   env: Env,
@@ -506,11 +572,6 @@ async function resolvePost(
 
   if (hasSession) {
     const jar = secretCookies(env);
-
-    // First open Instagram with the same jar so csrf/mid/etc. are retained for the API call.
-    const bootstrap = await instagramPage("https://www.instagram.com/", jar);
-    throwForInstagramStatus(bootstrap.status);
-
     const api = await instagramJsonWithJar(
       `https://www.instagram.com/api/v1/media/${mediaId}/info/`,
       jar,
@@ -524,16 +585,26 @@ async function resolvePost(
       if (groups.length) return groups;
     }
 
-    // Some Instagram sessions are redirected on the media-info endpoint while the web flow still works.
-    const webGroups = await resolvePostViaWeb(target, mediaId, jar);
-    if (webGroups?.length) return webGroups;
+    let webSessionValid = true;
+    if (api.authRedirect) {
+      webSessionValid = await checkSessionWeb(jar);
+    }
 
-    // Last fallback: check if the post itself is still accessible anonymously.
+    if (!api.authRedirect || webSessionValid) {
+      const webGroups = await resolvePostViaWeb(target, mediaId, jar);
+      if (webGroups?.length) return webGroups;
+    }
+
+    // Match yt-dlp behavior: once an authenticated API request is rejected,
+    // do the logged-out fallback with a clean cookie jar rather than the rejected session.
     const anonymousGroups = await resolvePostViaWeb(target, mediaId, new Map());
     if (anonymousGroups?.length) return anonymousGroups;
 
-    if (api.authRedirect || bootstrap.authRedirect) {
+    if (api.authRedirect && !webSessionValid) {
       throw new Error("INSTAGRAM_SESSION_REJECTED");
+    }
+    if (api.authRedirect && webSessionValid) {
+      throw new Error("INSTAGRAM_SESSION_API_BLOCKED");
     }
     throw new Error("INSTAGRAM_SESSION_NO_MEDIA");
   }
@@ -552,9 +623,6 @@ async function resolveStory(
   }
 
   const jar = secretCookies(env);
-  const bootstrap = await instagramPage("https://www.instagram.com/", jar);
-  throwForInstagramStatus(bootstrap.status);
-  if (bootstrap.authRedirect) throw new Error("INSTAGRAM_SESSION_REJECTED");
 
   let reelKey: string;
   let exactStoryId: string | null = null;
@@ -752,8 +820,11 @@ async function resolveTarget(target: InstagramTarget, env: Env): Promise<Resolve
 
 function friendlyError(detail: string): string {
   const value = detail.toLowerCase();
+  if (value.includes("session_api_blocked")) {
+    return "❌ Session روی Web معتبره، ولی Instagram درخواست API از Cloudflare رو می‌بنده. لاگ جدید رو بفرست.";
+  }
   if (value.includes("session_rejected")) {
-    return "❌ Instagram این Session رو قبول نکرد. sessionid رو دوباره از اکانتی که داخل Safari لاگین هست بگیر و Secret رو جایگزین کن.";
+    return "❌ Instagram این Session رو از سمت Cloudflare قبول نکرد. لاگ جدید رو بفرست؛ دوباره Cookie عوض نکن.";
   }
   if (value.includes("session_no_media")) {
     return "❌ Session وصل شده، ولی Instagram برای این Reel فایل ویدیو برنگردوند.";
@@ -897,7 +968,7 @@ export default {
           ok: true,
           service: "telegram-instagram-downloader",
           mode: "cloudflare-only",
-          resolver: "instagram-session-v2",
+          resolver: "instagram-session-v3-relay",
           botConfigured: Boolean(env.BOT_TOKEN),
           instagramSessionConfigured: Boolean(env.INSTAGRAM_SESSIONID?.trim()),
         }),
