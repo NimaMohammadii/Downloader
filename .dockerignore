@@ -1,7 +1,0 @@
-node_modules
-.git
-.github
-.wrangler
-.env
-.env.*
-README.md
