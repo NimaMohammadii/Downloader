@@ -1,6 +1,6 @@
-# Telegram YouTube Downloader
+# Telegram Instagram Downloader
 
-A Telegram bot backend designed to run on Cloudflare Workers Free + Workflows, without Containers or Docker.
+Telegram bot downloader running only on Cloudflare Workers.
 
 Production endpoint:
 
@@ -8,51 +8,49 @@ Production endpoint:
 
 ## Architecture
 
-Telegram -> Cloudflare Worker -> Cloudflare Workflow -> YouTube.js -> secure Worker media stream
+Telegram -> Cloudflare Worker -> Instagram API/CDN -> Telegram
 
-There is no Docker image, ffmpeg process, Durable Object, or Cloudflare Container in this version.
+There is no Render service, Docker container, ffmpeg process, Cloudflare Container, Workflow, or Durable Object in the active downloader path.
 
-## What it does
+## Supported links
 
-- Accepts normal YouTube and Shorts links.
-- Uses `youtubei.js/cf-worker`, the Cloudflare Worker build of YouTube.js.
-- Uses one Workflow per Telegram update so duplicate webhook deliveries do not create duplicate jobs.
-- Picks a pre-muxed MP4 format that already contains both video and audio.
-- For smaller files, Telegram fetches the secure Worker media URL and sends the video directly in chat.
-- For larger files, the bot shows a `Download video` button instead of failing.
-- `/media/...` streams bytes from YouTube through Cloudflare without loading the whole video into Worker memory.
-- Media links are temporary and HMAC-signed using the bot token.
-- Rejects private and live/upcoming videos.
+- Instagram Reel
+- Instagram video post
+- Instagram carousel media
+- Instagram Story
+- Instagram Highlights
 
-## Cloudflare plan
+Public Reel/Post downloads are attempted without an Instagram session first. A valid Instagram session can improve reliability and is required for Stories when Instagram requires login.
 
-This version does **not** require Cloudflare Containers or Workers Paid.
+## Telegram delivery
 
-Cloudflare Workflows are available on the Workers Free plan, subject to the normal Free-plan limits.
+The bot does not show a download-link button. The Worker resolves the Instagram media and creates a short-lived signed media proxy URL. Telegram fetches that URL and posts the actual video/photo into the chat.
 
-## Required secret
+Telegram's Bot API remote-URL limits apply: currently 20 MB for videos/other content and 5 MB for photos. The Worker tries lower Instagram renditions when a larger rendition exceeds that limit.
 
-Only the Telegram Bot Token must be stored as a Cloudflare secret/environment secret:
+## Required Cloudflare secret
 
 `BOT_TOKEN`
 
-Never put the Bot Token in the repository.
+Never commit the bot token to the repository.
 
-The Telegram webhook verification value is intentionally hardcoded in `src/index.ts`:
+## Optional Instagram secrets
 
-`dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1`
+For Story/Highlight support and content that Instagram gates behind login, add these as Cloudflare Worker secrets/environment variables:
 
-Because the repository is public, this webhook value is not confidential. The media-download links do not use this value; they are signed with the private `BOT_TOKEN`.
+- `INSTAGRAM_SESSIONID` — main required Instagram session cookie
+- `INSTAGRAM_CSRFTOKEN` — optional but recommended when available
+- `INSTAGRAM_DS_USER_ID` — optional
+
+Do not commit Instagram cookies to GitHub.
 
 ## Deploy
 
-The normal Cloudflare Git build command is enough:
+Cloudflare build/deploy command:
 
 `npx wrangler deploy`
 
-Docker is not required anymore.
-
-After deploy, open:
+After deploy open:
 
 `https://downloader.vexaagent.workers.dev/health`
 
@@ -61,35 +59,25 @@ Expected shape:
 ```json
 {
   "ok": true,
-  "service": "telegram-youtube-downloader",
-  "mode": "worker-streaming",
-  "domain": "downloader.vexaagent.workers.dev",
-  "botConfigured": true
+  "service": "telegram-instagram-downloader",
+  "mode": "cloudflare-only",
+  "botConfigured": true,
+  "instagramSessionConfigured": false
 }
 ```
 
-If `botConfigured` is false, add the `BOT_TOKEN` secret in the Cloudflare Worker settings and deploy again.
+`instagramSessionConfigured` becomes `true` after `INSTAGRAM_SESSIONID` is added.
 
 ## Telegram webhook
 
-Webhook URL:
+Webhook URL remains unchanged:
 
 `https://downloader.vexaagent.workers.dev/telegram/webhook`
 
-Webhook secret:
+Webhook verification value remains:
 
 `dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1`
 
-The webhook only needs to be set again if its URL or secret changes.
-
-## Important limitation of the free architecture
-
-There is no ffmpeg in a normal Worker. That means this version cannot merge separate high-quality YouTube video-only and audio-only tracks.
-
-It intentionally chooses a YouTube MP4 stream that already includes both video and audio. This keeps the system serverless and avoids the paid Container requirement, but some videos may only expose a lower pre-muxed quality such as 360p.
-
-For files too large for Telegram's remote-URL send limit, the bot gives the user a secure direct-download button instead.
-
-Private, age-restricted, region-restricted, or YouTube anti-bot challenged videos may still fail and can require authenticated cookies, a PO-token service, or a proxy later.
+You do not need to set the webhook again just because the downloader changed from YouTube to Instagram.
 
 Only download content when you have permission to do so and comply with the source platform's applicable terms.
