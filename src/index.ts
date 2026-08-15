@@ -3,6 +3,8 @@ type Env = {
   INSTAGRAM_SESSIONID?: string;
   INSTAGRAM_CSRFTOKEN?: string;
   INSTAGRAM_DS_USER_ID?: string;
+  INSTAGRAM_MID?: string;
+  INSTAGRAM_IG_DID?: string;
 };
 
 type TelegramMessage = {
@@ -165,6 +167,8 @@ function secretCookies(env: Env): CookieJar {
   }
   if (env.INSTAGRAM_CSRFTOKEN?.trim()) jar.set("csrftoken", env.INSTAGRAM_CSRFTOKEN.trim());
   if (env.INSTAGRAM_DS_USER_ID?.trim()) jar.set("ds_user_id", env.INSTAGRAM_DS_USER_ID.trim());
+  if (env.INSTAGRAM_MID?.trim()) jar.set("mid", env.INSTAGRAM_MID.trim());
+  if (env.INSTAGRAM_IG_DID?.trim()) jar.set("ig_did", env.INSTAGRAM_IG_DID.trim());
   return jar;
 }
 
@@ -1438,9 +1442,11 @@ export default {
           ok: true,
           service: "telegram-instagram-downloader",
           mode: "cloudflare-only",
-          resolver: "instagram-multistrategy-v6-story-state",
+          resolver: "instagram-multistrategy-v7-full-cookie-jar",
           botConfigured: Boolean(env.BOT_TOKEN),
           instagramSessionConfigured: Boolean(env.INSTAGRAM_SESSIONID?.trim()),
+          instagramMidConfigured: Boolean(env.INSTAGRAM_MID?.trim()),
+          instagramIgDidConfigured: Boolean(env.INSTAGRAM_IG_DID?.trim()),
         }),
         { headers: JSON_HEADERS },
       );
