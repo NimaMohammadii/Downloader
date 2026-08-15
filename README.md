@@ -1,122 +1,95 @@
 # Telegram YouTube Downloader
 
-A Telegram bot backend designed for Cloudflare Workers + Workflows + Containers.
+A Telegram bot backend designed to run on Cloudflare Workers Free + Workflows, without Containers or Docker.
 
 Production endpoint:
 
 `https://downloader.vexaagent.workers.dev`
 
-## What it does
-
-- Receives a YouTube / YouTube Shorts link through a Telegram webhook.
-- Starts one durable Cloudflare Workflow per Telegram update.
-- Runs `yt-dlp`, `ffmpeg`, and Deno inside a Cloudflare Container.
-- Downloads a fast Telegram-friendly version up to 720p.
-- Sends the result back as a Telegram video.
-- Falls back to `sendDocument` if Telegram cannot treat the MP4 as a playable video.
-- Automatically splits files that are too large for Telegram's normal Bot API upload limit.
-- Rejects playlists and live streams for now instead of accidentally starting unbounded jobs.
-- Uses Telegram `update_id` as the Workflow ID to avoid duplicate downloads when Telegram retries a webhook.
-
 ## Architecture
 
-Telegram -> Worker webhook -> Cloudflare Workflow -> Cloudflare Container -> yt-dlp/ffmpeg -> Telegram
+Telegram -> Cloudflare Worker -> Cloudflare Workflow -> YouTube.js -> secure Worker media stream
 
-The Worker stays lightweight. The Linux-only download tooling runs in the Container, while Workflows keep long-running downloads durable without relying on polling.
+There is no Docker image, ffmpeg process, Durable Object, or Cloudflare Container in this version.
 
-## Requirements
+## What it does
 
-- Cloudflare Workers Paid plan (Containers require the paid Workers plan).
-- Docker available in the environment that runs `wrangler deploy`.
-- A Telegram bot token from BotFather.
-- Node.js/npm for Wrangler.
+- Accepts normal YouTube and Shorts links.
+- Uses `youtubei.js/cf-worker`, the Cloudflare Worker build of YouTube.js.
+- Uses one Workflow per Telegram update so duplicate webhook deliveries do not create duplicate jobs.
+- Picks a pre-muxed MP4 format that already contains both video and audio.
+- For smaller files, Telegram fetches the secure Worker media URL and sends the video directly in chat.
+- For larger files, the bot shows a `Download video` button instead of failing.
+- `/media/...` streams bytes from YouTube through Cloudflare without loading the whole video into Worker memory.
+- Media links are temporary and HMAC-signed using the bot token.
+- Rejects private and live/upcoming videos.
 
-## Install
+## Cloudflare plan
 
-```bash
-npm install
-npm run types
-```
+This version does **not** require Cloudflare Containers or Workers Paid.
 
-## Configure secret
+Cloudflare Workflows are available on the Workers Free plan, subject to the normal Free-plan limits.
 
-Only the Telegram bot token needs to be stored as a Cloudflare Secret:
+## Required secret
 
-```bash
-npx wrangler secret put BOT_TOKEN
-```
+Only the Telegram Bot Token must be stored as a Cloudflare secret/environment secret:
 
-The Telegram webhook verification secret is intentionally hardcoded in `src/index.ts` as:
+`BOT_TOKEN`
 
-```text
-dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1
-```
+Never put the Bot Token in the repository.
 
-Because this repository is public, this webhook value is not confidential. Do not hardcode the Telegram Bot Token.
+The Telegram webhook verification value is intentionally hardcoded in `src/index.ts`:
 
-## Deploy to Cloudflare
+`dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1`
 
-Make sure Docker is running, then:
+Because the repository is public, this webhook value is not confidential. The media-download links do not use this value; they are signed with the private `BOT_TOKEN`.
 
-```bash
-npm run deploy
-```
+## Deploy
 
-Wrangler will build the Docker image, push it to Cloudflare's Container Registry, deploy the Container application, Workflow, Durable Object binding, and Worker.
+The normal Cloudflare Git build command is enough:
 
-The Worker name is `downloader`, so on the `vexaagent` workers.dev subdomain the expected URL is:
+`npx wrangler deploy`
 
-`https://downloader.vexaagent.workers.dev`
+Docker is not required anymore.
 
-Check it:
+After deploy, open:
 
-```bash
-curl https://downloader.vexaagent.workers.dev/health
-```
+`https://downloader.vexaagent.workers.dev/health`
 
-Expected response:
+Expected shape:
 
 ```json
-{"ok":true,"service":"telegram-youtube-downloader","domain":"downloader.vexaagent.workers.dev"}
+{
+  "ok": true,
+  "service": "telegram-youtube-downloader",
+  "mode": "worker-streaming",
+  "domain": "downloader.vexaagent.workers.dev",
+  "botConfigured": true
+}
 ```
 
-## Set the Telegram webhook
+If `botConfigured` is false, add the `BOT_TOKEN` secret in the Cloudflare Worker settings and deploy again.
 
-Set the bot token in your terminal for the command only:
+## Telegram webhook
 
-```bash
-export BOT_TOKEN='YOUR_TELEGRAM_BOT_TOKEN'
-```
+Webhook URL:
 
-Then register the webhook using the same hardcoded secret expected by the Worker:
+`https://downloader.vexaagent.workers.dev/telegram/webhook`
 
-```bash
-curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" \
-  --data-urlencode "url=https://downloader.vexaagent.workers.dev/telegram/webhook" \
-  --data-urlencode "secret_token=dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1" \
-  --data-urlencode 'allowed_updates=["message"]'
-```
+Webhook secret:
 
-Check Telegram's webhook status:
+`dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1`
 
-```bash
-curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo"
-```
+The webhook only needs to be set again if its URL or secret changes.
 
-## Bot behavior
+## Important limitation of the free architecture
 
-`/start` tells the user to send a YouTube link.
+There is no ffmpeg in a normal Worker. That means this version cannot merge separate high-quality YouTube video-only and audio-only tracks.
 
-For a normal YouTube video or Shorts link, the bot shows a short progress message, downloads up to 720p, uploads the file, and removes the progress message after success.
+It intentionally chooses a YouTube MP4 stream that already includes both video and audio. This keeps the system serverless and avoids the paid Container requirement, but some videos may only expose a lower pre-muxed quality such as 360p.
 
-If the final file is too large for the regular Telegram Bot API, it is split into Telegram-safe MP4 parts and sent sequentially.
+For files too large for Telegram's remote-URL send limit, the bot gives the user a secure direct-download button instead.
 
-## Current limitations
-
-- Public single videos and Shorts are the target for v1.
-- Playlists are intentionally rejected.
-- Live streams are intentionally rejected.
-- Private, age-restricted, geo-restricted, or YouTube anti-bot challenged videos can still require authenticated cookies/proxy support later.
-- The normal Telegram Bot API has a smaller upload limit than a self-hosted Local Bot API server, so large videos are split in v1.
+Private, age-restricted, region-restricted, or YouTube anti-bot challenged videos may still fail and can require authenticated cookies, a PO-token service, or a proxy later.
 
 Only download content when you have permission to do so and comply with the source platform's applicable terms.
