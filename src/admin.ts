@@ -205,7 +205,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
          LIMIT ? OFFSET ?`,
         ADMIN_USERS_PAGE_SIZE,
         offset,
-      ).toArray() as UserSqlRow[];
+      ).toArray() as unknown as UserSqlRow[];
 
       const users: AdminUserRow[] = rows.map((row) => ({
         id: String(row.id),
@@ -230,7 +230,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
   }
 }
 
-function statsStub(env: AdminStatsEnv): DurableObjectStub<AdminStatsStore> {
+function statsStub(env: AdminStatsEnv) {
   return env.ADMIN_STATS.getByName("global");
 }
 
@@ -275,7 +275,7 @@ export async function recordSuccessfulDelivery(env: AdminStatsEnv, deliveryKey: 
 export async function getAdminSummary(env: AdminStatsEnv): Promise<AdminSummary> {
   const response = await statsStub(env).fetch("https://admin-stats/summary");
   if (!response.ok) throw new Error(`ADMIN_SUMMARY_${response.status}`);
-  return response.json<AdminSummary>();
+  return (await response.json()) as AdminSummary;
 }
 
 export async function getAdminUsersPage(env: AdminStatsEnv, page: number): Promise<AdminUsersPage> {
@@ -283,7 +283,7 @@ export async function getAdminUsersPage(env: AdminStatsEnv, page: number): Promi
   url.searchParams.set("page", String(Math.max(0, Math.floor(page))));
   const response = await statsStub(env).fetch(url.toString());
   if (!response.ok) throw new Error(`ADMIN_USERS_${response.status}`);
-  return response.json<AdminUsersPage>();
+  return (await response.json()) as AdminUsersPage;
 }
 
 export function isInstagramDownloadLink(text: string): boolean {
