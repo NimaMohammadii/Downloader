@@ -1,12 +1,20 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "downloader",
-  "main": "src/entry.ts",
+  "main": "src/main.ts",
   "compatibility_date": "2026-08-14",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
   "observability": {
     "enabled": true
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ADMIN_STATS",
+        "class_name": "AdminStatsStore"
+      }
+    ]
   },
   "migrations": [
     {
@@ -16,6 +24,10 @@
     {
       "tag": "v2",
       "deleted_classes": ["DownloaderContainer"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["AdminStatsStore"]
     }
   ]
 }
