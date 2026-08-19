@@ -113,6 +113,8 @@ def ytdlp_common_args() -> list[str]:
         "--js-runtimes",
         "node",
         "--extractor-args",
+        "youtube:player_client=default,mweb",
+        "--extractor-args",
         f"youtubepot-bgutilhttp:base_url={POT_PROVIDER_URL}",
         "--retries",
         "5",
