@@ -22,4 +22,4 @@ until curl -sS -o /dev/null http://127.0.0.1:4416/; do
 done
 
 cd /app
-exec python3 /app/youtube_pipeline.py
+exec python3 /app/mini_pipeline.py
