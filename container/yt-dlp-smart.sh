@@ -24,14 +24,15 @@ rewrite_and_run() {
   "$REAL_YTDLP" \
     --force-overwrites \
     --force-ipv4 \
-    --sleep-requests 3 \
-    --retry-sleep extractor:3 \
+    --sleep-requests 1 \
+    --extractor-retries 1 \
+    --retry-sleep extractor:1 \
     "${rewritten[@]}" \
     >"$out_file" 2>"$err_file"
 }
 
-# Keep each YouTube client isolated. mweb uses the PO provider first; the
-# remaining clients are independent fallbacks for client-specific enforcement.
+# Keep clients isolated so a token/URL generated for one client is never reused
+# by another. mweb + PO provider remains the primary path.
 clients=("mweb" "web_safari" "android_vr" "web_embedded")
 last_code=1
 attempt=0
@@ -47,10 +48,8 @@ for client in "${clients[@]}"; do
   else
     last_code=$?
   fi
-
 done
 
-# Send diagnostics both to the caller and directly to the container log stream.
 for i in $(seq 1 "$attempt"); do
   if [[ -s "$TMPDIR_YTDLP/err-${i}" ]]; then
     header="===== yt-dlp attempt ${i} (${clients[$((i - 1))]}) ====="
