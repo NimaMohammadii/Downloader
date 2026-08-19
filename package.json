@@ -1,6 +1,6 @@
 {
-  "name": "telegram-instagram-downloader",
-  "version": "2.0.0",
+  "name": "telegram-media-downloader",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,6 +8,9 @@
     "deploy": "wrangler deploy",
     "types": "wrangler types",
     "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "latest"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "latest",
