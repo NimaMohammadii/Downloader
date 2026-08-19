@@ -1,6 +1,6 @@
 FROM node:22-bookworm-slim
 
-LABEL vexa.youtube.image="quality-selection-v2"
+LABEL vexa.youtube.image="audio-selection-v1"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
