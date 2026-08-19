@@ -24,4 +24,4 @@ until curl -sS -o /dev/null http://127.0.0.1:4416/; do
 done
 
 cd /app
-exec python3 /app/youtube_video_guard.py
+exec python3 /app/youtube_telegram_guard.py
