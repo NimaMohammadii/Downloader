@@ -15,6 +15,7 @@ TARGET_PART_SIZE = 42_000_000
 DOWNLOAD_TIMEOUT_SECONDS = 7_000
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "http://127.0.0.1:4416")
 SUPPORTED_QUALITIES = (360, 480, 720, 1080)
+SUPPORTED_AUDIO_MODES = ("low", "hq")
 
 
 class UserVisibleError(Exception):
@@ -89,7 +90,9 @@ def friendly_ytdlp_error(stderr: str) -> str:
         return "❌ این ویدیو به‌خاطر محدودیت صاحب محتوا قابل دانلود نیست."
     if "unsupported url" in value:
         return "❌ این لینک YouTube قابل دانلود نیست. لینک مستقیم ویدیو یا Shorts رو بفرست."
-    return "❌ نتونستم این ویدیو رو از YouTube بگیرم. دوباره همین لینک یا یک لینک دیگه رو امتحان کن."
+    if "requested format is not available" in value:
+        return "❌ این کیفیت برای این ویدیو موجود نیست. یک گزینه دیگه رو انتخاب کن."
+    return "❌ نتونستم این فایل رو از YouTube بگیرم. دوباره همین لینک یا یک لینک دیگه رو امتحان کن."
 
 
 def run_command(command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
@@ -167,6 +170,22 @@ def video_formats(metadata: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
+def audio_formats(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    formats = metadata.get("formats")
+    if not isinstance(formats, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in formats:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("vcodec") or "none").lower() != "none":
+            continue
+        if str(item.get("acodec") or "none").lower() == "none":
+            continue
+        result.append(item)
+    return result
+
+
 def short_side(format_info: dict[str, Any]) -> int | None:
     width_raw = format_info.get("width")
     height_raw = format_info.get("height")
@@ -215,8 +234,9 @@ def inspect_video(url: str) -> dict[str, Any]:
         metadata = fetch_metadata(url)
         validate_video_metadata(metadata)
         qualities = available_qualities(metadata)
-        if not qualities:
-            raise UserVisibleError("❌ برای این ویدیو کیفیت 360p تا 1080p قابل دانلود پیدا نشد.")
+        has_audio = len(audio_formats(metadata)) > 0
+        if not qualities and not has_audio:
+            raise UserVisibleError("❌ کیفیت قابل دانلود برای این ویدیو پیدا نشد.")
         video_id = str(metadata.get("id") or "").strip()
         if not video_id:
             raise UserVisibleError("❌ شناسه ویدیوی YouTube دریافت نشد.")
@@ -225,6 +245,7 @@ def inspect_video(url: str) -> dict[str, Any]:
             "videoId": video_id,
             "title": str(metadata.get("title") or "YouTube video").strip(),
             "qualities": qualities,
+            "audioAvailable": has_audio,
         }
     except UserVisibleError as exc:
         return {"ok": False, "message": str(exc)}
@@ -278,6 +299,98 @@ def download_video(url: str, workdir: Path, quality: int, metadata: dict[str, An
     if not media_files:
         raise UserVisibleError("❌ فایل ویدیو بعد از دانلود پیدا نشد.")
     return max(media_files, key=lambda path: path.stat().st_size)
+
+
+def download_audio(url: str, workdir: Path, audio_mode: str) -> Path:
+    if audio_mode == "low":
+        format_selector = (
+            "ba[abr<=80][ext=m4a]/"
+            "ba[abr<=80]/"
+            "worstaudio[ext=m4a]/"
+            "worstaudio"
+        )
+        fallback_bitrate = "64k"
+    else:
+        format_selector = "ba[ext=m4a]/ba"
+        fallback_bitrate = "128k"
+
+    source_template = str(workdir / "audio-source.%(ext)s")
+    result = run_command(
+        [
+            "yt-dlp",
+            *ytdlp_common_args(),
+            "--no-simulate",
+            "--format",
+            format_selector,
+            "--output",
+            source_template,
+            "--quiet",
+            "--print",
+            "after_move:%(filepath)s",
+            url,
+        ],
+        timeout=DOWNLOAD_TIMEOUT_SECONDS,
+    )
+    printed = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    source: Path | None = None
+    if printed:
+        candidate = Path(printed[-1])
+        if candidate.exists() and candidate.is_file():
+            source = candidate
+
+    if source is None:
+        candidates = [
+            path
+            for path in workdir.iterdir()
+            if path.is_file()
+            and path.name.startswith("audio-source.")
+            and path.suffix.lower() not in {".part", ".ytdl", ".json"}
+        ]
+        if candidates:
+            source = max(candidates, key=lambda path: path.stat().st_size)
+
+    if source is None:
+        raise UserVisibleError("❌ فایل صوتی بعد از دانلود پیدا نشد.")
+
+    target = workdir / "Vexa.m4a"
+    if source.suffix.lower() == ".m4a":
+        source.replace(target)
+        return target
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(source),
+                "-vn",
+                "-c:a",
+                "aac",
+                "-b:a",
+                fallback_bitrate,
+                "-movflags",
+                "+faststart",
+                str(target),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=1_200,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise UserVisibleError("❌ تبدیل فایل صوتی بیشتر از حد معمول طول کشید.") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or "").strip()
+        print(f"audio conversion failed: {detail}", flush=True)
+        raise UserVisibleError("❌ تبدیل فایل صوتی به M4A انجام نشد.") from exc
+
+    if not target.exists() or target.stat().st_size <= 0:
+        raise UserVisibleError("❌ فایل صوتی نهایی ساخته نشد.")
+    return target
 
 
 def probe_duration(path: Path) -> float:
@@ -403,27 +516,110 @@ def send_media_file(
             ) from document_error
 
 
+def send_audio_file(
+    token: str,
+    chat_id: int,
+    request_message_id: int,
+    path: Path,
+    caption: str,
+) -> None:
+    if path.stat().st_size > DIRECT_TELEGRAM_LIMIT:
+        raise UserVisibleError("❌ فایل صوتی برای ارسال مستقیم در تلگرام بیش از حد بزرگه.")
+
+    data: dict[str, Any] = {
+        "chat_id": str(chat_id),
+        "caption": caption[:1024],
+        "title": "Vexa",
+        "reply_parameters": json.dumps({"message_id": request_message_id}),
+    }
+
+    try:
+        with path.open("rb") as handle:
+            telegram_call(
+                token,
+                "sendAudio",
+                data=data,
+                files={"audio": ("Vexa.m4a", handle, "audio/mp4")},
+                timeout=1_800,
+            )
+        return
+    except Exception as audio_error:
+        try:
+            with path.open("rb") as handle:
+                telegram_call(
+                    token,
+                    "sendDocument",
+                    data={
+                        "chat_id": str(chat_id),
+                        "caption": caption[:1024],
+                        "reply_parameters": json.dumps({"message_id": request_message_id}),
+                    },
+                    files={"document": ("Vexa.m4a", handle, "audio/mp4")},
+                    timeout=1_800,
+                )
+            return
+        except Exception as document_error:
+            raise RuntimeError(
+                f"Telegram audio upload failed: {audio_error}; document fallback: {document_error}"
+            ) from document_error
+
+
 def process_job(payload: dict[str, Any]) -> dict[str, Any]:
     token = str(payload.get("botToken") or "")
     url = str(payload.get("url") or "")
     chat_id = int(payload.get("chatId"))
     request_message_id = int(payload.get("requestMessageId"))
-    quality = int(payload.get("quality") or 720)
+    quality_raw = payload.get("quality")
+    quality = int(quality_raw) if quality_raw is not None else None
+    audio_mode = str(payload.get("audioMode") or "").lower() or None
     status_raw = payload.get("statusMessageId")
     status_message_id = int(status_raw) if status_raw else None
 
     if not token or not url:
         raise ValueError("Missing bot token or URL")
-    if quality not in SUPPORTED_QUALITIES:
+    if quality is not None and quality not in SUPPORTED_QUALITIES:
         raise ValueError("Unsupported YouTube quality")
+    if audio_mode is not None and audio_mode not in SUPPORTED_AUDIO_MODES:
+        raise ValueError("Unsupported YouTube audio mode")
+    if (quality is None) == (audio_mode is None):
+        raise ValueError("Choose exactly one YouTube download mode")
 
     workdir = Path(tempfile.mkdtemp(prefix="youtube-download-"))
     try:
         edit_status(token, chat_id, status_message_id, "🔎 دارم ویدیوی YouTube رو بررسی می‌کنم…")
         metadata = fetch_metadata(url)
         validate_video_metadata(metadata)
-
         title = str(metadata.get("title") or "YouTube video").strip()
+
+        if audio_mode:
+            if not audio_formats(metadata):
+                raise UserVisibleError("❌ این ویدیو فایل صوتی قابل دانلود نداره.")
+
+            mode_label = "کم‌حجم" if audio_mode == "low" else "HQ"
+            edit_status(
+                token,
+                chat_id,
+                status_message_id,
+                f"⬇️ دارم صدای ویدیو رو با حالت {mode_label} دانلود می‌کنم…",
+            )
+            audio_path = download_audio(url, workdir, audio_mode)
+            edit_status(token, chat_id, status_message_id, "📤 فایل صوتی آماده شد؛ دارم می‌فرستم…")
+            send_audio_file(
+                token,
+                chat_id,
+                request_message_id,
+                audio_path,
+                f"{title}\nAudio {mode_label}",
+            )
+            delete_status(token, chat_id, status_message_id)
+            return {
+                "ok": True,
+                "parts": 1,
+                "title": title,
+                "audioMode": audio_mode,
+            }
+
+        assert quality is not None
         if quality not in available_qualities(metadata):
             raise UserVisibleError(f"❌ کیفیت {quality}p برای این ویدیو موجود نیست. دوباره لینک رو بفرست.")
 
