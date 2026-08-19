@@ -6,16 +6,20 @@ import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import requests
 
 PORT = int(os.environ.get("PORT", "8080"))
 DIRECT_TELEGRAM_LIMIT = 47_000_000
 TARGET_PART_SIZE = 42_000_000
-DOWNLOAD_TIMEOUT_SECONDS = 7_000
+METADATA_TIMEOUT_SECONDS = 90
+DOWNLOAD_TIMEOUT_SECONDS = 1_500
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "http://127.0.0.1:4416")
 SUPPORTED_QUALITIES = (360, 480, 720, 1080)
 SUPPORTED_AUDIO_MODES = ("low", "hq")
+REAL_YTDLP = "/opt/venv/bin/yt-dlp-real"
+METADATA_CACHE_PATH = Path("/tmp/vexa-youtube-info.json")
 
 
 class UserVisibleError(Exception):
@@ -105,10 +109,29 @@ def run_command(command: list[str], timeout: int) -> subprocess.CompletedProcess
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
-        raise UserVisibleError("❌ دانلود بیشتر از حد معمول طول کشید. دوباره امتحان کن.") from exc
+        raise UserVisibleError("❌ ارتباط با YouTube بیشتر از حد معمول طول کشید. دوباره امتحان کن.") from exc
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or "").strip()
         raise UserVisibleError(friendly_ytdlp_error(stderr)) from exc
+
+
+def run_cached_command(command: list[str], timeout: int) -> subprocess.CompletedProcess[str] | None:
+    """Try cached direct media URLs once; never turn a stale cache into a user error."""
+    try:
+        return subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print("cached yt-dlp attempt timed out; falling back to fresh extraction", flush=True)
+        return None
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or "").strip()
+        print(f"cached yt-dlp attempt failed; refreshing extraction: {detail[-1200:]}", flush=True)
+        return None
 
 
 def ytdlp_common_args() -> list[str]:
@@ -121,11 +144,13 @@ def ytdlp_common_args() -> list[str]:
         "--extractor-args",
         f"youtubepot-bgutilhttp:base_url={POT_PROVIDER_URL}",
         "--retries",
-        "5",
+        "2",
         "--fragment-retries",
-        "5",
+        "2",
+        "--extractor-retries",
+        "1",
         "--socket-timeout",
-        "30",
+        "15",
     ]
 
 
@@ -139,12 +164,56 @@ def fetch_metadata(url: str) -> dict[str, Any]:
             "--no-warnings",
             url,
         ],
-        timeout=180,
+        timeout=METADATA_TIMEOUT_SECONDS,
     )
     try:
         return json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise UserVisibleError("❌ اطلاعات ویدیو از YouTube دریافت نشد.") from exc
+
+
+def save_metadata_cache(metadata: dict[str, Any]) -> None:
+    try:
+        temp_path = METADATA_CACHE_PATH.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
+        temp_path.replace(METADATA_CACHE_PATH)
+    except Exception as exc:
+        print(f"metadata cache write failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+def youtube_video_id(url: str) -> str | None:
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname.lower().replace("www.", "") if parsed.hostname else ""
+        if host == "youtu.be":
+            value = parsed.path.strip("/").split("/")[0]
+            return value or None
+        if host.endswith("youtube.com") or host.endswith("youtube-nocookie.com"):
+            if parsed.path == "/watch":
+                return (parse_qs(parsed.query).get("v") or [None])[0]
+            pieces = [part for part in parsed.path.split("/") if part]
+            if len(pieces) >= 2 and pieces[0] in {"shorts", "embed", "live"}:
+                return pieces[1]
+    except Exception:
+        return None
+    return None
+
+
+def load_metadata_cache(url: str) -> dict[str, Any] | None:
+    if not METADATA_CACHE_PATH.exists():
+        return None
+    try:
+        metadata = json.loads(METADATA_CACHE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(metadata, dict):
+            return None
+        expected = youtube_video_id(url)
+        cached = str(metadata.get("id") or "")
+        if expected and cached and expected != cached:
+            return None
+        return metadata
+    except Exception as exc:
+        print(f"metadata cache read failed: {type(exc).__name__}: {exc}", flush=True)
+        return None
 
 
 def validate_video_metadata(metadata: dict[str, Any]) -> None:
@@ -240,6 +309,7 @@ def inspect_video(url: str) -> dict[str, Any]:
         video_id = str(metadata.get("id") or "").strip()
         if not video_id:
             raise UserVisibleError("❌ شناسه ویدیوی YouTube دریافت نشد.")
+        save_metadata_cache(metadata)
         return {
             "ok": True,
             "videoId": video_id,
@@ -251,6 +321,25 @@ def inspect_video(url: str) -> dict[str, Any]:
         return {"ok": False, "message": str(exc)}
 
 
+def result_path(result: subprocess.CompletedProcess[str], workdir: Path, *, prefix: str | None = None) -> Path | None:
+    printed = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if printed:
+        candidate = Path(printed[-1])
+        if candidate.exists() and candidate.is_file():
+            return candidate
+
+    candidates = []
+    for path in workdir.iterdir():
+        if not path.is_file() or path.suffix.lower() in {".part", ".ytdl", ".json"}:
+            continue
+        if path.name.startswith("part_"):
+            continue
+        if prefix and not path.name.startswith(prefix):
+            continue
+        candidates.append(path)
+    return max(candidates, key=lambda path: path.stat().st_size) if candidates else None
+
+
 def download_video(url: str, workdir: Path, quality: int, metadata: dict[str, Any]) -> Path:
     output_template = str(workdir / "%(title).100B [%(id)s].%(ext)s")
     dimension = "width" if is_portrait(metadata) else "height"
@@ -260,13 +349,48 @@ def download_video(url: str, workdir: Path, quality: int, metadata: dict[str, An
         f"bv*[{dimension}<={quality}]+ba/"
         f"b[{dimension}<={quality}][ext=mp4]/b[{dimension}<={quality}]/b"
     )
+
+    if METADATA_CACHE_PATH.exists():
+        cached = run_cached_command(
+            [
+                REAL_YTDLP,
+                "--load-info-json",
+                str(METADATA_CACHE_PATH),
+                "--no-simulate",
+                "--retries",
+                "1",
+                "--fragment-retries",
+                "1",
+                "--socket-timeout",
+                "12",
+                "--concurrent-fragments",
+                "2",
+                "--format",
+                format_selector,
+                "--merge-output-format",
+                "mp4",
+                "--remux-video",
+                "mp4",
+                "--output",
+                output_template,
+                "--quiet",
+                "--print",
+                "after_move:%(filepath)s",
+            ],
+            timeout=DOWNLOAD_TIMEOUT_SECONDS,
+        )
+        if cached is not None:
+            path = result_path(cached, workdir)
+            if path is not None:
+                return path
+
     result = run_command(
         [
             "yt-dlp",
             *ytdlp_common_args(),
             "--no-simulate",
             "--concurrent-fragments",
-            "4",
+            "2",
             "--format",
             format_selector,
             "--merge-output-format",
@@ -282,72 +406,66 @@ def download_video(url: str, workdir: Path, quality: int, metadata: dict[str, An
         ],
         timeout=DOWNLOAD_TIMEOUT_SECONDS,
     )
-
-    printed = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    if printed:
-        candidate = Path(printed[-1])
-        if candidate.exists() and candidate.is_file():
-            return candidate
-
-    media_files = [
-        path
-        for path in workdir.iterdir()
-        if path.is_file()
-        and not path.name.startswith("part_")
-        and path.suffix.lower() not in {".part", ".ytdl", ".json"}
-    ]
-    if not media_files:
+    path = result_path(result, workdir)
+    if path is None:
         raise UserVisibleError("❌ فایل ویدیو بعد از دانلود پیدا نشد.")
-    return max(media_files, key=lambda path: path.stat().st_size)
+    return path
 
 
 def download_audio(url: str, workdir: Path, audio_mode: str) -> Path:
     if audio_mode == "low":
-        format_selector = (
-            "ba[abr<=80][ext=m4a]/"
-            "ba[abr<=80]/"
-            "worstaudio[ext=m4a]/"
-            "worstaudio"
-        )
+        format_selector = "ba[abr<=80][ext=m4a]/ba[abr<=80]/worstaudio[ext=m4a]/worstaudio"
         fallback_bitrate = "64k"
     else:
         format_selector = "ba[ext=m4a]/ba"
         fallback_bitrate = "128k"
 
     source_template = str(workdir / "audio-source.%(ext)s")
-    result = run_command(
-        [
-            "yt-dlp",
-            *ytdlp_common_args(),
-            "--no-simulate",
-            "--format",
-            format_selector,
-            "--output",
-            source_template,
-            "--quiet",
-            "--print",
-            "after_move:%(filepath)s",
-            url,
-        ],
-        timeout=DOWNLOAD_TIMEOUT_SECONDS,
-    )
-    printed = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    source: Path | None = None
-    if printed:
-        candidate = Path(printed[-1])
-        if candidate.exists() and candidate.is_file():
-            source = candidate
+    result: subprocess.CompletedProcess[str] | None = None
 
+    if METADATA_CACHE_PATH.exists():
+        result = run_cached_command(
+            [
+                REAL_YTDLP,
+                "--load-info-json",
+                str(METADATA_CACHE_PATH),
+                "--no-simulate",
+                "--retries",
+                "1",
+                "--fragment-retries",
+                "1",
+                "--socket-timeout",
+                "12",
+                "--format",
+                format_selector,
+                "--output",
+                source_template,
+                "--quiet",
+                "--print",
+                "after_move:%(filepath)s",
+            ],
+            timeout=DOWNLOAD_TIMEOUT_SECONDS,
+        )
+
+    source = result_path(result, workdir, prefix="audio-source.") if result is not None else None
     if source is None:
-        candidates = [
-            path
-            for path in workdir.iterdir()
-            if path.is_file()
-            and path.name.startswith("audio-source.")
-            and path.suffix.lower() not in {".part", ".ytdl", ".json"}
-        ]
-        if candidates:
-            source = max(candidates, key=lambda path: path.stat().st_size)
+        result = run_command(
+            [
+                "yt-dlp",
+                *ytdlp_common_args(),
+                "--no-simulate",
+                "--format",
+                format_selector,
+                "--output",
+                source_template,
+                "--quiet",
+                "--print",
+                "after_move:%(filepath)s",
+                url,
+            ],
+            timeout=DOWNLOAD_TIMEOUT_SECONDS,
+        )
+        source = result_path(result, workdir, prefix="audio-source.")
 
     if source is None:
         raise UserVisibleError("❌ فایل صوتی بعد از دانلود پیدا نشد.")
@@ -586,8 +704,11 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
 
     workdir = Path(tempfile.mkdtemp(prefix="youtube-download-"))
     try:
-        edit_status(token, chat_id, status_message_id, "🔎 دارم ویدیوی YouTube رو بررسی می‌کنم…")
-        metadata = fetch_metadata(url)
+        metadata = load_metadata_cache(url)
+        if metadata is None:
+            edit_status(token, chat_id, status_message_id, "🔎 دارم اطلاعات ویدیو رو تازه می‌کنم…")
+            metadata = fetch_metadata(url)
+            save_metadata_cache(metadata)
         validate_video_metadata(metadata)
         title = str(metadata.get("title") or "YouTube video").strip()
 
@@ -612,12 +733,7 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
                 f"{title}\nAudio {mode_label}",
             )
             delete_status(token, chat_id, status_message_id)
-            return {
-                "ok": True,
-                "parts": 1,
-                "title": title,
-                "audioMode": audio_mode,
-            }
+            return {"ok": True, "parts": 1, "title": title, "audioMode": audio_mode}
 
         assert quality is not None
         if quality not in available_qualities(metadata):
