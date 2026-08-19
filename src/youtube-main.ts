@@ -17,6 +17,7 @@ export { AdminStatsStore } from "./admin";
 
 const SUPPORTED_QUALITIES = [360, 480, 720, 1080] as const;
 type YoutubeQuality = (typeof SUPPORTED_QUALITIES)[number];
+type YoutubeAudioMode = "low" | "hq";
 
 type YoutubeDownloadJob = {
   id: string;
@@ -25,6 +26,7 @@ type YoutubeDownloadJob = {
   userId: number;
   url: string;
   quality?: YoutubeQuality;
+  audioMode?: YoutubeAudioMode;
   statusMessageId?: number;
 };
 
@@ -79,6 +81,7 @@ type ContainerResult = {
   title?: string;
   parts?: number;
   quality?: number;
+  audioMode?: YoutubeAudioMode;
 };
 
 type YoutubeMetadataResult = {
@@ -87,13 +90,15 @@ type YoutubeMetadataResult = {
   title?: string;
   videoId?: string;
   qualities?: number[];
+  audioAvailable?: boolean;
 };
 
 type ParsedQualityCallback = {
   videoId: string;
-  quality: YoutubeQuality;
   requestMessageId: number;
   userId: number;
+  quality?: YoutubeQuality;
+  audioMode?: YoutubeAudioMode;
 };
 
 const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
@@ -110,7 +115,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
     let statusMessageId = job.statusMessageId;
 
     try {
-      if (!job.quality) {
+      if (!job.quality && !job.audioMode) {
         statusMessageId = await step.do(
           "show youtube quality status",
           {
@@ -162,12 +167,12 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         }
 
         const qualities = normalizeQualities(metadata.qualities);
-        if (qualities.length === 0) {
+        if (qualities.length === 0 && !metadata.audioAvailable) {
           await step.do("show no youtube qualities", async () => {
             await safeTelegramCall(this.env.BOT_TOKEN, "editMessageText", {
               chat_id: job.chatId,
               message_id: statusMessageId,
-              text: "❌ برای این ویدیو کیفیت 360p تا 1080p قابل دانلود پیدا نشد.",
+              text: "❌ کیفیت قابل دانلود برای این ویدیو پیدا نشد.",
             });
             return true;
           });
@@ -178,10 +183,11 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           await telegramCall(this.env.BOT_TOKEN, "editMessageText", {
             chat_id: job.chatId,
             message_id: statusMessageId,
-            text: `${formatVideoTitle(metadata.title)}\n\nکیفیت ویدیو رو انتخاب کن:`,
+            text: `${formatVideoTitle(metadata.title)}\n\nکیفیت یا حالت دانلود رو انتخاب کن:`,
             reply_markup: {
               inline_keyboard: buildQualityKeyboard(
                 qualities,
+                Boolean(metadata.audioAvailable),
                 metadata.videoId!,
                 job.requestMessageId,
                 job.userId,
@@ -193,6 +199,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         return;
       }
 
+      const selectionText = formatSelection(job);
       if (!statusMessageId) {
         statusMessageId = await step.do(
           "show youtube download status",
@@ -203,7 +210,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           async () => {
             const status = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
               chat_id: job.chatId,
-              text: `⏳ کیفیت ${job.quality}p انتخاب شد؛ دانلود شروع شد…`,
+              text: `⏳ ${selectionText} انتخاب شد؛ دانلود شروع شد…`,
               reply_parameters: { message_id: job.requestMessageId },
             });
             return status.message_id;
@@ -212,7 +219,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       }
 
       const result = await step.do(
-        "download and send youtube video",
+        job.audioMode ? "download and send youtube audio" : "download and send youtube video",
         {
           retries: { limit: 1, delay: "1 second", backoff: "constant" },
           timeout: "30 minutes",
@@ -330,8 +337,15 @@ function qualityLabel(quality: YoutubeQuality): string {
   return "1080p Full HD";
 }
 
+function formatSelection(job: Pick<YoutubeDownloadJob, "quality" | "audioMode">): string {
+  if (job.audioMode === "low") return "🎵 Audio • کم‌حجم";
+  if (job.audioMode === "hq") return "🎧 Audio • HQ";
+  return `کیفیت ${job.quality}p`;
+}
+
 function buildQualityKeyboard(
   qualities: YoutubeQuality[],
+  audioAvailable: boolean,
   videoId: string,
   requestMessageId: number,
   userId: number,
@@ -344,19 +358,29 @@ function buildQualityKeyboard(
   for (let index = 0; index < buttons.length; index += 2) {
     rows.push(buttons.slice(index, index + 2));
   }
+  if (audioAvailable) {
+    rows.push([
+      {
+        text: "🎵 Audio • کم‌حجم",
+        callback_data: `ytq|${videoId}|al|${requestMessageId}|${userId}`,
+      },
+      {
+        text: "🎧 Audio • HQ",
+        callback_data: `ytq|${videoId}|ah|${requestMessageId}|${userId}`,
+      },
+    ]);
+  }
   return rows;
 }
 
 function parseQualityCallback(data: string | undefined): ParsedQualityCallback | null {
   if (!data) return null;
-  const match = /^ytq\|([A-Za-z0-9_-]{6,20})\|(360|480|720|1080)\|(\d+)\|(\d+)$/.exec(data);
+  const match = /^ytq\|([A-Za-z0-9_-]{6,20})\|(360|480|720|1080|al|ah)\|(\d+)\|(\d+)$/.exec(data);
   if (!match) return null;
 
-  const quality = Number(match[2]);
   const requestMessageId = Number(match[3]);
   const userId = Number(match[4]);
   if (
-    !isYoutubeQuality(quality) ||
     !Number.isSafeInteger(requestMessageId) ||
     requestMessageId <= 0 ||
     !Number.isSafeInteger(userId) ||
@@ -365,6 +389,18 @@ function parseQualityCallback(data: string | undefined): ParsedQualityCallback |
     return null;
   }
 
+  const choice = match[2];
+  if (choice === "al" || choice === "ah") {
+    return {
+      videoId: match[1],
+      audioMode: choice === "al" ? "low" : "hq",
+      requestMessageId,
+      userId,
+    };
+  }
+
+  const quality = Number(choice);
+  if (!isYoutubeQuality(quality)) return null;
   return {
     videoId: match[1],
     quality,
@@ -482,20 +518,22 @@ async function handleQualityCallback(
     userId: parsed.userId,
     url: `https://www.youtube.com/watch?v=${parsed.videoId}`,
     quality: parsed.quality,
+    audioMode: parsed.audioMode,
     statusMessageId: callback.message.message_id,
   };
+  const selectionText = formatSelection(job);
 
   try {
     await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id: job.id, params: job });
     await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", {
       callback_query_id: callback.id,
-      text: `${parsed.quality}p انتخاب شد`,
+      text: `${selectionText} انتخاب شد`,
       show_alert: false,
     });
     await safeTelegramCall(env.BOT_TOKEN, "editMessageText", {
       chat_id: job.chatId,
       message_id: job.statusMessageId,
-      text: `⏳ کیفیت ${parsed.quality}p انتخاب شد؛ دانلود شروع شد…`,
+      text: `⏳ ${selectionText} انتخاب شد؛ دانلود شروع شد…`,
     });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
