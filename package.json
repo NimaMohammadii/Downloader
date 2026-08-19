@@ -9,6 +9,9 @@
     "types": "wrangler types",
     "check": "tsc --noEmit"
   },
+  "dependencies": {
+    "@cloudflare/containers": "^0.3.7"
+  },
   "devDependencies": {
     "@cloudflare/workers-types": "latest",
     "typescript": "^5.9.3",
