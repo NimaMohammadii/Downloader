@@ -1,18 +1,30 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "downloader",
-  "main": "src/story-main.ts",
+  "main": "src/root.ts",
   "compatibility_date": "2026-08-14",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
   "observability": {
     "enabled": true
   },
+  "containers": [
+    {
+      "class_name": "YouTubeDownloaderContainer",
+      "image": "./Dockerfile",
+      "max_instances": 10,
+      "instance_type": "standard-1"
+    }
+  ],
   "durable_objects": {
     "bindings": [
       {
         "name": "ADMIN_STATS",
         "class_name": "AdminStatsStore"
+      },
+      {
+        "name": "YOUTUBE_DOWNLOADER",
+        "class_name": "YouTubeDownloaderContainer"
       }
     ]
   },
@@ -28,6 +40,17 @@
     {
       "tag": "v3",
       "new_sqlite_classes": ["AdminStatsStore"]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": ["YouTubeDownloaderContainer"]
+    }
+  ],
+  "workflows": [
+    {
+      "name": "youtube-downloads",
+      "binding": "YOUTUBE_DOWNLOAD_WORKFLOW",
+      "class_name": "YouTubeDownloadWorkflow"
     }
   ]
 }
