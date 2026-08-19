@@ -1,6 +1,6 @@
 FROM node:22-bookworm-slim
 
-LABEL vexa.youtube.image="youtube-single-client-pipeline-v1"
+LABEL vexa.youtube.image="youtube-mini-app-direct-v1"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -39,6 +39,7 @@ RUN git clone --depth 1 --branch 1.3.1 https://github.com/Brainicism/bgutil-ytdl
 WORKDIR /app
 COPY container/youtube_app.py /app/youtube_app.py
 COPY container/youtube_pipeline.py /app/youtube_pipeline.py
+COPY container/mini_pipeline.py /app/mini_pipeline.py
 COPY container/start.sh /app/start.sh
 COPY container/yt-dlp-smart.sh /opt/venv/bin/yt-dlp
 RUN chmod +x /app/start.sh /opt/venv/bin/yt-dlp
