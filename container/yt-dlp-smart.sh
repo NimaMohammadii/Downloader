@@ -45,11 +45,16 @@ for client in "${clients[@]}"; do
   fi
 done
 
-# Preserve all failed-attempt diagnostics in Cloudflare logs.
+# Send diagnostics both to the caller and directly to the container log stream.
 for i in $(seq 1 "$attempt"); do
   if [[ -s "$TMPDIR_YTDLP/err-${i}" ]]; then
-    echo "===== yt-dlp attempt ${i} (${clients[$((i - 1))]}) =====" >&2
+    header="===== yt-dlp attempt ${i} (${clients[$((i - 1))]}) ====="
+    echo "$header" >&2
     cat "$TMPDIR_YTDLP/err-${i}" >&2
+    if [[ -w /proc/1/fd/2 ]]; then
+      echo "$header" > /proc/1/fd/2
+      cat "$TMPDIR_YTDLP/err-${i}" > /proc/1/fd/2
+    fi
   fi
 done
 
