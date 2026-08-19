@@ -105,8 +105,12 @@ const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
 
 export class YoutubeDownloaderContainer extends Container {
   defaultPort = 8080;
-  sleepAfter = "2m";
+  sleepAfter = "5m";
   enableInternet = true;
+}
+
+function containerSessionId(job: Pick<YoutubeDownloadJob, "chatId" | "requestMessageId" | "userId">): string {
+  return `yt-session-${job.chatId}-${job.requestMessageId}-${job.userId}`;
 }
 
 export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDownloadJob> {
@@ -136,10 +140,13 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           "inspect youtube qualities",
           {
             retries: { limit: 1, delay: "1 second", backoff: "constant" },
-            timeout: "5 minutes",
+            timeout: "2 minutes",
           },
           async () => {
-            const container = getContainer(this.env.YOUTUBE_DOWNLOADER_CONTAINER, `meta-${job.id}`);
+            const container = getContainer(
+              this.env.YOUTUBE_DOWNLOADER_CONTAINER,
+              containerSessionId(job),
+            );
             const response = await container.fetch(
               new Request("http://container/metadata", {
                 method: "POST",
@@ -225,7 +232,10 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           timeout: "30 minutes",
         },
         async () => {
-          const container = getContainer(this.env.YOUTUBE_DOWNLOADER_CONTAINER, job.id);
+          const container = getContainer(
+            this.env.YOUTUBE_DOWNLOADER_CONTAINER,
+            containerSessionId(job),
+          );
           const response = await container.fetch(
             new Request("http://container/download", {
               method: "POST",
