@@ -1,6 +1,6 @@
 FROM node:22-bookworm-slim
 
-LABEL vexa.youtube.image="youtube-antibot-v2"
+LABEL vexa.youtube.image="youtube-session-cache-v1"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
