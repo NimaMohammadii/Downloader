@@ -14,6 +14,7 @@ DIRECT_TELEGRAM_LIMIT = 47_000_000
 TARGET_PART_SIZE = 42_000_000
 DOWNLOAD_TIMEOUT_SECONDS = 7_000
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "http://127.0.0.1:4416")
+SUPPORTED_QUALITIES = (360, 480, 720, 1080)
 
 
 class UserVisibleError(Exception):
@@ -143,13 +144,100 @@ def fetch_metadata(url: str) -> dict[str, Any]:
         raise UserVisibleError("❌ اطلاعات ویدیو از YouTube دریافت نشد.") from exc
 
 
-def download_video(url: str, workdir: Path) -> Path:
+def validate_video_metadata(metadata: dict[str, Any]) -> None:
+    if metadata.get("_type") == "playlist" or metadata.get("entries"):
+        raise UserVisibleError("❌ لینک مستقیم یک ویدیو یا Shorts رو بفرست، نه Playlist یا کانال.")
+
+    live_status = str(metadata.get("live_status") or "").lower()
+    if metadata.get("is_live") or live_status in {"is_live", "is_upcoming"}:
+        raise UserVisibleError("❌ دانلود Live در حال پخش فعلاً پشتیبانی نمی‌شه.")
+
+
+def video_formats(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    formats = metadata.get("formats")
+    if not isinstance(formats, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in formats:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("vcodec") or "none").lower() == "none":
+            continue
+        result.append(item)
+    return result
+
+
+def short_side(format_info: dict[str, Any]) -> int | None:
+    width_raw = format_info.get("width")
+    height_raw = format_info.get("height")
+    try:
+        width = int(width_raw) if width_raw else 0
+        height = int(height_raw) if height_raw else 0
+    except (TypeError, ValueError):
+        return None
+    if width > 0 and height > 0:
+        return min(width, height)
+    return height or width or None
+
+
+def available_qualities(metadata: dict[str, Any]) -> list[int]:
+    found: set[int] = set()
+    for format_info in video_formats(metadata):
+        resolution = short_side(format_info)
+        if not resolution:
+            continue
+        for quality in SUPPORTED_QUALITIES:
+            if abs(resolution - quality) <= 16:
+                found.add(quality)
+    return [quality for quality in SUPPORTED_QUALITIES if quality in found]
+
+
+def is_portrait(metadata: dict[str, Any]) -> bool:
+    best: tuple[int, int, int] | None = None
+    for format_info in video_formats(metadata):
+        try:
+            width = int(format_info.get("width") or 0)
+            height = int(format_info.get("height") or 0)
+        except (TypeError, ValueError):
+            continue
+        if width <= 0 or height <= 0:
+            continue
+        area = width * height
+        if best is None or area > best[0]:
+            best = (area, width, height)
+    if best is None:
+        return False
+    return best[1] < best[2]
+
+
+def inspect_video(url: str) -> dict[str, Any]:
+    try:
+        metadata = fetch_metadata(url)
+        validate_video_metadata(metadata)
+        qualities = available_qualities(metadata)
+        if not qualities:
+            raise UserVisibleError("❌ برای این ویدیو کیفیت 360p تا 1080p قابل دانلود پیدا نشد.")
+        video_id = str(metadata.get("id") or "").strip()
+        if not video_id:
+            raise UserVisibleError("❌ شناسه ویدیوی YouTube دریافت نشد.")
+        return {
+            "ok": True,
+            "videoId": video_id,
+            "title": str(metadata.get("title") or "YouTube video").strip(),
+            "qualities": qualities,
+        }
+    except UserVisibleError as exc:
+        return {"ok": False, "message": str(exc)}
+
+
+def download_video(url: str, workdir: Path, quality: int, metadata: dict[str, Any]) -> Path:
     output_template = str(workdir / "%(title).100B [%(id)s].%(ext)s")
+    dimension = "width" if is_portrait(metadata) else "height"
     format_selector = (
-        "bv*[height<=720][ext=mp4][vcodec^=avc1]+ba[ext=m4a]/"
-        "bv*[height<=720][ext=mp4]+ba[ext=m4a]/"
-        "bv*[height<=720]+ba/"
-        "b[height<=720][ext=mp4]/b[height<=720]/b"
+        f"bv*[{dimension}<={quality}][ext=mp4][vcodec^=avc1]+ba[ext=m4a]/"
+        f"bv*[{dimension}<={quality}][ext=mp4]+ba[ext=m4a]/"
+        f"bv*[{dimension}<={quality}]+ba/"
+        f"b[{dimension}<={quality}][ext=mp4]/b[{dimension}<={quality}]/b"
     )
     result = run_command(
         [
@@ -320,27 +408,27 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
     url = str(payload.get("url") or "")
     chat_id = int(payload.get("chatId"))
     request_message_id = int(payload.get("requestMessageId"))
+    quality = int(payload.get("quality") or 720)
     status_raw = payload.get("statusMessageId")
     status_message_id = int(status_raw) if status_raw else None
 
     if not token or not url:
         raise ValueError("Missing bot token or URL")
+    if quality not in SUPPORTED_QUALITIES:
+        raise ValueError("Unsupported YouTube quality")
 
     workdir = Path(tempfile.mkdtemp(prefix="youtube-download-"))
     try:
         edit_status(token, chat_id, status_message_id, "🔎 دارم ویدیوی YouTube رو بررسی می‌کنم…")
         metadata = fetch_metadata(url)
-
-        if metadata.get("_type") == "playlist" or metadata.get("entries"):
-            raise UserVisibleError("❌ لینک مستقیم یک ویدیو یا Shorts رو بفرست، نه Playlist یا کانال.")
-
-        live_status = str(metadata.get("live_status") or "").lower()
-        if metadata.get("is_live") or live_status in {"is_live", "is_upcoming"}:
-            raise UserVisibleError("❌ دانلود Live در حال پخش فعلاً پشتیبانی نمی‌شه.")
+        validate_video_metadata(metadata)
 
         title = str(metadata.get("title") or "YouTube video").strip()
-        edit_status(token, chat_id, status_message_id, "⬇️ دارم ویدیو رو تا کیفیت 720p دانلود می‌کنم…")
-        video_path = download_video(url, workdir)
+        if quality not in available_qualities(metadata):
+            raise UserVisibleError(f"❌ کیفیت {quality}p برای این ویدیو موجود نیست. دوباره لینک رو بفرست.")
+
+        edit_status(token, chat_id, status_message_id, f"⬇️ دارم ویدیو رو با کیفیت {quality}p دانلود می‌کنم…")
+        video_path = download_video(url, workdir, quality, metadata)
         parts = split_for_telegram(video_path, workdir)
 
         if len(parts) > 1 and video_path.exists() and video_path not in parts:
@@ -357,7 +445,8 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
             edit_status(token, chat_id, status_message_id, "📤 دانلود شد؛ دارم می‌فرستم…")
 
         for index, part in enumerate(parts, start=1):
-            caption = title if len(parts) == 1 else f"{title}\nPart {index}/{len(parts)}"
+            base_caption = f"{title}\n{quality}p"
+            caption = base_caption if len(parts) == 1 else f"{base_caption}\nPart {index}/{len(parts)}"
             send_media_file(
                 token,
                 chat_id,
@@ -370,7 +459,7 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
                 part.unlink(missing_ok=True)
 
         delete_status(token, chat_id, status_message_id)
-        return {"ok": True, "parts": len(parts), "title": title}
+        return {"ok": True, "parts": len(parts), "title": title, "quality": quality}
 
     except UserVisibleError as exc:
         try:
@@ -412,7 +501,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(404, {"ok": False, "error": "not found"})
 
     def do_POST(self) -> None:
-        if self.path != "/download":
+        if self.path not in {"/metadata", "/download"}:
             self._send_json(404, {"ok": False, "error": "not found"})
             return
         try:
@@ -421,7 +510,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"ok": False, "error": "invalid body"})
                 return
             payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
-            result = process_job(payload)
+            if self.path == "/metadata":
+                url = str(payload.get("url") or "")
+                if not url:
+                    self._send_json(400, {"ok": False, "message": "❌ لینک YouTube نامعتبره."})
+                    return
+                result = inspect_video(url)
+            else:
+                result = process_job(payload)
             self._send_json(200, result)
         except Exception as exc:
             print(f"youtube container request failed: {type(exc).__name__}: {exc}", flush=True)
