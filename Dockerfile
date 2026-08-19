@@ -18,7 +18,11 @@ RUN apt-get update \
 
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir -U pip \
-    && /opt/venv/bin/pip install --no-cache-dir -U "yt-dlp[default]" requests bgutil-ytdlp-pot-provider==1.3.1
+    && /opt/venv/bin/pip install --no-cache-dir --pre -U \
+      "yt-dlp[default,curl-cffi]" \
+      requests \
+      bgutil-ytdlp-pot-provider==1.3.1 \
+    && mv /opt/venv/bin/yt-dlp /opt/venv/bin/yt-dlp-real
 
 RUN git clone --depth 1 --branch 1.3.1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /opt/bgutil \
     && cd /opt/bgutil/server \
@@ -29,7 +33,8 @@ RUN git clone --depth 1 --branch 1.3.1 https://github.com/Brainicism/bgutil-ytdl
 WORKDIR /app
 COPY container/youtube_app.py /app/youtube_app.py
 COPY container/start.sh /app/start.sh
-RUN chmod +x /app/start.sh
+COPY container/yt-dlp-smart.sh /opt/venv/bin/yt-dlp
+RUN chmod +x /app/start.sh /opt/venv/bin/yt-dlp
 
 EXPOSE 8080
 CMD ["/app/start.sh"]
