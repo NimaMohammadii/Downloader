@@ -6,6 +6,7 @@ import mini_live_entry as live
 
 app = live.app
 mini_pipeline = live.mini_pipeline
+mini_pipeline.MINI_FILE_TTL_SECONDS = 2 * 60 * 60
 
 JOBS: dict[str, dict[str, object]] = {}
 JOBS_LOCK = threading.Lock()
@@ -32,10 +33,7 @@ def _job_worker(payload: dict[str, object]) -> None:
             flush=True,
         )
     except app.UserVisibleError as exc:
-        _set_job(
-            file_id,
-            {"ok": False, "state": "error", "message": str(exc)},
-        )
+        _set_job(file_id, {"ok": False, "state": "error", "message": str(exc)})
         print(f"mini async prepare user error file={file_id}: {exc}", flush=True)
     except Exception as exc:
         _set_job(
@@ -79,17 +77,13 @@ class MiniAsyncHandler(mini_pipeline.MiniAppHandler):
             self._send_json(200, current)
             return
 
-        # One Mini App session maps to one Container. Avoid concurrent prepares in
-        # the same session because yt-dlp metadata/session cache is intentionally
-        # shared within that Container.
+        # A Mini App session maps to one Container. Keep one prepare active at a
+        # time because the yt-dlp metadata/session cache is scoped to that session.
         with JOBS_LOCK:
             if any(job.get("state") == "preparing" for job in JOBS.values()):
                 self._send_json(
                     409,
-                    {
-                        "ok": False,
-                        "message": "یک دانلود دیگه هنوز در حال آماده‌سازیه.",
-                    },
+                    {"ok": False, "message": "یک دانلود دیگه هنوز در حال آماده‌سازیه."},
                 )
                 return
             JOBS[file_id] = {"ok": True, "state": "preparing", "fileId": file_id}
@@ -107,7 +101,10 @@ class MiniAsyncHandler(mini_pipeline.MiniAppHandler):
         parsed = urlparse(self.path)
         file_id = (parse_qs(parsed.query).get("fileId") or [""])[0]
         if not mini_pipeline.FILE_ID_RE.fullmatch(file_id):
-            self._send_json(400, {"ok": False, "state": "error", "message": "❌ شناسه دانلود نامعتبره."})
+            self._send_json(
+                400,
+                {"ok": False, "state": "error", "message": "❌ شناسه دانلود نامعتبره."},
+            )
             return
 
         loaded = mini_pipeline._load_manifest(file_id)
@@ -130,8 +127,7 @@ class MiniAsyncHandler(mini_pipeline.MiniAppHandler):
         self._send_json(200, current)
 
     def do_GET(self) -> None:
-        path = urlparse(self.path).path
-        if path == "/mini/status":
+        if urlparse(self.path).path == "/mini/status":
             self._send_status()
             return
         super().do_GET()
