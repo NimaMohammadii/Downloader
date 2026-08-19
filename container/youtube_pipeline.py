@@ -7,10 +7,23 @@ from typing import Any
 
 import youtube_app as app
 
-CLIENTS = ("mweb", "android_vr", "web_embedded", "web_safari")
+# web_safari is intentionally excluded. In current YouTube/yt-dlp behavior its
+# HLS formats are intermittent and can disappear between otherwise identical
+# requests. Keep every actual download bound to one explicit client from start
+# to finish instead of reusing a format_id/direct URL extracted by another run.
+CLIENTS = ("mweb", "android_vr", "web_embedded")
 SESSION_STATE_PATH = Path("/tmp/vexa-youtube-session.json")
 ASPECT_TOLERANCE = 0.06
 QUALITY_TOLERANCE = 18
+
+
+class ClientAttemptError(Exception):
+    def __init__(self, client: str, category: str, message: str, detail: str = "") -> None:
+        super().__init__(message)
+        self.client = client
+        self.category = category
+        self.message = message
+        self.detail = detail
 
 
 def _client_args(client: str) -> list[str]:
@@ -48,8 +61,44 @@ def _run(command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _friendly(stderr: str) -> str:
-    return app.friendly_ytdlp_error(stderr or "")
+def _classify_ytdlp_error(stderr: str) -> tuple[str, str]:
+    value = (stderr or "").lower()
+
+    # Specific format errors MUST be checked before generic "not available".
+    if "requested format is not available" in value or "only images are available" in value:
+        return "format", "❌ این کیفیت از مسیر فعلی YouTube قابل دریافت نبود."
+    if "private video" in value or "this video is private" in value:
+        return "private", "❌ این ویدیو Private هست و بدون دسترسی به اکانت قابل دانلود نیست."
+    if "members-only" in value or "join this channel" in value:
+        return "members", "❌ این ویدیو فقط برای اعضای کانال قابل مشاهده است."
+    if "age" in value and ("restricted" in value or "confirm" in value or "sign in" in value):
+        return "age", "❌ این ویدیو محدودیت سنی داره و بدون ورود به YouTube قابل دانلود نیست."
+    if "copyright" in value:
+        return "copyright", "❌ این ویدیو به‌خاطر محدودیت صاحب محتوا قابل دانلود نیست."
+    if "unsupported url" in value:
+        return "unsupported", "❌ این لینک YouTube قابل دانلود نیست. لینک مستقیم ویدیو یا Shorts رو بفرست."
+    if "sign in to confirm" in value or "not a bot" in value:
+        return "botcheck", "❌ YouTube این IP رو موقتاً محدود کرده. چند لحظه بعد دوباره امتحان کن."
+    if "http error 403" in value or "403: forbidden" in value:
+        return "forbidden", "❌ YouTube دسترسی دانلود این ویدیو رو موقتاً بسته. دوباره امتحان کن."
+
+    unavailable_markers = (
+        "video unavailable",
+        "this video is not available",
+        "not available in your country",
+        "not available in your region",
+        "the uploader has not made this video available",
+    )
+    if any(marker in value for marker in unavailable_markers):
+        return "unavailable", "❌ این ویدیو در دسترس نیست یا برای این منطقه محدود شده."
+
+    return "generic", "❌ نتونستم این فایل رو از YouTube بگیرم. دوباره امتحان کن."
+
+
+def _attempt_error(client: str, exc: subprocess.CalledProcessError) -> ClientAttemptError:
+    detail = (exc.stderr or "").strip()
+    category, message = _classify_ytdlp_error(detail)
+    return ClientAttemptError(client, category, message, detail)
 
 
 def _fetch_metadata_for_client(url: str, client: str) -> dict[str, Any]:
@@ -61,20 +110,32 @@ def _fetch_metadata_for_client(url: str, client: str) -> dict[str, Any]:
                 "--skip-download",
                 "--dump-single-json",
                 "--no-warnings",
+                "--format",
+                "all",
                 url,
             ],
             app.METADATA_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
-        raise app.UserVisibleError("❌ ارتباط با YouTube بیشتر از حد معمول طول کشید. دوباره امتحان کن.") from exc
+        raise ClientAttemptError(
+            client,
+            "timeout",
+            "❌ ارتباط با YouTube بیشتر از حد معمول طول کشید. دوباره امتحان کن.",
+        ) from exc
     except subprocess.CalledProcessError as exc:
-        raise app.UserVisibleError(_friendly((exc.stderr or "").strip())) from exc
+        raise _attempt_error(client, exc) from exc
+
     try:
         metadata = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
-        raise app.UserVisibleError("❌ اطلاعات ویدیو از YouTube دریافت نشد.") from exc
+        raise ClientAttemptError(
+            client,
+            "metadata",
+            "❌ اطلاعات ویدیو از YouTube دریافت نشد.",
+            result.stdout[-1000:],
+        ) from exc
     if not isinstance(metadata, dict):
-        raise app.UserVisibleError("❌ اطلاعات ویدیو از YouTube دریافت نشد.")
+        raise ClientAttemptError(client, "metadata", "❌ اطلاعات ویدیو از YouTube دریافت نشد.")
     return metadata
 
 
@@ -84,9 +145,12 @@ def _save_session(metadata: dict[str, Any], client: str) -> None:
         "client": client,
         "videoId": str(metadata.get("id") or ""),
     }
-    temp = SESSION_STATE_PATH.with_suffix(".tmp")
-    temp.write_text(json.dumps(state), encoding="utf-8")
-    temp.replace(SESSION_STATE_PATH)
+    try:
+        temp = SESSION_STATE_PATH.with_suffix(".tmp")
+        temp.write_text(json.dumps(state), encoding="utf-8")
+        temp.replace(SESSION_STATE_PATH)
+    except Exception as exc:
+        print(f"youtube session state write failed: {type(exc).__name__}: {exc}", flush=True)
 
 
 def _load_session_client(metadata: dict[str, Any] | None = None) -> str | None:
@@ -122,12 +186,14 @@ def _is_storyboard(item: dict[str, Any]) -> bool:
     protocol = str(item.get("protocol") or "").lower()
     ext = str(item.get("ext") or "").lower()
     note = str(item.get("format_note") or "").lower()
+    format_text = str(item.get("format") or "").lower()
     return (
         protocol == "mhtml"
         or ext == "mhtml"
         or vcodec in {"images", "image"}
         or bool(re.fullmatch(r"sb\d+", format_id))
         or "storyboard" in note
+        or "storyboard" in format_text
     )
 
 
@@ -144,8 +210,6 @@ def video_formats(metadata: dict[str, Any]) -> list[dict[str, Any]]:
         if item.get("has_drm"):
             continue
         if _dimensions(item) is None:
-            continue
-        if not str(item.get("format_id") or "").strip():
             continue
         if not str(item.get("url") or "").strip():
             continue
@@ -166,8 +230,6 @@ def audio_formats(metadata: dict[str, Any]) -> list[dict[str, Any]]:
         if str(item.get("acodec") or "none").lower() == "none":
             continue
         if item.get("has_drm"):
-            continue
-        if not str(item.get("format_id") or "").strip():
             continue
         if not str(item.get("url") or "").strip():
             continue
@@ -200,7 +262,7 @@ def _source_ratio(metadata: dict[str, Any]) -> float | None:
         ratio = _ratio(candidate)
         if ratio is None:
             continue
-        cluster = []
+        cluster: list[dict[str, Any]] = []
         for item in formats:
             item_ratio = _ratio(item)
             if item_ratio is None:
@@ -237,7 +299,7 @@ def available_qualities(metadata: dict[str, Any]) -> list[int]:
         for quality in app.SUPPORTED_QUALITIES:
             if abs(resolution - quality) <= QUALITY_TOLERANCE:
                 found.add(quality)
-    return [q for q in app.SUPPORTED_QUALITIES if q in found]
+    return [quality for quality in app.SUPPORTED_QUALITIES if quality in found]
 
 
 def is_portrait(metadata: dict[str, Any]) -> bool:
@@ -245,256 +307,76 @@ def is_portrait(metadata: dict[str, Any]) -> bool:
     return bool(ratio is not None and ratio < 1.0)
 
 
-def _video_score(item: dict[str, Any], quality: int) -> tuple[int, int, int, float, float]:
-    resolution = _short_side(item) or 0
-    ext = str(item.get("ext") or "").lower()
-    vcodec = str(item.get("vcodec") or "").lower()
-    acodec = str(item.get("acodec") or "none").lower()
-    try:
-        fps = float(item.get("fps") or 0)
-    except (TypeError, ValueError):
-        fps = 0.0
-    try:
-        tbr = float(item.get("tbr") or 0)
-    except (TypeError, ValueError):
-        tbr = 0.0
-    return (
-        -abs(resolution - quality),
-        1 if ext == "mp4" else 0,
-        1 if vcodec.startswith("avc1") else 0,
-        fps,
-        tbr + (1 if acodec != "none" else 0),
-    )
-
-
-def _select_video(metadata: dict[str, Any], quality: int) -> dict[str, Any] | None:
-    source_ratio = _source_ratio(metadata)
-    candidates = [
-        item
-        for item in video_formats(metadata)
-        if _matches_ratio(item, source_ratio)
-        and (resolution := _short_side(item)) is not None
-        and abs(resolution - quality) <= QUALITY_TOLERANCE
-    ]
-    return max(candidates, key=lambda item: _video_score(item, quality)) if candidates else None
-
-
-def _select_audio(metadata: dict[str, Any], mode: str) -> dict[str, Any] | None:
-    formats = audio_formats(metadata)
-    if not formats:
-        return None
-
-    def abr(item: dict[str, Any]) -> float:
-        try:
-            return float(item.get("abr") or item.get("tbr") or 0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    if mode == "low":
-        under = [item for item in formats if 0 < abr(item) <= 80]
-        pool = under or formats
-        return max(
-            pool,
-            key=lambda item: (
-                1 if str(item.get("ext") or "").lower() == "m4a" else 0,
-                abr(item) if under else -abr(item),
-            ),
-        )
-
-    return max(
-        formats,
-        key=lambda item: (
-            abr(item),
-            1 if str(item.get("ext") or "").lower() == "m4a" else 0,
-        ),
-    )
-
-
-def _safe_format_id(item: dict[str, Any]) -> str:
-    format_id = str(item.get("format_id") or "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9._+:-]+", format_id):
-        raise app.UserVisibleError("❌ فرمت ویدیوی YouTube نامعتبر بود.")
-    return format_id
-
-
-def _write_info(metadata: dict[str, Any]) -> None:
-    app.save_metadata_cache(metadata)
-
-
 def _clean_workdir(workdir: Path) -> None:
+    if not workdir.exists():
+        return
     for path in workdir.iterdir():
         if path.is_file():
             path.unlink(missing_ok=True)
-
-
-def _download_video_from_metadata(
-    metadata: dict[str, Any],
-    client: str,
-    workdir: Path,
-    quality: int,
-) -> Path:
-    selected = _select_video(metadata, quality)
-    if selected is None:
-        raise app.UserVisibleError(f"❌ کیفیت {quality}p برای این ویدیو روی این مسیر موجود نیست.")
-
-    video_id = _safe_format_id(selected)
-    has_audio = str(selected.get("acodec") or "none").lower() != "none"
-    selector = video_id if has_audio else f"{video_id}+ba[ext=m4a]/{video_id}+ba/{video_id}"
-    _write_info(metadata)
-    output_template = str(workdir / "%(title).100B [%(id)s].%(ext)s")
-
-    try:
-        result = _run(
-            [
-                app.REAL_YTDLP,
-                "--load-info-json",
-                str(app.METADATA_CACHE_PATH),
-                "--force-overwrites",
-                "--force-ipv4",
-                "--no-simulate",
-                "--retries",
-                "1",
-                "--fragment-retries",
-                "1",
-                "--socket-timeout",
-                "12",
-                "--concurrent-fragments",
-                "2",
-                "--format",
-                selector,
-                "--merge-output-format",
-                "mp4",
-                "--remux-video",
-                "mp4",
-                "--output",
-                output_template,
-                "--quiet",
-                "--print",
-                "after_move:%(filepath)s",
-            ],
-            app.DOWNLOAD_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise app.UserVisibleError("❌ دانلود بیشتر از حد معمول طول کشید.") from exc
-    except subprocess.CalledProcessError as exc:
-        raise app.UserVisibleError(_friendly((exc.stderr or "").strip())) from exc
-
-    path = app.result_path(result, workdir)
-    if path is None:
-        raise app.UserVisibleError("❌ فایل ویدیو بعد از دانلود پیدا نشد.")
-
-    expected = _ratio(selected)
-    if expected:
-        probed = _probe_geometry(path)
-        if probed is None:
-            raise app.UserVisibleError("❌ مشخصات فایل ویدیوی نهایی قابل خواندن نبود.")
-        width, height, actual = probed
-        if abs(actual - expected) / expected > 0.08:
-            raise app.UserVisibleError(f"❌ نسبت تصویر خروجی نادرست شد ({width}×{height}).")
-    print(
-        f"youtube video downloaded with client={client} format={video_id} quality={quality}",
-        flush=True,
-    )
-    return path
-
-
-def _download_audio_from_metadata(
-    metadata: dict[str, Any],
-    client: str,
-    workdir: Path,
-    mode: str,
-) -> Path:
-    selected = _select_audio(metadata, mode)
-    if selected is None:
-        raise app.UserVisibleError("❌ این ویدیو فایل صوتی قابل دانلود نداره.")
-    format_id = _safe_format_id(selected)
-    _write_info(metadata)
-    source_template = str(workdir / "audio-source.%(ext)s")
-    try:
-        result = _run(
-            [
-                app.REAL_YTDLP,
-                "--load-info-json",
-                str(app.METADATA_CACHE_PATH),
-                "--force-overwrites",
-                "--force-ipv4",
-                "--no-simulate",
-                "--retries",
-                "1",
-                "--fragment-retries",
-                "1",
-                "--socket-timeout",
-                "12",
-                "--format",
-                format_id,
-                "--output",
-                source_template,
-                "--quiet",
-                "--print",
-                "after_move:%(filepath)s",
-            ],
-            app.DOWNLOAD_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise app.UserVisibleError("❌ دانلود صدا بیشتر از حد معمول طول کشید.") from exc
-    except subprocess.CalledProcessError as exc:
-        raise app.UserVisibleError(_friendly((exc.stderr or "").strip())) from exc
-
-    source = app.result_path(result, workdir, prefix="audio-source.")
-    if source is None:
-        raise app.UserVisibleError("❌ فایل صوتی بعد از دانلود پیدا نشد.")
-
-    target = workdir / "Vexa.m4a"
-    if source.suffix.lower() == ".m4a":
-        source.replace(target)
-        return target
-
-    bitrate = "64k" if mode == "low" else "128k"
-    try:
-        _run(
-            [
-                "ffmpeg",
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                str(source),
-                "-vn",
-                "-c:a",
-                "aac",
-                "-b:a",
-                bitrate,
-                "-movflags",
-                "+faststart",
-                str(target),
-            ],
-            1200,
-        )
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
-        raise app.UserVisibleError("❌ تبدیل فایل صوتی به M4A انجام نشد.") from exc
-    return target
+        elif path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def _client_order(cached: str | None) -> list[str]:
-    return ([cached] if cached in CLIENTS else []) + [c for c in CLIENTS if c != cached]
+    return ([cached] if cached in CLIENTS else []) + [client for client in CLIENTS if client != cached]
+
+
+def _log_attempt_failure(kind: str, error: ClientAttemptError) -> None:
+    detail = error.detail.replace("\n", " ")[-1200:]
+    print(
+        f"youtube {kind} client={error.client} failed category={error.category}: "
+        f"{error.message} detail={detail}",
+        flush=True,
+    )
+
+
+def _terminal_category(category: str) -> bool:
+    return category in {"private", "members", "age", "copyright", "unsupported"}
+
+
+def _final_attempt_message(errors: list[ClientAttemptError], fallback: str) -> str:
+    if not errors:
+        return fallback
+
+    for error in errors:
+        if _terminal_category(error.category):
+            return error.message
+
+    categories = {error.category for error in errors}
+    if categories and categories <= {"unavailable"}:
+        return "❌ این ویدیو در دسترس نیست یا برای این منطقه محدود شده."
+    if "botcheck" in categories:
+        return "❌ YouTube این IP رو موقتاً محدود کرده. چند لحظه بعد دوباره امتحان کن."
+    if "forbidden" in categories:
+        return "❌ YouTube دسترسی دانلود این ویدیو رو موقتاً بسته. دوباره امتحان کن."
+    if "timeout" in categories:
+        return "❌ ارتباط با YouTube بیشتر از حد معمول طول کشید. دوباره امتحان کن."
+    if "format" in categories:
+        return "❌ کیفیت انتخاب‌شده این بار از YouTube دریافت نشد. دوباره امتحان کن."
+    return fallback
 
 
 def fetch_metadata(url: str) -> dict[str, Any]:
-    errors: list[str] = []
+    errors: list[ClientAttemptError] = []
     for client in CLIENTS:
         try:
             metadata = _fetch_metadata_for_client(url, client)
             app.validate_video_metadata(metadata)
             if not available_qualities(metadata) and not audio_formats(metadata):
+                print(f"youtube metadata client={client} returned no playable formats", flush=True)
                 continue
             _save_session(metadata, client)
             print(f"youtube metadata selected client={client}", flush=True)
             return metadata
-        except app.UserVisibleError as exc:
-            errors.append(str(exc))
-            print(f"youtube metadata client={client} failed: {exc}", flush=True)
-    raise app.UserVisibleError(errors[-1] if errors else "❌ اطلاعات ویدیو از YouTube دریافت نشد.")
+        except ClientAttemptError as exc:
+            errors.append(exc)
+            _log_attempt_failure("metadata", exc)
+        except app.UserVisibleError:
+            raise
+
+    raise app.UserVisibleError(
+        _final_attempt_message(errors, "❌ اطلاعات ویدیو از YouTube دریافت نشد. دوباره امتحان کن.")
+    )
 
 
 def inspect_video(url: str) -> dict[str, Any]:
@@ -512,63 +394,6 @@ def inspect_video(url: str) -> dict[str, Any]:
         }
     except app.UserVisibleError as exc:
         return {"ok": False, "message": str(exc)}
-
-
-def download_video(url: str, workdir: Path, quality: int, metadata: dict[str, Any]) -> Path:
-    cached_client = _load_session_client(metadata)
-    errors: list[str] = []
-
-    if cached_client:
-        try:
-            return _download_video_from_metadata(metadata, cached_client, workdir, quality)
-        except app.UserVisibleError as exc:
-            errors.append(str(exc))
-            print(f"cached youtube client={cached_client} failed: {exc}", flush=True)
-            _clean_workdir(workdir)
-
-    for client in _client_order(cached_client):
-        try:
-            fresh = _fetch_metadata_for_client(url, client)
-            app.validate_video_metadata(fresh)
-            if quality not in available_qualities(fresh):
-                continue
-            _save_session(fresh, client)
-            return _download_video_from_metadata(fresh, client, workdir, quality)
-        except app.UserVisibleError as exc:
-            errors.append(str(exc))
-            print(f"youtube full attempt client={client} failed: {exc}", flush=True)
-            _clean_workdir(workdir)
-
-    raise app.UserVisibleError(errors[-1] if errors else f"❌ کیفیت {quality}p برای این ویدیو در دسترس نیست.")
-
-
-def download_audio(url: str, workdir: Path, mode: str) -> Path:
-    cached_metadata = app.load_metadata_cache(url)
-    cached_client = _load_session_client(cached_metadata)
-    errors: list[str] = []
-
-    if cached_metadata is not None and cached_client:
-        try:
-            return _download_audio_from_metadata(cached_metadata, cached_client, workdir, mode)
-        except app.UserVisibleError as exc:
-            errors.append(str(exc))
-            print(f"cached audio client={cached_client} failed: {exc}", flush=True)
-            _clean_workdir(workdir)
-
-    for client in _client_order(cached_client):
-        try:
-            fresh = _fetch_metadata_for_client(url, client)
-            app.validate_video_metadata(fresh)
-            if not audio_formats(fresh):
-                continue
-            _save_session(fresh, client)
-            return _download_audio_from_metadata(fresh, client, workdir, mode)
-        except app.UserVisibleError as exc:
-            errors.append(str(exc))
-            print(f"youtube audio full attempt client={client} failed: {exc}", flush=True)
-            _clean_workdir(workdir)
-
-    raise app.UserVisibleError(errors[-1] if errors else "❌ فایل صوتی قابل دانلود پیدا نشد.")
 
 
 def _fraction(value: str) -> float | None:
@@ -600,7 +425,10 @@ def _probe_geometry(path: Path) -> tuple[int, int, float] | None:
             60,
         )
         payload = json.loads(result.stdout)
-        stream = payload["streams"][0]
+        streams = payload.get("streams") if isinstance(payload, dict) else None
+        if not isinstance(streams, list) or not streams:
+            return None
+        stream = streams[0]
         width = int(stream.get("width") or 0)
         height = int(stream.get("height") or 0)
         if width <= 0 or height <= 0:
@@ -610,8 +438,213 @@ def _probe_geometry(path: Path) -> tuple[int, int, float] | None:
             sar = _fraction(str(stream.get("sample_aspect_ratio") or "")) or 1.0
             dar = (width / height) * sar
         return width, height, dar
-    except Exception:
+    except Exception as exc:
+        print(f"video geometry probe failed: {type(exc).__name__}: {exc}", flush=True)
         return None
+
+
+def _verify_video(path: Path, quality: int, expected_ratio: float | None) -> tuple[bool, str]:
+    probed = _probe_geometry(path)
+    if probed is None:
+        return False, "ffprobe could not read video geometry"
+    width, height, actual_ratio = probed
+    resolution = min(width, height)
+    if abs(resolution - quality) > QUALITY_TOLERANCE:
+        return False, f"expected {quality}p but got {width}x{height}"
+    if expected_ratio is not None:
+        ratio_error = abs(actual_ratio - expected_ratio) / expected_ratio
+        if ratio_error > 0.08:
+            return False, f"expected aspect {expected_ratio:.4f} but got {actual_ratio:.4f} ({width}x{height})"
+    return True, f"{width}x{height}"
+
+
+def _download_video_with_client(
+    url: str,
+    client: str,
+    workdir: Path,
+    quality: int,
+    expected_ratio: float | None,
+) -> Path:
+    _clean_workdir(workdir)
+    output_template = str(workdir / "%(title).100B [%(id)s].%(ext)s")
+
+    try:
+        result = _run(
+            [
+                app.REAL_YTDLP,
+                *_client_args(client),
+                "--no-simulate",
+                "--concurrent-fragments",
+                "2",
+                "--format",
+                "bv*+ba/b",
+                "--format-sort",
+                f"res:{quality},+codec:avc:m4a,ext:mp4:m4a",
+                "--merge-output-format",
+                "mp4",
+                "--remux-video",
+                "mp4",
+                "--output",
+                output_template,
+                "--quiet",
+                "--print",
+                "after_move:%(filepath)s",
+                url,
+            ],
+            app.DOWNLOAD_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ClientAttemptError(client, "timeout", "❌ دانلود بیشتر از حد معمول طول کشید.") from exc
+    except subprocess.CalledProcessError as exc:
+        raise _attempt_error(client, exc) from exc
+
+    path = app.result_path(result, workdir)
+    if path is None:
+        raise ClientAttemptError(client, "missing-file", "❌ فایل ویدیو بعد از دانلود پیدا نشد.")
+
+    valid, detail = _verify_video(path, quality, expected_ratio)
+    if not valid:
+        path.unlink(missing_ok=True)
+        raise ClientAttemptError(client, "verification", "❌ کیفیت یا نسبت تصویر خروجی درست نبود.", detail)
+
+    print(
+        f"youtube video downloaded client={client} quality={quality} output={detail}",
+        flush=True,
+    )
+    return path
+
+
+def download_video(url: str, workdir: Path, quality: int, metadata: dict[str, Any]) -> Path:
+    if quality not in app.SUPPORTED_QUALITIES:
+        raise app.UserVisibleError("❌ کیفیت انتخاب‌شده پشتیبانی نمی‌شه.")
+    if quality not in available_qualities(metadata):
+        raise app.UserVisibleError(f"❌ کیفیت {quality}p برای این ویدیو موجود نیست.")
+
+    cached_client = _load_session_client(metadata)
+    expected_ratio = _source_ratio(metadata)
+    errors: list[ClientAttemptError] = []
+
+    for client in _client_order(cached_client):
+        try:
+            path = _download_video_with_client(url, client, workdir, quality, expected_ratio)
+            try:
+                fresh = _fetch_metadata_for_client(url, client)
+                if available_qualities(fresh) or audio_formats(fresh):
+                    _save_session(fresh, client)
+            except Exception:
+                pass
+            return path
+        except ClientAttemptError as exc:
+            errors.append(exc)
+            _log_attempt_failure("download", exc)
+            if _terminal_category(exc.category):
+                break
+
+    _clean_workdir(workdir)
+    raise app.UserVisibleError(
+        _final_attempt_message(
+            errors,
+            "❌ نتونستم این کیفیت رو از YouTube دریافت کنم. دوباره امتحان کن.",
+        )
+    )
+
+
+def _download_audio_with_client(url: str, client: str, workdir: Path, mode: str) -> Path:
+    _clean_workdir(workdir)
+    if mode == "low":
+        selector = "ba[abr<=80][ext=m4a]/ba[abr<=80]/worstaudio[ext=m4a]/worstaudio"
+        fallback_bitrate = "64k"
+    else:
+        selector = "ba[ext=m4a]/ba"
+        fallback_bitrate = "128k"
+
+    source_template = str(workdir / "audio-source.%(ext)s")
+    try:
+        result = _run(
+            [
+                app.REAL_YTDLP,
+                *_client_args(client),
+                "--no-simulate",
+                "--format",
+                selector,
+                "--output",
+                source_template,
+                "--quiet",
+                "--print",
+                "after_move:%(filepath)s",
+                url,
+            ],
+            app.DOWNLOAD_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ClientAttemptError(client, "timeout", "❌ دانلود صدا بیشتر از حد معمول طول کشید.") from exc
+    except subprocess.CalledProcessError as exc:
+        raise _attempt_error(client, exc) from exc
+
+    source = app.result_path(result, workdir, prefix="audio-source.")
+    if source is None:
+        raise ClientAttemptError(client, "missing-file", "❌ فایل صوتی بعد از دانلود پیدا نشد.")
+
+    target = workdir / "Vexa.m4a"
+    if source.suffix.lower() == ".m4a":
+        source.replace(target)
+        print(f"youtube audio downloaded client={client} mode={mode} native=m4a", flush=True)
+        return target
+
+    try:
+        _run(
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(source),
+                "-vn",
+                "-c:a",
+                "aac",
+                "-b:a",
+                fallback_bitrate,
+                "-movflags",
+                "+faststart",
+                str(target),
+            ],
+            1200,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ClientAttemptError(client, "timeout", "❌ تبدیل فایل صوتی بیشتر از حد معمول طول کشید.") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or "").strip()
+        raise ClientAttemptError(client, "conversion", "❌ تبدیل فایل صوتی به M4A انجام نشد.", detail) from exc
+
+    if not target.exists() or target.stat().st_size <= 0:
+        raise ClientAttemptError(client, "missing-file", "❌ فایل صوتی نهایی ساخته نشد.")
+    print(f"youtube audio downloaded client={client} mode={mode} converted=m4a", flush=True)
+    return target
+
+
+def download_audio(url: str, workdir: Path, mode: str) -> Path:
+    if mode not in app.SUPPORTED_AUDIO_MODES:
+        raise app.UserVisibleError("❌ حالت صوتی انتخاب‌شده پشتیبانی نمی‌شه.")
+
+    cached_metadata = app.load_metadata_cache(url)
+    cached_client = _load_session_client(cached_metadata)
+    errors: list[ClientAttemptError] = []
+
+    for client in _client_order(cached_client):
+        try:
+            return _download_audio_with_client(url, client, workdir, mode)
+        except ClientAttemptError as exc:
+            errors.append(exc)
+            _log_attempt_failure("audio", exc)
+            if _terminal_category(exc.category):
+                break
+
+    _clean_workdir(workdir)
+    raise app.UserVisibleError(
+        _final_attempt_message(errors, "❌ فایل صوتی قابل دانلود پیدا نشد. دوباره امتحان کن.")
+    )
 
 
 def send_media_file(
@@ -687,7 +720,7 @@ if __name__ == "__main__":
     server = app.ThreadingHTTPServer(("0.0.0.0", app.PORT), app.Handler)
     print(
         f"youtube downloader listening on :{app.PORT} "
-        "(single-client end-to-end pipeline)",
+        "(fresh single-client extraction/download pipeline)",
         flush=True,
     )
     server.serve_forever()
