@@ -1,6 +1,6 @@
 FROM node:22-bookworm-slim
 
-LABEL vexa.youtube.image="youtube-mini-app-direct-v1"
+LABEL vexa.youtube.image="youtube-mini-app-live-v2"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -40,6 +40,7 @@ WORKDIR /app
 COPY container/youtube_app.py /app/youtube_app.py
 COPY container/youtube_pipeline.py /app/youtube_pipeline.py
 COPY container/mini_pipeline.py /app/mini_pipeline.py
+COPY container/mini_live_entry.py /app/mini_live_entry.py
 COPY container/start.sh /app/start.sh
 COPY container/yt-dlp-smart.sh /opt/venv/bin/yt-dlp
 RUN chmod +x /app/start.sh /opt/venv/bin/yt-dlp
