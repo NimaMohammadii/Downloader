@@ -1,0 +1,56 @@
+#!/bin/bash
+set -u
+
+REAL_YTDLP="/opt/venv/bin/yt-dlp-real"
+TMPDIR_YTDLP="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR_YTDLP"' EXIT
+
+rewrite_and_run() {
+  local client="$1"
+  local out_file="$2"
+  local err_file="$3"
+  shift 3
+
+  local -a rewritten=()
+  local arg
+  for arg in "$@"; do
+    if [[ "$arg" == youtube:player_client=* ]]; then
+      rewritten+=("youtube:player_client=${client}")
+    else
+      rewritten+=("$arg")
+    fi
+  done
+
+  "$REAL_YTDLP" \
+    --force-overwrites \
+    --sleep-requests 1 \
+    "${rewritten[@]}" \
+    >"$out_file" 2>"$err_file"
+}
+
+clients=("mweb" "web_safari" "web_embedded" "android_vr")
+last_code=1
+attempt=0
+
+for client in "${clients[@]}"; do
+  attempt=$((attempt + 1))
+  out_file="$TMPDIR_YTDLP/out-${attempt}"
+  err_file="$TMPDIR_YTDLP/err-${attempt}"
+
+  if rewrite_and_run "$client" "$out_file" "$err_file" "$@"; then
+    cat "$out_file"
+    exit 0
+  else
+    last_code=$?
+  fi
+done
+
+# Preserve all failed-attempt diagnostics in Cloudflare logs.
+for i in $(seq 1 "$attempt"); do
+  if [[ -s "$TMPDIR_YTDLP/err-${i}" ]]; then
+    echo "===== yt-dlp attempt ${i} (${clients[$((i - 1))]}) =====" >&2
+    cat "$TMPDIR_YTDLP/err-${i}" >&2
+  fi
+done
+
+exit "$last_code"
