@@ -1,0 +1,9 @@
+.git
+.github
+node_modules
+.wrangler
+src
+README.md
+package.json
+tsconfig.json
+wrangler.jsonc
