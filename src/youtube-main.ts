@@ -100,7 +100,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         "download and send youtube video",
         {
           retries: { limit: 1, delay: "1 second", backoff: "constant" },
-          timeout: "2 hours",
+          timeout: "30 minutes",
         },
         async () => {
           const container = getContainer(this.env.YOUTUBE_DOWNLOADER_CONTAINER, job.id);
