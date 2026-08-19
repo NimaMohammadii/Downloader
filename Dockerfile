@@ -1,5 +1,7 @@
 FROM node:22-bookworm-slim
 
+LABEL vexa.youtube.image="quality-selection-v2"
+
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
