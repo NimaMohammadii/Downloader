@@ -8,7 +8,7 @@ export const WEB_APP_HTML = `<!doctype html>
 <meta name="robots" content="index,follow">
 <title>Video Downloader</title>
 <style>
-:root{color-scheme:dark;--bg:#050505;--text:#f5f5f5;--muted:#858585;--line:#222;--panel:#0a0a0a;--metallic-white:linear-gradient(180deg,#fff 0%,#f8f8f8 22%,#dedede 58%,#f2f2f2 100%);--metallic-shadow:inset 0 1px 0 rgba(255,255,255,.96),inset 0 -1px 0 rgba(0,0,0,.13),0 8px 22px rgba(0,0,0,.3)}
+:root{color-scheme:dark;--bg:#050505;--text:#f5f5f5;--muted:#858585;--line:#222;--panel:#0a0a0a;--metallic-white:linear-gradient(90deg,#cecece 0%,#f3f3f3 12%,#ffffff 24%,#d6d6d6 43%,#ffffff 63%,#eeeeee 79%,#c9c9c9 100%);--metallic-shadow:inset 1px 0 0 rgba(255,255,255,.84),inset -1px 0 0 rgba(0,0,0,.15),0 8px 22px rgba(0,0,0,.3);--card-line:linear-gradient(112deg,rgba(255,255,255,.26) 0%,rgba(255,255,255,.07) 18%,rgba(255,255,255,.13) 48%,rgba(255,255,255,.055) 76%,rgba(255,255,255,.2) 100%);--card-line-focus:linear-gradient(112deg,rgba(255,255,255,.38) 0%,rgba(255,255,255,.11) 18%,rgba(255,255,255,.22) 48%,rgba(255,255,255,.08) 76%,rgba(255,255,255,.3) 100%)}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text",Inter,system-ui,sans-serif}
 body{overflow-x:hidden}
@@ -25,8 +25,8 @@ h1{margin:0 0 24px;font-size:clamp(40px,8vw,68px);line-height:.93;letter-spacing
 .modeSwitch.watch .modeThumb{transform:translateX(100%)}
 .modeButton{position:relative;z-index:1;display:flex;align-items:center;justify-content:center;gap:8px;background:transparent;color:#666;font-size:13px;font-weight:720;transition:color .2s,transform .16s}
 .modeButton.active{color:#080808}.modeButton:active{transform:scale(.98)}.modeButton svg{width:19px;height:19px;stroke-width:2.1}
-.inputShell{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;padding:8px;border:1px solid rgba(255,255,255,.12);background:linear-gradient(180deg,#0c0c0c,#090909);border-radius:21px;box-shadow:inset 0 1px 0 rgba(255,255,255,.025),0 10px 30px rgba(0,0,0,.16);transition:border-color .2s,transform .2s,box-shadow .2s}
-.inputShell:focus-within{border-color:rgba(255,255,255,.2);transform:translateY(-1px);box-shadow:inset 0 1px 0 rgba(255,255,255,.04),0 12px 34px rgba(0,0,0,.2)}
+.inputShell{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;padding:8px;border:1px solid transparent;background:linear-gradient(180deg,rgba(13,13,13,.98),rgba(7,7,7,.98)) padding-box,var(--card-line) border-box;border-radius:21px;box-shadow:inset 0 1px 0 rgba(255,255,255,.032),inset 0 -1px 0 rgba(0,0,0,.72),0 12px 36px rgba(0,0,0,.18);transition:background .2s,transform .2s,box-shadow .2s}
+.inputShell:focus-within{background:linear-gradient(180deg,rgba(14,14,14,.99),rgba(7,7,7,.99)) padding-box,var(--card-line-focus) border-box;transform:translateY(-1px);box-shadow:inset 0 1px 0 rgba(255,255,255,.05),inset 0 -1px 0 rgba(0,0,0,.78),0 14px 42px rgba(0,0,0,.22)}
 .linkIcon{width:42px;height:42px;border-radius:14px;background:#111;display:grid;place-items:center;color:#aaa;font-size:18px}
 .url{min-width:0;width:100%;border:0;outline:0;background:transparent;color:#fff;padding:11px 0;font-size:15px}
 .url:focus,.url:focus-visible{border:0;outline:0;box-shadow:none}
