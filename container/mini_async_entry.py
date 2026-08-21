@@ -15,7 +15,8 @@ JOBS_LOCK = threading.Lock()
 WATCH_STREAMS: dict[str, dict[str, object]] = {}
 WATCH_STREAMS_LOCK = threading.Lock()
 WATCH_STREAM_TTL_SECONDS = 30 * 60
-WATCH_FORMAT = (
+WATCH_QUALITY_VALUES = {144, 240, 360, 480, 720, 1080}
+WATCH_AUTO_FORMAT = (
     "b[protocol=https][ext=mp4][height<=720]/"
     "b[protocol=https][ext=mp4]/"
     "b[protocol=https]"
@@ -99,6 +100,21 @@ def _watch_http_headers(value: object) -> dict[str, str]:
     return headers
 
 
+def _is_progressive_watch_format(item: object) -> bool:
+    if not isinstance(item, dict):
+        return False
+    direct_url = str(item.get("url") or "").strip()
+    protocol = str(item.get("protocol") or "").lower()
+    vcodec = str(item.get("vcodec") or "none").lower()
+    acodec = str(item.get("acodec") or "none").lower()
+    return (
+        direct_url.startswith("https://")
+        and protocol in {"https", "http"}
+        and vcodec != "none"
+        and acodec != "none"
+    )
+
+
 def _selected_progressive_format(metadata: object) -> dict[str, object] | None:
     if not isinstance(metadata, dict):
         return None
@@ -110,24 +126,50 @@ def _selected_progressive_format(metadata: object) -> dict[str, object] | None:
     candidates.append(metadata)
 
     for item in candidates:
-        direct_url = str(item.get("url") or "").strip()
-        protocol = str(item.get("protocol") or "").lower()
-        vcodec = str(item.get("vcodec") or "none").lower()
-        acodec = str(item.get("acodec") or "none").lower()
-        if (
-            direct_url.startswith("https://")
-            and protocol in {"https", "http"}
-            and vcodec != "none"
-            and acodec != "none"
-        ):
+        if _is_progressive_watch_format(item):
             return item
     return None
 
 
-def _resolve_watch_stream(url: str, stream_id: str) -> dict[str, object]:
+def _progressive_watch_qualities(metadata: object) -> list[int]:
+    if not isinstance(metadata, dict):
+        return []
+    candidates: list[dict[str, object]] = []
+    formats = metadata.get("formats")
+    if isinstance(formats, list):
+        candidates.extend(item for item in formats if isinstance(item, dict))
+    requested = metadata.get("requested_downloads")
+    if isinstance(requested, list):
+        candidates.extend(item for item in requested if isinstance(item, dict))
+    candidates.append(metadata)
+
+    qualities: set[int] = set()
+    for item in candidates:
+        if not _is_progressive_watch_format(item):
+            continue
+        try:
+            height = int(item.get("height") or 0)
+        except (TypeError, ValueError):
+            continue
+        if height in WATCH_QUALITY_VALUES:
+            qualities.add(height)
+    return sorted(qualities, reverse=True)
+
+
+def _watch_format_selector(quality: int | None) -> str:
+    if quality is None:
+        return WATCH_AUTO_FORMAT
+    return (
+        f"b[protocol=https][ext=mp4][height={quality}]/"
+        f"b[protocol=https][height={quality}]"
+    )
+
+
+def _resolve_watch_stream(url: str, stream_id: str, quality: int | None) -> dict[str, object]:
     metadata_cache = app.load_metadata_cache(url)
     preferred = live.pipeline._load_session_client(metadata_cache)
     errors: list[str] = []
+    format_selector = _watch_format_selector(quality)
 
     for client in live.pipeline._client_order(preferred):
         try:
@@ -139,7 +181,7 @@ def _resolve_watch_stream(url: str, stream_id: str) -> dict[str, object]:
                     "--dump-single-json",
                     "--no-warnings",
                     "--format",
-                    WATCH_FORMAT,
+                    format_selector,
                     url,
                 ],
                 timeout=app.METADATA_TIMEOUT_SECONDS,
@@ -150,22 +192,36 @@ def _resolve_watch_stream(url: str, stream_id: str) -> dict[str, object]:
                 errors.append(f"{client}: no progressive combined format")
                 continue
 
+            try:
+                selected_quality = int(selected.get("height") or 0) or None
+            except (TypeError, ValueError):
+                selected_quality = None
+            if quality is not None and selected_quality != quality:
+                errors.append(f"{client}: requested {quality}p but selected {selected_quality or 'unknown'}p")
+                continue
+
             direct_url = str(selected.get("url") or "").strip()
             mime = "video/mp4" if str(selected.get("ext") or "").lower() == "mp4" else "video/mp4"
             title = str(metadata.get("title") or "YouTube video").strip()
             headers = _watch_http_headers(selected.get("http_headers") or metadata.get("http_headers"))
+            qualities = _progressive_watch_qualities(metadata)
+            if selected_quality in WATCH_QUALITY_VALUES and selected_quality not in qualities:
+                qualities.append(selected_quality)
+                qualities.sort(reverse=True)
             payload: dict[str, object] = {
                 "streamId": stream_id,
                 "url": direct_url,
                 "mime": mime,
                 "title": title,
+                "quality": selected_quality,
+                "qualities": qualities,
                 "headers": headers,
                 "createdAt": time.time(),
                 "client": client,
             }
             _set_watch_stream(stream_id, payload)
             print(
-                f"mini watch stream ready stream={stream_id[:8]} client={client}",
+                f"mini watch stream ready stream={stream_id[:8]} client={client} quality={selected_quality or 'auto'}",
                 flush=True,
             )
             return payload
@@ -241,6 +297,17 @@ class MiniAsyncHandler(mini_pipeline.MiniAppHandler):
 
         stream_id = str(payload.get("streamId") or "").strip()
         url = str(payload.get("url") or "").strip()
+        raw_quality = payload.get("quality")
+        quality: int | None = None
+        if raw_quality not in {None, ""}:
+            try:
+                quality = int(raw_quality)
+            except (TypeError, ValueError):
+                self._send_json(400, {"ok": False, "message": "❌ کیفیت پخش نامعتبره."})
+                return
+            if quality not in WATCH_QUALITY_VALUES:
+                self._send_json(400, {"ok": False, "message": "❌ کیفیت پخش نامعتبره."})
+                return
         if not mini_pipeline.FILE_ID_RE.fullmatch(stream_id) or not app.youtube_video_id(url):
             self._send_json(400, {"ok": False, "message": "❌ درخواست پخش نامعتبره."})
             return
@@ -254,12 +321,14 @@ class MiniAsyncHandler(mini_pipeline.MiniAppHandler):
                     "streamId": stream_id,
                     "title": existing.get("title"),
                     "mime": existing.get("mime"),
+                    "quality": existing.get("quality"),
+                    "qualities": existing.get("qualities") or [],
                 },
             )
             return
 
         try:
-            stream = _resolve_watch_stream(url, stream_id)
+            stream = _resolve_watch_stream(url, stream_id, quality)
             self._send_json(
                 200,
                 {
@@ -267,6 +336,8 @@ class MiniAsyncHandler(mini_pipeline.MiniAppHandler):
                     "streamId": stream_id,
                     "title": stream.get("title"),
                     "mime": stream.get("mime"),
+                    "quality": stream.get("quality"),
+                    "qualities": stream.get("qualities") or [],
                 },
             )
         except app.UserVisibleError as exc:
