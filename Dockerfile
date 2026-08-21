@@ -1,6 +1,6 @@
 FROM node:22-bookworm-slim
 
-LABEL vexa.youtube.image="youtube-mini-app-async-large-v4"
+LABEL vexa.youtube.image="youtube-mini-app-watch-v5"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
