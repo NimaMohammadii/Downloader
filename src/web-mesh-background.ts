@@ -275,24 +275,17 @@ body:before{display:none!important}
 #meshBackground{--mesh-bleed:40vh;position:fixed;left:0;top:calc(0px - var(--mesh-bleed));z-index:0;width:100vw;height:calc(100vh + var(--mesh-bleed) + var(--mesh-bleed));display:block;pointer-events:none;background:#0d0616}
 @supports (width:100dvw) and (height:100dvh){#meshBackground{--mesh-bleed:40dvh;width:100dvw;height:calc(100dvh + var(--mesh-bleed) + var(--mesh-bleed))}}
 .page{position:relative;z-index:1}
-:root{--glass-line:linear-gradient(118deg,rgba(255,255,255,.46) 0%,rgba(255,255,255,.08) 20%,rgba(255,255,255,.18) 47%,rgba(255,255,255,.055) 74%,rgba(255,255,255,.34) 100%);--glass-line-focus:linear-gradient(118deg,rgba(255,255,255,.64) 0%,rgba(255,255,255,.13) 20%,rgba(255,255,255,.27) 47%,rgba(255,255,255,.09) 74%,rgba(255,255,255,.48) 100%)}
-.modeSwitch,.inputShell,.result,.progress,.ready{position:relative;border:1px solid rgba(255,255,255,.095)!important;background:transparent!important;-webkit-backdrop-filter:blur(2.5px);backdrop-filter:blur(2.5px);box-shadow:inset 0 1px 0 rgba(255,255,255,.065),inset 0 -1px 0 rgba(0,0,0,.12),0 16px 44px rgba(0,0,0,.11)!important}
-.modeSwitch{background:transparent!important}
-.inputShell{transition:transform .2s,box-shadow .2s!important}
-.inputShell:focus-within{border-color:rgba(255,255,255,.15)!important;background:transparent!important;transform:translateY(-1px);box-shadow:inset 0 1px 0 rgba(255,255,255,.09),inset 0 -1px 0 rgba(0,0,0,.15),0 18px 50px rgba(0,0,0,.13)!important}
-.linkIcon{background:rgba(0,0,0,.045)!important;border:1px solid rgba(255,255,255,.08)}
-.url::placeholder{color:rgba(255,255,255,.44)!important}
-.modeButton:not(.active){color:rgba(255,255,255,.54)!important}
+:root{--glass-line:linear-gradient(118deg,rgba(255,255,255,.46) 0%,rgba(255,255,255,.08) 20%,rgba(255,255,255,.18) 47%,rgba(255,255,255,.055) 74%,rgba(255,255,255,.34) 100%)}
+.result,.progress,.ready{position:relative;border:1px solid rgba(255,255,255,.095)!important;background:transparent!important;-webkit-backdrop-filter:blur(2.5px);backdrop-filter:blur(2.5px);box-shadow:inset 0 1px 0 rgba(255,255,255,.065),inset 0 -1px 0 rgba(0,0,0,.12),0 16px 44px rgba(0,0,0,.11)!important}
 .format{background:rgba(0,0,0,.075)!important;border-color:rgba(255,255,255,.115)!important}
 .format.selected{background:var(--metallic-white)!important;color:#080808!important;border-color:rgba(255,255,255,.72)!important}
 .resultHead{border-bottom-color:rgba(255,255,255,.1)!important}
 .playerCard{background:transparent!important}
 .watchMeta{color:#fff;text-shadow:0 1px 12px rgba(0,0,0,.32)}
 @supports ((-webkit-mask-composite:xor) or (mask-composite:exclude)){
-  .modeSwitch::before,.inputShell::before,.result::before,.progress::before,.ready::before{content:"";position:absolute;inset:-1px;border-radius:inherit;padding:1px;background:var(--glass-line);pointer-events:none;z-index:3;-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);mask-composite:exclude}
-  .inputShell:focus-within::before{background:var(--glass-line-focus)}
+  .result::before,.progress::before,.ready::before{content:"";position:absolute;inset:-1px;border-radius:inherit;padding:1px;background:var(--glass-line);pointer-events:none;z-index:3;-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);mask-composite:exclude}
 }
-@supports not ((backdrop-filter:blur(2.5px)) or (-webkit-backdrop-filter:blur(2.5px))){.modeSwitch,.inputShell,.result,.progress,.ready{background:rgba(13,6,22,.24)!important}}
+@supports not ((backdrop-filter:blur(2.5px)) or (-webkit-backdrop-filter:blur(2.5px))){.result,.progress,.ready{background:rgba(13,6,22,.24)!important}}
 `;
 
 function toScriptLiteral(value: string): string {
