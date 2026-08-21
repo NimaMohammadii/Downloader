@@ -1,9 +1,9 @@
 const WEB_VIEWPORT_STYLE = `
 :root{
-  --mesh-overscroll-base:#03120e;
-  --mesh-overscroll-deep:#0e7c5a;
-  --mesh-overscroll-mid:#7ce577;
-  --mesh-overscroll-high:#f4ffc7;
+  --mesh-overscroll-base:#0d0616;
+  --mesh-overscroll-deep:#5b21b6;
+  --mesh-overscroll-mid:#b66cff;
+  --mesh-overscroll-high:#f2e7ff;
 }
 html{
   width:100%;
@@ -14,10 +14,10 @@ html{
   overscroll-behavior-y:auto!important;
   background-color:var(--mesh-overscroll-base)!important;
   background-image:
-    radial-gradient(82% 58% at 16% 2%,rgba(124,229,119,.72) 0%,rgba(14,124,90,.34) 42%,rgba(3,18,14,0) 72%),
-    radial-gradient(82% 58% at 84% 98%,rgba(124,229,119,.68) 0%,rgba(14,124,90,.32) 42%,rgba(3,18,14,0) 72%),
-    radial-gradient(56% 42% at 54% 48%,rgba(244,255,199,.18) 0%,rgba(14,124,90,.13) 46%,rgba(3,18,14,0) 76%),
-    linear-gradient(180deg,#0e7c5a 0%,#063326 22%,#03120e 50%,#063326 78%,#0e7c5a 100%)!important;
+    radial-gradient(82% 58% at 16% 2%,rgba(182,108,255,.72) 0%,rgba(91,33,182,.34) 42%,rgba(13,6,22,0) 72%),
+    radial-gradient(82% 58% at 84% 98%,rgba(182,108,255,.68) 0%,rgba(91,33,182,.32) 42%,rgba(13,6,22,0) 72%),
+    radial-gradient(56% 42% at 54% 48%,rgba(242,231,255,.18) 0%,rgba(91,33,182,.13) 46%,rgba(13,6,22,0) 76%),
+    linear-gradient(180deg,#5b21b6 0%,#250e48 22%,#0d0616 50%,#250e48 78%,#5b21b6 100%)!important;
   background-size:100% 100vh!important;
   background-repeat:repeat-y!important;
   background-position:center top!important;
@@ -42,10 +42,10 @@ body::before{
   z-index:-1!important;
   pointer-events:none!important;
   background:
-    radial-gradient(68% 44% at 18% 8%,rgba(124,229,119,.68) 0%,rgba(14,124,90,.30) 48%,rgba(3,18,14,0) 76%),
-    radial-gradient(70% 46% at 82% 92%,rgba(124,229,119,.64) 0%,rgba(14,124,90,.28) 48%,rgba(3,18,14,0) 76%),
-    radial-gradient(52% 36% at 50% 50%,rgba(244,255,199,.14) 0%,rgba(14,124,90,.11) 48%,rgba(3,18,14,0) 78%),
-    linear-gradient(180deg,#0e7c5a 0%,#063326 24%,#03120e 50%,#063326 76%,#0e7c5a 100%)!important;
+    radial-gradient(68% 44% at 18% 8%,rgba(182,108,255,.68) 0%,rgba(91,33,182,.30) 48%,rgba(13,6,22,0) 76%),
+    radial-gradient(70% 46% at 82% 92%,rgba(182,108,255,.64) 0%,rgba(91,33,182,.28) 48%,rgba(13,6,22,0) 76%),
+    radial-gradient(52% 36% at 50% 50%,rgba(242,231,255,.14) 0%,rgba(91,33,182,.11) 48%,rgba(13,6,22,0) 78%),
+    linear-gradient(180deg,#5b21b6 0%,#250e48 24%,#0d0616 50%,#250e48 76%,#5b21b6 100%)!important;
   transform:translateZ(0);
 }
 .page{
