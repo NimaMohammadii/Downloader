@@ -4,6 +4,7 @@ import youtubeWorker, {
   YoutubeDownloaderContainer as BaseYoutubeDownloaderContainer,
 } from "./youtube-main";
 import { handleMiniAppRequestV2 } from "./mini-app-v2";
+import { handleWebAppRequest } from "./web-app";
 
 export { AdminStatsStore, YoutubeDownloadWorkflow };
 
@@ -36,6 +37,9 @@ type Env = {
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const webAppResponse = await handleWebAppRequest(request, env);
+    if (webAppResponse) return webAppResponse;
+
     const miniAppResponse = await handleMiniAppRequestV2(request, env);
     if (miniAppResponse) return miniAppResponse;
     return youtubeWorker.fetch(request, env as any, ctx);
