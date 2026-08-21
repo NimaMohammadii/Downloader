@@ -9,13 +9,18 @@ const WEB_SCROLL_SCRIPT = `(function(){
 var originX=Number(window.scrollX)||0;
 var originY=Number(window.scrollY)||0;
 var settleTimer=0;
+var restoreAttempt=0;
 function isAtOrigin(){
   return Math.abs((Number(window.scrollX)||0)-originX)<0.5&&Math.abs((Number(window.scrollY)||0)-originY)<0.5;
 }
 function restoreOrigin(){
   clearTimeout(settleTimer);
-  if(isAtOrigin())return;
-  window.scrollTo({left:originX,top:originY,behavior:'smooth'});
+  if(isAtOrigin()){
+    restoreAttempt=0;
+    return;
+  }
+  window.scrollTo({left:originX,top:originY,behavior:restoreAttempt?'auto':'smooth'});
+  restoreAttempt++;
   settleTimer=setTimeout(restoreOrigin,480);
 }
 window.addEventListener('scroll',function(){
