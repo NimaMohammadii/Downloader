@@ -5,7 +5,7 @@ import youtubeWorker, {
 } from "./youtube-main";
 import { handleMiniAppRequestV2 } from "./mini-app-v2";
 import { handleWebAppRequest } from "./web-app";
-import { applyWebBackground } from "./web-background";
+import { applyWebBackground } from "./web-mesh-background";
 import { WEB_APP_HTML } from "./web-ui";
 
 export { AdminStatsStore, YoutubeDownloadWorkflow };
