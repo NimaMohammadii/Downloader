@@ -342,11 +342,13 @@ function resize(){
   var dpr=Math.min(window.devicePixelRatio||1,2);
   var width=Math.max(1,Math.round(rect.width*dpr));
   var height=Math.max(1,Math.round(rect.height*dpr));
-  var bleed=Math.max(0,parseFloat(getComputedStyle(canvas).getPropertyValue('--mesh-bleed'))||0);
-  var nominalWidth=Math.max(1,rect.width);
-  var nominalHeight=Math.max(1,rect.height-bleed*2);
-  meshScale=1.16*(Math.min(rect.width,rect.height)/Math.max(1,Math.min(nominalWidth,nominalHeight)));
-  if(canvas.width!==width||canvas.height!==height){canvas.width=width;canvas.height=height;gl.viewport(0,0,width,height)}
+  if(canvas.width!==width||canvas.height!==height){
+    var bleed=Math.max(0,-(parseFloat(getComputedStyle(canvas).top)||0));
+    var nominalWidth=Math.max(1,rect.width);
+    var nominalHeight=Math.max(1,rect.height-bleed*2);
+    meshScale=1.16*(Math.min(rect.width,rect.height)/Math.max(1,Math.min(nominalWidth,nominalHeight)));
+    canvas.width=width;canvas.height=height;gl.viewport(0,0,width,height)
+  }
 }
 function draw(now){
   raf=0;if(document.hidden||!program)return;
