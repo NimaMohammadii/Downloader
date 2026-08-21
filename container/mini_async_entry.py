@@ -323,6 +323,7 @@ class MiniAsyncHandler(mini_pipeline.MiniAppHandler):
             headers["Range"] = requested_range
 
         response = None
+        response_started = False
         try:
             if head_only:
                 response = app.requests.head(
@@ -377,6 +378,7 @@ class MiniAsyncHandler(mini_pipeline.MiniAppHandler):
             self.send_header("cross-origin-resource-policy", "cross-origin")
             self.send_header("x-content-type-options", "nosniff")
             self.end_headers()
+            response_started = True
 
             if head_only:
                 return
@@ -392,7 +394,7 @@ class MiniAsyncHandler(mini_pipeline.MiniAppHandler):
                 f"mini watch proxy failed stream={stream_id[:8]}: {type(exc).__name__}: {exc}",
                 flush=True,
             )
-            if not self.wfile.closed:
+            if not response_started:
                 try:
                     self._send_json(502, {"ok": False, "message": "stream failed"})
                 except Exception:
