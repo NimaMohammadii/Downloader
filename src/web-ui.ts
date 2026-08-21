@@ -19,17 +19,17 @@ button:focus-visible{outline:2px solid #fff;outline-offset:3px}
 .layout{display:grid;grid-template-columns:minmax(0,1fr);gap:22px}
 .intro{width:min(100%,720px);margin:0 auto}
 h1{margin:0 0 24px;font-size:clamp(40px,8vw,68px);line-height:.93;letter-spacing:-.055em;font-weight:680}
-.modeSwitch{position:relative;display:grid;grid-template-columns:1fr 1fr;width:min(100%,390px);height:56px;padding:5px;margin:0 0 18px;border:1px solid #242424;border-radius:19px;background:#090909;isolation:isolate}
+.modeSwitch{position:relative;display:grid;grid-template-columns:1fr 1fr;width:min(100%,390px);height:56px;padding:5px;margin:0 0 18px;border:1px solid rgba(255,255,255,.16);border-radius:19px;background:transparent;box-shadow:none;isolation:isolate}
 .modeThumb{position:absolute;z-index:0;left:5px;top:5px;width:calc(50% - 5px);height:46px;border-radius:14px;background:var(--metallic-white);box-shadow:var(--metallic-shadow);transition:transform .3s cubic-bezier(.22,.85,.28,1)}
 .modeSwitch.watch .modeThumb{transform:translateX(100%)}
-.modeButton{position:relative;z-index:1;display:flex;align-items:center;justify-content:center;gap:8px;background:transparent;color:#666;font-size:13px;font-weight:720;transition:color .2s,transform .16s}
+.modeButton{position:relative;z-index:1;display:flex;align-items:center;justify-content:center;gap:8px;background:transparent;color:rgba(255,255,255,.54);font-size:13px;font-weight:720;transition:color .2s,transform .16s}
 .modeButton.active{color:#080808}.modeButton:active{transform:scale(.98)}.modeButton svg{width:19px;height:19px;stroke-width:2.1}
-.inputShell{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;padding:8px;border:1px solid transparent;background:linear-gradient(180deg,rgba(13,13,13,.98),rgba(7,7,7,.98)) padding-box,var(--card-line) border-box;border-radius:21px;box-shadow:inset 0 1px 0 rgba(255,255,255,.032),inset 0 -1px 0 rgba(0,0,0,.72),0 12px 36px rgba(0,0,0,.18);transition:background .2s,transform .2s,box-shadow .2s}
-.inputShell:focus-within{background:linear-gradient(180deg,rgba(14,14,14,.99),rgba(7,7,7,.99)) padding-box,var(--card-line-focus) border-box;transform:translateY(-1px);box-shadow:inset 0 1px 0 rgba(255,255,255,.05),inset 0 -1px 0 rgba(0,0,0,.78),0 14px 42px rgba(0,0,0,.22)}
-.linkIcon{width:42px;height:42px;border-radius:14px;background:#111;display:grid;place-items:center;color:#aaa;font-size:18px}
+.inputShell{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;padding:8px;border:1px solid rgba(255,255,255,.16);background:transparent;border-radius:21px;box-shadow:none;transition:border-color .18s ease}
+.inputShell:focus-within{border-color:rgba(255,255,255,.28);background:transparent;box-shadow:none}
+.linkIcon{width:42px;height:42px;border-radius:14px;background:transparent;display:grid;place-items:center;color:#aaa;font-size:18px}
 .url{min-width:0;width:100%;border:0;outline:0;background:transparent;color:#fff;padding:11px 0;font-size:15px}
 .url:focus,.url:focus-visible{border:0;outline:0;box-shadow:none}
-.url::placeholder{color:#555}
+.url::placeholder{color:rgba(255,255,255,.44)}
 .go{height:46px;padding:0 18px;border-radius:15px;background:var(--metallic-white);box-shadow:var(--metallic-shadow);color:#050505;font-weight:720;transition:transform .16s,opacity .16s,filter .16s}
 .go:hover{filter:brightness(1.025)}.go:active{transform:scale(.975)}.go:disabled{opacity:.38;cursor:default;filter:none}
 .message{min-height:22px;margin:10px 4px 0;color:#777;font-size:13px;line-height:1.4}.message:empty{min-height:0;margin-top:0}.message.error{color:#e7e7e7}
