@@ -19,13 +19,13 @@ button:focus-visible{outline:2px solid #fff;outline-offset:3px}
 .layout{display:grid;grid-template-columns:minmax(0,1fr);gap:22px}
 .intro{width:min(100%,720px);margin:0 auto}
 h1{margin:0 0 24px;font-size:clamp(40px,8vw,68px);line-height:.93;letter-spacing:-.055em;font-weight:680}
-.modeSwitch{position:relative;display:grid;grid-template-columns:1fr 1fr;width:min(100%,390px);height:56px;padding:5px;margin:0 0 18px;border:1px solid rgba(255,255,255,.18);border-radius:19px;background:transparent;-webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px);box-shadow:inset 0 1px 0 rgba(255,255,255,.08),inset 0 -1px 0 rgba(255,255,255,.025);isolation:isolate}
+.modeSwitch{position:relative;display:grid;grid-template-columns:1fr 1fr;width:min(100%,390px);height:56px;padding:5px;margin:0 0 18px;border:1px solid rgba(255,255,255,.24);border-radius:19px;background:transparent;-webkit-backdrop-filter:blur(3px) saturate(125%) contrast(1.04);backdrop-filter:blur(3px) saturate(125%) contrast(1.04);box-shadow:inset 0 1px 0 rgba(255,255,255,.22),inset 1px 0 0 rgba(255,255,255,.08),inset 0 -1px 0 rgba(255,255,255,.045);isolation:isolate}
 .modeThumb{position:absolute;z-index:0;left:5px;top:5px;width:calc(50% - 5px);height:46px;border-radius:14px;background:var(--metallic-white);box-shadow:var(--metallic-shadow);transition:transform .3s cubic-bezier(.22,.85,.28,1)}
 .modeSwitch.watch .modeThumb{transform:translateX(100%)}
 .modeButton{position:relative;z-index:1;display:flex;align-items:center;justify-content:center;gap:8px;background:transparent;color:rgba(255,255,255,.54);font-size:13px;font-weight:720;transition:color .2s,transform .16s}
 .modeButton.active{color:#080808}.modeButton:active{transform:scale(.98)}.modeButton svg{width:19px;height:19px;stroke-width:2.1}
-.inputShell{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;padding:8px;border:1px solid rgba(255,255,255,.18);background:transparent;border-radius:21px;-webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px);box-shadow:inset 0 1px 0 rgba(255,255,255,.08),inset 0 -1px 0 rgba(255,255,255,.025);transition:border-color .18s ease,box-shadow .18s ease}
-.inputShell:focus-within{border-color:rgba(255,255,255,.32);background:transparent;box-shadow:inset 0 1px 0 rgba(255,255,255,.12),inset 0 -1px 0 rgba(255,255,255,.04)}
+.inputShell{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;padding:8px;border:1px solid rgba(255,255,255,.24);background:transparent;border-radius:21px;-webkit-backdrop-filter:blur(3px) saturate(125%) contrast(1.04);backdrop-filter:blur(3px) saturate(125%) contrast(1.04);box-shadow:inset 0 1px 0 rgba(255,255,255,.22),inset 1px 0 0 rgba(255,255,255,.08),inset 0 -1px 0 rgba(255,255,255,.045);transition:border-color .18s ease,box-shadow .18s ease}
+.inputShell:focus-within{border-color:rgba(255,255,255,.36);background:transparent;box-shadow:inset 0 1px 0 rgba(255,255,255,.28),inset 1px 0 0 rgba(255,255,255,.1),inset 0 -1px 0 rgba(255,255,255,.06)}
 .linkIcon{width:42px;height:42px;border-radius:14px;background:transparent;display:grid;place-items:center;color:#aaa;font-size:18px}
 .url{min-width:0;width:100%;border:0;outline:0;background:transparent;color:#fff;padding:11px 0;font-size:15px}
 .url:focus,.url:focus-visible{border:0;outline:0;box-shadow:none}
