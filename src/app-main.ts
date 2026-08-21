@@ -7,11 +7,6 @@ import { handleMiniAppRequestV2 } from "./mini-app-v2";
 import { handleWebAppRequest } from "./web-app";
 import { WEB_APP_HTML } from "./web-ui";
 
-const WEB_APP_HTML_WITHOUT_INPUT_BORDER = WEB_APP_HTML.replace(
-  "</style>",
-  ".inputShell{border:0!important}.inputShell:focus-within{border-color:transparent!important}</style>",
-);
-
 export { AdminStatsStore, YoutubeDownloadWorkflow };
 
 export class YoutubeDownloaderContainer extends BaseYoutubeDownloaderContainer {
@@ -52,7 +47,7 @@ export default {
         (webAppResponse.headers.get("content-type") || "").includes("text/html");
 
       if (isWebPage) {
-        return new Response(request.method === "HEAD" ? null : WEB_APP_HTML_WITHOUT_INPUT_BORDER, {
+        return new Response(request.method === "HEAD" ? null : WEB_APP_HTML, {
           status: webAppResponse.status,
           statusText: webAppResponse.statusText,
           headers: webAppResponse.headers,
