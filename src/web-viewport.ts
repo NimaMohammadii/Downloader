@@ -50,6 +50,12 @@ var root=document.documentElement;
 var vv=window.visualViewport||null;
 var activeEditable=null;
 var settleTimers=[];
+var originX=Number(window.scrollX)||0;
+var originY=Number(window.scrollY)||0;
+var originReady=false;
+var returningToOrigin=false;
+var returnTimer=0;
+var scrollIdleTimer=0;
 function isEditable(node){
   if(!node||node.nodeType!==1)return false;
   if(node.isContentEditable)return true;
@@ -89,16 +95,40 @@ function settleKeyboardViewport(){
   settleTimers.push(setTimeout(syncKeyboardViewport,80));
   settleTimers.push(setTimeout(syncKeyboardViewport,320));
 }
-function normalizePositiveRootOffset(){
-  if((Number(window.scrollY)||0)<=0)return;
-  requestAnimationFrame(function(){
-    if((Number(window.scrollY)||0)>0)window.scrollTo(0,0);
-  });
+function captureOrigin(){
+  if(originReady)return;
+  originX=Number(window.scrollX)||0;
+  originY=Number(window.scrollY)||0;
+  originReady=true;
+}
+function isAtOrigin(){
+  return Math.abs((Number(window.scrollX)||0)-originX)<0.5&&Math.abs((Number(window.scrollY)||0)-originY)<0.5;
+}
+function restoreOrigin(){
+  if(!originReady)captureOrigin();
+  if(isAtOrigin()){
+    returningToOrigin=false;
+    return;
+  }
+  returningToOrigin=true;
+  clearTimeout(returnTimer);
+  try{
+    window.scrollTo({left:originX,top:originY,behavior:'smooth'});
+  }catch(error){
+    window.scrollTo(originX,originY);
+  }
+  returnTimer=setTimeout(function(){
+    if(!isAtOrigin())window.scrollTo(originX,originY);
+    returningToOrigin=false;
+    if(activeEditable)settleKeyboardViewport();
+  },360);
 }
 function settleAfterGesture(){
-  normalizePositiveRootOffset();
+  restoreOrigin();
   if(activeEditable)settleKeyboardViewport();
 }
+if(document.readyState==='complete')requestAnimationFrame(captureOrigin);
+else window.addEventListener('pageshow',function(){requestAnimationFrame(captureOrigin)},{once:true,passive:true});
 document.addEventListener('focusin',function(event){
   if(!isEditable(event.target))return;
   activeEditable=event.target;
@@ -116,12 +146,22 @@ document.addEventListener('focusout',function(event){
     activeEditable=null;
     clearTimers();
     clearViewportVars();
-    normalizePositiveRootOffset();
+    restoreOrigin();
   },0);
 },true);
-document.addEventListener('touchend',settleAfterGesture,{capture:true,passive:true});
-document.addEventListener('touchcancel',settleAfterGesture,{capture:true,passive:true});
-if('onscrollend' in window)window.addEventListener('scrollend',settleAfterGesture,{passive:true});
+document.addEventListener('touchend',function(){setTimeout(settleAfterGesture,32)},{capture:true,passive:true});
+document.addEventListener('touchcancel',function(){setTimeout(settleAfterGesture,32)},{capture:true,passive:true});
+if('onscrollend' in document){
+  document.addEventListener('scrollend',function(){
+    if(!returningToOrigin)settleAfterGesture();
+  },{passive:true});
+}else{
+  window.addEventListener('scroll',function(){
+    if(returningToOrigin)return;
+    clearTimeout(scrollIdleTimer);
+    scrollIdleTimer=setTimeout(settleAfterGesture,96);
+  },{passive:true});
+}
 if(vv){
   vv.addEventListener('resize',syncKeyboardViewport,{passive:true});
   vv.addEventListener('scroll',syncKeyboardViewport,{passive:true});
