@@ -295,18 +295,24 @@ body{background:transparent!important;position:relative;isolation:isolate}
 body:before{display:none!important}
 #meshBackground{position:fixed;inset:0;z-index:0;width:100vw;height:100vh;display:block;pointer-events:none;background:#03120e}
 .page{position:relative;z-index:1}
-:root{--glass-line:linear-gradient(118deg,rgba(255,255,255,.42) 0%,rgba(255,255,255,.08) 20%,rgba(255,255,255,.16) 48%,rgba(255,255,255,.055) 75%,rgba(255,255,255,.31) 100%);--glass-line-focus:linear-gradient(118deg,rgba(255,255,255,.58) 0%,rgba(255,255,255,.12) 20%,rgba(255,255,255,.24) 48%,rgba(255,255,255,.08) 75%,rgba(255,255,255,.42) 100%)}
-.modeSwitch,.inputShell,.result,.progress,.ready{border:1px solid transparent!important;background:linear-gradient(rgba(255,255,255,.014),rgba(255,255,255,.014)) padding-box,var(--glass-line) border-box!important;-webkit-backdrop-filter:blur(2.5px);backdrop-filter:blur(2.5px);box-shadow:inset 0 1px 0 rgba(255,255,255,.075),inset 0 -1px 0 rgba(0,0,0,.13),0 16px 44px rgba(0,0,0,.12)!important}
-.modeSwitch{background:linear-gradient(rgba(255,255,255,.012),rgba(255,255,255,.012)) padding-box,var(--glass-line) border-box!important}
-.inputShell{transition:background .2s,transform .2s,box-shadow .2s!important}
-.inputShell:focus-within{background:linear-gradient(rgba(255,255,255,.018),rgba(255,255,255,.018)) padding-box,var(--glass-line-focus) border-box!important;transform:translateY(-1px);box-shadow:inset 0 1px 0 rgba(255,255,255,.1),inset 0 -1px 0 rgba(0,0,0,.16),0 18px 50px rgba(0,0,0,.14)!important}
-.linkIcon{background:rgba(0,0,0,.055)!important;border:1px solid rgba(255,255,255,.075)}
-.format{background:rgba(3,18,14,.12)!important;border-color:rgba(255,255,255,.11)!important}
+:root{--glass-line:linear-gradient(118deg,rgba(255,255,255,.46) 0%,rgba(255,255,255,.08) 20%,rgba(255,255,255,.18) 47%,rgba(255,255,255,.055) 74%,rgba(255,255,255,.34) 100%);--glass-line-focus:linear-gradient(118deg,rgba(255,255,255,.64) 0%,rgba(255,255,255,.13) 20%,rgba(255,255,255,.27) 47%,rgba(255,255,255,.09) 74%,rgba(255,255,255,.48) 100%)}
+.modeSwitch,.inputShell,.result,.progress,.ready{position:relative;border:1px solid rgba(255,255,255,.095)!important;background:transparent!important;-webkit-backdrop-filter:blur(2.5px);backdrop-filter:blur(2.5px);box-shadow:inset 0 1px 0 rgba(255,255,255,.065),inset 0 -1px 0 rgba(0,0,0,.12),0 16px 44px rgba(0,0,0,.11)!important}
+.modeSwitch{background:transparent!important}
+.inputShell{transition:transform .2s,box-shadow .2s!important}
+.inputShell:focus-within{border-color:rgba(255,255,255,.15)!important;background:transparent!important;transform:translateY(-1px);box-shadow:inset 0 1px 0 rgba(255,255,255,.09),inset 0 -1px 0 rgba(0,0,0,.15),0 18px 50px rgba(0,0,0,.13)!important}
+.linkIcon{background:rgba(0,0,0,.045)!important;border:1px solid rgba(255,255,255,.08)}
+.url::placeholder{color:rgba(255,255,255,.44)!important}
+.modeButton:not(.active){color:rgba(255,255,255,.54)!important}
+.format{background:rgba(0,0,0,.075)!important;border-color:rgba(255,255,255,.115)!important}
 .format.selected{background:var(--metallic-white)!important;color:#080808!important;border-color:rgba(255,255,255,.72)!important}
 .resultHead{border-bottom-color:rgba(255,255,255,.1)!important}
 .playerCard{background:transparent!important}
 .watchMeta{color:#fff;text-shadow:0 1px 12px rgba(0,0,0,.32)}
-@supports not ((backdrop-filter:blur(2.5px)) or (-webkit-backdrop-filter:blur(2.5px))){.modeSwitch,.inputShell,.result,.progress,.ready{background:rgba(3,18,14,.28)!important}}
+@supports ((-webkit-mask-composite:xor) or (mask-composite:exclude)){
+  .modeSwitch::before,.inputShell::before,.result::before,.progress::before,.ready::before{content:"";position:absolute;inset:-1px;border-radius:inherit;padding:1px;background:var(--glass-line);pointer-events:none;z-index:3;-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);mask-composite:exclude}
+  .inputShell:focus-within::before{background:var(--glass-line-focus)}
+}
+@supports not ((backdrop-filter:blur(2.5px)) or (-webkit-backdrop-filter:blur(2.5px))){.modeSwitch,.inputShell,.result,.progress,.ready{background:rgba(3,18,14,.24)!important}}
 `;
 
 function toScriptLiteral(value: string): string {
