@@ -20,6 +20,9 @@ body{
 body::before{
   display:none!important;
 }
+#meshBackground{
+  filter:brightness(.76) saturate(.92);
+}
 .page{
   position:fixed!important;
   inset:0!important;
