@@ -272,8 +272,8 @@ const WEB_BACKGROUND_STYLE = `
 html{background:#0d0616!important}
 body{background:transparent!important;position:relative;isolation:isolate}
 body:before{display:none!important}
-#meshBackground{position:fixed;inset:0;z-index:0;width:100vw;height:100vh;display:block;pointer-events:none;background:#0d0616}
-@supports (width:100dvw) and (height:100dvh){#meshBackground{width:100dvw;height:100dvh}}
+#meshBackground{--mesh-bleed:clamp(128px,16vh,192px);position:fixed;left:0;top:calc(0px - var(--mesh-bleed));z-index:0;width:100vw;height:calc(100vh + var(--mesh-bleed) + var(--mesh-bleed));display:block;pointer-events:none;background:#0d0616}
+@supports (width:100dvw) and (height:100dvh){#meshBackground{--mesh-bleed:clamp(128px,16dvh,192px);width:100dvw;height:calc(100dvh + var(--mesh-bleed) + var(--mesh-bleed))}}
 .page{position:relative;z-index:1}
 :root{--glass-line:linear-gradient(118deg,rgba(255,255,255,.46) 0%,rgba(255,255,255,.08) 20%,rgba(255,255,255,.18) 47%,rgba(255,255,255,.055) 74%,rgba(255,255,255,.34) 100%);--glass-line-focus:linear-gradient(118deg,rgba(255,255,255,.64) 0%,rgba(255,255,255,.13) 20%,rgba(255,255,255,.27) 47%,rgba(255,255,255,.09) 74%,rgba(255,255,255,.48) 100%)}
 .modeSwitch,.inputShell,.result,.progress,.ready{position:relative;border:1px solid rgba(255,255,255,.095)!important;background:transparent!important;-webkit-backdrop-filter:blur(2.5px);backdrop-filter:blur(2.5px);box-shadow:inset 0 1px 0 rgba(255,255,255,.065),inset 0 -1px 0 rgba(0,0,0,.12),0 16px 44px rgba(0,0,0,.11)!important}
@@ -306,7 +306,7 @@ var gl=canvas.getContext('webgl',{alpha:false,antialias:false,depth:false,stenci
 if(!gl){canvas.style.display='none';return;}
 var vertexSource=${toScriptLiteral(VERTEX_SHADER)};
 var fragmentSource=${toScriptLiteral(FRAGMENT_SHADER)};
-var program=null,buffer=null,locations=null,raf=0,lastFrame=0,activeSeconds=0;
+var program=null,buffer=null,locations=null,raf=0,lastFrame=0,activeSeconds=0,meshScale=1.16;
 var colors=new Float32Array([
   0.051,0.024,0.086,
   0.357,0.129,0.714,
@@ -330,7 +330,7 @@ function setup(){
   var position=gl.getAttribLocation(program,'a_position');gl.enableVertexAttribArray(position);gl.vertexAttribPointer(position,2,gl.FLOAT,false,0,0);
   locations={colors:gl.getUniformLocation(program,'u_colors[0]'),scene:gl.getUniformLocation(program,'u_scene'),shape:gl.getUniformLocation(program,'u_shape'),surface:gl.getUniformLocation(program,'u_surface'),finish:gl.getUniformLocation(program,'u_finish'),transform:gl.getUniformLocation(program,'u_transform'),space:gl.getUniformLocation(program,'u_space'),cursor:gl.getUniformLocation(program,'u_cursor')};
   gl.uniform3fv(locations.colors,colors);
-  gl.uniform4f(locations.shape,1.16,0.34,0.50,0.00);
+  gl.uniform4f(locations.shape,meshScale,0.34,0.50,0.00);
   gl.uniform4f(locations.surface,2.40,1.16,0.00,1.00);
   gl.uniform4f(locations.finish,0.00,0.00,0.000,0.09);
   gl.uniform4f(locations.transform,1453.0,0.00,0.00,0.0);
@@ -342,12 +342,17 @@ function resize(){
   var dpr=Math.min(window.devicePixelRatio||1,2);
   var width=Math.max(1,Math.round(rect.width*dpr));
   var height=Math.max(1,Math.round(rect.height*dpr));
+  var bleed=Math.max(0,parseFloat(getComputedStyle(canvas).getPropertyValue('--mesh-bleed'))||0);
+  var nominalWidth=Math.max(1,rect.width);
+  var nominalHeight=Math.max(1,rect.height-bleed*2);
+  meshScale=1.16*(Math.min(rect.width,rect.height)/Math.max(1,Math.min(nominalWidth,nominalHeight)));
   if(canvas.width!==width||canvas.height!==height){canvas.width=width;canvas.height=height;gl.viewport(0,0,width,height)}
 }
 function draw(now){
   raf=0;if(document.hidden||!program)return;
   if(lastFrame)activeSeconds+=(now-lastFrame)/1000;lastFrame=now;
   resize();gl.useProgram(program);
+  gl.uniform4f(locations.shape,meshScale,0.34,0.50,0.00);
   gl.uniform4f(locations.scene,canvas.width,canvas.height,activeSeconds*0.73,4.0);
   gl.drawArrays(gl.TRIANGLES,0,3);
   raf=requestAnimationFrame(draw);
