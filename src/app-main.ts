@@ -56,7 +56,20 @@ export default {
     }
 
     const miniAppResponse = await handleMiniAppRequestV2(request, env);
-    if (miniAppResponse) return miniAppResponse;
+    if (miniAppResponse) {
+      const url = new URL(request.url);
+      const isMiniAppPage =
+        (url.pathname === "/mini-app" || url.pathname === "/mini-app/") &&
+        (request.method === "GET" || request.method === "HEAD") &&
+        (miniAppResponse.headers.get("content-type") || "").includes("text/html");
+
+      if (isMiniAppPage) {
+        return request.method === "HEAD"
+          ? miniAppResponse
+          : applyWebViewport(applyWebBackground(miniAppResponse));
+      }
+      return miniAppResponse;
+    }
     return youtubeWorker.fetch(request, env as any, ctx);
   },
 } satisfies ExportedHandler<Env>;
