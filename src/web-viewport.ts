@@ -22,6 +22,9 @@ html{
   background-repeat:repeat-y!important;
   background-position:center top!important;
 }
+@supports (height:100dvh){
+  html{background-size:100% 100dvh!important}
+}
 body{
   width:100%;
   height:100%;
