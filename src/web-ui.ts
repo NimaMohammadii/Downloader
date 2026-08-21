@@ -3,7 +3,6 @@ export const WEB_APP_HTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#050505">
 <meta name="description" content="Watch or download YouTube videos.">
 <meta name="robots" content="index,follow">
 <title>Video Downloader</title>
