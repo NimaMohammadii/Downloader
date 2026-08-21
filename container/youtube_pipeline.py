@@ -107,6 +107,10 @@ def _fetch_metadata_for_client(url: str, client: str) -> dict[str, Any]:
             [
                 app.REAL_YTDLP,
                 *_client_args(client),
+                "--extractor-args",
+                "youtube:player_skip=webpage,configs",
+                "--extractor-retries",
+                "0",
                 "--skip-download",
                 "--dump-single-json",
                 "--no-warnings",
