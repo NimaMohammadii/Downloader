@@ -272,7 +272,7 @@ const WEB_BACKGROUND_STYLE = `
 html{background:#0d0616!important}
 body{background:transparent!important;position:relative;isolation:isolate}
 body:before{display:none!important}
-#meshBackground{--mesh-bleed:40vh;position:fixed;left:0;top:calc(0px - var(--mesh-bleed));z-index:0;width:100vw;height:calc(100vh + var(--mesh-bleed) + var(--mesh-bleed));display:block;pointer-events:none;background:#0d0616}
+#meshBackground{--mesh-bleed:40vh;position:fixed;left:0;top:calc(0px - var(--mesh-bleed));z-index:0;width:100vw;height:calc(100vh + var(--mesh-bleed) + var(--mesh-bleed));display:block;pointer-events:none;background:#0d0616;filter:brightness(.76) saturate(.92)}
 @supports (width:100dvw) and (height:100dvh){#meshBackground{--mesh-bleed:40dvh;width:100dvw;height:calc(100dvh + var(--mesh-bleed) + var(--mesh-bleed))}}
 .page{position:relative;z-index:1}
 :root{--glass-line:linear-gradient(118deg,rgba(255,255,255,.46) 0%,rgba(255,255,255,.08) 20%,rgba(255,255,255,.18) 47%,rgba(255,255,255,.055) 74%,rgba(255,255,255,.34) 100%)}
