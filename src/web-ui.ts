@@ -15,7 +15,7 @@ body{overflow-x:hidden}
 body:before{content:"";position:fixed;inset:-25%;pointer-events:none;background:radial-gradient(circle at 50% 8%,rgba(255,255,255,.055),transparent 28%)}
 button,input{font:inherit}
 button{border:0;cursor:pointer}
-button:focus-visible,input:focus-visible{outline:2px solid #fff;outline-offset:3px}
+button:focus-visible{outline:2px solid #fff;outline-offset:3px}
 .page{width:min(100%,1180px);margin:0 auto;padding:clamp(24px,4vw,52px) clamp(14px,4vw,44px) max(30px,env(safe-area-inset-bottom))}
 .layout{display:grid;grid-template-columns:minmax(0,1fr);gap:22px}
 .intro{width:min(100%,720px);margin:0 auto}
@@ -25,10 +25,11 @@ h1{margin:0 0 24px;font-size:clamp(40px,8vw,68px);line-height:.93;letter-spacing
 .modeSwitch.watch .modeThumb{transform:translateX(100%)}
 .modeButton{position:relative;z-index:1;display:flex;align-items:center;justify-content:center;gap:8px;background:transparent;color:#666;font-size:13px;font-weight:720;transition:color .2s,transform .16s}
 .modeButton.active{color:#080808}.modeButton:active{transform:scale(.98)}.modeButton svg{width:19px;height:19px;stroke-width:2.1}
-.inputShell{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;padding:8px;border:1px solid var(--line);background:#0a0a0a;border-radius:21px;transition:border-color .2s,transform .2s}
-.inputShell:focus-within{border-color:#3a3a3a;transform:translateY(-1px)}
+.inputShell{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;padding:8px;background:#0a0a0a;border-radius:21px;transition:transform .2s}
+.inputShell:focus-within{transform:translateY(-1px)}
 .linkIcon{width:42px;height:42px;border-radius:14px;background:#111;display:grid;place-items:center;color:#aaa;font-size:18px}
 .url{min-width:0;width:100%;border:0;outline:0;background:transparent;color:#fff;padding:11px 0;font-size:15px}
+.url:focus,.url:focus-visible{border:0;outline:0;box-shadow:none}
 .url::placeholder{color:#555}
 .go{height:46px;padding:0 18px;border-radius:15px;background:#fff;color:#050505;font-weight:720;transition:transform .16s,opacity .16s}
 .go:active{transform:scale(.975)}.go:disabled{opacity:.38;cursor:default}
