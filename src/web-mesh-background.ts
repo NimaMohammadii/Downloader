@@ -6,10 +6,10 @@ void main() {
 const FRAGMENT_SHADER = `// "Mesh drift" — made with the 21st.dev Shader Builder
 // Packed WebGL1 uniforms (the shader exposes readable u_* aliases as macros):
 //   u_colors[8] (first 4 used)
-//   vec3(0.012, 0.071, 0.055)
-//   vec3(0.055, 0.486, 0.353)
-//   vec3(0.486, 0.898, 0.467)
-//   vec3(0.957, 1.000, 0.780)
+//   vec3(0.051, 0.024, 0.086)
+//   vec3(0.357, 0.129, 0.714)
+//   vec3(0.714, 0.424, 1.000)
+//   vec3(0.949, 0.906, 1.000)
 //   u_scene = vec4(canvas width, canvas height, seconds * 0.73, 4.0)
 //   u_shape = vec4(1.16, 0.34, 0.50, 0.00)
 //   u_surface = vec4(2.40, 1.16, 0.00, 1.00)
@@ -269,10 +269,10 @@ void main() {
 }`;
 
 const WEB_BACKGROUND_STYLE = `
-html{background:#03120e!important}
+html{background:#0d0616!important}
 body{background:transparent!important;position:relative;isolation:isolate}
 body:before{display:none!important}
-#meshBackground{position:fixed;inset:0;z-index:0;width:100vw;height:100vh;display:block;pointer-events:none;background:#03120e}
+#meshBackground{position:fixed;inset:0;z-index:0;width:100vw;height:100vh;display:block;pointer-events:none;background:#0d0616}
 @supports (width:100dvw) and (height:100dvh){#meshBackground{width:100dvw;height:100dvh}}
 .page{position:relative;z-index:1}
 :root{--glass-line:linear-gradient(118deg,rgba(255,255,255,.46) 0%,rgba(255,255,255,.08) 20%,rgba(255,255,255,.18) 47%,rgba(255,255,255,.055) 74%,rgba(255,255,255,.34) 100%);--glass-line-focus:linear-gradient(118deg,rgba(255,255,255,.64) 0%,rgba(255,255,255,.13) 20%,rgba(255,255,255,.27) 47%,rgba(255,255,255,.09) 74%,rgba(255,255,255,.48) 100%)}
@@ -292,7 +292,7 @@ body:before{display:none!important}
   .modeSwitch::before,.inputShell::before,.result::before,.progress::before,.ready::before{content:"";position:absolute;inset:-1px;border-radius:inherit;padding:1px;background:var(--glass-line);pointer-events:none;z-index:3;-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);mask-composite:exclude}
   .inputShell:focus-within::before{background:var(--glass-line-focus)}
 }
-@supports not ((backdrop-filter:blur(2.5px)) or (-webkit-backdrop-filter:blur(2.5px))){.modeSwitch,.inputShell,.result,.progress,.ready{background:rgba(3,18,14,.24)!important}}
+@supports not ((backdrop-filter:blur(2.5px)) or (-webkit-backdrop-filter:blur(2.5px))){.modeSwitch,.inputShell,.result,.progress,.ready{background:rgba(13,6,22,.24)!important}}
 `;
 
 function toScriptLiteral(value: string): string {
@@ -308,10 +308,10 @@ var vertexSource=${toScriptLiteral(VERTEX_SHADER)};
 var fragmentSource=${toScriptLiteral(FRAGMENT_SHADER)};
 var program=null,buffer=null,locations=null,raf=0,lastFrame=0,activeSeconds=0;
 var colors=new Float32Array([
-  0.012,0.071,0.055,
-  0.055,0.486,0.353,
-  0.486,0.898,0.467,
-  0.957,1.000,0.780,
+  0.051,0.024,0.086,
+  0.357,0.129,0.714,
+  0.714,0.424,1.000,
+  0.949,0.906,1.000,
   0,0,0,0,0,0,0,0,0,0,0,0
 ]);
 function compile(type,source){
