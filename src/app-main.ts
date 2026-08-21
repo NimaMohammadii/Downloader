@@ -5,6 +5,7 @@ import youtubeWorker, {
 } from "./youtube-main";
 import { handleMiniAppRequestV2 } from "./mini-app-v2";
 import { handleWebAppRequest } from "./web-app";
+import { WEB_APP_HTML } from "./web-ui";
 
 export { AdminStatsStore, YoutubeDownloadWorkflow };
 
@@ -38,7 +39,22 @@ type Env = {
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const webAppResponse = await handleWebAppRequest(request, env);
-    if (webAppResponse) return webAppResponse;
+    if (webAppResponse) {
+      const url = new URL(request.url);
+      const isWebPage =
+        (url.pathname === "/" || url.pathname === "/app" || url.pathname === "/app/") &&
+        (request.method === "GET" || request.method === "HEAD") &&
+        (webAppResponse.headers.get("content-type") || "").includes("text/html");
+
+      if (isWebPage) {
+        return new Response(request.method === "HEAD" ? null : WEB_APP_HTML, {
+          status: webAppResponse.status,
+          statusText: webAppResponse.statusText,
+          headers: webAppResponse.headers,
+        });
+      }
+      return webAppResponse;
+    }
 
     const miniAppResponse = await handleMiniAppRequestV2(request, env);
     if (miniAppResponse) return miniAppResponse;
