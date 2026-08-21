@@ -205,7 +205,10 @@ def _resolve_watch_stream(url: str, stream_id: str, quality: int | None) -> dict
             mime = "video/mp4" if str(selected.get("ext") or "").lower() == "mp4" else "video/mp4"
             title = str(metadata.get("title") or "YouTube video").strip()
             headers = _watch_http_headers(selected.get("http_headers") or metadata.get("http_headers"))
-            qualities = _progressive_watch_qualities(metadata)
+            qualities = _progressive_watch_qualities(metadata_cache)
+            if selected_quality in WATCH_QUALITY_VALUES and selected_quality not in qualities:
+                qualities.append(selected_quality)
+                qualities.sort(reverse=True)
             payload: dict[str, object] = {
                 "streamId": stream_id,
                 "url": direct_url,
