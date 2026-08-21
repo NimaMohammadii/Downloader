@@ -1,23 +1,7 @@
-const WEB_VIEWPORT_STYLE = `
+const WEB_SCROLL_STYLE = `
 html{
-  width:100%;
-  min-height:100%;
-  overflow-x:hidden!important;
   overflow-y:auto!important;
-  overscroll-behavior-x:none!important;
   overscroll-behavior-y:auto!important;
-  background:#0d0616!important;
-}
-body{
-  width:100%;
-  min-height:100%;
-  background:transparent!important;
-}
-body::before{
-  display:none!important;
-}
-#meshBackground{
-  filter:brightness(.76) saturate(.92);
 }
 `;
 
@@ -50,7 +34,7 @@ export function applyWebViewport(response: Response): Response {
   return new HTMLRewriter()
     .on("head", {
       element(element) {
-        element.append(`<style>${WEB_VIEWPORT_STYLE}</style>`, { html: true });
+        element.append(`<style>${WEB_SCROLL_STYLE}</style>`, { html: true });
       },
     })
     .on("body", {
