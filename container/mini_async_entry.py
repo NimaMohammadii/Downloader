@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 from urllib.parse import parse_qs, urlparse
 
 import mini_live_entry as live
@@ -10,6 +11,15 @@ mini_pipeline.MINI_FILE_TTL_SECONDS = 2 * 60 * 60
 
 JOBS: dict[str, dict[str, object]] = {}
 JOBS_LOCK = threading.Lock()
+
+WATCH_STREAMS: dict[str, dict[str, object]] = {}
+WATCH_STREAMS_LOCK = threading.Lock()
+WATCH_STREAM_TTL_SECONDS = 30 * 60
+WATCH_FORMAT = (
+    "b[protocol=https][ext=mp4][height<=720]/"
+    "b[protocol=https][ext=mp4]/"
+    "b[protocol=https]"
+)
 
 
 def _set_job(file_id: str, payload: dict[str, object]) -> None:
@@ -48,6 +58,132 @@ def _job_worker(payload: dict[str, object]) -> None:
             f"mini async prepare failed file={file_id}: {type(exc).__name__}: {exc}",
             flush=True,
         )
+
+
+def _cleanup_watch_streams() -> None:
+    cutoff = time.time() - WATCH_STREAM_TTL_SECONDS
+    with WATCH_STREAMS_LOCK:
+        stale = [
+            stream_id
+            for stream_id, stream in WATCH_STREAMS.items()
+            if float(stream.get("createdAt") or 0) < cutoff
+        ]
+        for stream_id in stale:
+            WATCH_STREAMS.pop(stream_id, None)
+
+
+def _set_watch_stream(stream_id: str, payload: dict[str, object]) -> None:
+    _cleanup_watch_streams()
+    with WATCH_STREAMS_LOCK:
+        WATCH_STREAMS[stream_id] = payload
+
+
+def _get_watch_stream(stream_id: str) -> dict[str, object] | None:
+    _cleanup_watch_streams()
+    with WATCH_STREAMS_LOCK:
+        value = WATCH_STREAMS.get(stream_id)
+        return dict(value) if value is not None else None
+
+
+def _watch_http_headers(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    headers: dict[str, str] = {}
+    blocked = {"host", "content-length", "range", "connection", "transfer-encoding"}
+    for key, item in value.items():
+        name = str(key).strip()
+        text = str(item).strip()
+        if not name or not text or name.lower() in blocked:
+            continue
+        headers[name] = text
+    return headers
+
+
+def _selected_progressive_format(metadata: object) -> dict[str, object] | None:
+    if not isinstance(metadata, dict):
+        return None
+
+    candidates: list[dict[str, object]] = []
+    requested = metadata.get("requested_downloads")
+    if isinstance(requested, list):
+        candidates.extend(item for item in requested if isinstance(item, dict))
+    candidates.append(metadata)
+
+    for item in candidates:
+        direct_url = str(item.get("url") or "").strip()
+        protocol = str(item.get("protocol") or "").lower()
+        vcodec = str(item.get("vcodec") or "none").lower()
+        acodec = str(item.get("acodec") or "none").lower()
+        if (
+            direct_url.startswith("https://")
+            and protocol in {"https", "http"}
+            and vcodec != "none"
+            and acodec != "none"
+        ):
+            return item
+    return None
+
+
+def _resolve_watch_stream(url: str, stream_id: str) -> dict[str, object]:
+    metadata_cache = app.load_metadata_cache(url)
+    preferred = live.pipeline._load_session_client(metadata_cache)
+    errors: list[str] = []
+
+    for client in live.pipeline._client_order(preferred):
+        try:
+            result = app.run_command(
+                [
+                    app.REAL_YTDLP,
+                    *live.pipeline._client_args(client),
+                    "--skip-download",
+                    "--dump-single-json",
+                    "--no-warnings",
+                    "--format",
+                    WATCH_FORMAT,
+                    url,
+                ],
+                timeout=app.METADATA_TIMEOUT_SECONDS,
+            )
+            metadata = json.loads(result.stdout)
+            selected = _selected_progressive_format(metadata)
+            if selected is None:
+                errors.append(f"{client}: no progressive combined format")
+                continue
+
+            direct_url = str(selected.get("url") or "").strip()
+            mime = "video/mp4" if str(selected.get("ext") or "").lower() == "mp4" else "video/mp4"
+            title = str(metadata.get("title") or "YouTube video").strip()
+            headers = _watch_http_headers(selected.get("http_headers") or metadata.get("http_headers"))
+            payload: dict[str, object] = {
+                "streamId": stream_id,
+                "url": direct_url,
+                "mime": mime,
+                "title": title,
+                "headers": headers,
+                "createdAt": time.time(),
+                "client": client,
+            }
+            _set_watch_stream(stream_id, payload)
+            print(
+                f"mini watch stream ready stream={stream_id[:8]} client={client}",
+                flush=True,
+            )
+            return payload
+        except app.UserVisibleError as exc:
+            errors.append(f"{client}: {exc}")
+            print(f"mini watch resolve client={client} failed: {exc}", flush=True)
+        except Exception as exc:
+            errors.append(f"{client}: {type(exc).__name__}: {exc}")
+            print(
+                f"mini watch resolve client={client} failed: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+    detail = errors[-1] if errors else "no compatible progressive stream"
+    raise app.UserVisibleError(
+        "❌ پخش آنلاین برای این ویدیو از مسیر سازگار پیدا نشد. "
+        "می‌تونی حالت Download رو استفاده کنی."
+    ) from RuntimeError(detail)
 
 
 class MiniAsyncHandler(mini_pipeline.MiniAppHandler):
@@ -97,6 +233,48 @@ class MiniAsyncHandler(mini_pipeline.MiniAppHandler):
         thread.start()
         self._send_json(202, {"ok": True, "state": "preparing", "fileId": file_id})
 
+    def _start_watch(self) -> None:
+        payload = self._read_payload()
+        if payload is None:
+            self._send_json(400, {"ok": False, "message": "❌ درخواست نامعتبره."})
+            return
+
+        stream_id = str(payload.get("streamId") or "").strip()
+        url = str(payload.get("url") or "").strip()
+        if not mini_pipeline.FILE_ID_RE.fullmatch(stream_id) or not app.youtube_video_id(url):
+            self._send_json(400, {"ok": False, "message": "❌ درخواست پخش نامعتبره."})
+            return
+
+        existing = _get_watch_stream(stream_id)
+        if existing is not None:
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "streamId": stream_id,
+                    "title": existing.get("title"),
+                    "mime": existing.get("mime"),
+                },
+            )
+            return
+
+        try:
+            stream = _resolve_watch_stream(url, stream_id)
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "streamId": stream_id,
+                    "title": stream.get("title"),
+                    "mime": stream.get("mime"),
+                },
+            )
+        except app.UserVisibleError as exc:
+            self._send_json(200, {"ok": False, "message": str(exc)})
+        except Exception as exc:
+            print(f"mini watch start failed: {type(exc).__name__}: {exc}", flush=True)
+            self._send_json(500, {"ok": False, "message": "❌ پخش آنلاین شروع نشد."})
+
     def _send_status(self) -> None:
         parsed = urlparse(self.path)
         file_id = (parse_qs(parsed.query).get("fileId") or [""])[0]
@@ -126,15 +304,126 @@ class MiniAsyncHandler(mini_pipeline.MiniAppHandler):
             return
         self._send_json(200, current)
 
+    def _serve_watch(self, *, head_only: bool) -> None:
+        parsed = urlparse(self.path)
+        stream_id = (parse_qs(parsed.query).get("streamId") or [""])[0]
+        if not mini_pipeline.FILE_ID_RE.fullmatch(stream_id):
+            self._send_json(400, {"ok": False, "message": "invalid stream"})
+            return
+
+        stream = _get_watch_stream(stream_id)
+        if stream is None:
+            self._send_json(404, {"ok": False, "message": "stream expired"})
+            return
+
+        direct_url = str(stream.get("url") or "")
+        headers = _watch_http_headers(stream.get("headers"))
+        requested_range = self.headers.get("range")
+        if requested_range:
+            headers["Range"] = requested_range
+
+        response = None
+        try:
+            if head_only:
+                response = app.requests.head(
+                    direct_url,
+                    headers=headers,
+                    allow_redirects=True,
+                    timeout=(20, 90),
+                )
+                if response.status_code >= 400:
+                    response.close()
+                    fallback_headers = dict(headers)
+                    fallback_headers.setdefault("Range", "bytes=0-0")
+                    response = app.requests.get(
+                        direct_url,
+                        headers=fallback_headers,
+                        allow_redirects=True,
+                        stream=True,
+                        timeout=(20, 90),
+                    )
+            else:
+                response = app.requests.get(
+                    direct_url,
+                    headers=headers,
+                    allow_redirects=True,
+                    stream=True,
+                    timeout=(20, 900),
+                )
+
+            if response.status_code not in {200, 206}:
+                print(
+                    f"mini watch upstream rejected stream={stream_id[:8]} status={response.status_code}",
+                    flush=True,
+                )
+                self._send_json(502, {"ok": False, "message": "stream unavailable"})
+                return
+
+            self.send_response(response.status_code)
+            for name in (
+                "content-type",
+                "content-length",
+                "content-range",
+                "accept-ranges",
+                "etag",
+                "last-modified",
+            ):
+                value = response.headers.get(name)
+                if value:
+                    self.send_header(name, value)
+            if not response.headers.get("content-type"):
+                self.send_header("content-type", str(stream.get("mime") or "video/mp4"))
+            self.send_header("cache-control", "private, no-store")
+            self.send_header("cross-origin-resource-policy", "cross-origin")
+            self.send_header("x-content-type-options", "nosniff")
+            self.end_headers()
+
+            if head_only:
+                return
+
+            try:
+                for chunk in response.iter_content(chunk_size=512 * 1024):
+                    if chunk:
+                        self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        except Exception as exc:
+            print(
+                f"mini watch proxy failed stream={stream_id[:8]}: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            if not self.wfile.closed:
+                try:
+                    self._send_json(502, {"ok": False, "message": "stream failed"})
+                except Exception:
+                    pass
+        finally:
+            if response is not None:
+                response.close()
+
+    def do_HEAD(self) -> None:
+        if urlparse(self.path).path == "/mini/watch":
+            self._serve_watch(head_only=True)
+            return
+        super().do_HEAD()
+
     def do_GET(self) -> None:
-        if urlparse(self.path).path == "/mini/status":
+        path = urlparse(self.path).path
+        if path == "/mini/status":
             self._send_status()
+            return
+        if path == "/mini/watch":
+            self._serve_watch(head_only=False)
             return
         super().do_GET()
 
     def do_POST(self) -> None:
-        if urlparse(self.path).path == "/mini/start":
+        path = urlparse(self.path).path
+        if path == "/mini/start":
             self._start_prepare()
+            return
+        if path == "/mini/watch/start":
+            self._start_watch()
             return
         super().do_POST()
 
@@ -143,7 +432,7 @@ if __name__ == "__main__":
     server = app.ThreadingHTTPServer(("0.0.0.0", app.PORT), MiniAsyncHandler)
     print(
         f"youtube downloader listening on :{app.PORT} "
-        "(async Mini App prepare + streaming large files)",
+        "(async Mini App prepare + in-app watch streaming)",
         flush=True,
     )
     server.serve_forever()
