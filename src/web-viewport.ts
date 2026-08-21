@@ -36,17 +36,13 @@ function restoreOrigin(){
   var x=Number(window.scrollX)||0;
   var y=Number(window.scrollY)||0;
   if(Math.abs(x-originX)<0.5&&Math.abs(y-originY)<0.5)return;
-  try{
-    window.scrollTo({left:originX,top:originY,behavior:'smooth'});
-  }catch(error){
-    window.scrollTo(originX,originY);
-  }
+  window.scrollTo({left:originX,top:originY,behavior:'smooth'});
 }
 requestAnimationFrame(captureOrigin);
 window.addEventListener('scroll',function(){
   if(!originReady)return;
   clearTimeout(idleTimer);
-  idleTimer=setTimeout(restoreOrigin,120);
+  idleTimer=setTimeout(restoreOrigin,96);
 },{passive:true});
 })();`;
 
