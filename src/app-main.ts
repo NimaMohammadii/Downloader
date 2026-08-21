@@ -7,7 +7,6 @@ import { handleMiniAppRequestV2 } from "./mini-app-v2";
 import { handleWebAppRequest } from "./web-app";
 import { applyWebBackground } from "./web-mesh-background";
 import { applyWebViewport } from "./web-viewport";
-import { WEB_APP_HTML } from "./web-ui";
 
 export { AdminStatsStore, YoutubeDownloadWorkflow };
 
@@ -49,14 +48,9 @@ export default {
         (webAppResponse.headers.get("content-type") || "").includes("text/html");
 
       if (isWebPage) {
-        const pageResponse = new Response(request.method === "HEAD" ? null : WEB_APP_HTML, {
-          status: webAppResponse.status,
-          statusText: webAppResponse.statusText,
-          headers: webAppResponse.headers,
-        });
         return request.method === "HEAD"
-          ? pageResponse
-          : applyWebViewport(applyWebBackground(pageResponse));
+          ? webAppResponse
+          : applyWebViewport(applyWebBackground(webAppResponse));
       }
       return webAppResponse;
     }
