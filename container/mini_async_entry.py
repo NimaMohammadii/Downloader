@@ -147,6 +147,8 @@ def _progressive_watch_qualities(metadata: object) -> list[int]:
     for item in candidates:
         if not _is_progressive_watch_format(item):
             continue
+        if str(item.get("ext") or "").lower() != "mp4":
+            continue
         try:
             height = int(item.get("height") or 0)
         except (TypeError, ValueError):
@@ -159,10 +161,7 @@ def _progressive_watch_qualities(metadata: object) -> list[int]:
 def _watch_format_selector(quality: int | None) -> str:
     if quality is None:
         return WATCH_AUTO_FORMAT
-    return (
-        f"b[protocol=https][ext=mp4][height={quality}]/"
-        f"b[protocol=https][height={quality}]"
-    )
+    return f"b[protocol=https][ext=mp4][height={quality}]"
 
 
 def _resolve_watch_stream(url: str, stream_id: str, quality: int | None) -> dict[str, object]:
@@ -196,8 +195,10 @@ def _resolve_watch_stream(url: str, stream_id: str, quality: int | None) -> dict
                 selected_quality = int(selected.get("height") or 0) or None
             except (TypeError, ValueError):
                 selected_quality = None
-            if quality is not None and selected_quality != quality:
-                errors.append(f"{client}: requested {quality}p but selected {selected_quality or 'unknown'}p")
+            if quality is not None and (
+                selected_quality != quality or str(selected.get("ext") or "").lower() != "mp4"
+            ):
+                errors.append(f"{client}: requested playable MP4 {quality}p was not selected")
                 continue
 
             direct_url = str(selected.get("url") or "").strip()
@@ -205,9 +206,6 @@ def _resolve_watch_stream(url: str, stream_id: str, quality: int | None) -> dict
             title = str(metadata.get("title") or "YouTube video").strip()
             headers = _watch_http_headers(selected.get("http_headers") or metadata.get("http_headers"))
             qualities = _progressive_watch_qualities(metadata)
-            if selected_quality in WATCH_QUALITY_VALUES and selected_quality not in qualities:
-                qualities.append(selected_quality)
-                qualities.sort(reverse=True)
             payload: dict[str, object] = {
                 "streamId": stream_id,
                 "url": direct_url,
@@ -299,7 +297,7 @@ class MiniAsyncHandler(mini_pipeline.MiniAppHandler):
         url = str(payload.get("url") or "").strip()
         raw_quality = payload.get("quality")
         quality: int | None = None
-        if raw_quality not in {None, ""}:
+        if raw_quality is not None and raw_quality != "":
             try:
                 quality = int(raw_quality)
             except (TypeError, ValueError):
