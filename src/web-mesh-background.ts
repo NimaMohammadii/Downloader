@@ -269,15 +269,12 @@ void main() {
 }`;
 
 const WEB_BACKGROUND_STYLE = `
-html{width:100%;height:100%;overflow:hidden!important;overscroll-behavior:none;background:#03120e!important}
-body{width:100%;height:100%;overflow:hidden!important;overscroll-behavior:none;background:transparent!important;position:fixed;inset:0;isolation:isolate}
+html{background:#03120e!important}
+body{background:transparent!important;position:relative;isolation:isolate}
 body:before{display:none!important}
 #meshBackground{position:fixed;inset:0;z-index:0;width:100vw;height:100vh;display:block;pointer-events:none;background:#03120e}
 @supports (width:100dvw) and (height:100dvh){#meshBackground{width:100dvw;height:100dvh}}
-.page{position:relative;z-index:1;height:100vh;max-height:100vh;overflow:hidden}
-@supports (height:100dvh){.page{height:100dvh;max-height:100dvh}}
-.layout{max-height:100%;min-height:0}
-@supports (overflow:clip){html,body,.page{overflow:clip!important}}
+.page{position:relative;z-index:1}
 :root{--glass-line:linear-gradient(118deg,rgba(255,255,255,.46) 0%,rgba(255,255,255,.08) 20%,rgba(255,255,255,.18) 47%,rgba(255,255,255,.055) 74%,rgba(255,255,255,.34) 100%);--glass-line-focus:linear-gradient(118deg,rgba(255,255,255,.64) 0%,rgba(255,255,255,.13) 20%,rgba(255,255,255,.27) 47%,rgba(255,255,255,.09) 74%,rgba(255,255,255,.48) 100%)}
 .modeSwitch,.inputShell,.result,.progress,.ready{position:relative;border:1px solid rgba(255,255,255,.095)!important;background:transparent!important;-webkit-backdrop-filter:blur(2.5px);backdrop-filter:blur(2.5px);box-shadow:inset 0 1px 0 rgba(255,255,255,.065),inset 0 -1px 0 rgba(0,0,0,.12),0 16px 44px rgba(0,0,0,.11)!important}
 .modeSwitch{background:transparent!important}
