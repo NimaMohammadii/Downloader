@@ -8,25 +8,19 @@ html{
 const WEB_SCROLL_SCRIPT = `(function(){
 var originX=Number(window.scrollX)||0;
 var originY=Number(window.scrollY)||0;
-var originReady=false;
-var idleTimer=0;
-function captureOrigin(){
-  originX=Number(window.scrollX)||0;
-  originY=Number(window.scrollY)||0;
-  originReady=true;
+var settleTimer=0;
+function isAtOrigin(){
+  return Math.abs((Number(window.scrollX)||0)-originX)<0.5&&Math.abs((Number(window.scrollY)||0)-originY)<0.5;
 }
 function restoreOrigin(){
-  if(!originReady)return;
-  var x=Number(window.scrollX)||0;
-  var y=Number(window.scrollY)||0;
-  if(Math.abs(x-originX)<0.5&&Math.abs(y-originY)<0.5)return;
+  clearTimeout(settleTimer);
+  if(isAtOrigin())return;
   window.scrollTo({left:originX,top:originY,behavior:'smooth'});
+  settleTimer=setTimeout(restoreOrigin,480);
 }
-requestAnimationFrame(captureOrigin);
 window.addEventListener('scroll',function(){
-  if(!originReady)return;
-  clearTimeout(idleTimer);
-  idleTimer=setTimeout(restoreOrigin,96);
+  clearTimeout(settleTimer);
+  settleTimer=setTimeout(restoreOrigin,220);
 },{passive:true});
 })();`;
 
