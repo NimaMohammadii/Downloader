@@ -1,75 +1,92 @@
-import youtubeWorker, {
-  AdminStatsStore,
-  YoutubeDownloadWorkflow,
-  YoutubeDownloaderContainer as BaseYoutubeDownloaderContainer,
-} from "./youtube-main";
-import { handleMiniAppRequestV2 } from "./mini-app-v2";
-import { handleWebAppRequest } from "./web-app";
+import storyWorker, { AdminStatsStore } from "./story-main";
+import { MINI_APP_HTML } from "./mini-app-ui";
+import { WEB_APP_HTML } from "./web-ui";
 import { applyWebBackground } from "./web-mesh-background";
 import { applyWebViewport } from "./web-viewport";
 
-export { AdminStatsStore, YoutubeDownloadWorkflow };
-
-export class YoutubeDownloaderContainer extends BaseYoutubeDownloaderContainer {
-  requiredPorts = [8080];
-  sleepAfter = "15m";
-
-  override async fetch(request: Request): Promise<Response> {
-    await this.startAndWaitForPorts({
-      ports: [8080],
-      cancellationOptions: {
-        instanceGetTimeoutMS: 60_000,
-        portReadyTimeoutMS: 90_000,
-        waitInterval: 500,
-      },
-    });
-    return this.containerFetch(request);
-  }
-
-  override onError(error: unknown): never {
-    console.error("youtube container lifecycle error", error);
-    throw error;
-  }
-}
+export { AdminStatsStore };
 
 type Env = {
   BOT_TOKEN: string;
-  YOUTUBE_DOWNLOADER_CONTAINER: DurableObjectNamespace<any>;
+  INSTAGRAM_SESSIONID?: string;
+  INSTAGRAM_CSRFTOKEN?: string;
+  INSTAGRAM_DS_USER_ID?: string;
+  INSTAGRAM_MID?: string;
+  INSTAGRAM_IG_DID?: string;
 };
+
+function htmlResponse(request: Request, html: string): Response {
+  const headers = new Headers({
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+  });
+  const response = new Response(request.method === "HEAD" ? null : html, { headers });
+  return request.method === "HEAD"
+    ? response
+    : applyWebViewport(applyWebBackground(response));
+}
+
+function disabledContainerResponse(request: Request): Response {
+  const url = new URL(request.url);
+  const isApi = url.pathname.includes("/api/");
+  if (isApi) {
+    return Response.json(
+      {
+        ok: false,
+        message: "This feature is temporarily unavailable.",
+      },
+      {
+        status: 503,
+        headers: {
+          "cache-control": "no-store",
+          "x-content-type-options": "nosniff",
+        },
+      },
+    );
+  }
+  return new Response("This feature is temporarily unavailable.", {
+    status: 503,
+    headers: {
+      "cache-control": "no-store",
+      "content-type": "text/plain; charset=utf-8",
+      "x-content-type-options": "nosniff",
+    },
+  });
+}
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const webAppResponse = await handleWebAppRequest(request, env);
-    if (webAppResponse) {
-      const url = new URL(request.url);
-      const isWebPage =
-        (url.pathname === "/" || url.pathname === "/app" || url.pathname === "/app/") &&
-        (request.method === "GET" || request.method === "HEAD") &&
-        (webAppResponse.headers.get("content-type") || "").includes("text/html");
+    const url = new URL(request.url);
 
-      if (isWebPage) {
-        return request.method === "HEAD"
-          ? webAppResponse
-          : applyWebViewport(applyWebBackground(webAppResponse));
-      }
-      return webAppResponse;
+    if (
+      (url.pathname === "/" || url.pathname === "/app" || url.pathname === "/app/") &&
+      (request.method === "GET" || request.method === "HEAD")
+    ) {
+      return htmlResponse(request, WEB_APP_HTML);
     }
 
-    const miniAppResponse = await handleMiniAppRequestV2(request, env);
-    if (miniAppResponse) {
-      const url = new URL(request.url);
-      const isMiniAppPage =
-        (url.pathname === "/mini-app" || url.pathname === "/mini-app/") &&
-        (request.method === "GET" || request.method === "HEAD") &&
-        (miniAppResponse.headers.get("content-type") || "").includes("text/html");
-
-      if (isMiniAppPage) {
-        return request.method === "HEAD"
-          ? miniAppResponse
-          : applyWebViewport(applyWebBackground(miniAppResponse));
-      }
-      return miniAppResponse;
+    if (
+      (url.pathname === "/mini-app" || url.pathname === "/mini-app/") &&
+      (request.method === "GET" || request.method === "HEAD")
+    ) {
+      return htmlResponse(request, MINI_APP_HTML);
     }
-    return youtubeWorker.fetch(request, env as any, ctx);
+
+    if (url.pathname === "/robots.txt" && request.method === "GET") {
+      return new Response("User-agent: *\nAllow: /\nDisallow: /web/\n", {
+        headers: {
+          "content-type": "text/plain; charset=utf-8",
+          "cache-control": "public, max-age=3600",
+        },
+      });
+    }
+
+    if (url.pathname.startsWith("/web/") || url.pathname.startsWith("/mini-app/")) {
+      return disabledContainerResponse(request);
+    }
+
+    return storyWorker.fetch(request, env as any, ctx);
   },
 } satisfies ExportedHandler<Env>;
