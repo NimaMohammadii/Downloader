@@ -1,6 +1,6 @@
 FROM node:22-bookworm-slim
 
-LABEL vexa.youtube.image="youtube-mini-app-watch-v5"
+LABEL vexa.youtube.image="youtube-chat-mtproto-v6"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -26,6 +26,8 @@ RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --pre -U \
       "yt-dlp[default,curl-cffi]" \
       requests \
+      telethon==1.45.0 \
+      cryptg==0.5.2 \
       bgutil-ytdlp-pot-provider==1.3.1 \
       yt-dlp-getpot-wpc==1.1.2 \
     && mv /opt/venv/bin/yt-dlp /opt/venv/bin/yt-dlp-real

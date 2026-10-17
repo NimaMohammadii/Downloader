@@ -1,8 +1,12 @@
+import asyncio
+import hashlib
 import json
+import secrets
 import os
 import shutil
 import subprocess
 import tempfile
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -10,9 +14,10 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 
+JOB_LOCK = threading.Lock()
+
 PORT = int(os.environ.get("PORT", "8080"))
-DIRECT_TELEGRAM_LIMIT = 47_000_000
-TARGET_PART_SIZE = 42_000_000
+DIRECT_TELEGRAM_LIMIT = 2_000_000_000
 METADATA_TIMEOUT_SECONDS = 90
 DOWNLOAD_TIMEOUT_SECONDS = 1_500
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "http://127.0.0.1:4416")
@@ -35,6 +40,8 @@ def telegram_call(
     files: dict[str, Any] | None = None,
     timeout: int = 900,
 ) -> Any:
+    if files:
+        return asyncio.run(upload_complete_file(token, method, data or {}, next(iter(files.values()))))
     response = requests.post(
         f"https://api.telegram.org/bot{token}/{method}",
         json=json_payload,
@@ -534,61 +541,83 @@ def probe_duration(path: Path) -> float:
         return 0.0
 
 
-def split_for_telegram(path: Path, workdir: Path) -> list[Path]:
-    size = path.stat().st_size
-    if size <= DIRECT_TELEGRAM_LIMIT:
-        return [path]
+def validate_file_size(path: Path) -> None:
+    if path.stat().st_size > DIRECT_TELEGRAM_LIMIT:
+        raise UserVisibleError("❌ حجم فایل از سقف ۲ گیگابایت بیشتره؛ کیفیت پایین‌تر رو انتخاب کن.")
 
-    duration = probe_duration(path)
-    if duration <= 0:
-        raise UserVisibleError("❌ فایل خیلی بزرگه و نتونستم به پارت‌های امن تقسیمش کنم.")
 
-    base_seconds = max(4.0, duration * TARGET_PART_SIZE / size)
-    for attempt in range(8):
-        for old_part in workdir.glob("part_*.mp4"):
-            old_part.unlink(missing_ok=True)
+async def upload_complete_file(token: str, method: str, data: dict[str, Any], file: tuple) -> Any:
+    from telethon import TelegramClient, functions, types
+    from telethon.errors import FloodWaitError
 
-        segment_seconds = max(3.0, base_seconds * (0.78**attempt))
-        pattern = str(workdir / "part_%03d.mp4")
-        try:
-            subprocess.run(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-i",
-                    str(path),
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "0:a?",
-                    "-c",
-                    "copy",
-                    "-f",
-                    "segment",
-                    "-segment_time",
-                    f"{segment_seconds:.3f}",
-                    "-reset_timestamps",
-                    "1",
-                    "-avoid_negative_ts",
-                    "make_zero",
-                    pattern,
-                ],
-                check=True,
-                text=True,
-                capture_output=True,
-                timeout=1_200,
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            continue
+    filename, handle, mime = file
+    path = Path(handle.name)
+    validate_file_size(path)
+    api_id = os.environ.get("API_ID", "")
+    api_hash = os.environ.get("API_HASH", "")
+    if not api_id.isdecimal() or not api_hash:
+        raise UserVisibleError("❌ تنظیمات API_ID و API_HASH برای ارسال فایل آماده نیست.")
 
-        parts = sorted(workdir.glob("part_*.mp4"))
-        if parts and all(part.stat().st_size <= DIRECT_TELEGRAM_LIMIT for part in parts):
-            return parts
+    # This MTProto bot session leaves the existing Bot API webhook intact.
+    async with await TelegramClient(
+        "/tmp/youtube-uploader", int(api_id), api_hash,
+        receive_updates=False, flood_sleep_threshold=60,
+    ).start(bot_token=token) as client:
+        size = path.stat().st_size
+        part_size = 512 * 1024
+        count = (size + part_size - 1) // part_size
+        file_id = secrets.randbits(63)
+        digest = hashlib.md5()
+        big = size > 10 * 1024 * 1024
 
-    raise UserVisibleError("❌ ویدیو برای ارسال مستقیم در تلگرام بیش از حد بزرگه.")
+        async def save_part(index: int, chunk: bytes) -> None:
+            for attempt in range(3):
+                try:
+                    request = (functions.upload.SaveBigFilePartRequest(file_id, index, count, chunk)
+                               if big else functions.upload.SaveFilePartRequest(file_id, index, chunk))
+                    if not await client(request):
+                        raise RuntimeError("Telegram rejected an upload part")
+                    return
+                except FloodWaitError as exc:
+                    if attempt == 2 or exc.seconds > 60:
+                        raise
+                    await asyncio.sleep(exc.seconds)
+
+        # Bound memory to eight chunks, await every part before publishing media.
+        with path.open("rb") as source:
+            for first in range(0, count, 8):
+                batch = []
+                for index in range(first, min(first + 8, count)):
+                    chunk = source.read(part_size)
+                    if not big:
+                        digest.update(chunk)
+                    batch.append(save_part(index, chunk))
+                async with asyncio.TaskGroup() as group:
+                    for task in batch:
+                        group.create_task(task)
+        uploaded = (types.InputFileBig(file_id, count, filename) if big
+                    else types.InputFile(file_id, count, filename, digest.hexdigest()))
+        attributes = [types.DocumentAttributeFilename(filename)]
+        if method == "sendVideo":
+            attributes.append(types.DocumentAttributeVideo(
+                duration=float(data.get("duration", 0)),
+                w=int(data.get("width", 0)), h=int(data.get("height", 0)),
+                supports_streaming=True,
+            ))
+        elif method == "sendAudio":
+            attributes.append(types.DocumentAttributeAudio(
+                duration=int(probe_duration(path)), title=str(data.get("title") or path.stem),
+            ))
+        reply = json.loads(data.get("reply_parameters", "{}"))
+        message = await client.send_file(
+            int(data["chat_id"]), uploaded,
+            caption=data.get("caption", ""), parse_mode=None,
+            mime_type=mime, attributes=attributes,
+            supports_streaming=method == "sendVideo",
+            force_document=method == "sendDocument",
+            reply_to=reply.get("message_id"),
+        )
+        return {"message_id": message.id}
 
 
 def send_media_file(
@@ -600,38 +629,14 @@ def send_media_file(
     *,
     reply: bool,
 ) -> None:
-    common_data: dict[str, Any] = {
-        "chat_id": str(chat_id),
-        "caption": caption[:1024],
-    }
+    data: dict[str, Any] = {"chat_id": str(chat_id), "caption": caption[:1024]}
     if reply:
-        common_data["reply_parameters"] = json.dumps({"message_id": request_message_id})
-
-    try:
-        with path.open("rb") as handle:
-            telegram_call(
-                token,
-                "sendVideo",
-                data={**common_data, "supports_streaming": "true"},
-                files={"video": (path.name, handle, "video/mp4")},
-                timeout=1_800,
-            )
-        return
-    except Exception as video_error:
-        try:
-            with path.open("rb") as handle:
-                telegram_call(
-                    token,
-                    "sendDocument",
-                    data=common_data,
-                    files={"document": (path.name, handle, "application/octet-stream")},
-                    timeout=1_800,
-                )
-            return
-        except Exception as document_error:
-            raise RuntimeError(
-                f"Telegram upload failed: {video_error}; document fallback: {document_error}"
-            ) from document_error
+        data["reply_parameters"] = json.dumps({"message_id": request_message_id})
+    with path.open("rb") as handle:
+        telegram_call(
+            token, "sendVideo", data=data,
+            files={"video": (path.name, handle, "video/mp4")}, timeout=1800,
+        )
 
 
 def send_audio_file(
@@ -651,35 +656,11 @@ def send_audio_file(
         "reply_parameters": json.dumps({"message_id": request_message_id}),
     }
 
-    try:
-        with path.open("rb") as handle:
-            telegram_call(
-                token,
-                "sendAudio",
-                data=data,
-                files={"audio": ("Vexa.m4a", handle, "audio/mp4")},
-                timeout=1_800,
-            )
-        return
-    except Exception as audio_error:
-        try:
-            with path.open("rb") as handle:
-                telegram_call(
-                    token,
-                    "sendDocument",
-                    data={
-                        "chat_id": str(chat_id),
-                        "caption": caption[:1024],
-                        "reply_parameters": json.dumps({"message_id": request_message_id}),
-                    },
-                    files={"document": ("Vexa.m4a", handle, "audio/mp4")},
-                    timeout=1_800,
-                )
-            return
-        except Exception as document_error:
-            raise RuntimeError(
-                f"Telegram audio upload failed: {audio_error}; document fallback: {document_error}"
-            ) from document_error
+    with path.open("rb") as handle:
+        telegram_call(
+            token, "sendAudio", data=data,
+            files={"audio": (path.name, handle, "audio/mp4")}, timeout=1800,
+        )
 
 
 def process_job(payload: dict[str, Any]) -> dict[str, Any]:
@@ -741,37 +722,14 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
 
         edit_status(token, chat_id, status_message_id, f"⬇️ دارم ویدیو رو با کیفیت {quality}p دانلود می‌کنم…")
         video_path = download_video(url, workdir, quality, metadata)
-        parts = split_for_telegram(video_path, workdir)
-
-        if len(parts) > 1 and video_path.exists() and video_path not in parts:
-            video_path.unlink(missing_ok=True)
-
-        if len(parts) > 1:
-            edit_status(
-                token,
-                chat_id,
-                status_message_id,
-                f"📦 فایل بزرگه؛ دارم توی {len(parts)} پارت برات می‌فرستم…",
-            )
-        else:
-            edit_status(token, chat_id, status_message_id, "📤 دانلود شد؛ دارم می‌فرستم…")
-
-        for index, part in enumerate(parts, start=1):
-            base_caption = f"{title}\n{quality}p"
-            caption = base_caption if len(parts) == 1 else f"{base_caption}\nPart {index}/{len(parts)}"
-            send_media_file(
-                token,
-                chat_id,
-                request_message_id,
-                part,
-                caption,
-                reply=index == 1,
-            )
-            if len(parts) > 1:
-                part.unlink(missing_ok=True)
-
+        validate_file_size(video_path)
+        edit_status(token, chat_id, status_message_id, "📤 ویدیو کامل آماده شد؛ دارم می‌فرستم…")
+        send_media_file(
+            token, chat_id, request_message_id, video_path,
+            f"{title}\n{quality}p", reply=True,
+        )
         delete_status(token, chat_id, status_message_id)
-        return {"ok": True, "parts": len(parts), "title": title, "quality": quality}
+        return {"ok": True, "parts": 1, "title": title, "quality": quality}
 
     except UserVisibleError as exc:
         try:
@@ -829,7 +787,8 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 result = inspect_video(url)
             else:
-                result = process_job(payload)
+                with JOB_LOCK:
+                    result = process_job(payload)
             self._send_json(200, result)
         except Exception as exc:
             print(f"youtube container request failed: {type(exc).__name__}: {exc}", flush=True)

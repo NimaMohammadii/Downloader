@@ -1,6 +1,6 @@
 # Telegram Instagram Downloader
 
-Telegram bot downloader running only on Cloudflare Workers.
+Telegram bot with Instagram delivery on Cloudflare Workers and full YouTube downloads in a Cloudflare Container.
 
 Production endpoint:
 
@@ -10,9 +10,17 @@ Production endpoint:
 
 Telegram -> Cloudflare Worker -> Instagram API/CDN -> Telegram
 
-There is no Render service, Docker container, ffmpeg process, Cloudflare Container, Workflow, or Durable Object in the active downloader path.
+Instagram keeps its existing Worker path. YouTube links are handled by a Workflow and a Container running yt-dlp, ffmpeg and Telethon.
 
-## Supported links
+## YouTube in bot chat
+
+Send a YouTube video or Shorts URL, then select 360p, 480p, 720p, 1080p or audio. Only available qualities are offered. The complete file is delivered as one message, up to 2,000,000,000 bytes; larger files are rejected with a request to choose a lower quality. Unavailable fragments abort the download instead of producing incomplete videos.
+
+Set Worker secrets `API_ID` and `API_HASH` from my.telegram.org alongside `BOT_TOKEN`. The Worker passes them to the Container environment; no user login or session string is needed. Telethon authenticates as the existing bot and preserves its HTTP webhook. Eight upload parts are in flight at a time with bounded memory; YouTube fragment downloads also use eight concurrent requests. These are transfer optimizations, not a fixed speed guarantee.
+
+The Docker image and Container/Workflow bindings must be deployed with `npx wrangler deploy`. A source commit alone does not activate this feature. There are up to 20 Container instances and they sleep after five minutes idle; Cloudflare Container and Workflow charges apply.
+
+## Supported Instagram links
 
 - Instagram Reel
 - Instagram video post

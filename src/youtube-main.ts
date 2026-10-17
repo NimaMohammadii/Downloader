@@ -32,6 +32,8 @@ type YoutubeDownloadJob = {
 
 type Env = AdminStatsEnv & {
   BOT_TOKEN: string;
+  API_ID: string;
+  API_HASH: string;
   YOUTUBE_DOWNLOAD_WORKFLOW: Workflow<YoutubeDownloadJob>;
   YOUTUBE_DOWNLOADER_CONTAINER: DurableObjectNamespace<YoutubeDownloaderContainer>;
   INSTAGRAM_SESSIONID?: string;
@@ -103,10 +105,11 @@ type ParsedQualityCallback = {
 
 const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
 
-export class YoutubeDownloaderContainer extends Container {
+export class YoutubeDownloaderContainer extends Container<Env> {
   defaultPort = 8080;
   sleepAfter = "5m";
   enableInternet = true;
+  envVars = { API_ID: this.env.API_ID, API_HASH: this.env.API_HASH };
 }
 
 function containerSessionId(job: Pick<YoutubeDownloadJob, "chatId" | "requestMessageId" | "userId">): string {
@@ -228,8 +231,8 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       const result = await step.do(
         job.audioMode ? "download and send youtube audio" : "download and send youtube video",
         {
-          retries: { limit: 1, delay: "1 second", backoff: "constant" },
-          timeout: "30 minutes",
+          retries: { limit: 0, delay: "1 second", backoff: "constant" },
+          timeout: "60 minutes",
         },
         async () => {
           const container = getContainer(
@@ -522,7 +525,7 @@ async function handleQualityCallback(
   }
 
   const job: YoutubeDownloadJob = {
-    id: `ytdl-${update.update_id}`,
+    id: `ytdl-${callback.message.chat.id}-${parsed.requestMessageId}-${parsed.userId}`,
     chatId: callback.message.chat.id,
     requestMessageId: parsed.requestMessageId,
     userId: parsed.userId,
@@ -547,7 +550,13 @@ async function handleQualityCallback(
     });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    if (!/already|exists|duplicate|conflict/i.test(detail)) {
+    if (/already|exists|duplicate|conflict/i.test(detail)) {
+      await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", {
+        callback_query_id: callback.id,
+        text: "دانلود این درخواست قبلاً شروع شده؛ برای دانلود دوباره لینک رو بفرست.",
+        show_alert: false,
+      });
+    } else {
       console.error("youtube download workflow create failed", { jobId: job.id, detail });
       await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", {
         callback_query_id: callback.id,

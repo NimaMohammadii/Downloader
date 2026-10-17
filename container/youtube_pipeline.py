@@ -29,6 +29,9 @@ class ClientAttemptError(Exception):
 def _client_args(client: str) -> list[str]:
     return [
         "--no-playlist",
+        "--abort-on-unavailable-fragments",
+        "--max-filesize",
+        str(app.DIRECT_TELEGRAM_LIMIT),
         "--force-ipv4",
         "--js-runtimes",
         "node",
@@ -479,7 +482,7 @@ def _download_video_with_client(
                 *_client_args(client),
                 "--no-simulate",
                 "--concurrent-fragments",
-                "2",
+                "8",
                 "--format",
                 "bv*+ba/b",
                 "--format-sort",
@@ -531,12 +534,6 @@ def download_video(url: str, workdir: Path, quality: int, metadata: dict[str, An
     for client in _client_order(cached_client):
         try:
             path = _download_video_with_client(url, client, workdir, quality, expected_ratio)
-            try:
-                fresh = _fetch_metadata_for_client(url, client)
-                if available_qualities(fresh) or audio_formats(fresh):
-                    _save_session(fresh, client)
-            except Exception:
-                pass
             return path
         except ClientAttemptError as exc:
             errors.append(exc)
@@ -676,35 +673,11 @@ def send_media_file(
     if reply:
         data["reply_parameters"] = json.dumps({"message_id": request_message_id})
 
-    try:
-        with path.open("rb") as handle:
-            app.telegram_call(
-                token,
-                "sendVideo",
-                data=data,
-                files={"video": (path.name, handle, "video/mp4")},
-                timeout=1800,
-            )
-    except Exception as video_error:
-        try:
-            with path.open("rb") as handle:
-                doc_data: dict[str, Any] = {
-                    "chat_id": str(chat_id),
-                    "caption": caption[:1024],
-                }
-                if reply:
-                    doc_data["reply_parameters"] = json.dumps({"message_id": request_message_id})
-                app.telegram_call(
-                    token,
-                    "sendDocument",
-                    data=doc_data,
-                    files={"document": (path.name, handle, "video/mp4")},
-                    timeout=1800,
-                )
-        except Exception as document_error:
-            raise RuntimeError(
-                f"Telegram upload failed: {video_error}; document fallback: {document_error}"
-            ) from document_error
+    with path.open("rb") as handle:
+        app.telegram_call(
+            token, "sendVideo", data=data,
+            files={"video": (path.name, handle, "video/mp4")}, timeout=1800,
+        )
 
 
 def install() -> None:
