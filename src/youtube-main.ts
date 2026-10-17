@@ -4,7 +4,7 @@ import {
   type WorkflowEvent,
   type WorkflowStep,
 } from "cloudflare:workers";
-import storyWorker from "./story-main";
+import storyWorker, { parseInstagramVideoTarget, resolveInstagramVideo, instagramVideoErrorText, type InstagramVideoTarget } from "./story-main";
 import {
   ADMIN_USER_ID,
   recordSuccessfulDelivery,
@@ -28,6 +28,7 @@ type YoutubeDownloadJob = {
   quality?: YoutubeQuality;
   audioMode?: YoutubeAudioMode;
   statusMessageId?: number;
+  instagram?: InstagramVideoTarget;
 };
 
 type Env = AdminStatsEnv & {
@@ -110,13 +111,71 @@ const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
 
 export class YoutubeDownloaderContainer extends Container<Env> {
   defaultPort = 8080;
-  sleepAfter = "5m";
+  sleepAfter: string | number = "5m";
   enableInternet = true;
   envVars = { API_ID: this.env.API_ID || "", API_HASH: this.env.API_HASH || "" };
+
+  async instagramRequest(action: string, payload: Record<string, unknown>): Promise<ContainerResult> {
+    if (!["start", "stop", "send", "cleanup"].includes(action)) throw new Error("IG_ACTION");
+    if (action === "start") {
+      await this.ctx.storage.put("instagramJob", { id: String(payload.id), until: Date.now() + 3 * 60 * 60 * 1000 });
+    }
+    const response = await this.containerFetch(`http://container/instagram/${action}`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload),
+    });
+    if (!response.ok) throw new Error(`IG_CONTAINER_${response.status}`);
+    return response.json() as Promise<ContainerResult>;
+  }
+
+  async releaseInstagram(): Promise<void> {
+    await this.ctx.storage.delete("instagramJob");
+    this.sleepAfter = "5m";
+    this.renewActivityTimeout();
+  }
+
+  override async onActivityExpired(): Promise<void> {
+    const job = await this.ctx.storage.get<{ until: number }>("instagramJob");
+    if (job && job.until > Date.now()) {
+      this.sleepAfter = Math.ceil((job.until - Date.now()) / 1000);
+      this.renewActivityTimeout();
+      return;
+    }
+    await super.onActivityExpired();
+  }
+
+  private async instagramInterrupted(): Promise<boolean> {
+    const job = await this.ctx.storage.get<{ id: string }>("instagramJob");
+    if (!job) return false;
+    const instance = await this.env.YOUTUBE_DOWNLOAD_WORKFLOW.get(job.id);
+    await instance.sendEvent({ type: "instagram-ready", payload: { ok: false, message: "❌ سرور هنگام ضبط ری‌استارت شد؛ ضبط پیوسته نماند. لینک لایو را دوباره بفرست." } });
+    return true;
+  }
+
+  override async onStop(): Promise<void> { await this.instagramInterrupted(); }
+  override async onError(error: unknown): Promise<void> {
+    if (!await this.instagramInterrupted()) super.onError(error);
+  }
 }
 
 function containerSessionId(job: Pick<YoutubeDownloadJob, "chatId" | "requestMessageId" | "userId">): string {
   return `yt-session-${job.chatId}-${job.requestMessageId}-${job.userId}`;
+}
+
+function instagramContainer(env: Env, job: Pick<YoutubeDownloadJob, "id">) {
+  return getContainer(env.YOUTUBE_DOWNLOADER_CONTAINER, `instagram-${job.id}`);
+}
+
+async function instagramSignature(token: string, value: string): Promise<string> {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(token), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value));
+  return [...new Uint8Array(signature)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function equalSignature(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
 }
 
 function redactDiagnostic(detail: string, env: Env): string {
@@ -160,6 +219,7 @@ async function containerResult<T>(env: Env, job: YoutubeDownloadJob, request: Re
 export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDownloadJob> {
   async run(event: WorkflowEvent<YoutubeDownloadJob>, step: WorkflowStep) {
     const job = event.payload;
+    if (job.instagram) return this.runInstagram(job, step);
     let statusMessageId = job.statusMessageId;
     let phase = "startup";
     const startContainer = () => step.do(
@@ -336,6 +396,81 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           return true;
         },
       );
+    }
+  }
+
+  private async runInstagram(job: YoutubeDownloadJob, step: WorkflowStep): Promise<void> {
+    let statusId: number | undefined;
+    let started = false;
+    try {
+      statusId = await step.do("show instagram video status", async () => {
+        const message = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
+          chat_id: job.chatId, reply_parameters: { message_id: job.requestMessageId },
+          text: "🔎 دارم لایو یا بازپخش اینستاگرام را بررسی می‌کنم…",
+        });
+        return message.message_id;
+      });
+      if (!/^\d+$/.test(this.env.API_ID || "") || !this.env.API_HASH?.trim()) throw new Error("YT_CONFIG");
+      // Return friendly failures durably, without retrying rejected Instagram sessions.
+      const resolution = await step.do("resolve instagram live or replay", { retries: { limit: 0, delay: "1 second" }, timeout: "2 minutes" }, async () => {
+        try { return { source: await resolveInstagramVideo(job.instagram!, this.env) }; }
+        catch (error) { return { message: instagramVideoErrorText(error) }; }
+      });
+      if (!resolution.source) {
+        await step.do("show instagram resolution error", () => telegramCall<boolean>(this.env.BOT_TOKEN, "editMessageText", {
+          chat_id: job.chatId, message_id: statusId, text: resolution.message,
+        }));
+        return;
+      }
+      const source = resolution.source;
+      await step.do("start instagram container", { retries: { limit: 2, delay: "5 seconds", backoff: "linear" }, timeout: "2 minutes" }, async () => {
+        await instagramContainer(this.env, job).startAndWaitForPorts({ ports: [8080], cancellationOptions: { instanceGetTimeoutMS: 45_000, portReadyTimeoutMS: 60_000 } });
+        return true;
+      });
+      started = true;
+      await step.do("begin instagram capture", { retries: { limit: 2, delay: "3 seconds" }, timeout: "1 minute" }, async () => {
+        const signature = (await instagramSignature(this.env.BOT_TOKEN, `stop:${job.chatId}:${job.requestMessageId}:${job.userId}`)).slice(0, 16);
+        const result = await instagramContainer(this.env, job).instagramRequest("start", {
+          id: job.id, source, botToken: this.env.BOT_TOKEN, chatId: job.chatId, requestMessageId: job.requestMessageId,
+          statusMessageId: statusId,
+          stopData: `igs|${job.requestMessageId}|${job.userId}|${signature}`,
+          completionUrl: `https://downloader.vexaagent.workers.dev/instagram/events/${job.id}`,
+          completionToken: await instagramSignature(this.env.BOT_TOKEN, `event:${job.id}`),
+        });
+        if (!result.ok) throw new Error("IG_START_FAILED");
+        return true;
+      });
+      // A completion event may arrive before this call; Workflows buffers it.
+      const ready = await step.waitForEvent<ContainerResult>("await instagram recording", { type: "instagram-ready", timeout: "150 minutes" });
+      if (!ready.payload.ok) {
+        await step.do("show instagram capture failure", () => telegramCall<boolean>(this.env.BOT_TOKEN, "editMessageText", {
+          chat_id: job.chatId, message_id: statusId, text: ready.payload.message || "❌ دریافت لایو کامل نشد؛ دوباره لینک را بفرست.", reply_markup: { inline_keyboard: [] },
+        }));
+        return;
+      }
+      const result = await step.do("send complete instagram recording", { retries: { limit: 0, delay: "1 second" }, timeout: "30 minutes" }, () =>
+        instagramContainer(this.env, job).instagramRequest("send", { id: job.id }),
+      );
+      if (result.ok) await step.do("record instagram video delivery", () => recordSuccessfulDelivery(this.env, `instagram:${job.id}`));
+      else throw new Error("IG_SEND_FAILED");
+    } catch (error) {
+      console.error("instagram video workflow failed", { jobId: job.id, type: error instanceof Error ? error.name : "error" });
+      await step.do("notify instagram video failure", async () => {
+        const text = error instanceof Error && error.message.includes("YT_CONFIG")
+          ? workflowFailureMessage("YT_CONFIG", "startup")
+          : "❌ ضبط یا ارسال لایو کامل نشد؛ لینک را دوباره بفرست. ممکن است سرور ری‌استارت شده باشد.";
+        await safeTelegramCall(this.env.BOT_TOKEN, statusId ? "editMessageText" : "sendMessage", {
+          chat_id: job.chatId, message_id: statusId, text, reply_markup: { inline_keyboard: [] },
+        });
+        return true;
+      });
+    } finally {
+      if (started) await step.do("release instagram recording", { retries: { limit: 1, delay: "2 seconds" }, timeout: "1 minute" }, async () => {
+        const container = instagramContainer(this.env, job);
+        try { await container.instagramRequest("cleanup", { id: job.id }); }
+        finally { await container.releaseInstagram(); }
+        return true;
+      });
     }
   }
 }
@@ -623,9 +758,65 @@ async function handleQualityCallback(
   return Response.json({ ok: true });
 }
 
+async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target: InstagramVideoTarget): Promise<Response> {
+  const message = update.message!;
+  const user = trackedUser(message);
+  const userId = user?.id ?? message.chat.id;
+  const job: YoutubeDownloadJob = {
+    id: `igdl-${message.chat.id}-${message.message_id}-${userId}`, chatId: message.chat.id,
+    requestMessageId: message.message_id, userId, url: "", instagram: target,
+  };
+  try {
+    await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id: job.id, params: job });
+    if (user && user.id !== ADMIN_USER_ID) await recordUserActivity(env, user, true);
+  } catch (error) {
+    if (!/already|exists|duplicate|conflict/i.test(error instanceof Error ? error.message : String(error))) {
+      await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id, text: "❌ شروع دریافت لایو ناموفق بود؛ لینک را دوباره بفرست." });
+    }
+  }
+  return Response.json({ ok: true });
+}
+
+async function stopInstagramRecording(env: Env, callback: TelegramCallbackQuery): Promise<Response> {
+  const match = /^igs\|(\d+)\|(\d+)\|([a-f0-9]{16})$/.exec(callback.data || "");
+  const chatId = callback.message?.chat.id;
+  let text = "این دکمه معتبر نیست یا برای شما نیست.";
+  if (match && chatId && callback.from.id === Number(match[2])) {
+    const signature = (await instagramSignature(env.BOT_TOKEN, `stop:${chatId}:${match[1]}:${match[2]}`)).slice(0, 16);
+    if (equalSignature(signature, match[3])) {
+      // Acknowledge immediately; the capture process finalizes its file separately.
+      await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "درخواست توقف ضبط ارسال شد…" });
+      try {
+        const result = await instagramContainer(env, { id: `igdl-${chatId}-${match[1]}-${match[2]}` }).instagramRequest("stop", { id: `igdl-${chatId}-${match[1]}-${match[2]}` });
+        if (!result.ok) await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: result.message || "ضبط قبلاً تمام شده یا در حال ارسال است." });
+      } catch {
+        await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "❌ ارتباط با ضبط‌کننده برقرار نشد؛ ممکن است ضبط پایان یافته یا سرور ری‌استارت شده باشد." });
+      }
+      return Response.json({ ok: true });
+    }
+  }
+  await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text, show_alert: true });
+  return Response.json({ ok: true });
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const requestUrl = new URL(request.url);
+
+    const completion = /^\/instagram\/events\/(igdl--?\d+-\d+-\d+)$/.exec(requestUrl.pathname);
+    if (request.method === "POST" && completion) {
+      const expected = await instagramSignature(env.BOT_TOKEN, `event:${completion[1]}`);
+      if (!equalSignature(request.headers.get("x-instagram-event-token") || "", expected)) return new Response("Forbidden", { status: 403 });
+      const body = await request.text();
+      if (body.length > 4096) return new Response("Too large", { status: 413 });
+      try {
+        const payload = JSON.parse(body) as ContainerResult;
+        if (typeof payload.ok !== "boolean") return new Response("Invalid event", { status: 400 });
+        const instance = await env.YOUTUBE_DOWNLOAD_WORKFLOW.get(completion[1]);
+        await instance.sendEvent({ type: "instagram-ready", payload: { ok: payload.ok, message: payload.message?.slice(0, 500) } });
+        return Response.json({ ok: true });
+      } catch { return new Response("Event delivery failed", { status: 503 }); }
+    }
 
     if (
       request.method === "POST" &&
@@ -642,6 +833,7 @@ export default {
       if (update?.callback_query?.data?.startsWith("ytq|")) {
         return handleQualityCallback(env, update, update.callback_query);
       }
+      if (update?.callback_query?.data?.startsWith("igs|")) return stopInstagramRecording(env, update.callback_query);
 
       const message = update?.message;
       if (update && message) {
@@ -654,11 +846,17 @@ export default {
           }
           await telegramCall(env.BOT_TOKEN, "sendMessage", {
             chat_id: message.chat.id,
-            text: "لینک ویدیوی YouTube، Shorts، Reel، پست یا Story اینستاگرام رو بفرست؛ فایلش رو همین‌جا برات می‌فرستم ⚡️",
+            text: "لینک ویدیوی YouTube، Shorts، Reel، پست، Story یا Live اینستاگرام رو بفرست؛ فایلش رو همین‌جا برات می‌فرستم ⚡️\n\nضبط لایو: /live username\nبازپخش: /replay و لینک بازپخش منتشرشده\nتوقف ضبط با دکمهٔ زیر پیام ضبط انجام می‌شود.",
           });
           return Response.json({ ok: true });
         }
 
+        const instagramTarget = parseInstagramVideoTarget(text);
+        if (instagramTarget) return createInstagramWorkflow(env, update, instagramTarget);
+        if (/^\/(live|replay)(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) {
+          await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id, text: "ضبط لایو: /live username\nبازپخش: /replay و لینک پست، Reel یا TV\nهمچنین می‌توانی لینک مستقیم Live را بفرستی." });
+          return Response.json({ ok: true });
+        }
         const youtubeUrl = extractYouTubeUrl(text);
         if (youtubeUrl) {
           return createYoutubeInspectWorkflow(env, update, youtubeUrl);

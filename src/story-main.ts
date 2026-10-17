@@ -500,6 +500,133 @@ async function privateResolve(target: StoryTarget, env: Env): Promise<MediaCandi
   return media;
 }
 
+// Live/replay resolution shares the working Story session and exact-ID parser.
+export type InstagramVideoTarget = {
+  kind: "live" | "replay";
+  username?: string;
+  broadcastId?: string;
+  shortcode?: string;
+};
+export type InstagramVideoSource = {
+  mode: "live" | "replay";
+  url?: string;
+  manifest?: string;
+  title: string;
+  duration?: number;
+};
+
+export function parseInstagramVideoTarget(text: string): InstagramVideoTarget | null {
+  const command = /^\/(live|replay)(?:@[A-Za-z0-9_]+)?(?:\s+(.+))?$/i.exec(text.trim());
+  const mode = command?.[1].toLowerCase();
+  const input = (command?.[2] || text).trim();
+  if (command && /^@?[A-Za-z0-9_.]{1,30}$/.test(input)) {
+    return { kind: mode as "live" | "replay", username: input.replace(/^@/, "") };
+  }
+  for (const raw of input.match(/https?:\/\/[^\s<>"']+/gi) || []) {
+    try {
+      const url = new URL(raw.replace(/[),.!?\]}]+$/g, ""));
+      if (url.hostname.toLowerCase().replace(/^www\./, "") !== "instagram.com") continue;
+      const parts = url.pathname.split("/").filter(Boolean);
+      const live = parts.indexOf("live");
+      if (live === 0 || live === 1) {
+        const username = live === 1 ? parts[0] : undefined;
+        const broadcastId = /^\d+$/.test(parts[live + 1] || "") ? parts[live + 1] : undefined;
+        if (parts[live + 1] && !broadcastId) continue;
+        if (username || broadcastId) return { kind: mode === "replay" ? "replay" : "live", username, broadcastId };
+      }
+      if ((parts[0] === "tv" || (mode === "replay" && ["p", "reel", "reels"].includes(parts[0]))) && /^[A-Za-z0-9_-]{1,20}$/.test(parts[1] || "")) {
+        return { kind: "replay", shortcode: parts[1] };
+      }
+      if (command && parts.length === 1 && /^[A-Za-z0-9_.]{1,30}$/.test(parts[0])) {
+        return { kind: mode as "live" | "replay", username: parts[0] };
+      }
+    } catch { /* Keep scanning. */ }
+  }
+  return null;
+}
+
+class InstagramVideoError extends Error {}
+
+export function instagramVideoErrorText(error: unknown): string {
+  if (error instanceof InstagramVideoError) return error.message;
+  return storyErrorText(error);
+}
+
+function instagramMediaUrl(value: unknown): string | undefined {
+  if (typeof value !== "string") return;
+  try {
+    const url = new URL(value);
+    if (url.protocol === "https:" && !url.username && !url.password && !url.port &&
+      ["cdninstagram.com", "fbcdn.net"].some(host => url.hostname === host || url.hostname.endsWith(`.${host}`))) return value;
+  } catch { /* Invalid upstream URL. */ }
+}
+
+async function instagramVideoRequest(path: string, jar: CookieJar): Promise<any> {
+  const headers = privateHeaders(jar);
+  if (!headers) throw new StoryError("session_missing");
+  const result = await jsonRequest(`https://i.instagram.com/api/v1/${path}`, headers, jar);
+  if (!result.data || result.data.status === "fail") {
+    throw new InstagramVideoError("❌ اینستاگرام اطلاعات این لایو را برنگرداند؛ دسترسی حساب یا لینک را بررسی کن.");
+  }
+  return result.data;
+}
+
+function replayMediaSource(item: any): InstagramVideoSource | null {
+  const videos = Array.isArray(item?.video_versions) ? item.video_versions : [];
+  const best = videos.filter((v: any) => instagramMediaUrl(v?.url))
+    .sort((a: any, b: any) => Number(b.width || 0) * Number(b.height || 0) - Number(a.width || 0) * Number(a.height || 0))[0];
+  if (!best) return null;
+  return { mode: "replay", url: best.url, title: String(item?.caption?.text || "Instagram Live Replay").slice(0, 180), duration: Number(item?.video_duration) || undefined };
+}
+
+export async function resolveInstagramVideo(target: InstagramVideoTarget, env: Env): Promise<InstagramVideoSource> {
+  const jar = createJar(env);
+  if (!authParts(jar)) throw new StoryError("session_missing");
+  if (target.shortcode) {
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let id = 0n;
+    for (const char of target.shortcode) id = id * 64n + BigInt(alphabet.indexOf(char));
+    const data = await instagramVideoRequest(`media/${id}/info/`, jar);
+    const item = (Array.isArray(data.items) ? data.items : []).find((v: any) => [v.pk, v.id].some(value => String(value || "").split("_")[0] === String(id)));
+    const source = replayMediaSource(item);
+    if (source) return source;
+    throw new InstagramVideoError("❌ این لینک ویدیوی بازپخش قابل دانلود ندارد؛ لینک بازپخش منتشرشده را بفرست.");
+  }
+  let feed: any = null;
+  let broadcast: any = null;
+  if (target.username && (!target.broadcastId || target.kind === "replay")) {
+    const userId = await privateUserId(target.username, jar) || await webUserId(target.username, jar);
+    if (!userId) throw new StoryError("user_lookup");
+    feed = await instagramVideoRequest(`feed/user/${userId}/story/`, jar);
+    if (target.kind === "replay") {
+      const broadcasts = Array.isArray(feed?.post_live_item?.broadcasts) ? feed.post_live_item.broadcasts : [];
+      broadcast = target.broadcastId
+        ? broadcasts.find((v: any) => String(v.id || v.broadcast_id) === target.broadcastId)
+        : [...broadcasts].sort((a: any, b: any) => Number(b.published_time || 0) - Number(a.published_time || 0))[0];
+    } else broadcast = feed?.broadcast;
+  }
+  const id = target.broadcastId || String(broadcast?.id || broadcast?.broadcast_id || "");
+  if (!/^\d+$/.test(id)) {
+    throw new InstagramVideoError(target.kind === "live"
+      ? "❌ این اکانت الان لایو فعالِ قابل مشاهده ندارد. برای بازپخش، لینک منتشرشده یا /replay username را بفرست."
+      : "❌ بازپخش منتشرشده‌ای برای این حساب پیدا نشد؛ لینک پست، Reel یا TV بازپخش را بفرست.");
+  }
+  // Archived broadcasts in post_live_item may no longer expose /live/{id}/info/.
+  if (!broadcast || target.kind === "live") broadcast = await instagramVideoRequest(`live/${id}/info/`, jar);
+  const active = ["active", "interrupted"].includes(String(broadcast?.broadcast_status || "").toLowerCase());
+  if (active && target.kind === "replay") throw new InstagramVideoError("❌ این لایو هنوز در حال پخش است؛ برای ضبطش /live username را بفرست.");
+  const mode = active ? "live" : "replay";
+  const url = instagramMediaUrl(broadcast?.dash_abr_playback_url) || instagramMediaUrl(broadcast?.dash_playback_url);
+  const manifest = typeof broadcast?.dash_manifest === "string" ? broadcast.dash_manifest : undefined;
+  if (url || manifest) return { mode, url, manifest, title: String(broadcast?.broadcast_message || `${target.username || "Instagram"} Live${active ? "" : " Replay"}`).slice(0, 180) };
+  if (!active && /^\d+(?:_\d+)?$/.test(String(broadcast?.media_id || ""))) {
+    const data = await instagramVideoRequest(`media/${broadcast.media_id}/info/`, jar);
+    const source = replayMediaSource(data.items?.[0]);
+    if (source) return source;
+  }
+  throw new InstagramVideoError("❌ فایل پخش این لایو در دسترس حساب متصل نیست؛ برای لایو پایان‌یافته لینک بازپخش منتشرشده لازم است.");
+}
+
 async function signValue(secret: string, value: string): Promise<string> {
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);

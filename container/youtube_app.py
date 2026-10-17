@@ -3,14 +3,17 @@ import hashlib
 import json
 import secrets
 import os
+import re
+import signal
 import shutil
 import subprocess
 import tempfile
 import threading
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urljoin
 
 import requests
 
@@ -753,6 +756,336 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+INSTAGRAM_RECORD_SECONDS = 2 * 60 * 60
+INSTAGRAM_FILE_LIMIT = 1_900_000_000  # Leave room for the finalized MP4 below Telegram's cap.
+INSTAGRAM_JOBS: dict[str, "InstagramCapture"] = {}
+INSTAGRAM_LOCK = threading.Lock()
+
+
+def instagram_safe_url(value: str) -> str:
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").lower()
+    if (parsed.scheme != "https" or parsed.username or parsed.password or parsed.port
+            or not any(host == domain or host.endswith("." + domain) for domain in ("cdninstagram.com", "fbcdn.net"))):
+        raise UserVisibleError("❌ آدرس فایل لایو معتبر نیست.")
+    return value
+
+
+def instagram_manifest(xml: str, origin: str | None, live: bool) -> str:
+    if len(xml) > 2_000_000 or "<!DOCTYPE" in xml.upper() or "<!ENTITY" in xml.upper():
+        raise UserVisibleError("❌ اطلاعات پخش لایو معتبر نیست.")
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError as exc:
+        raise UserVisibleError("❌ اطلاعات پخش لایو دریافت نشد.") from exc
+    tag = lambda node: node.tag.rsplit("}", 1)[-1]
+    if tag(root) != "MPD" or any(tag(node) == "ContentProtection" for node in root.iter()):
+        raise UserVisibleError("❌ این فایل پخش قابل دانلود نیست.")
+    if root.tag.startswith("{"):
+        ET.register_namespace("", root.tag[1:].split("}", 1)[0])
+    if not live and root.get("type", "static") == "dynamic":
+        raise UserVisibleError("❌ این لینک بازپخش منتشرشده نیست؛ لینک پست یا Reel بازپخش را بفرست.")
+
+    def rewrite(node: ET.Element, base: str) -> None:
+        bases = [child for child in node if tag(child) == "BaseURL"]
+        for child in bases:
+            child.text = instagram_safe_url(urljoin(base, (child.text or "").strip()))
+        current = bases[0].text if bases else base
+        for key, value in list(node.attrib.items()):
+            if key.rsplit("}", 1)[-1] in {"media", "initialization", "sourceURL", "href"}:
+                node.set(key, instagram_safe_url(urljoin(current or "", value)))
+        for child in node:
+            if tag(child) == "Location":
+                child.text = instagram_safe_url(urljoin(current or "", (child.text or "").strip()))
+            elif tag(child) != "BaseURL":
+                rewrite(child, current or "")
+    rewrite(root, origin or "")
+    # A local static MPD needs a network base for relative segment URLs.
+    if origin and not any(tag(child) == "BaseURL" for child in root):
+        namespace = root.tag[:-3] if root.tag.endswith("MPD") else ""
+        child = ET.Element(namespace + "BaseURL")
+        child.text = instagram_safe_url(urljoin(origin, "."))
+        root.insert(0, child)
+    if not any(tag(node) == "Representation" for node in root.iter()):
+        raise UserVisibleError("❌ فایل ویدیو داخل اطلاعات پخش وجود ندارد.")
+    return ET.tostring(root, encoding="unicode")
+
+
+def instagram_read_manifest(url: str) -> tuple[str, str]:
+    # Validate each redirect; never forward Instagram account cookies to a CDN.
+    for _ in range(4):
+        instagram_safe_url(url)
+        with requests.get(url, headers={"Referer": "https://www.instagram.com/"}, timeout=(15, 30), stream=True, allow_redirects=False) as response:
+            if response.status_code in {301, 302, 303, 307, 308}:
+                url = urljoin(url, response.headers.get("location", ""))
+                continue
+            if response.status_code in {401, 403, 404}:
+                raise UserVisibleError("❌ آدرس پخش لایو منقضی شده یا دسترسی سرور رد شده؛ لینک را دوباره بفرست.")
+            response.raise_for_status()
+            chunks, size = [], 0
+            for chunk in response.iter_content(64 * 1024):
+                size += len(chunk)
+                if size > 2_000_000:
+                    raise UserVisibleError("❌ اطلاعات پخش لایو بیش از حد بزرگ است.")
+                chunks.append(chunk)
+            return b"".join(chunks).decode("utf-8"), url
+    raise UserVisibleError("❌ آدرس پخش لایو بیش از حد تغییر مسیر داد.")
+
+
+class InstagramCapture:
+    def __init__(self, payload: dict[str, Any]):
+        self.payload = payload
+        self.id = str(payload.get("id") or "")
+        if not re.fullmatch(r"igdl--?\d+-\d+-\d+", self.id):
+            raise ValueError("Invalid Instagram job ID")
+        self.source = payload.get("source") or {}
+        self.live = self.source.get("mode") == "live"
+        if self.source.get("mode") not in {"live", "replay"}:
+            raise ValueError("Invalid Instagram mode")
+        if payload.get("completionUrl") != f"https://downloader.vexaagent.workers.dev/instagram/events/{self.id}":
+            raise ValueError("Invalid completion destination")
+        if not re.fullmatch(r"[a-f0-9]{64}", str(payload.get("completionToken") or "")):
+            raise ValueError("Invalid event token")
+        self.workdir = Path(tempfile.mkdtemp(prefix="instagram-capture-"))
+        self.path = self.workdir / "Instagram.mp4"
+        self.process: subprocess.Popen | None = None
+        self.lock = threading.RLock()
+        self.stop_event = threading.Event()
+        self.cleanup_requested = False
+        self.reason = ""
+        self.state = "starting"
+        self.result: dict[str, Any] = {"ok": False}
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.expiry = threading.Timer(3 * 60 * 60, self.cleanup)
+        self.expiry.daemon = True
+
+    def status(self, text: str, *, button: bool = False) -> None:
+        telegram_call(self.payload["botToken"], "editMessageText", json_payload={
+            "chat_id": self.payload["chatId"], "message_id": self.payload["statusMessageId"], "text": text,
+            "reply_markup": {"inline_keyboard": [[{"text": "⏹ توقف ضبط و ارسال", "callback_data": self.payload["stopData"]}]] if button else []},
+        }, timeout=30)
+
+    def safe_status(self, text: str, *, button: bool = False) -> None:
+        try:
+            self.status(text, button=button)
+        except Exception:
+            print("instagram status delivery failed", flush=True)
+
+    def stop(self, reason: str = "user") -> bool:
+        with self.lock:
+            if self.state not in {"starting", "recording"} or (reason == "user" and not self.live):
+                return False
+            if not self.reason:
+                self.reason = reason
+            self.stop_event.set()
+            if self.process is not None and self.process.poll() is None:
+                try:
+                    self.process.send_signal(signal.SIGINT)
+                except ProcessLookupError:
+                    return True
+                killer = threading.Timer(15, self.kill)
+                killer.daemon = True
+                killer.start()
+            return True
+
+    def kill(self) -> None:
+        with self.lock:
+            if self.process is not None and self.process.poll() is None:
+                self.process.kill()
+
+    def notify(self) -> None:
+        for attempt in range(3):
+            try:
+                response = requests.post(self.payload["completionUrl"], headers={"x-instagram-event-token": self.payload["completionToken"]}, json=self.result, timeout=(10, 20))
+                if response.ok:
+                    return
+            except requests.RequestException:
+                pass
+            if attempt < 2:
+                self.stop_event.wait(2 ** (attempt + 1))
+        self.safe_status("❌ فایل دریافت شد ولی اعلام نتیجه به ربات کامل نشد؛ لینک را دوباره بفرست.")
+
+    def run(self) -> None:
+        watchdog = wall_timer = None
+        try:
+            source_url = self.source.get("url")
+            xml = self.source.get("manifest")
+            if source_url:
+                instagram_safe_url(source_url)
+            if self.live or xml or (source_url and urlparse(source_url).path.lower().endswith(".mpd")):
+                origin = source_url
+                if not xml:
+                    xml, origin = instagram_read_manifest(source_url)
+                xml = instagram_manifest(xml, origin, self.live)
+                if self.live:
+                    # FFmpeg must reload the remote dynamic MPD to receive new segments.
+                    if not source_url:
+                        raise UserVisibleError("❌ آدرس زندهٔ پخش موجود نیست؛ لینک Live را دوباره بفرست.")
+                    input_url = instagram_safe_url(origin)
+                else:
+                    manifest_path = self.workdir / "replay.mpd"
+                    manifest_path.write_text(xml, encoding="utf-8")
+                    input_url = str(manifest_path)
+            elif source_url:
+                input_url = source_url
+            else:
+                raise UserVisibleError("❌ فایل پخش این لایو در دسترس نیست.")
+            if self.stop_event.is_set():
+                raise UserVisibleError("ضبط پیش از دریافت تصویر متوقف شد؛ فایلی برای ارسال وجود ندارد.")
+            raw_path = self.workdir / "capture.mp4"
+            command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
+                       "-rw_timeout", "45000000", "-protocol_whitelist", "file,https,tls,tcp",
+                       "-i", input_url,
+                       "-sn", "-dn", "-c", "copy"]
+            if self.live:
+                command += ["-t", str(INSTAGRAM_RECORD_SECONDS)]
+            command += ["-fs", str(INSTAGRAM_FILE_LIMIT), "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                        "-progress", "pipe:1", str(raw_path)]
+            with self.lock:
+                self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                self.state = "recording"
+                if self.stop_event.is_set():
+                    self.stop()
+            self.safe_status("🔴 ضبط Live شروع شد.\nاز این لحظه تا پایان پخش یا توقف ضبط ذخیره می‌شود.\nسقف هر ضبط: 2 ساعت یا 1.9 GB." if self.live else "⬇️ دارم بازپخش کامل لایو را دانلود می‌کنم…", button=self.live)
+            wall_timer = threading.Timer(INSTAGRAM_RECORD_SECONDS + 60 if self.live else 25 * 60, lambda: self.stop("time_limit"))
+            wall_timer.daemon = True
+            wall_timer.start()
+            last_progress = None
+            # FFmpeg's progress stream drives the stall watchdog; no status polling.
+            assert self.process.stdout is not None
+            watchdog = threading.Timer(90, lambda: self.stop("interrupted"))
+            watchdog.daemon = True
+            watchdog.start()
+            for line in self.process.stdout:
+                if line.startswith("out_time_us=") and line.strip() != last_progress:
+                    last_progress = line.strip()
+                    watchdog.cancel()
+                    watchdog = threading.Timer(90, lambda: self.stop("interrupted"))
+                    watchdog.daemon = True
+                    watchdog.start()
+            self.process.stdout.close()
+            returncode = self.process.wait()
+            watchdog.cancel()
+            wall_timer.cancel()
+            with self.lock:
+                self.state = "finalizing"
+            if not raw_path.exists() or raw_path.stat().st_size < 100:
+                raise UserVisibleError("❌ تصویری از لایو دریافت نشد؛ ممکن است پخش پایان یافته یا آدرس آن منقضی شده باشد.")
+            capped = raw_path.stat().st_size >= INSTAGRAM_FILE_LIMIT
+            if not self.live and (returncode != 0 or self.reason or capped):
+                raise UserVisibleError("❌ بازپخش کامل دریافت نشد یا حجم آن از سقف ارسال بیشتر است؛ فایل ناقص ارسال نشد.")
+            if self.live and not self.reason:
+                self.reason = "size_limit" if capped else ("interrupted" if returncode != 0 else "ended")
+            subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin", "-i", str(raw_path),
+                            "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-movflags", "+faststart", str(self.path)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=180)
+            raw_path.unlink(missing_ok=True)
+            validate_file_size(self.path)
+            info = subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(self.path)],
+                                  capture_output=True, text=True, check=True, timeout=45)
+            metadata = json.loads(info.stdout)
+            video = next((stream for stream in metadata.get("streams", []) if stream.get("codec_type") == "video"), None)
+            duration = float(metadata.get("format", {}).get("duration") or 0)
+            if not video or duration <= 0:
+                raise UserVisibleError("❌ فایل ویدیوی سالم برای ارسال ساخته نشد.")
+            expected = float(self.source.get("duration") or 0)
+            if not self.live and expected and duration < expected - 2:
+                raise UserVisibleError("❌ بازپخش ناقص دریافت شد؛ فایل ناقص ارسال نشد.")
+            if self.live and self.reason == "ended" and duration >= INSTAGRAM_RECORD_SECONDS - 1:
+                self.reason = "time_limit"
+            self.video = {"width": str(video.get("width", 0)), "height": str(video.get("height", 0)), "duration": str(duration)}
+            self.result = {"ok": True}
+            self.safe_status("📤 فایل آماده شد؛ در حال آماده‌سازی ارسال…")
+            with self.lock:
+                self.state = "ready"
+        except Exception as exc:
+            # Never print commands, signed stream URLs, bot tokens or account data.
+            print(f"instagram capture failed: {type(exc).__name__}", flush=True)
+            self.result = {"ok": False, "message": str(exc) if isinstance(exc, UserVisibleError) else "❌ دریافت یا آماده‌سازی لایو کامل نشد؛ لینک را دوباره بفرست."}
+            with self.lock:
+                self.state = "failed"
+        finally:
+            if self.process is not None:
+                if self.process.poll() is None:
+                    self.kill()
+                    self.process.wait(timeout=20)
+                if self.process.stdout is not None:
+                    self.process.stdout.close()
+            if watchdog:
+                watchdog.cancel()
+            if wall_timer:
+                wall_timer.cancel()
+            self.notify()
+            if self.cleanup_requested:
+                shutil.rmtree(self.workdir, ignore_errors=True)
+
+    def send(self) -> dict[str, Any]:
+        with self.lock:
+            if self.state == "sent":
+                return {"ok": True}
+            if self.state != "ready":
+                return {"ok": False, "message": "فایل آمادهٔ ارسال نیست یا قبلاً ارسال آن شروع شده است."}
+            self.state = "sending"
+        try:
+            notes = {"user": "ضبط با درخواست شما متوقف شد.", "time_limit": "ضبط به سقف زمانی رسید.", "size_limit": "ضبط به سقف حجم رسید.", "interrupted": "ارتباط پخش قطع شد؛ بخش دریافت‌شده ارسال شد."}
+            caption = str(self.source.get("title") or "Instagram Live")[:180]
+            caption += "\n" + ("Live Recording" if self.live else "Live Replay")
+            if self.live and self.reason in notes:
+                caption += "\n" + notes[self.reason]
+            data = {"chat_id": str(self.payload["chatId"]), "caption": caption,
+                    "reply_parameters": json.dumps({"message_id": self.payload["requestMessageId"]}), **self.video}
+            self.safe_status("📤 دارم فایل ویدیو را کامل در تلگرام ارسال می‌کنم…")
+            with self.path.open("rb") as handle:
+                asyncio.run(asyncio.wait_for(upload_complete_file(self.payload["botToken"], "sendVideo", data, (self.path.name, handle, "video/mp4")), timeout=25 * 60))
+            with self.lock:
+                self.state = "sent"
+            delete_status(self.payload["botToken"], self.payload["chatId"], self.payload["statusMessageId"])
+            return {"ok": True}
+        except Exception as exc:
+            print(f"instagram upload failed: {type(exc).__name__}", flush=True)
+            with self.lock:
+                self.state = "failed"
+            return {"ok": False}
+
+    def cleanup(self) -> None:
+        self.cleanup_requested = True
+        self.stop("cleanup")
+        if self.thread.is_alive() and threading.current_thread() is not self.thread:
+            self.thread.join(timeout=20)
+        if not self.thread.is_alive():
+            shutil.rmtree(self.workdir, ignore_errors=True)
+        self.expiry.cancel()
+
+
+def instagram_action(action: str, payload: dict[str, Any]) -> dict[str, Any]:
+    job_id = str(payload.get("id") or "")
+    with INSTAGRAM_LOCK:
+        job = INSTAGRAM_JOBS.get(job_id)
+        if action == "start":
+            if job:
+                # Workflow start retries reuse the same process and file.
+                return {"ok": True}
+            if INSTAGRAM_JOBS:
+                return {"ok": False, "message": "ضبط دیگری در حال انجام است."}
+            job = InstagramCapture(payload)
+            INSTAGRAM_JOBS[job_id] = job
+            job.expiry.start()
+            job.thread.start()
+            return {"ok": True}
+    if not job:
+        return {"ok": action == "cleanup", "message": "ضبط قبلاً تمام شده یا سرور ری‌استارت شده است."}
+    if action == "stop":
+        return {"ok": job.stop(), "message": "ضبط تمام شده یا در حال ارسال است."}
+    if action == "send":
+        return job.send()
+    if action == "cleanup":
+        job.cleanup()
+        with INSTAGRAM_LOCK:
+            INSTAGRAM_JOBS.pop(job_id, None)
+        return {"ok": True}
+    raise ValueError("Invalid Instagram action")
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -771,7 +1104,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(404, {"ok": False, "error": "not found"})
 
     def do_POST(self) -> None:
-        if self.path not in {"/metadata", "/download"}:
+        if self.path not in {"/metadata", "/download", "/instagram/start", "/instagram/stop", "/instagram/send", "/instagram/cleanup"}:
             self._send_json(404, {"ok": False, "error": "not found"})
             return
         try:
@@ -780,7 +1113,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"ok": False, "error": "invalid body"})
                 return
             payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
-            if self.path == "/metadata":
+            if self.path.startswith("/instagram/"):
+                result = instagram_action(self.path.rsplit("/", 1)[-1], payload)
+            elif self.path == "/metadata":
                 url = str(payload.get("url") or "")
                 if not url:
                     self._send_json(400, {"ok": False, "message": "❌ لینک YouTube نامعتبره."})
