@@ -86,6 +86,8 @@ type ContainerResult = {
   audioMode?: YoutubeAudioMode;
 };
 
+type YoutubeFileSize = { bytes: number; estimated: boolean };
+
 type YoutubeMetadataResult = {
   ok: boolean;
   message?: string;
@@ -93,6 +95,7 @@ type YoutubeMetadataResult = {
   videoId?: string;
   qualities?: number[];
   audioAvailable?: boolean;
+  sizes?: Record<string, YoutubeFileSize>;
 };
 
 type ParsedQualityCallback = {
@@ -249,6 +252,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
                 metadata.videoId!,
                 job.requestMessageId,
                 job.userId,
+                metadata.sizes,
               ),
             },
           });
@@ -384,16 +388,25 @@ function formatVideoTitle(title: string | undefined): string {
 }
 
 function qualityLabel(quality: YoutubeQuality): string {
-  if (quality === 360) return "360p • کم‌حجم";
-  if (quality === 480) return "480p • معمولی";
+  if (quality === 360) return "360p • Low";
+  if (quality === 480) return "480p • Standard";
   if (quality === 720) return "⭐ 720p HD";
   return "1080p Full HD";
 }
 
 function formatSelection(job: Pick<YoutubeDownloadJob, "quality" | "audioMode">): string {
-  if (job.audioMode === "low") return "🎵 Audio • کم‌حجم";
+  if (job.audioMode === "low") return "🎵 Audio • Low";
   if (job.audioMode === "hq") return "🎧 Audio • HQ";
-  return `کیفیت ${job.quality}p`;
+  return qualityLabel(job.quality!);
+}
+
+function fileSizeLabel(size: YoutubeFileSize | undefined): string {
+  if (!size || !Number.isFinite(size.bytes) || size.bytes <= 0) return "Size unknown";
+  const bytes = size.bytes;
+  const label = bytes >= 1_000_000_000 ? `${(bytes / 1_000_000_000).toFixed(2)} GB`
+    : bytes >= 1_000_000 ? `${(bytes / 1_000_000).toFixed(1)} MB`
+    : `${Math.max(1, Math.round(bytes / 1000))} KB`;
+  return `${size.estimated ? "≈" : ""}${label}`;
 }
 
 function buildQualityKeyboard(
@@ -402,9 +415,10 @@ function buildQualityKeyboard(
   videoId: string,
   requestMessageId: number,
   userId: number,
+  sizes?: Record<string, YoutubeFileSize>,
 ): Array<Array<{ text: string; callback_data: string }>> {
   const buttons = qualities.map((quality) => ({
-    text: qualityLabel(quality),
+    text: `${qualityLabel(quality)} • ${fileSizeLabel(sizes?.[String(quality)])}`,
     callback_data: `ytq|${videoId}|${quality}|${requestMessageId}|${userId}`,
   }));
   const rows: Array<Array<{ text: string; callback_data: string }>> = [];
@@ -414,11 +428,11 @@ function buildQualityKeyboard(
   if (audioAvailable) {
     rows.push([
       {
-        text: "🎵 Audio • کم‌حجم",
+        text: `🎵 Audio • Low • ${fileSizeLabel(sizes?.low)}`,
         callback_data: `ytq|${videoId}|al|${requestMessageId}|${userId}`,
       },
       {
-        text: "🎧 Audio • HQ",
+        text: `🎧 Audio • HQ • ${fileSizeLabel(sizes?.hq)}`,
         callback_data: `ytq|${videoId}|ah|${requestMessageId}|${userId}`,
       },
     ]);

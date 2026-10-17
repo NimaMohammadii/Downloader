@@ -1,4 +1,6 @@
 import json
+import math
+import tempfile
 import re
 import shutil
 import subprocess
@@ -374,6 +376,61 @@ def fetch_metadata(url: str) -> dict[str, Any]:
     )
 
 
+def _format_size(item: dict[str, Any], duration: float) -> tuple[int, bool] | None:
+    for key in ("filesize", "filesize_approx"):
+        value = item.get(key)
+        if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
+            return round(value), key != "filesize"
+    bitrate = item.get("tbr") or item.get("abr")
+    if isinstance(bitrate, (int, float)) and math.isfinite(bitrate) and bitrate > 0 and duration > 0:
+        return round(duration * bitrate * 1000 / 8), True
+    return None
+
+
+def _selection_size(selected: dict[str, Any], audio_mode: str | None = None) -> dict[str, Any] | None:
+    duration = float(selected.get("duration") or 0)
+    if audio_mode and selected.get("ext") != "m4a":
+        # Match the existing AAC conversion bitrate.
+        if duration <= 0:
+            return None
+        return {"bytes": round(duration * (64_000 if audio_mode == "low" else 128_000) / 8), "estimated": True}
+    formats = selected.get("requested_formats") or [selected]
+    sizes = [_format_size(item, duration) for item in formats]
+    if not sizes or any(size is None for size in sizes):
+        return None
+    # Video is remuxed/merged, so container overhead makes the final size approximate.
+    return {"bytes": sum(size[0] for size in sizes),
+            "estimated": not audio_mode or any(size[1] for size in sizes)}
+
+
+def quality_sizes(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the same selectors locally, using cached metadata without network requests."""
+    result: dict[str, Any] = {}
+    with tempfile.TemporaryDirectory(prefix="youtube-sizes-") as directory:
+        info = Path(directory) / "info.json"
+        info.write_text(json.dumps(metadata), encoding="utf-8")
+        choices = [(str(q), "bv*+ba/b", f"res:{q},+codec:avc:m4a,ext:mp4:m4a", None)
+                   for q in available_qualities(metadata)]
+        if audio_formats(metadata):
+            choices += [("low", "ba[abr<=80][ext=m4a]/ba[abr<=80]/worstaudio[ext=m4a]/worstaudio", None, "low"),
+                        ("hq", "ba[ext=m4a]/ba", None, "hq")]
+        for key, selector, sort, mode in choices:
+            command = [app.REAL_YTDLP, "--ignore-config", "--load-info-json", str(info),
+                       "--skip-download", "--no-check-formats", "--dump-single-json", "--no-warnings",
+                       "--format", selector]
+            if sort:
+                command += ["--format-sort", sort]
+            try:
+                selected = json.loads(_run(command, 10).stdout)
+                size = _selection_size(selected, mode)
+                if size:
+                    result[key] = size
+            except (subprocess.SubprocessError, OSError, ValueError, TypeError):
+                # A missing size must not block the working quality catalog.
+                continue
+    return result
+
+
 def inspect_video(url: str) -> dict[str, Any]:
     try:
         metadata = fetch_metadata(url)
@@ -386,6 +443,7 @@ def inspect_video(url: str) -> dict[str, Any]:
             "title": str(metadata.get("title") or "YouTube video").strip(),
             "qualities": available_qualities(metadata),
             "audioAvailable": bool(audio_formats(metadata)),
+            "sizes": quality_sizes(metadata),
         }
     except app.UserVisibleError as exc:
         return {"ok": False, "message": str(exc)}

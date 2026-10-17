@@ -30,7 +30,7 @@ const { outputFiles } = await build({
 });
 const { YoutubeDownloadWorkflow } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
 
-async function run({ inspect = false, startupError, httpError, credentials = true } = {}) {
+async function run({ inspect = false, startupError, httpError, sizes, credentials = true } = {}) {
   const messages = [];
   const calls = [];
   const steps = [];
@@ -47,7 +47,7 @@ async function run({ inspect = false, startupError, httpError, credentials = tru
     async fetch(request) {
       calls.push([new URL(request.url).pathname]);
       if (httpError) return new Response(httpError.body, { status: httpError.status });
-      return Response.json(inspect ? { ok: true, videoId: 'dQw4w9WgXcQ', qualities: [720], audioAvailable: true } : { ok: true });
+      return Response.json(inspect ? { ok: true, videoId: 'dQw4w9WgXcQ', qualities: [360, 480, 720, 1080], audioAvailable: true, sizes } : { ok: true });
     },
   };
   const step = { async do(name, config, callback) {
@@ -108,4 +108,25 @@ test('transfer is not automatically replayed after an ambiguous HTTP failure', a
   assert.equal(config.retries.limit, 0);
   assert.equal(result.delivered, 0);
   assert.match(result.messages.at(-1).text, /ارتباط.*قطع/);
+});
+
+
+test('quality buttons use English labels and show video plus audio sizes', async () => {
+  const result = await run({ inspect: true, sizes: {
+    '720': { bytes: 123400000, estimated: true },
+    '1080': { bytes: 1500000000, estimated: true },
+    low: { bytes: 3200000, estimated: false },
+  } });
+  const buttons = result.messages.find(m => m.reply_markup)?.reply_markup.inline_keyboard.flat();
+  assert.ok(buttons.some(b => b.text === '⭐ 720p HD • ≈123.4 MB'));
+  assert.ok(buttons.some(b => b.text === '1080p Full HD • ≈1.50 GB'));
+  assert.ok(buttons.some(b => b.text === '🎵 Audio • Low • 3.2 MB'));
+  assert.ok(buttons.every(b => !/[\u0600-\u06ff]/u.test(b.text)));
+});
+
+test('older metadata without a size still offers working quality buttons', async () => {
+  const result = await run({ inspect: true });
+  const buttons = result.messages.find(m => m.reply_markup)?.reply_markup.inline_keyboard.flat();
+  assert.ok(buttons.some(b => b.text === '360p • Low • Size unknown'));
+  assert.ok(buttons.every(b => b.callback_data.startsWith('ytq|')));
 });

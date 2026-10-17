@@ -62,5 +62,29 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(command[command.index('--max-filesize') + 1], '2000000000')
 
 
+    def test_muxed_size_includes_audio_and_is_marked_as_estimate(self):
+        size = pipeline._selection_size({'duration': 60, 'requested_formats': [
+            {'filesize': 20_000_000}, {'filesize': 1_000_000},
+        ]})
+        self.assertEqual(size, {'bytes': 21_000_000, 'estimated': True})
+
+    def test_converted_audio_uses_output_bitrate_instead_of_source_size(self):
+        size = pipeline._selection_size({'duration': 60, 'ext': 'webm', 'filesize': 9_000_000}, 'low')
+        self.assertEqual(size, {'bytes': 480_000, 'estimated': True})
+        self.assertIsNone(pipeline._selection_size({'duration': 60}))
+
+    def test_size_selection_uses_cached_metadata_without_network_checks(self):
+        selected = {'duration': 60, 'filesize': 12_000_000}
+        with patch.object(pipeline, 'available_qualities', return_value=[720]), \
+             patch.object(pipeline, 'audio_formats', return_value=[]), \
+             patch.object(pipeline, '_run', return_value=subprocess.CompletedProcess([], 0, json.dumps(selected), '')) as run:
+            sizes = pipeline.quality_sizes({'id': 'video'})
+        command = run.call_args.args[0]
+        self.assertIn('--load-info-json', command)
+        self.assertIn('--no-check-formats', command)
+        self.assertIn('res:720,+codec:avc:m4a,ext:mp4:m4a', command)
+        self.assertEqual(sizes['720']['bytes'], 12_000_000)
+
+
 if __name__ == '__main__':
     unittest.main()
