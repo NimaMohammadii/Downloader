@@ -9,6 +9,9 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
+import wave
+from array import array
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -762,6 +765,119 @@ INSTAGRAM_FILE_LIMIT = 1_900_000_000  # Leave room for the finalized MP4 below T
 INSTAGRAM_JOBS: dict[str, "InstagramCapture"] = {}
 INSTAGRAM_LOCK = threading.Lock()
 
+RECOGNITION_FILE_LIMIT = 20_000_000
+RECOGNITION_WINDOW_SECONDS = 12
+RECOGNITION_SAMPLE_SECONDS = 36
+
+
+def download_recognition_input(token: str, media: dict[str, Any], workdir: Path) -> Path:
+    file_id = str(media.get("fileId") or "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,1024}", file_id):
+        raise UserVisibleError("❌ شناسهٔ فایل معتبر نیست؛ فایل را دوباره بفرست.")
+    try:
+        info = telegram_call(token, "getFile", json_payload={"file_id": file_id}, timeout=30)
+        size = int(info.get("file_size") or media.get("fileSize") or 0)
+        if size > RECOGNITION_FILE_LIMIT:
+            raise UserVisibleError("❌ فایل برای تشخیص آهنگ بزرگ است؛ یک تکهٔ کوتاه با حجم حداکثر 20 MB بفرست.")
+        file_path = str(info.get("file_path") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_./-]+", file_path) or any(part in {"", ".", ".."} for part in file_path.split("/")):
+            raise UserVisibleError("❌ دریافت آدرس فایل از تلگرام کامل نشد؛ فایل را دوباره بفرست.")
+        target = workdir / "recognition-input"
+        deadline = time.monotonic() + 120
+        with requests.get(f"https://api.telegram.org/file/bot{token}/{file_path}",
+                          stream=True, allow_redirects=False, timeout=(15, 30)) as response:
+            if response.status_code != 200:
+                raise UserVisibleError("❌ دریافت فایل از تلگرام انجام نشد؛ یک تکهٔ کوتاه‌تر بفرست.")
+            if int(response.headers.get("content-length") or 0) > RECOGNITION_FILE_LIMIT:
+                raise UserVisibleError("❌ برای تشخیص آهنگ فایل باید حداکثر 20 MB باشد.")
+            total = 0
+            with target.open("wb") as handle:
+                for chunk in response.iter_content(64 * 1024):
+                    total += len(chunk)
+                    if total > RECOGNITION_FILE_LIMIT or time.monotonic() > deadline:
+                        raise UserVisibleError("❌ دریافت فایل کامل نشد؛ یک تکهٔ کوتاه‌تر با حجم حداکثر 20 MB بفرست.")
+                    handle.write(chunk)
+        if not total or (size and total != size):
+            raise UserVisibleError("❌ فایل صوتی کامل دریافت نشد؛ دوباره بفرست.")
+        return target
+    except UserVisibleError:
+        raise
+    except Exception as exc:
+        # Telegram errors can contain the token-bearing download URL. Never expose them.
+        raise UserVisibleError("❌ دریافت فایل از تلگرام انجام نشد؛ یک تکهٔ کوتاه‌تر با حجم حداکثر 20 MB بفرست.") from exc
+
+
+def recognition_samples(source: Path, workdir: Path) -> list[Path]:
+    decoded = workdir / "recognition-pcm.wav"
+    try:
+        subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
+                        "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov,matroska,webm,mp3,ogg,wav,aac,flac,asf,aiff",
+                        "-i", str(source), "-t", str(RECOGNITION_SAMPLE_SECONDS), "-map", "0:a:0", "-vn",
+                        "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(decoded)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=45)
+    except subprocess.SubprocessError as exc:
+        raise UserVisibleError("❌ صدای قابل خواندن داخل این فایل نیست؛ یک ویس یا ویدیوی صدادار بفرست.") from exc
+    samples = []
+    with wave.open(str(decoded), "rb") as audio:
+        while len(samples) < 3:
+            frames = audio.readframes(16000 * RECOGNITION_WINDOW_SECONDS)
+            if len(frames) < 16000 * 2 * 3:
+                break
+            # Ignore digital silence rather than spend a recognition request on it.
+            if max(map(abs, array("h", frames)), default=0) < 8:
+                continue
+            sample = workdir / f"recognition-{len(samples)}.wav"
+            with wave.open(str(sample), "wb") as output:
+                output.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+                output.writeframes(frames)
+            samples.append(sample)
+    if not samples:
+        raise UserVisibleError("❌ صدای کافی برای تشخیص ندارم؛ حداقل 3 ثانیه و ترجیحاً 10 تا 30 ثانیه از آهنگ را بفرست.")
+    return samples
+
+
+async def recognize_samples(samples: list[Path]) -> dict[str, str]:
+    from shazamio import Shazam
+    from shazamio.client import HTTPClient
+    from shazamio.exceptions import RateLimited
+    from aiohttp_retry import ExponentialRetry
+
+    # The upstream default retries twenty times. Bound this interactive request instead.
+    try:
+        async with HTTPClient(retry_options=ExponentialRetry(attempts=1)) as client:
+            async with Shazam(http_client=client, segment_duration_seconds=12) as recognizer:
+                for sample in samples[:3]:
+                    result = await asyncio.wait_for(recognizer.recognize(str(sample)), timeout=25)
+                    if not isinstance(result, dict):
+                        raise ValueError("Invalid recognition response")
+                    if not isinstance(result.get("matches"), list):
+                        raise ValueError("Invalid recognition matches")
+                    track = result.get("track")
+                    if not result.get("matches") or not isinstance(track, dict):
+                        continue
+                    title = " ".join(str(track.get("title") or "").split())[:180]
+                    artist = " ".join(str(track.get("subtitle") or "").split())[:120]
+                    if title and artist:
+                        return {"title": title, "artist": artist}
+    except Exception as exc:
+        print(f"music recognition service failed: {type(exc).__name__}", flush=True)
+        message = "❌ سرویس تشخیص آهنگ موقتاً پاسخ نداد؛ کمی بعد دوباره امتحان کن."
+        if isinstance(exc, RateLimited):
+            message = "❌ سرویس Shazam فعلاً درخواست‌ها را محدود کرده؛ کمی بعد دوباره امتحان کن."
+        raise UserVisibleError(message) from exc
+    raise UserVisibleError("❌ آهنگ شناسایی نشد؛ یک بخش واضح‌تر با موسیقی بیشتر و صحبت کمتر بفرست.")
+
+
+def recognize_telegram_music(token: str, media: dict[str, Any], workdir: Path) -> dict[str, str]:
+    try:
+        source = download_recognition_input(token, media, workdir)
+        samples = recognition_samples(source, workdir)
+        return asyncio.run(recognize_samples(samples))
+    finally:
+        # Keep only the final song, never the user's source clip or fingerprints.
+        for path in workdir.glob("recognition-*"):
+            path.unlink(missing_ok=True)
+
 
 def instagram_safe_url(value: str) -> str:
     parsed = urlparse(value)
@@ -910,9 +1026,16 @@ class InstagramCapture:
     def run(self) -> None:
         watchdog = wall_timer = None
         try:
+            if self.source.get("recognition"):
+                self.safe_status("🎧 دارم صدای فایل را با Shazam بررسی می‌کنم…")
+                match = recognize_telegram_music(self.payload["botToken"], self.source["recognition"], self.workdir)
+                self.source.update({"recognizedTitle": match["title"], "recognizedArtist": match["artist"],
+                                    "musicQuery": f"{match['artist']} {match['title']}"})
+                self.safe_status(f"✅ آهنگ شناسایی شد\n🎵 {match['title']}\n👤 {match['artist']}\n⬇️ دارم فایل کاملش را پیدا می‌کنم…")
             if self.source.get("musicQuery"):
                 from youtube_pipeline import prepare_music
-                self.safe_status("🔎 دارم نتیجهٔ مناسب آهنگ را از YouTube پیدا و دانلود می‌کنم…")
+                if not self.source.get("recognition"):
+                    self.safe_status("🔎 دارم نتیجهٔ مناسب آهنگ را از YouTube پیدا و دانلود می‌کنم…")
                 self.path, title, artist, url = prepare_music(self.source["musicQuery"], self.workdir)
                 self.source.update({"title": title, "performer": artist, "musicUrl": url})
                 self.video = {"title": title, "performer": artist}
@@ -1017,6 +1140,10 @@ class InstagramCapture:
             # Never print commands, signed stream URLs, bot tokens or account data.
             print(f"instagram capture failed: {type(exc).__name__}", flush=True)
             self.result = {"ok": False, "message": str(exc) if isinstance(exc, UserVisibleError) else "❌ دریافت یا آماده‌سازی لایو کامل نشد؛ لینک را دوباره بفرست."}
+            if self.source.get("recognition"):
+                self.result["message"] = str(exc) if isinstance(exc, UserVisibleError) else "❌ دریافت فایل آهنگ کامل نشد؛ دوباره امتحان کن."
+                if self.source.get("recognizedTitle"):
+                    self.result["message"] = f"✅ آهنگ شناسایی شد\n🎵 {self.source['recognizedTitle']}\n👤 {self.source['recognizedArtist']}\n" + self.result["message"]
             with self.lock:
                 self.state = "failed"
         finally:
@@ -1044,6 +1171,8 @@ class InstagramCapture:
         try:
             notes = {"user": "ضبط با درخواست شما متوقف شد.", "time_limit": "ضبط به سقف زمانی رسید.", "size_limit": "ضبط به سقف حجم رسید.", "interrupted": "ارتباط پخش قطع شد؛ بخش دریافت‌شده ارسال شد."}
             caption = str(self.source.get("title") or "Instagram Live")[:180]
+            if self.source.get("recognizedTitle"):
+                caption = f"🎵 {self.source['recognizedTitle']}\n👤 {self.source['recognizedArtist']}"
             caption += "\n" + ("Music" if self.source.get("musicQuery") else "Instagram Audio" if self.audio_only else "Live Recording" if self.live else "Live Replay")
             if self.source.get("musicUrl"):
                 caption += "\n" + self.source["musicUrl"]

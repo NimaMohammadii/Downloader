@@ -243,3 +243,70 @@ test('Instagram audio button enforces ownership and replies to the selected vide
     assert.equal(jobs[0].params.instagram.videoIndex,1);
   } finally {env.YOUTUBE_DOWNLOAD_WORKFLOW=original;}
 });
+
+async function mediaWebhook(message, workerEnv) {
+  return mod.default.fetch(new Request('https://worker/telegram/webhook', { method:'POST',
+    headers:{'content-type':'application/json','x-telegram-bot-api-secret-token':'dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1'},
+    body:JSON.stringify({update_id:20,message:{message_id:20,chat:{id:42,type:'private'},from:{id:42},...message}}),
+  }),workerEnv,{});
+}
+
+test('voice, audio, video notes and audio documents queue recognition without treating captions as song names',async()=>{
+  const jobs=[];
+  const workerEnv={...env,YOUTUBE_DOWNLOAD_WORKFLOW:{async create(job){jobs.push(job);}}};
+  for (const field of ['voice','audio','video','video_note','document']) {
+    await mediaWebhook({[field]:{file_id:'valid_'+field,file_size:1000,mime_type:'audio/ogg'},caption:'an unrelated caption'},workerEnv);
+  }
+  assert.equal(jobs.length,5);
+  assert.deepEqual(jobs.map(j=>j.params.recognition.fileId),['valid_voice','valid_audio','valid_video','valid_video_note','valid_document']);
+  assert.ok(jobs.every(j=>!j.params.instagram));
+  assert.ok(jobs.every(j=>j.id==='igdl-42-20-42'));
+});
+
+test('group media keeps its route until /shazam or /recognize is explicitly requested',async()=>{
+  const jobs=[]; const messages=[];
+  globalThis.fetch=async(url,init)=>{messages.push(JSON.parse(init.body));return Response.json({ok:true,result:{message_id:10}});};
+  const workerEnv={...env,YOUTUBE_DOWNLOAD_WORKFLOW:{async create(job){jobs.push(job);}}};
+  const group={chat:{id:-42,type:'supergroup'},voice:{file_id:'valid',file_size:2000}};
+  assert.equal((await (await mediaWebhook(group,workerEnv)).json()).delegated,true);
+  assert.equal(jobs.length,0);
+  await mediaWebhook({chat:group.chat,text:'/shazam@ExampleBot',reply_to_message:{message_id:5,chat:group.chat,voice:group.voice}},workerEnv);
+  assert.equal(jobs[0].params.recognition.fileId,'valid');
+  assert.equal(jobs[0].params.requestMessageId,20);
+  await mediaWebhook({...group,caption:'/recognize'},workerEnv);
+  assert.equal(jobs.length,2);
+  await mediaWebhook({text:'/shazam'},workerEnv);
+  assert.equal(jobs.length,2);assert.match(messages.at(-1).text,/ریپلای/);
+});
+
+test('oversized recognition files are rejected before starting a container; unrelated documents retain their route',async()=>{
+  const jobs=[];const messages=[];
+  globalThis.fetch=async(url,init)=>{messages.push(JSON.parse(init.body));return Response.json({ok:true,result:{message_id:10}});};
+  const workerEnv={...env,YOUTUBE_DOWNLOAD_WORKFLOW:{async create(job){jobs.push(job);}}};
+  await mediaWebhook({video:{file_id:'valid',file_size:20_000_001}},workerEnv);
+  assert.equal(jobs.length,0);assert.match(messages.at(-1).text,/20 MB/);
+  const response=await mediaWebhook({document:{file_id:'valid',mime_type:'application/pdf',file_name:'report.pdf'}},workerEnv);
+  assert.equal((await response.json()).delegated,true);assert.equal(jobs.length,0);
+});
+
+test('recognition uses the same completion event and upload path without requiring an Instagram session',async()=>{
+  const calls=[];const steps=[];
+  globalThis.containerIds=[];globalThis.delivered=0;
+  globalThis.container={
+    async startAndWaitForPorts(){calls.push('boot');},
+    async instagramRequest(action,payload){calls.push(action);if(action==='start')globalThis.recognitionPayload=payload;return {ok:true};},
+    async releaseInstagram(){calls.push('release');},
+  };
+  globalThis.fetch=async(url)=>{
+    assert.ok(String(url).startsWith('https://api.telegram.org/'));
+    return Response.json({ok:true,result:{message_id:10}});
+  };
+  const step={async do(name,options,fn){if(typeof options==='function')fn=options;return fn();},
+    async waitForEvent(name,options){steps.push(options);return {payload:{ok:true}};}};
+  await new mod.YoutubeDownloadWorkflow({},{...env,INSTAGRAM_SESSIONID:undefined}).run({payload:{...job,instagram:undefined,recognition:{fileId:'valid',fileSize:1000}}},step);
+  assert.deepEqual(calls,['boot','start','send','cleanup','release']);
+  assert.equal(globalThis.recognitionPayload.source.recognition.fileId,'valid');
+  assert.equal(globalThis.recognitionPayload.source.audioOnly,true);
+  assert.ok(steps.some(s=>s.type==='instagram-ready'));
+  assert.equal(globalThis.delivered,1);
+});

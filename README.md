@@ -54,6 +54,16 @@ Ordinary Instagram video posts/Reels and individual video Stories now offer a **
 
 Instagram audio is delivered as M4A, music search as MP3. Both reuse the event-driven download job, FFmpeg validation and complete-file MTProto sender. No new secrets or bindings are needed. Ordinary Instagram URLs and YouTube quality selection retain their routes; non-command text without a URL is treated as a song search.
 
+## Recognize music from an uploaded clip
+
+Send a voice message, audio file, video, video note, or audio/video document in a private chat. In groups, reply to a file with `/shazam` or `/recognize`, or attach the file with that command as its caption. The bot identifies the song and artist, then uses the existing music search/download path to deliver a full MP3. Identification details remain visible if the full song cannot be downloaded.
+
+Input clips are limited to 20 MB because this path uses Telegram Bot API `getFile`. Send a clear 10–30-second excerpt; files without audio, silence and clips shorter than 3 seconds are rejected. FFmpeg reads at most the first 36 seconds and produces up to three 12-second mono windows. Shazam receives audio fingerprints through ShazamIO, with one request per window and a 25-second timeout; processing stops on the first match or a service error. Uploaded clips and temporary samples are deleted after recognition. A Telegram upload is only downloaded from the fixed Telegram file host, with streaming size checks and redirects disabled.
+
+ShazamIO reuses the existing Workflow/Container and bot credentials; no Shazam account, Apple login or new API secret is required. It is an unofficial client, so service availability and rate limits are not guaranteed. The Dockerfile pins upstream revision `f94faafdabff9cdec258f3ac024a6402989e9040` (ShazamIO 0.9.0, `shazamio-core==2.0.0`) for Python 3.14-compatible ABI3 wheels. The published 0.8.1 package pins an older core without Python 3.14 wheels. The base downloader image and yt-dlp version remain unchanged. Rebuild/deploy the Container image to install the dependency.
+
+Tests cover private/group routing, bounded real FFmpeg samples, service failures, input cleanup and the shared complete-file sender. A live Shazam request from the development environment was blocked by DNS resolution; recognition and Telegram delivery from the production Container IP still need a live clip after deployment.
+
 ## Telegram delivery
 
 Ordinary Instagram media does not show a download-link button. The Worker resolves the Instagram media and creates a short-lived signed media proxy URL. Telegram fetches that URL and posts the actual video/photo into the chat.
