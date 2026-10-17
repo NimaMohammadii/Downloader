@@ -118,15 +118,15 @@ test('quality buttons use English labels and show video plus audio sizes', async
     low: { bytes: 3200000, estimated: false },
   } });
   const buttons = result.messages.find(m => m.reply_markup)?.reply_markup.inline_keyboard.flat();
-  assert.ok(buttons.some(b => b.text === '⭐ 720p HD • ≈123.4 MB'));
-  assert.ok(buttons.some(b => b.text === '1080p Full HD • ≈1.50 GB'));
-  assert.ok(buttons.some(b => b.text === '🎵 Audio • Low • 3.2 MB'));
+  assert.ok(buttons.some(b => b.text === '⭐ 720p HD 123.4 MB'));
+  assert.ok(buttons.some(b => b.text === '1080p Full HD 1.50 GB'));
+  assert.ok(buttons.some(b => b.text === '🎵 Audio Low 3.2 MB'));
   assert.ok(buttons.every(b => !/[\u0600-\u06ff]/u.test(b.text)));
 });
 
 test('older metadata without a size still offers working quality buttons', async () => {
   const result = await run({ inspect: true });
   const buttons = result.messages.find(m => m.reply_markup)?.reply_markup.inline_keyboard.flat();
-  assert.ok(buttons.some(b => b.text === '360p • Low • Size unknown'));
+  assert.ok(buttons.some(b => b.text === '360p Low Size unknown'));
   assert.ok(buttons.every(b => b.callback_data.startsWith('ytq|')));
 });

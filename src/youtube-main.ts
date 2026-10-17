@@ -388,15 +388,15 @@ function formatVideoTitle(title: string | undefined): string {
 }
 
 function qualityLabel(quality: YoutubeQuality): string {
-  if (quality === 360) return "360p • Low";
-  if (quality === 480) return "480p • Standard";
+  if (quality === 360) return "360p Low";
+  if (quality === 480) return "480p Standard";
   if (quality === 720) return "⭐ 720p HD";
   return "1080p Full HD";
 }
 
 function formatSelection(job: Pick<YoutubeDownloadJob, "quality" | "audioMode">): string {
-  if (job.audioMode === "low") return "🎵 Audio • Low";
-  if (job.audioMode === "hq") return "🎧 Audio • HQ";
+  if (job.audioMode === "low") return "🎵 Audio Low";
+  if (job.audioMode === "hq") return "🎧 Audio HQ";
   return qualityLabel(job.quality!);
 }
 
@@ -406,7 +406,7 @@ function fileSizeLabel(size: YoutubeFileSize | undefined): string {
   const label = bytes >= 1_000_000_000 ? `${(bytes / 1_000_000_000).toFixed(2)} GB`
     : bytes >= 1_000_000 ? `${(bytes / 1_000_000).toFixed(1)} MB`
     : `${Math.max(1, Math.round(bytes / 1000))} KB`;
-  return `${size.estimated ? "≈" : ""}${label}`;
+  return label;
 }
 
 function buildQualityKeyboard(
@@ -418,7 +418,7 @@ function buildQualityKeyboard(
   sizes?: Record<string, YoutubeFileSize>,
 ): Array<Array<{ text: string; callback_data: string }>> {
   const buttons = qualities.map((quality) => ({
-    text: `${qualityLabel(quality)} • ${fileSizeLabel(sizes?.[String(quality)])}`,
+    text: `${qualityLabel(quality)} ${fileSizeLabel(sizes?.[String(quality)])}`,
     callback_data: `ytq|${videoId}|${quality}|${requestMessageId}|${userId}`,
   }));
   const rows: Array<Array<{ text: string; callback_data: string }>> = [];
@@ -428,11 +428,11 @@ function buildQualityKeyboard(
   if (audioAvailable) {
     rows.push([
       {
-        text: `🎵 Audio • Low • ${fileSizeLabel(sizes?.low)}`,
+        text: `🎵 Audio Low ${fileSizeLabel(sizes?.low)}`,
         callback_data: `ytq|${videoId}|al|${requestMessageId}|${userId}`,
       },
       {
-        text: `🎧 Audio • HQ • ${fileSizeLabel(sizes?.hq)}`,
+        text: `🎧 Audio HQ ${fileSizeLabel(sizes?.hq)}`,
         callback_data: `ytq|${videoId}|ah|${requestMessageId}|${userId}`,
       },
     ]);
