@@ -32,8 +32,8 @@ type YoutubeDownloadJob = {
 
 type Env = AdminStatsEnv & {
   BOT_TOKEN: string;
-  API_ID: string;
-  API_HASH: string;
+  API_ID?: string;
+  API_HASH?: string;
   YOUTUBE_DOWNLOAD_WORKFLOW: Workflow<YoutubeDownloadJob>;
   YOUTUBE_DOWNLOADER_CONTAINER: DurableObjectNamespace<YoutubeDownloaderContainer>;
   INSTAGRAM_SESSIONID?: string;
@@ -109,17 +109,71 @@ export class YoutubeDownloaderContainer extends Container<Env> {
   defaultPort = 8080;
   sleepAfter = "5m";
   enableInternet = true;
-  envVars = { API_ID: this.env.API_ID, API_HASH: this.env.API_HASH };
+  envVars = { API_ID: this.env.API_ID || "", API_HASH: this.env.API_HASH || "" };
 }
 
 function containerSessionId(job: Pick<YoutubeDownloadJob, "chatId" | "requestMessageId" | "userId">): string {
   return `yt-session-${job.chatId}-${job.requestMessageId}-${job.userId}`;
 }
 
+function redactDiagnostic(detail: string, env: Env): string {
+  for (const secret of [env.BOT_TOKEN, env.API_HASH]) {
+    if (secret) detail = detail.split(secret).join("[redacted]");
+  }
+  return detail.slice(0, 2000);
+}
+
+function workflowFailureMessage(detail: string, phase: string): string {
+  if (detail.includes("YT_CONFIG")) {
+    return "❌ تنظیمات ارسال فایل آماده نیست؛ API_ID و API_HASH باید در Secretهای همین Worker تنظیم شوند.";
+  }
+  if (/YT_HTTP_(503|429)|no container instance|max.*instance|provision/i.test(detail)) {
+    return "❌ سرور دانلود هنوز آماده نیست یا ظرفیتش پر شده؛ کمی بعد دوباره لینک رو بفرست.";
+  }
+  if (phase === "startup" || /YT_HTTP_500|not listening|port.*ready/i.test(detail)) {
+    return "❌ راه‌اندازی سرور دانلود ناموفق بود؛ وضعیت کانتینر باید بررسی شود.";
+  }
+  if (phase === "metadata") {
+    return "❌ دریافت اطلاعات ویدیو از سرور دانلود کامل نشد؛ دوباره لینک رو بفرست.";
+  }
+  return "❌ ارتباط با سرور هنگام دانلود یا ارسال فایل قطع شد؛ دوباره لینک رو بفرست.";
+}
+
+async function containerResult<T>(env: Env, job: YoutubeDownloadJob, request: Request): Promise<T> {
+  const container = getContainer(env.YOUTUBE_DOWNLOADER_CONTAINER, containerSessionId(job));
+  const response = await container.fetch(request);
+  if (!response.ok) {
+    const detail = redactDiagnostic(await response.text(), env);
+    console.error("youtube container response failed", { jobId: job.id, status: response.status, detail });
+    throw new Error(`YT_HTTP_${response.status}`);
+  }
+  try {
+    return await response.json() as T;
+  } catch {
+    throw new Error("YT_INVALID_RESPONSE");
+  }
+}
+
 export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDownloadJob> {
   async run(event: WorkflowEvent<YoutubeDownloadJob>, step: WorkflowStep) {
     const job = event.payload;
     let statusMessageId = job.statusMessageId;
+    let phase = "startup";
+    const startContainer = () => step.do(
+      "start youtube container",
+      {
+        retries: { limit: 2, delay: "5 seconds", backoff: "linear" },
+        timeout: "2 minutes",
+      },
+      async () => {
+        const container = getContainer(this.env.YOUTUBE_DOWNLOADER_CONTAINER, containerSessionId(job));
+        await container.startAndWaitForPorts({
+          ports: [8080],
+          cancellationOptions: { instanceGetTimeoutMS: 45_000, portReadyTimeoutMS: 60_000 },
+        });
+        return true;
+      },
+    );
 
     try {
       if (!job.quality && !job.audioMode) {
@@ -139,28 +193,22 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           },
         );
 
+        await startContainer();
+        phase = "metadata";
         const metadata = await step.do(
           "inspect youtube qualities",
           {
             retries: { limit: 1, delay: "1 second", backoff: "constant" },
-            timeout: "2 minutes",
+            timeout: "6 minutes",
           },
           async () => {
-            const container = getContainer(
-              this.env.YOUTUBE_DOWNLOADER_CONTAINER,
-              containerSessionId(job),
-            );
-            const response = await container.fetch(
+            return containerResult<YoutubeMetadataResult>(this.env, job,
               new Request("http://container/metadata", {
                 method: "POST",
                 headers: { "content-type": "application/json" },
                 body: JSON.stringify({ url: job.url }),
               }),
             );
-            if (!response.ok) {
-              throw new Error(`YouTube metadata container returned HTTP ${response.status}`);
-            }
-            return (await response.json()) as YoutubeMetadataResult;
           },
         );
 
@@ -228,34 +276,25 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         );
       }
 
+      if (!/^\d+$/.test(this.env.API_ID || "") || !this.env.API_HASH?.trim()) {
+        throw new Error("YT_CONFIG");
+      }
+      await startContainer();
+      phase = "transfer";
       const result = await step.do(
         job.audioMode ? "download and send youtube audio" : "download and send youtube video",
         {
           retries: { limit: 0, delay: "1 second", backoff: "constant" },
-          timeout: "60 minutes",
+          timeout: "30 minutes",
         },
         async () => {
-          const container = getContainer(
-            this.env.YOUTUBE_DOWNLOADER_CONTAINER,
-            containerSessionId(job),
-          );
-          const response = await container.fetch(
+          return containerResult<ContainerResult>(this.env, job,
             new Request("http://container/download", {
               method: "POST",
               headers: { "content-type": "application/json" },
-              body: JSON.stringify({
-                ...job,
-                statusMessageId,
-                botToken: this.env.BOT_TOKEN,
-              }),
+              body: JSON.stringify({ ...job, statusMessageId, botToken: this.env.BOT_TOKEN }),
             }),
           );
-
-          if (!response.ok) {
-            throw new Error(`YouTube container returned HTTP ${response.status}`);
-          }
-
-          return (await response.json()) as ContainerResult;
         },
       );
 
@@ -266,8 +305,9 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         });
       }
     } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      console.error("youtube workflow failed", { jobId: job.id, detail });
+      const detail = redactDiagnostic(error instanceof Error ? error.message : String(error), this.env);
+      console.error("youtube workflow failed", { jobId: job.id, phase, detail });
+      const failureMessage = workflowFailureMessage(detail, phase);
 
       await step.do(
         "notify youtube workflow failure",
@@ -280,12 +320,12 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
             await safeTelegramCall(this.env.BOT_TOKEN, "editMessageText", {
               chat_id: job.chatId,
               message_id: statusMessageId,
-              text: "❌ دانلود YouTube انجام نشد. یک‌بار دیگه لینک رو بفرست.",
+              text: failureMessage,
             });
           } else {
             await safeTelegramCall(this.env.BOT_TOKEN, "sendMessage", {
               chat_id: job.chatId,
-              text: "❌ دانلود YouTube انجام نشد. یک‌بار دیگه لینک رو بفرست.",
+              text: failureMessage,
               reply_parameters: { message_id: job.requestMessageId },
             });
           }
