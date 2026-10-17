@@ -23,7 +23,7 @@ DOWNLOAD_TIMEOUT_SECONDS = 1_500
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "http://127.0.0.1:4416")
 SUPPORTED_QUALITIES = (360, 480, 720, 1080)
 SUPPORTED_AUDIO_MODES = ("low", "hq")
-REAL_YTDLP = "/opt/venv/bin/yt-dlp-real"
+REAL_YTDLP = shutil.which("yt-dlp") or "yt-dlp"
 METADATA_CACHE_PATH = Path("/tmp/vexa-youtube-info.json")
 
 

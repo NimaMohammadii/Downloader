@@ -20,6 +20,8 @@ Set Worker secrets `API_ID` and `API_HASH` from my.telegram.org alongside `BOT_T
 
 The Docker image and Container/Workflow bindings must be deployed with `npx wrangler deploy`. A source commit alone does not activate this feature. There are up to 20 Container instances and they sleep after five minutes idle; Cloudflare Container and Workflow charges apply.
 
+The YouTube runtime matches ai-configa: image `friedrichrehren/yt-dlp:2026.08.19`, Deno, and isolated `web_embedded` then `android_vr` clients. Metadata loads the normal YouTube webpage/configuration; the selected client is reused when downloading. No browser token-provider service or floating prerelease yt-dlp install is used in this path. YouTube can still require authentication or reject a server's network; matching the runtime does not guarantee that every public video is accessible.
+
 ## Supported Instagram links
 
 - Instagram Reel

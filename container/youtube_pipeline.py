@@ -7,11 +7,9 @@ from typing import Any
 
 import youtube_app as app
 
-# web_safari is intentionally excluded. In current YouTube/yt-dlp behavior its
-# HLS formats are intermittent and can disappear between otherwise identical
-# requests. Keep every actual download bound to one explicit client from start
-# to finish instead of reusing a format_id/direct URL extracted by another run.
-CLIENTS = ("mweb", "android_vr", "web_embedded")
+# Match ai-configa's pinned runtime and client strategy. Keep the client that
+# produced the quality catalog for the subsequent download as well.
+CLIENTS = ("web_embedded", "android_vr")
 SESSION_STATE_PATH = Path("/tmp/vexa-youtube-session.json")
 ASPECT_TOLERANCE = 0.06
 QUALITY_TOLERANCE = 18
@@ -27,31 +25,25 @@ class ClientAttemptError(Exception):
 
 
 def _client_args(client: str) -> list[str]:
+    if client not in CLIENTS:
+        raise ValueError("Unsupported YouTube client")
     return [
+        "--ignore-config",
         "--no-playlist",
-        "--abort-on-unavailable-fragments",
-        "--max-filesize",
-        str(app.DIRECT_TELEGRAM_LIMIT),
         "--force-ipv4",
-        "--js-runtimes",
-        "node",
-        "--extractor-args",
-        f"youtube:player_client={client}",
-        "--extractor-args",
-        f"youtubepot-bgutilhttp:base_url={app.POT_PROVIDER_URL}",
-        "--extractor-args",
-        "youtubepot-wpc:browser_path=/usr/bin/chromium",
-        "--retries",
-        "2",
-        "--fragment-retries",
-        "2",
-        "--extractor-retries",
-        "1",
-        "--socket-timeout",
-        "15",
-        "--sleep-requests",
-        "1",
+        "--js-runtimes", "deno",
+        "--extractor-args", f"youtube:player_client={client}",
+        "--socket-timeout", "15",
+        "--retries", "2",
+        "--fragment-retries", "2",
     ]
+
+
+def _download_args(client: str) -> list[str]:
+    # File caps apply to downloads, not metadata: a large best format must not
+    # prevent listing smaller quality choices for the same video.
+    return [*_client_args(client), "--abort-on-unavailable-fragments",
+            "--max-filesize", str(app.DIRECT_TELEGRAM_LIMIT)]
 
 
 def _run(command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
@@ -74,14 +66,14 @@ def _classify_ytdlp_error(stderr: str) -> tuple[str, str]:
         return "private", "❌ این ویدیو Private هست و بدون دسترسی به اکانت قابل دانلود نیست."
     if "members-only" in value or "join this channel" in value:
         return "members", "❌ این ویدیو فقط برای اعضای کانال قابل مشاهده است."
-    if "age" in value and ("restricted" in value or "confirm" in value or "sign in" in value):
+    if any(marker in value for marker in ("age-restricted", "age restricted", "confirm your age", "inappropriate for some users")):
         return "age", "❌ این ویدیو محدودیت سنی داره و بدون ورود به YouTube قابل دانلود نیست."
     if "copyright" in value:
         return "copyright", "❌ این ویدیو به‌خاطر محدودیت صاحب محتوا قابل دانلود نیست."
     if "unsupported url" in value:
         return "unsupported", "❌ این لینک YouTube قابل دانلود نیست. لینک مستقیم ویدیو یا Shorts رو بفرست."
     if "sign in to confirm" in value or "not a bot" in value:
-        return "botcheck", "❌ YouTube این IP رو موقتاً محدود کرده. چند لحظه بعد دوباره امتحان کن."
+        return "botcheck", "❌ YouTube برای این درخواست تأیید ورود می‌خواهد؛ دریافت ویدیو از این سرور فعلاً ممکن نیست."
     if "http error 403" in value or "403: forbidden" in value:
         return "forbidden", "❌ YouTube دسترسی دانلود این ویدیو رو موقتاً بسته. دوباره امتحان کن."
 
@@ -110,15 +102,9 @@ def _fetch_metadata_for_client(url: str, client: str) -> dict[str, Any]:
             [
                 app.REAL_YTDLP,
                 *_client_args(client),
-                "--extractor-args",
-                "youtube:player_skip=webpage,configs",
-                "--extractor-retries",
-                "0",
                 "--skip-download",
                 "--dump-single-json",
                 "--no-warnings",
-                "--format",
-                "all",
                 url,
             ],
             app.METADATA_TIMEOUT_SECONDS,
@@ -353,7 +339,7 @@ def _final_attempt_message(errors: list[ClientAttemptError], fallback: str) -> s
     if categories and categories <= {"unavailable"}:
         return "❌ این ویدیو در دسترس نیست یا برای این منطقه محدود شده."
     if "botcheck" in categories:
-        return "❌ YouTube این IP رو موقتاً محدود کرده. چند لحظه بعد دوباره امتحان کن."
+        return "❌ YouTube برای این درخواست تأیید ورود می‌خواهد؛ دریافت ویدیو از این سرور فعلاً ممکن نیست."
     if "forbidden" in categories:
         return "❌ YouTube دسترسی دانلود این ویدیو رو موقتاً بسته. دوباره امتحان کن."
     if "timeout" in categories:
@@ -378,6 +364,8 @@ def fetch_metadata(url: str) -> dict[str, Any]:
         except ClientAttemptError as exc:
             errors.append(exc)
             _log_attempt_failure("metadata", exc)
+            if _terminal_category(exc.category):
+                break
         except app.UserVisibleError:
             raise
 
@@ -479,7 +467,7 @@ def _download_video_with_client(
         result = _run(
             [
                 app.REAL_YTDLP,
-                *_client_args(client),
+                *_download_args(client),
                 "--no-simulate",
                 "--concurrent-fragments",
                 "8",
@@ -564,7 +552,7 @@ def _download_audio_with_client(url: str, client: str, workdir: Path, mode: str)
         result = _run(
             [
                 app.REAL_YTDLP,
-                *_client_args(client),
+                *_download_args(client),
                 "--no-simulate",
                 "--format",
                 selector,

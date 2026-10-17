@@ -99,13 +99,13 @@ class ChatTests(unittest.TestCase):
         self.assertIsNone(FakeClient.instances[-1].sent)
 
     def test_download_aborts_missing_fragments(self):
-        args = pipeline._client_args('mweb')
+        args = pipeline._download_args('web_embedded')
         self.assertIn('--abort-on-unavailable-fragments', args)
         self.assertIn(str(app.DIRECT_TELEGRAM_LIMIT), args)
 
     def test_no_reextraction_after_download(self):
         with patch.object(pipeline, 'available_qualities', return_value=[720]), \
-             patch.object(pipeline, '_load_session_client', return_value='mweb'), \
+             patch.object(pipeline, '_load_session_client', return_value='web_embedded'), \
              patch.object(pipeline, '_source_ratio', return_value=None), \
              patch.object(pipeline, '_download_video_with_client', return_value=Path('/tmp/video.mp4')), \
              patch.object(pipeline, '_fetch_metadata_for_client') as fetch:
