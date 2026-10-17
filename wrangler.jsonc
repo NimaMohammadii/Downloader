@@ -48,6 +48,7 @@
   ],
   "containers": [
     {
+      "name": "downloader-youtube-chat-v6",
       "class_name": "YoutubeDownloaderContainer",
       "image": "./Dockerfile",
       "max_instances": 20,
