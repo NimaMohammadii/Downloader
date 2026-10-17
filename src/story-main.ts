@@ -258,25 +258,63 @@ function privateHeaders(jar: CookieJar): Headers | null {
   return headers;
 }
 
+type StoryFailure = "session_missing" | "login_required" | "challenge_required" | "rate_limited" | "network" | "user_lookup" | "unavailable" | "no_media";
+
+class StoryError extends Error {
+  constructor(readonly code: StoryFailure) {
+    super(code);
+  }
+}
+
+function storyErrorText(error: unknown): string {
+  const code = error instanceof StoryError ? error.code : "network";
+  if (code === "session_missing") return "❌ سشن اینستاگرام تنظیم نشده یا معتبر نیست؛ INSTAGRAM_SESSIONID باید در Secretهای همین Worker تنظیم شود.";
+  if (code === "login_required") return "❌ اینستاگرام سشن ذخیره‌شده را قبول نکرد؛ سشن نیاز به ورود دوباره دارد.";
+  if (code === "challenge_required") return "❌ اکانت اینستاگرام نیاز به تأیید امنیتی دارد؛ ابتدا داخل خود اینستاگرام تأییدش کن.";
+  if (code === "rate_limited") return "❌ اینستاگرام درخواست‌های این اکانت یا سرور را محدود کرده؛ کمی بعد دوباره امتحان کن.";
+  if (code === "user_lookup") return "❌ شناسه اکانت استوری دریافت نشد؛ لینک کامل همان استوری را بفرست.";
+  if (code === "unavailable") return "❌ این استوری منقضی شده یا برای اکانت متصل قابل مشاهده نیست.";
+  if (code === "no_media") return "❌ فایل قابل ارسال برای این استوری پیدا نشد؛ ممکن است حجم فایل از سقف ارسال مستقیم بیشتر باشد.";
+  return "❌ ارتباط با اینستاگرام کامل نشد؛ دوباره لینک استوری را بفرست.";
+}
+
 async function jsonRequest(url: string, headers: Headers, jar: CookieJar): Promise<{ data: any | null; status: number }> {
   try {
-    const response = await fetch(url, { headers, redirect: "manual" });
+    const response = await fetch(url, { headers, redirect: "manual", signal: AbortSignal.timeout(12_000) });
     absorbState(response.headers, jar);
-    const data = response.ok ? await response.json().catch(() => null) : null;
-    if (!response.ok) await response.body?.cancel().catch(() => undefined);
-    return { data, status: response.status };
+    // Authentication errors are frequently JSON on HTTP 400/401/403. Preserve
+    // their meaning instead of turning them into an empty story response.
+    const data: any = await response.json().catch(() => null);
+    const message = String(data?.message || data?.error_type || "").toLowerCase();
+    const location = response.headers.get("location") || "";
+    let failure: StoryFailure | null = null;
+    if (data?.challenge || /challenge_required|checkpoint_required|checkpoint_url|consent_required/.test(message) || /\/(challenge|checkpoint)\//.test(location)) failure = "challenge_required";
+    else if (response.status === 429 || /please wait|rate_limit|too many requests|feedback_required/.test(message)) failure = "rate_limited";
+    else if (response.status === 401 || /login_required|user_has_logged_out|session_expired/.test(message) || /\/accounts\/login/.test(location)) failure = "login_required";
+    console.log("instagram story response", { path: new URL(url).pathname, status: response.status, failure, json: Boolean(data) });
+    if (failure) throw new StoryError(failure);
+    return { data: response.ok ? data : null, status: response.status };
   } catch (error) {
-    console.warn("instagram private story request failed", {
-      path: new URL(url).pathname,
-      detail: error instanceof Error ? error.message : String(error),
-    });
-    return { data: null, status: 0 };
+    if (error instanceof StoryError) throw error;
+    console.warn("instagram story network failure", { path: new URL(url).pathname });
+    throw new StoryError("network");
   }
 }
 
 function userIdFrom(value: any): string | null {
   const id = String(value?.pk || value?.id || value?.profile_id || "");
   return /^\d+$/.test(id) ? id : null;
+}
+
+async function privateStoryOwnerId(storyId: string, jar: CookieJar): Promise<string | null> {
+  const headers = privateHeaders(jar);
+  if (!headers) return null;
+  const result = await jsonRequest(
+    `https://i.instagram.com/api/v1/media/${encodeURIComponent(storyId)}/info/`, headers, jar,
+  );
+  const items = Array.isArray(result.data?.items) ? result.data.items : [];
+  const item = items.find((value: any) => String(value?.pk || value?.id || "").split("_")[0] === storyId);
+  return userIdFrom(item?.user);
 }
 
 async function privateUserId(username: string, jar: CookieJar): Promise<string | null> {
@@ -300,8 +338,10 @@ async function webUserId(username: string, jar: CookieJar): Promise<string | nul
     "x-ig-app-id": WEB_APP_ID,
     "sec-fetch-site": "same-origin",
   });
-  const cookie = jar.get("sessionid");
-  if (cookie) headers.set("cookie", `sessionid=${cookie}`);
+  const cookie = cookieHeader(jar);
+  if (cookie) headers.set("cookie", cookie);
+  if (jar.get("csrftoken")) headers.set("x-csrftoken", jar.get("csrftoken")!);
+  headers.set("referer", `https://www.instagram.com/${encodeURIComponent(username)}/`);
   const result = await jsonRequest(
     `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`,
     headers,
@@ -313,7 +353,7 @@ async function webUserId(username: string, jar: CookieJar): Promise<string | nul
 }
 
 function findReel(data: any, key: string): any | null {
-  const direct = data?.reels?.[key];
+  const direct = data?.reels?.[key] || data?.data?.reels?.[key];
   if (direct && typeof direct === "object") return direct;
   for (const list of [data?.reels_media, data?.data?.reels_media]) {
     if (!Array.isArray(list)) continue;
@@ -336,7 +376,13 @@ async function privateStoryReel(userId: string, jar: CookieJar): Promise<any | n
     found: Boolean(reel),
     itemCount: Array.isArray(reel?.items) ? reel.items.length : 0,
   });
-  return reel;
+  if (reel && Array.isArray(reel.items) && reel.items.length) return reel;
+  const fallbackHeaders = privateHeaders(jar);
+  if (!fallbackHeaders) return reel;
+  const fallbackUrl = new URL("https://i.instagram.com/api/v1/feed/reels_media/");
+  fallbackUrl.searchParams.set("reel_ids", userId);
+  const fallback = await jsonRequest(fallbackUrl.toString(), fallbackHeaders, jar);
+  return findReel(fallback.data, userId) || reel;
 }
 
 async function privateHighlightReel(highlightId: string, jar: CookieJar): Promise<any | null> {
@@ -409,8 +455,9 @@ async function chooseCandidate(item: any): Promise<MediaCandidate | null> {
 }
 
 async function privateResolve(target: StoryTarget, env: Env): Promise<MediaCandidate[] | null> {
-  if (!env.INSTAGRAM_SESSIONID?.trim()) return null;
+  if (!env.INSTAGRAM_SESSIONID?.trim()) throw new StoryError("session_missing");
   const jar = createJar(env); // One jar for the entire private resolver chain.
+  if (!authParts(jar)) throw new StoryError("session_missing");
   let reel: any | null = null;
   let storyId: string | null = null;
 
@@ -418,25 +465,27 @@ async function privateResolve(target: StoryTarget, env: Env): Promise<MediaCandi
     reel = await privateHighlightReel(target.highlightId, jar);
   } else {
     storyId = target.storyId;
-    let userId = await privateUserId(target.username, jar);
+    let userId = storyId ? await privateStoryOwnerId(storyId, jar) : null;
+    if (!userId) userId = await privateUserId(target.username, jar);
     if (!userId) userId = await webUserId(target.username, jar);
-    if (!userId) return null;
+    if (!userId) throw new StoryError("user_lookup");
     reel = await privateStoryReel(userId, jar);
   }
-  if (!reel) return null;
+  if (!reel) throw new StoryError("unavailable");
 
   const allItems = Array.isArray(reel.items) ? reel.items : [];
   const items = storyId
     ? allItems.filter((item: any) => String(item?.pk || item?.id || "").split("_")[0] === storyId)
     : allItems;
-  if (!items.length) return null;
+  if (!items.length) throw new StoryError("unavailable");
 
   const media: MediaCandidate[] = [];
   for (const item of items) {
     const candidate = await chooseCandidate(item);
     if (candidate) media.push(candidate);
   }
-  return media.length ? media : null;
+  if (!media.length) throw new StoryError("no_media");
+  return media;
 }
 
 async function signValue(secret: string, value: string): Promise<string> {
@@ -525,17 +574,28 @@ export default {
       const text = (message?.text || message?.caption || "").trim();
       const target = parseStoryTarget(text);
       if (update && message && target) {
-        const media = await privateResolve(target, env);
-        if (media?.length) {
-          const user = trackedUser(message);
-          if (user && user.id !== ADMIN_USER_ID) await recordUserActivity(env, user, true);
-          return sendResolvedStory(env, target, update, media);
+        try {
+          const media = await privateResolve(target, env);
+          if (media?.length) {
+            const user = trackedUser(message);
+            if (user && user.id !== ADMIN_USER_ID) await recordUserActivity(env, user, true);
+            return sendResolvedStory(env, target, update, media);
+          }
+        } catch (error) {
+          console.warn("instagram story resolution failed", {
+            target: target.kind, code: error instanceof StoryError ? error.code : "network",
+          });
+          await safeTelegramCall(env.BOT_TOKEN, "sendMessage", {
+            chat_id: message.chat.id,
+            text: storyErrorText(error),
+            reply_parameters: { message_id: message.message_id },
+          });
         }
-        console.warn("instagram private story fallback to existing resolver", { target: target.kind });
+        return Response.json({ ok: true });
       }
     }
 
-    // Reels, posts, admin panel, media proxy, and public Story fallbacks remain untouched.
+    // Non-Story requests keep their existing route.
     return appWorker.fetch(request, env as any, ctx);
   },
 } satisfies ExportedHandler<Env>;
