@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import wave
+import unicodedata
 from array import array
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -553,7 +554,7 @@ def validate_file_size(path: Path) -> None:
 
 
 async def upload_complete_file(token: str, method: str, data: dict[str, Any], file: tuple) -> Any:
-    from telethon import TelegramClient, functions, types
+    from telethon import TelegramClient, functions, types, utils
     from telethon.errors import FloodWaitError
 
     filename, handle, mime = file
@@ -624,7 +625,7 @@ async def upload_complete_file(token: str, method: str, data: dict[str, Any], fi
             force_document=method == "sendDocument",
             reply_to=reply.get("message_id"),
         )
-        return {"message_id": message.id}
+        return {"message_id": message.id, "file_id": utils.pack_bot_file_id(getattr(message, "document", None))}
 
 
 def send_media_file(
@@ -635,12 +636,12 @@ def send_media_file(
     caption: str,
     *,
     reply: bool,
-) -> None:
+) -> Any:
     data: dict[str, Any] = {"chat_id": str(chat_id), "caption": caption[:1024]}
     if reply:
         data["reply_parameters"] = json.dumps({"message_id": request_message_id})
     with path.open("rb") as handle:
-        telegram_call(
+        return telegram_call(
             token, "sendVideo", data=data,
             files={"video": (path.name, handle, "video/mp4")}, timeout=1800,
         )
@@ -652,7 +653,7 @@ def send_audio_file(
     request_message_id: int,
     path: Path,
     caption: str,
-) -> None:
+) -> Any:
     if path.stat().st_size > DIRECT_TELEGRAM_LIMIT:
         raise UserVisibleError("❌ فایل صوتی برای ارسال مستقیم در تلگرام بیش از حد بزرگه.")
 
@@ -664,7 +665,7 @@ def send_audio_file(
     }
 
     with path.open("rb") as handle:
-        telegram_call(
+        return telegram_call(
             token, "sendAudio", data=data,
             files={"audio": (path.name, handle, "audio/mp4")}, timeout=1800,
         )
@@ -692,6 +693,9 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
 
     workdir = Path(tempfile.mkdtemp(prefix="youtube-download-"))
     try:
+        if reuse_cached_file(payload, payload.get("mediaCacheKey")):
+            delete_status(token, chat_id, status_message_id)
+            return {"ok": True, "parts": 1, "cached": True}
         metadata = load_metadata_cache(url)
         if metadata is None:
             edit_status(token, chat_id, status_message_id, "🔎 دارم اطلاعات ویدیو رو تازه می‌کنم…")
@@ -713,13 +717,14 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
             )
             audio_path = download_audio(url, workdir, audio_mode)
             edit_status(token, chat_id, status_message_id, "📤 فایل صوتی آماده شد؛ دارم می‌فرستم…")
-            send_audio_file(
+            sent = send_audio_file(
                 token,
                 chat_id,
                 request_message_id,
                 audio_path,
                 f"{title}\nAudio {mode_label}",
             )
+            store_uploaded_file(payload, [payload.get("mediaCacheKey")], "sendAudio", {"caption": f"{title}\nAudio {mode_label}", "title": title}, sent)
             delete_status(token, chat_id, status_message_id)
             return {"ok": True, "parts": 1, "title": title, "audioMode": audio_mode}
 
@@ -731,10 +736,11 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
         video_path = download_video(url, workdir, quality, metadata)
         validate_file_size(video_path)
         edit_status(token, chat_id, status_message_id, "📤 ویدیو کامل آماده شد؛ دارم می‌فرستم…")
-        send_media_file(
+        sent = send_media_file(
             token, chat_id, request_message_id, video_path,
             f"{title}\n{quality}p", reply=True,
         )
+        store_uploaded_file(payload, [payload.get("mediaCacheKey")], "sendVideo", {"caption": f"{title}\n{quality}p", "supports_streaming": True}, sent)
         delete_status(token, chat_id, status_message_id)
         return {"ok": True, "parts": 1, "title": title, "quality": quality}
 
@@ -768,6 +774,56 @@ INSTAGRAM_LOCK = threading.Lock()
 RECOGNITION_FILE_LIMIT = 20_000_000
 RECOGNITION_WINDOW_SECONDS = 12
 RECOGNITION_SAMPLE_SECONDS = 36
+
+
+def music_query_key(query: str) -> str:
+    normalized = " ".join(unicodedata.normalize("NFKC", query).lower().split())
+    return "mq:" + hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def file_cache(payload: dict[str, Any], op: str, key: str | None, value: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    if not key or not re.fullmatch(r"[A-Za-z0-9:_-]{1,180}", key):
+        return None
+    url = str(payload.get("cacheUrl") or "")
+    if not re.fullmatch(r"https://downloader\.vexaagent\.workers\.dev/media-cache/(?:igdl|ytdl)--?\d+-\d+-\d+", url):
+        return None
+    try:
+        response = requests.post(url, headers={"x-media-cache-token": payload["cacheToken"]},
+                                 json={"op": op, "key": key, "value": value}, timeout=(5, 10), allow_redirects=False)
+        if response.ok:
+            return response.json().get("value")
+    except Exception:
+        print("telegram file cache unavailable", flush=True)
+    return None
+
+
+def reuse_cached_file(payload: dict[str, Any], key: str | None, caption: str | None = None) -> bool:
+    cached = file_cache(payload, "get", key)
+    if not isinstance(cached, dict) or cached.get("method") not in {"sendAudio", "sendVideo"} or not cached.get("fileId"):
+        return False
+    data = dict(cached.get("data") or {})
+    if caption is not None:
+        data["caption"] = caption[:1024]
+    data.update({"chat_id": payload["chatId"], "reply_parameters": {"message_id": payload["requestMessageId"]},
+                 "audio" if cached["method"] == "sendAudio" else "video": cached["fileId"]})
+    try:
+        telegram_call(payload["botToken"], cached["method"], json_payload=data, timeout=90)
+        return True
+    except Exception as exc:
+        if re.search(r"wrong.*file|file.*(?:invalid|expired)|file_reference|failed to get.*file", str(exc), re.I):
+            file_cache(payload, "delete", key)
+            return False
+        raise UserVisibleError("❌ ارسال فایل ذخیره‌شده کامل نشد؛ برای جلوگیری از ارسال تکراری، آپلود دوباره شروع نشد.") from exc
+
+
+def store_uploaded_file(payload: dict[str, Any], keys: list[str | None], method: str, data: dict[str, Any], result: Any) -> None:
+    if not isinstance(result, dict) or not result.get("file_id"):
+        return
+    allowed = {key: data[key] for key in ("caption", "title", "performer", "width", "height", "duration", "supports_streaming") if key in data}
+    value = {"method": method, "fileId": result["file_id"], "data": allowed}
+    for key in dict.fromkeys(keys):
+        if key:
+            file_cache(payload, "put", key, value)
 
 
 def download_recognition_input(token: str, media: dict[str, Any], workdir: Path) -> Path:
@@ -807,11 +863,11 @@ def download_recognition_input(token: str, media: dict[str, Any], workdir: Path)
         raise UserVisibleError("❌ دریافت فایل از تلگرام انجام نشد؛ یک تکهٔ کوتاه‌تر با حجم حداکثر 20 MB بفرست.") from exc
 
 
-def recognition_samples(source: Path, workdir: Path) -> list[Path]:
+def recognition_samples(source: Path | str, workdir: Path, *, remote: bool = False) -> list[Path]:
     decoded = workdir / "recognition-pcm.wav"
     try:
         subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
-                        "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov,matroska,webm,mp3,ogg,wav,aac,flac,asf,aiff",
+                        "-rw_timeout", "15000000", "-protocol_whitelist", "https,tls,tcp" if remote else "file,pipe", "-format_whitelist", "mov,matroska,webm,mp3,ogg,wav,aac,flac,asf,aiff",
                         "-i", str(source), "-t", str(RECOGNITION_SAMPLE_SECONDS), "-map", "0:a:0", "-vn",
                         "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(decoded)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=45)
@@ -875,6 +931,15 @@ def recognize_telegram_music(token: str, media: dict[str, Any], workdir: Path) -
         return asyncio.run(recognize_samples(samples))
     finally:
         # Keep only the final song, never the user's source clip or fingerprints.
+        for path in workdir.glob("recognition-*"):
+            path.unlink(missing_ok=True)
+
+
+def recognize_instagram_music(url: str, workdir: Path) -> dict[str, str]:
+    try:
+        samples = recognition_samples(instagram_safe_url(url), workdir, remote=True)
+        return asyncio.run(recognize_samples(samples))
+    finally:
         for path in workdir.glob("recognition-*"):
             path.unlink(missing_ok=True)
 
@@ -971,6 +1036,7 @@ class InstagramCapture:
         self.stop_event = threading.Event()
         self.cleanup_requested = False
         self.reason = ""
+        self.cached = False
         self.state = "starting"
         self.result: dict[str, Any] = {"ok": False}
         self.thread = threading.Thread(target=self.run, daemon=True)
@@ -980,7 +1046,7 @@ class InstagramCapture:
     def status(self, text: str, *, button: bool = False) -> None:
         telegram_call(self.payload["botToken"], "editMessageText", json_payload={
             "chat_id": self.payload["chatId"], "message_id": self.payload["statusMessageId"], "text": text,
-            "reply_markup": {"inline_keyboard": [[{"text": "⏹ توقف ضبط و ارسال", "callback_data": self.payload["stopData"]}]] if button else []},
+            "reply_markup": {"inline_keyboard": [[{"text": "⏹ توقف پلی‌لیست" if self.source.get("playlist") else "⏹ توقف ضبط و ارسال", "callback_data": self.payload["stopData"]}]] if button else []},
         }, timeout=30)
 
     def safe_status(self, text: str, *, button: bool = False) -> None:
@@ -991,7 +1057,7 @@ class InstagramCapture:
 
     def stop(self, reason: str = "user") -> bool:
         with self.lock:
-            if self.state not in {"starting", "recording"} or (reason == "user" and not self.live):
+            if self.state not in {"starting", "recording"} or (reason == "user" and not self.live and not self.source.get("playlist")):
                 return False
             if not self.reason:
                 self.reason = reason
@@ -1021,23 +1087,41 @@ class InstagramCapture:
                 pass
             if attempt < 2:
                 self.stop_event.wait(2 ** (attempt + 1))
-        self.safe_status("❌ فایل دریافت شد ولی اعلام نتیجه به ربات کامل نشد؛ لینک را دوباره بفرست.")
+        self.safe_status("❌ اعلام نتیجهٔ پلی‌لیست به ربات کامل نشد؛ پیش از درخواست دوباره، فایل‌های ارسال‌شده را بررسی کن." if self.source.get("playlist") else "❌ فایل دریافت شد ولی اعلام نتیجه به ربات کامل نشد؛ لینک را دوباره بفرست.")
 
     def run(self) -> None:
         watchdog = wall_timer = None
         try:
-            if self.source.get("recognition"):
+            if self.source.get("playlist"):
+                self.run_playlist()
+                return
+            if reuse_cached_file(self.payload, self.payload.get("mediaCacheKey")):
+                self.cached = True
+                self.result = {"ok": True}
+                with self.lock:
+                    self.state = "ready"
+                return
+            if self.source.get("recognition") or self.source.get("recognizeMusic"):
                 self.safe_status("🎧 دارم صدای فایل را با Shazam بررسی می‌کنم…")
-                match = recognize_telegram_music(self.payload["botToken"], self.source["recognition"], self.workdir)
+                match = (recognize_instagram_music(self.source.get("url", ""), self.workdir) if self.source.get("recognizeMusic")
+                         else recognize_telegram_music(self.payload["botToken"], self.source["recognition"], self.workdir))
                 self.source.update({"recognizedTitle": match["title"], "recognizedArtist": match["artist"],
                                     "musicQuery": f"{match['artist']} {match['title']}"})
                 self.safe_status(f"✅ آهنگ شناسایی شد\n🎵 {match['title']}\n👤 {match['artist']}\n⬇️ دارم فایل کاملش را پیدا می‌کنم…")
             if self.source.get("musicQuery"):
                 from youtube_pipeline import prepare_music
-                if not self.source.get("recognition"):
+                if reuse_cached_file(self.payload, music_query_key(self.source["musicQuery"])):
+                    self.cached = True
+                    self.result = {"ok": True}
+                    with self.lock:
+                        self.state = "ready"
+                    return
+                if not self.source.get("recognition") and not self.source.get("recognizeMusic"):
                     self.safe_status("🔎 دارم نتیجهٔ مناسب آهنگ را از YouTube پیدا و دانلود می‌کنم…")
                 self.path, title, artist, url = prepare_music(self.source["musicQuery"], self.workdir)
                 self.source.update({"title": title, "performer": artist, "musicUrl": url})
+                video_id = parse_qs(urlparse(url).query).get("v", [""])[0]
+                self.source["musicFileKey"] = f"yt:{video_id}:mp3"
                 self.video = {"title": title, "performer": artist}
                 self.result = {"ok": True}
                 with self.lock:
@@ -1140,7 +1224,9 @@ class InstagramCapture:
             # Never print commands, signed stream URLs, bot tokens or account data.
             print(f"instagram capture failed: {type(exc).__name__}", flush=True)
             self.result = {"ok": False, "message": str(exc) if isinstance(exc, UserVisibleError) else "❌ دریافت یا آماده‌سازی لایو کامل نشد؛ لینک را دوباره بفرست."}
-            if self.source.get("recognition"):
+            if self.source.get("playlist") and not isinstance(exc, UserVisibleError):
+                self.result["message"] = "❌ پردازش پلی‌لیست کامل نشد؛ فایل‌های ارسال‌شده را قبل از درخواست دوباره بررسی کن."
+            if self.source.get("recognition") or self.source.get("recognizeMusic"):
                 self.result["message"] = str(exc) if isinstance(exc, UserVisibleError) else "❌ دریافت فایل آهنگ کامل نشد؛ دوباره امتحان کن."
                 if self.source.get("recognizedTitle"):
                     self.result["message"] = f"✅ آهنگ شناسایی شد\n🎵 {self.source['recognizedTitle']}\n👤 {self.source['recognizedArtist']}\n" + self.result["message"]
@@ -1161,12 +1247,87 @@ class InstagramCapture:
             if self.cleanup_requested:
                 shutil.rmtree(self.workdir, ignore_errors=True)
 
+    def run_playlist(self) -> None:
+        from youtube_pipeline import playlist_entries, prepare_music_url
+        playlist = self.source["playlist"]
+        title, entries = playlist_entries(playlist["url"], int(playlist["start"]), int(playlist["end"]))
+        sent, failed, uncertain = 0, [], None
+        processed: set[int] = set()
+        deadline = time.monotonic() + 90 * 60
+        with self.lock:
+            self.state = "recording"
+        for entry in entries:
+            if self.stop_event.is_set() or time.monotonic() > deadline:
+                break
+            index = entry["index"]
+            self.safe_status(f"🎵 {title}\nآهنگ {index} از بازهٔ {playlist['start']}-{playlist['end']}\nارسال‌شده: {sent}", button=True)
+            if not entry["id"]:
+                failed.append(index)
+                processed.add(index)
+                continue
+            key = f"yt:{entry['id']}:mp3"
+            caption = f"{title}\n{index}. {entry['title']}"
+            trackdir = self.workdir / f"track-{index}"
+            trackdir.mkdir(exist_ok=True)
+            try:
+                if reuse_cached_file(self.payload, key, caption):
+                    sent += 1
+                    processed.add(index)
+                    continue
+                try:
+                    path, track, artist, url = prepare_music_url(f"https://www.youtube.com/watch?v={entry['id']}", trackdir)
+                except UserVisibleError:
+                    failed.append(index)
+                    processed.add(index)
+                    continue
+                if self.stop_event.is_set():
+                    break
+                data = {"chat_id": str(self.payload["chatId"]), "caption": f"{title}\n{index}. {track}\n{url}"[:1024],
+                        "title": track, "performer": artist,
+                        "reply_parameters": json.dumps({"message_id": self.payload["requestMessageId"]})}
+                with path.open("rb") as handle:
+                    result = asyncio.run(asyncio.wait_for(upload_complete_file(self.payload["botToken"], "sendAudio", data, ("Music.mp3", handle, "audio/mpeg")), timeout=10 * 60))
+                sent += 1
+                processed.add(index)
+                # The shared cache caption must not retain a different user's playlist name.
+                store_uploaded_file(self.payload, [key], "sendAudio", {**data, "caption": f"{track}\n{artist}\n{url}"[:1024]}, result)
+            except Exception:
+                # A send may have reached Telegram before its response was lost. Stop; never retry it.
+                uncertain = index
+                processed.add(index)
+                break
+            finally:
+                shutil.rmtree(trackdir, ignore_errors=True)
+        summary = f"🎵 {title}\n✅ ارسال‌شده: {sent} از {len(entries)}"
+        if failed:
+            summary += "\n❌ دریافت نشد: " + ", ".join(map(str, failed))
+        if uncertain:
+            summary += f"\n⚠️ ارسال مورد {uncertain} تأیید نشد؛ برای جلوگیری از تکرار، صف متوقف شد."
+        if self.stop_event.is_set() or time.monotonic() > deadline:
+            summary += "\nصف متوقف شد؛ فایل‌های باقی‌مانده ارسال نشدند."
+        pending = next((item["index"] for item in entries if item["index"] not in processed), None)
+        resume = pending if pending is not None else playlist["end"] + 1
+        if resume <= 10000 and (pending is not None or len(entries) == playlist["end"] - playlist["start"] + 1):
+            summary += f"\nادامه: /playlist {playlist['url']} {resume}-{min(10000, resume + 19)}"
+        self.playlist_result = {"ok": sent > 0, "parts": sent, "message": summary[:1000]}
+        self.result = self.playlist_result
+        self.safe_status(summary[:3000])
+        with self.lock:
+            self.state = "ready" if sent else "failed"
+
     def send(self) -> dict[str, Any]:
         with self.lock:
             if self.state == "sent":
                 return {"ok": True}
             if self.state != "ready":
                 return {"ok": False, "message": "فایل آمادهٔ ارسال نیست یا قبلاً ارسال آن شروع شده است."}
+            if self.source.get("playlist"):
+                self.state = "sent"
+                return self.playlist_result
+            if self.cached:
+                self.state = "sent"
+                delete_status(self.payload["botToken"], self.payload["chatId"], self.payload["statusMessageId"])
+                return {"ok": True}
             self.state = "sending"
         try:
             notes = {"user": "ضبط با درخواست شما متوقف شد.", "time_limit": "ضبط به سقف زمانی رسید.", "size_limit": "ضبط به سقف حجم رسید.", "interrupted": "ارتباط پخش قطع شد؛ بخش دریافت‌شده ارسال شد."}
@@ -1184,7 +1345,9 @@ class InstagramCapture:
             with self.path.open("rb") as handle:
                 method = "sendAudio" if self.audio_only else "sendVideo"
                 mime = "audio/mpeg" if self.path.suffix == ".mp3" else "audio/mp4" if self.audio_only else "video/mp4"
-                asyncio.run(asyncio.wait_for(upload_complete_file(self.payload["botToken"], method, data, (self.path.name, handle, mime)), timeout=25 * 60))
+                sent = asyncio.run(asyncio.wait_for(upload_complete_file(self.payload["botToken"], method, data, (self.path.name, handle, mime)), timeout=25 * 60))
+            store_uploaded_file(self.payload, [self.payload.get("mediaCacheKey"), self.source.get("musicFileKey"),
+                music_query_key(self.source["musicQuery"]) if self.source.get("musicQuery") else None], method, data, sent)
             with self.lock:
                 self.state = "sent"
             delete_status(self.payload["botToken"], self.payload["chatId"], self.payload["statusMessageId"])

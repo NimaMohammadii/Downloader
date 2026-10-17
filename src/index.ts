@@ -1,4 +1,6 @@
-type Env = {
+import { telegramFileCache, type AdminStatsEnv } from "./admin";
+
+type Env = Partial<AdminStatsEnv> & {
   BOT_TOKEN: string;
   INSTAGRAM_SESSIONID?: string;
   INSTAGRAM_CSRFTOKEN?: string;
@@ -13,6 +15,7 @@ type TelegramMessage = {
   chat: { id: number };
   text?: string;
   caption?: string;
+  video?: { file_id: string };
 };
 
 type TelegramUpdate = {
@@ -1462,17 +1465,29 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
           reply_parameters: index === 0 ? { message_id: message.message_id } : undefined,
         });
       } else {
-        await telegramCall(env.BOT_TOKEN, "sendVideo", {
+        const cacheKey = target.kind === "post" ? `ig:${message.from?.id || message.chat.id}:${target.shortcode}:${index}:video` : undefined;
+        const cached = cacheKey ? await telegramFileCache(env, "get", cacheKey) : null;
+        const payload = {
           chat_id: message.chat.id,
-          video: proxyUrl,
+          video: cached?.method === "sendVideo" ? cached.fileId : proxyUrl,
           caption,
           width: item.width || undefined,
           height: item.height || undefined,
           supports_streaming: true,
           reply_markup: target.kind === "post" && message.from?.id ? { inline_keyboard: [[{
             text: "🎵 فقط صدا", callback_data: `iga|p|${target.shortcode}|${index}|${message.from.id}`,
-          }]] } : undefined,
+          }, { text: "🔎 پیداکردن آهنگ", callback_data: `igm|p|${target.shortcode}|${index}|${message.from.id}` }]] } : undefined,
           reply_parameters: index === 0 ? { message_id: message.message_id } : undefined,
+        };
+        let sent: TelegramMessage;
+        try { sent = await telegramCall<TelegramMessage>(env.BOT_TOKEN, "sendVideo", payload); }
+        catch (error) {
+          if (!cached || !/wrong.*file|file.*(?:invalid|expired)|file_reference|failed to get.*file/i.test(String(error))) throw error;
+          await telegramFileCache(env, "delete", cacheKey!);
+          sent = await telegramCall<TelegramMessage>(env.BOT_TOKEN, "sendVideo", { ...payload, video: proxyUrl });
+        }
+        if (cacheKey && sent.video?.file_id) await telegramFileCache(env, "put", cacheKey, {
+          method: "sendVideo", fileId: sent.video.file_id, data: { caption, supports_streaming: true },
         });
       }
     }

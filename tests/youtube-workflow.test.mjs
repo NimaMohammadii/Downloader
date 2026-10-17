@@ -19,7 +19,7 @@ const { outputFiles } = await build({
       ` };
       if (args.path === './story-main') return { contents: 'export default { fetch() {} }; export const parseInstagramVideoTarget = () => null; export const parseInstagramAudioTarget = () => null; export const resolveInstagramVideo = () => {}; export const instagramVideoErrorText = () => "error";' };
       if (args.path === './admin') return { contents: `
-        export class AdminStatsStore {}
+        export const telegramFileCache=async(...args)=>globalThis.testFileCache ? globalThis.testFileCache(...args) : null; export class AdminStatsStore {}
         export const ADMIN_USER_ID = 1;
         export const recordSuccessfulDelivery = async () => { globalThis.delivered++; };
         export const recordUserActivity = async () => {};

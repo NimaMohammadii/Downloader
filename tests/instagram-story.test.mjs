@@ -9,7 +9,7 @@ const { outputFiles } = await build({
     build.onResolve({ filter: /.*/ }, a => ({ path: a.path, namespace: 'test' }));
     build.onLoad({ filter: /.*/, namespace: 'test' }, a => ({ contents: a.path === './main'
       ? 'export default { fetch() { globalThis.legacy++; return Response.json({delegated: true}); } };'
-      : 'export class AdminStatsStore {} export const ADMIN_USER_ID = 1; export async function recordUserActivity() {}' }));
+      : 'export const telegramFileCache=async(...args)=>globalThis.storyFileCache ? globalThis.storyFileCache(...args) : null; export class AdminStatsStore {} export const ADMIN_USER_ID = 1; export async function recordUserActivity() {}' }));
   } }],
 });
 const { default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
@@ -23,7 +23,7 @@ async function run({ routes = {}, env = {}, link = 'https://www.instagram.com/st
     const headers = new Headers(init.headers);
     if (url.hostname === 'api.telegram.org') {
       const body = JSON.parse(init.body); telegram.push({ method: url.pathname.split('/').at(-1), body });
-      return Response.json({ ok: true, result: { message_id: 10 } });
+      return Response.json({ ok: true, result: { message_id: 10, ...(url.pathname.endsWith('/sendVideo') ? { video: { file_id: 'genuine_story_file' } } : {}) } });
     }
     requests.push({ url, headers });
     if (url.hostname === 'cdn.instagram.com') return new Response(null, { headers: { 'content-length': '1000000' } });
@@ -153,4 +153,24 @@ test('neighboring large ID is never mistaken for a missing requested story', asy
   } });
   assert.equal(r.telegram.filter(t => t.method === 'sendVideo').length, 0);
   assert.match(r.telegram[0].body.text, /منقضی|قابل مشاهده/);
+});
+
+test('Story video reuse keeps source access checks and owner-bound song buttons',async()=>{
+  const operations=[];
+  globalThis.storyFileCache=async(_env,op,key,value)=>{
+    operations.push({op,key,value});
+    return op==='get'?{method:'sendVideo',fileId:'cached_story_id',data:{caption:'Instagram'}}:null;
+  };
+  try {
+    const r=await run({routes:{
+      '/api/v1/media/999/info/':()=>Response.json({items:[media]}),
+      '/api/v1/feed/user/77/story/':()=>Response.json({reel:{items:[media]}}),
+    }});
+    const sent=r.telegram.find(t=>t.method==='sendVideo').body;
+    assert.equal(sent.video,'cached_story_id');
+    assert.ok(r.requests.some(r=>r.url.pathname.includes('/feed/user/')));
+    assert.equal(sent.reply_markup.inline_keyboard[0][1].callback_data,'igm|s|999|0|1');
+    assert.equal(operations[0].key,'ig:1:999:0:video');
+    assert.equal(operations.at(-1).value.fileId,'genuine_story_file');
+  } finally {delete globalThis.storyFileCache;}
 });

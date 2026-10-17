@@ -45,6 +45,24 @@ type RecordPayload = {
   linkSent: boolean;
 };
 
+export type CachedTelegramFile = {
+  method: "sendAudio" | "sendVideo";
+  fileId: string;
+  data: Record<string, string | number | boolean>;
+};
+
+function cleanCachedFile(value: any): CachedTelegramFile | null {
+  if (!value || !["sendAudio", "sendVideo"].includes(value.method)
+      || typeof value.fileId !== "string" || !/^[A-Za-z0-9_-]{1,1024}$/.test(value.fileId)) return null;
+  const data: CachedTelegramFile["data"] = {};
+  for (const key of ["caption", "title", "performer", "width", "height", "duration", "supports_streaming"]) {
+    const item = value.data?.[key];
+    if (typeof item === "string") data[key] = item.slice(0, key === "caption" ? 1024 : 180);
+    else if (typeof item === "boolean" || (typeof item === "number" && Number.isFinite(item))) data[key] = item;
+  }
+  return { method: value.method, fileId: value.fileId, data };
+}
+
 type SummarySqlRow = {
   total_users: number | string;
   links_sent: number | string;
@@ -105,11 +123,36 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         delivered_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_delivered_media_at ON delivered_media(delivered_at);
+
+      CREATE TABLE IF NOT EXISTS telegram_file_cache (
+        key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_telegram_file_cache_at ON telegram_file_cache(created_at);
     `);
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+
+    if (request.method === "POST" && url.pathname === "/file-cache") {
+      const payload = await request.json() as { op: string; key: string; value?: CachedTelegramFile };
+      if (!/^[A-Za-z0-9:_-]{1,180}$/.test(payload.key || "")) return new Response("Invalid key", { status: 400 });
+      const sql = this.ctx.storage.sql;
+      const now = Date.now();
+      if (payload.op === "get") {
+        const rows = sql.exec("SELECT value FROM telegram_file_cache WHERE key = ? AND created_at > ?", payload.key, now - 30 * 86400_000).toArray();
+        return Response.json({ value: rows.length ? JSON.parse(String(rows[0].value)) : null });
+      }
+      if (payload.op === "delete") sql.exec("DELETE FROM telegram_file_cache WHERE key = ?", payload.key);
+      else if (payload.op === "put") {
+        const value = cleanCachedFile(payload.value);
+        if (!value) return new Response("Invalid file", { status: 400 });
+        sql.exec("INSERT INTO telegram_file_cache(key,value,created_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,created_at=excluded.created_at", payload.key, JSON.stringify(value), now);
+        sql.exec("DELETE FROM telegram_file_cache WHERE created_at <= ?", now - 30 * 86400_000);
+        sql.exec("DELETE FROM telegram_file_cache WHERE key IN (SELECT key FROM telegram_file_cache ORDER BY created_at DESC LIMIT -1 OFFSET 10000)");
+      } else return new Response("Invalid operation", { status: 400 });
+      return Response.json({ ok: true });
+    }
 
     if (request.method === "POST" && url.pathname === "/record") {
       const payload = (await request.json()) as RecordPayload;
@@ -232,6 +275,20 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
 
 function statsStub(env: AdminStatsEnv) {
   return env.ADMIN_STATS.getByName("global");
+}
+
+export async function telegramFileCache(env: Partial<AdminStatsEnv> & { BOT_TOKEN: string }, op: "get" | "put" | "delete", key: string, value?: CachedTelegramFile): Promise<CachedTelegramFile | null> {
+  try {
+    if (!env.ADMIN_STATS) return null;
+    // A file_id belongs to one bot. Never share cached IDs across bot identities.
+    const store = env.ADMIN_STATS.getByName(`telegram-files-${env.BOT_TOKEN.split(":")[0]}`);
+    const response = await store.fetch(new Request("https://store/file-cache", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ op, key, value }),
+    }));
+    if (!response.ok) return null;
+    const result = await response.json() as { value?: CachedTelegramFile };
+    return result.value || null;
+  } catch { return null; } // Cache outages must not block ordinary downloads.
 }
 
 export async function recordUserActivity(

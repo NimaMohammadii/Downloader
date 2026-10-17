@@ -2,6 +2,7 @@ import appWorker from "./main";
 import {
   ADMIN_USER_ID,
   recordUserActivity,
+  telegramFileCache,
   type AdminStatsEnv,
   type TrackedUser,
 } from "./admin";
@@ -24,6 +25,7 @@ type TelegramMessage = {
   from?: TelegramUser;
   text?: string;
   caption?: string;
+  video?: { file_id: string };
 };
 type TelegramUpdate = { update_id: number; message?: TelegramMessage };
 type TelegramApiResponse<T> = { ok: boolean; result?: T; description?: string };
@@ -509,6 +511,7 @@ export type InstagramVideoTarget = {
   mediaId?: string;
   videoIndex?: number;
   query?: string;
+  recognizeMusic?: boolean;
 };
 export type InstagramVideoSource = {
   mode: "live" | "replay";
@@ -518,6 +521,7 @@ export type InstagramVideoSource = {
   duration?: number;
   audioOnly?: boolean;
   musicQuery?: string;
+  recognizeMusic?: boolean;
 };
 
 export function parseInstagramAudioTarget(text: string): InstagramVideoTarget | null {
@@ -617,7 +621,7 @@ export async function resolveInstagramVideo(target: InstagramVideoTarget, env: E
     const video = children ? (target.videoIndex === undefined ? children.find((v: any) => v?.video_versions?.length) : children[target.videoIndex]) : item;
     if (target.kind === "audio" && video?.has_audio === false) throw new InstagramVideoError("❌ این ویدیو صدا ندارد.");
     const source = replayMediaSource(video);
-    if (source && target.kind === "audio") return { ...source, audioOnly: true, title: "Instagram Audio" };
+    if (source && target.kind === "audio") return { ...source, audioOnly: true, title: "Instagram Audio", ...(target.recognizeMusic ? { recognizeMusic: true } : {}) };
     if (source) return source;
     throw new InstagramVideoError(target.kind === "audio" ? "❌ این لینک ویدیوی دارای صدا ندارد؛ عکس به فایل صوتی تبدیل نمی‌شود." : "❌ این لینک ویدیوی بازپخش قابل دانلود ندارد؛ لینک بازپخش منتشرشده را بفرست.");
   }
@@ -696,17 +700,29 @@ async function sendResolvedStory(env: Env, target: StoryTarget, update: Telegram
           reply_parameters: i === 0 ? { message_id: message.message_id } : undefined,
         });
       } else {
-        await telegramCall(env.BOT_TOKEN, "sendVideo", {
+        const cacheKey = target.kind === "story" && target.storyId ? `ig:${message.from?.id || message.chat.id}:${target.storyId}:0:video` : undefined;
+        const cached = cacheKey ? await telegramFileCache(env, "get", cacheKey) : null;
+        const payload = {
           chat_id: message.chat.id,
-          video: mediaUrl,
+          video: cached?.method === "sendVideo" ? cached.fileId : mediaUrl,
           caption,
           width: item.width || undefined,
           height: item.height || undefined,
           supports_streaming: true,
           reply_markup: target.kind === "story" && target.storyId && message.from?.id ? { inline_keyboard: [[{
             text: "🎵 فقط صدا", callback_data: `iga|s|${target.storyId}|0|${message.from.id}`,
-          }]] } : undefined,
+          }, { text: "🔎 پیداکردن آهنگ", callback_data: `igm|s|${target.storyId}|0|${message.from.id}` }]] } : undefined,
           reply_parameters: i === 0 ? { message_id: message.message_id } : undefined,
+        };
+        let sent: TelegramMessage;
+        try { sent = await telegramCall<TelegramMessage>(env.BOT_TOKEN, "sendVideo", payload); }
+        catch (error) {
+          if (!cached || !/wrong.*file|file.*(?:invalid|expired)|file_reference|failed to get.*file/i.test(String(error))) throw error;
+          await telegramFileCache(env, "delete", cacheKey!);
+          sent = await telegramCall<TelegramMessage>(env.BOT_TOKEN, "sendVideo", { ...payload, video: mediaUrl });
+        }
+        if (cacheKey && sent.video?.file_id) await telegramFileCache(env, "put", cacheKey, {
+          method: "sendVideo", fileId: sent.video.file_id, data: { caption, supports_streaming: true },
         });
       }
     }

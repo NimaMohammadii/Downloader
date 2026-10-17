@@ -332,5 +332,175 @@ class RecognitionSampleTests(unittest.TestCase):
                 app.recognition_samples(source,workdir)
 
 
+class PlaylistAndCacheTests(unittest.TestCase):
+    def payload(self, **source):
+        return {'id':'igdl-42-7-42','source':{'mode':'replay','audioOnly':True,**source},
+                'botToken':'fictional-token','chatId':42,'requestMessageId':7,'statusMessageId':10,
+                'completionUrl':'https://downloader.vexaagent.workers.dev/instagram/events/igdl-42-7-42',
+                'completionToken':'0'*64}
+
+    def test_playlist_extraction_is_bounded_and_preserves_positions(self):
+        data={'title':'Playlist','entries':[
+            {'id':'aaaaaaaaaaa','playlist_index':21,'title':'First'},
+            {'id':'bad-id!','playlist_index':22},
+            {'id':'bbbbbbbbbbb','playlist_index':23,'is_live':True},
+            {'id':'ccccccccccc','playlist_index':24,'title':'Fourth'},
+        ]}
+        with patch.object(pipeline,'_run',return_value=subprocess.CompletedProcess([],0,json.dumps(data))) as run:
+            title,entries=pipeline.playlist_entries('https://www.youtube.com/playlist?list=PLabcdef',21,40)
+        self.assertEqual([e['index'] for e in entries],[21,22,23,24])
+        self.assertEqual([e['id'] for e in entries],['aaaaaaaaaaa',None,None,'ccccccccccc'])
+        command=run.call_args.args[0]
+        self.assertEqual(command[command.index('--playlist-items')+1],'21:40')
+        self.assertNotIn('--no-playlist',command)
+        self.assertEqual(command[-2],'--')
+        self.assertEqual(title,'Playlist')
+        with self.assertRaises(app.UserVisibleError):
+            pipeline.playlist_entries('https://attacker.example/list',1,20)
+        with self.assertRaises(app.UserVisibleError):
+            pipeline.playlist_entries('https://www.youtube.com/playlist?list=PLabcdef',1,21)
+
+    def test_cached_file_uses_current_chat_and_invalid_id_is_evicted(self):
+        entry={'method':'sendAudio','fileId':'cached_id','data':{'caption':'Hello','title':'Hello'}}
+        payload=self.payload()
+        with patch.object(app,'file_cache',return_value=entry) as cache,patch.object(app,'telegram_call',return_value={'message_id':1}) as telegram:
+            self.assertTrue(app.reuse_cached_file(payload,'yt:aaaaaaaaaaa:mp3'))
+            data=telegram.call_args.kwargs['json_payload']
+            self.assertEqual(data['chat_id'],42);self.assertEqual(data['audio'],'cached_id')
+            self.assertEqual(data['reply_parameters'],{'message_id':7})
+        with patch.object(app,'file_cache',return_value=entry) as cache,patch.object(app,'telegram_call',side_effect=RuntimeError('Bad Request: wrong file identifier')):
+            self.assertFalse(app.reuse_cached_file(payload,'yt:aaaaaaaaaaa:mp3'))
+            self.assertEqual(cache.call_args.args[1],'delete')
+        with patch.object(app,'file_cache',return_value=entry) as cache,patch.object(app,'telegram_call',side_effect=RuntimeError('timeout after sending')):
+            with self.assertRaisesRegex(app.UserVisibleError,'تکراری'):
+                app.reuse_cached_file(payload,'yt:aaaaaaaaaaa:mp3')
+            self.assertEqual(cache.call_count,1)
+
+    def test_successful_upload_cache_has_no_chat_or_reply_context(self):
+        payload=self.payload()
+        with patch.object(app,'file_cache') as cache:
+            app.store_uploaded_file(payload,['yt:aaaaaaaaaaa:mp3','yt:aaaaaaaaaaa:mp3'], 'sendAudio',
+                                    {'chat_id':'42','reply_parameters':'private','caption':'Hello','title':'Hello'},
+                                    {'message_id':10,'file_id':'valid_id'})
+            cache.assert_called_once()
+            record=cache.call_args.args[3]
+            self.assertEqual(record['data'],{'caption':'Hello','title':'Hello'})
+        with patch.object(app,'file_cache') as cache:
+            app.store_uploaded_file(payload,['key'],'sendAudio',{}, {'ok':False})
+            cache.assert_not_called()
+
+    def test_cached_youtube_download_does_not_extract_or_download_again(self):
+        payload={**self.payload(),'url':'https://www.youtube.com/watch?v=aaaaaaaaaaa','audioMode':'hq'}
+        with patch.object(app,'reuse_cached_file',return_value=True),patch.object(app,'fetch_metadata') as metadata, \
+             patch.object(app,'download_audio') as download,patch.object(app,'delete_status'):
+            result=app.process_job(payload)
+        self.assertTrue(result['cached']);metadata.assert_not_called();download.assert_not_called()
+
+    def test_cache_transport_is_signed_and_does_not_accept_arbitrary_hosts(self):
+        payload={**self.payload(),'cacheUrl':'https://downloader.vexaagent.workers.dev/media-cache/igdl-42-7-42','cacheToken':'signed-token'}
+        with patch.object(app.requests,'post') as post:
+            post.return_value.ok=True;post.return_value.json.return_value={'value':{'fileId':'cached'}}
+            self.assertEqual(app.file_cache(payload,'get','yt:test:mp3')['fileId'],'cached')
+            self.assertFalse(post.call_args.kwargs['allow_redirects'])
+            self.assertEqual(post.call_args.kwargs['headers']['x-media-cache-token'],'signed-token')
+        with patch.object(app.requests,'post') as post:
+            app.file_cache({**payload,'cacheUrl':'https://attacker.example/'},'get','yt:test:mp3')
+            post.assert_not_called()
+
+    def test_playlist_sends_in_order_skips_unavailable_and_reuses_cached_track(self):
+        playlist={'url':'https://www.youtube.com/playlist?list=PLabcdef','start':1,'end':20}
+        entries=[{'id':'aaaaaaaaaaa','index':1,'title':'First'}, {'id':None,'index':2,'title':'Private'},
+                 {'id':'bbbbbbbbbbb','index':3,'title':'Third'}]
+        job=app.InstagramCapture(self.payload(playlist=playlist));calls=[]
+        def reuse(payload,key,caption=None):
+            calls.append(('cache',key))
+            return key=='yt:aaaaaaaaaaa:mp3'
+        def prepare(url,workdir):
+            calls.append(('prepare',url));path=workdir/'Music.mp3';path.write_bytes(b'complete')
+            return path,'Third','Artist',url
+        async def upload(token,method,data,file):
+            calls.append(('upload',data['caption']));return {'message_id':3,'file_id':'stored'}
+        try:
+            with patch.object(pipeline,'playlist_entries',return_value=('Playlist',entries)), \
+                 patch.object(pipeline,'prepare_music_url',side_effect=prepare),patch.object(app,'reuse_cached_file',side_effect=reuse), \
+                 patch.object(app,'upload_complete_file',side_effect=upload),patch.object(app,'store_uploaded_file') as store, \
+                 patch.object(job,'safe_status'),patch.object(job,'notify'):
+                job.run()
+            self.assertEqual(job.result['parts'],2)
+            self.assertIn('دریافت نشد: 2',job.result['message'])
+            self.assertEqual([c[0] for c in calls],['cache','cache','prepare','upload'])
+            self.assertNotIn('Playlist',store.call_args.args[3]['caption'])
+            with patch.object(app,'upload_complete_file') as upload:
+                self.assertEqual(job.send()['parts'],2);job.send();upload.assert_not_called()
+            self.assertEqual(list(job.workdir.glob('track-*')),[])
+        finally: job.cleanup()
+
+    def test_uncertain_playlist_send_stops_without_retrying_next_track(self):
+        playlist={'url':'https://www.youtube.com/playlist?list=PLabcdef','start':1,'end':20}
+        entries=[{'id':'aaaaaaaaaaa','index':1,'title':'First'},{'id':'bbbbbbbbbbb','index':2,'title':'Second'}]
+        job=app.InstagramCapture(self.payload(playlist=playlist))
+        def prepare(url,workdir):
+            path=workdir/'Music.mp3';path.write_bytes(b'data');return path,'First','Artist',url
+        try:
+            with patch.object(pipeline,'playlist_entries',return_value=('Playlist',entries)), \
+                 patch.object(pipeline,'prepare_music_url',side_effect=prepare) as prepare_mock,patch.object(app,'reuse_cached_file',return_value=False), \
+                 patch.object(app,'upload_complete_file',new=AsyncMock(side_effect=asyncio.TimeoutError())) as upload, \
+                 patch.object(job,'safe_status'),patch.object(job,'notify'):
+                job.run()
+            upload.assert_awaited_once();prepare_mock.assert_called_once()
+            self.assertFalse(job.result['ok']);self.assertIn('تأیید نشد',job.result['message'])
+        finally: job.cleanup()
+
+    def test_playlist_stop_reports_resume_without_sending_pending_tracks(self):
+        playlist={'url':'https://www.youtube.com/playlist?list=PLabcdef','start':21,'end':40}
+        entries=[{'id':'aaaaaaaaaaa','index':21,'title':'First'},{'id':'bbbbbbbbbbb','index':22,'title':'Second'}]
+        job=app.InstagramCapture(self.payload(playlist=playlist))
+        def reuse(payload,key,caption=None):
+            self.assertTrue(job.stop())
+            return True
+        try:
+            with patch.object(pipeline,'playlist_entries',return_value=('Playlist',entries)), \
+                 patch.object(app,'reuse_cached_file',side_effect=reuse) as cached, \
+                 patch.object(pipeline,'prepare_music_url') as prepare,patch.object(job,'safe_status'),patch.object(job,'notify'):
+                job.run()
+            cached.assert_called_once();prepare.assert_not_called()
+            self.assertEqual(job.result['parts'],1)
+            self.assertIn('22-41',job.result['message'])
+        finally: job.cleanup()
+
+    def test_instagram_capture_identifies_before_searching_and_sends_mp3(self):
+        job=app.InstagramCapture(self.payload(recognizeMusic=True,url='https://scontent.cdninstagram.com/video.mp4'))
+        def prepare(query,workdir):
+            self.assertEqual(query,'Adele Hello')
+            path=workdir/'Music.mp3';path.write_bytes(b'complete')
+            return path,'Hello','Adele','https://www.youtube.com/watch?v=abcdefghijk'
+        try:
+            with patch.object(app,'recognize_instagram_music',return_value={'title':'Hello','artist':'Adele'}) as identify, \
+                 patch.object(app,'reuse_cached_file',return_value=False),patch.object(pipeline,'prepare_music',side_effect=prepare), \
+                 patch.object(job,'safe_status'),patch.object(job,'notify'):
+                job.run()
+            identify.assert_called_once()
+            self.assertEqual(job.state,'ready');self.assertEqual(job.path.suffix,'.mp3')
+            with patch.object(app,'upload_complete_file',new=AsyncMock(return_value={'file_id':'stored'})) as upload, \
+                 patch.object(job,'safe_status'),patch.object(app,'delete_status'),patch.object(app,'store_uploaded_file'):
+                job.send()
+            self.assertEqual(upload.call_args.args[1],'sendAudio')
+            self.assertIn('Adele',upload.call_args.args[2]['caption'])
+        finally: job.cleanup()
+
+    def test_instagram_song_resolution_uses_short_remote_sample_and_cleans_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workdir=Path(directory);sample=workdir/'recognition-0.wav';sample.write_bytes(b'fixture')
+            with patch.object(app,'recognition_samples',return_value=[sample]) as samples, \
+                 patch.object(app,'recognize_samples',new=AsyncMock(return_value={'title':'Hello','artist':'Adele'})):
+                result=app.recognize_instagram_music('https://scontent.cdninstagram.com/video.mp4',workdir)
+            self.assertEqual(result['title'],'Hello');self.assertTrue(samples.call_args.kwargs['remote'])
+            self.assertFalse(sample.exists())
+            with patch.object(app,'recognition_samples') as samples:
+                with self.assertRaises(app.UserVisibleError):
+                    app.recognize_instagram_music('https://attacker.example/video.mp4',workdir)
+                samples.assert_not_called()
+
+
 if __name__=='__main__':
     unittest.main()

@@ -756,6 +756,49 @@ def prepare_music(query: str, workdir: Path) -> tuple[Path, str, str, str]:
     if not selected:
         raise last_error or app.UserVisibleError("❌ فایل صوتی قابل دریافت برای این آهنگ پیدا نشد.")
     metadata, url = selected
+    return prepare_music_file(metadata, url, workdir, query)
+
+
+def prepare_music_url(url: str, workdir: Path) -> tuple[Path, str, str, str]:
+    match = re.fullmatch(r"https://www\.youtube\.com/watch\?v=([A-Za-z0-9_-]{11})", url)
+    if not match:
+        raise app.UserVisibleError("❌ لینک آهنگ پلی‌لیست معتبر نیست.")
+    metadata = fetch_metadata(url)
+    if not audio_formats(metadata):
+        raise app.UserVisibleError("❌ این مورد فایل صوتی قابل دانلود ندارد.")
+    return prepare_music_file(metadata, url, workdir, "Music")
+
+
+def playlist_entries(url: str, start: int, end: int) -> tuple[str, list[dict[str, Any]]]:
+    if not re.fullmatch(r"https://www\.youtube\.com/playlist\?list=[A-Za-z0-9_-]{6,150}", url) or not (1 <= start <= end <= 10000 and end - start < 20):
+        raise app.UserVisibleError("❌ لینک یا بازهٔ پلی‌لیست معتبر نیست؛ هر درخواست حداکثر 20 آهنگ.")
+    try:
+        result = _run([app.REAL_YTDLP, "--ignore-config", "--force-ipv4", "--flat-playlist", "--yes-playlist",
+                       "--skip-download", "--dump-single-json", "--ignore-errors", "--no-warnings", "--socket-timeout", "15",
+                       "--retries", "1", "--extractor-retries", "1", "--playlist-items", f"{start}:{end}", "--", url], 90)
+        data = json.loads(result.stdout)
+        if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+            raise ValueError("Missing playlist entries")
+        entries = []
+        for offset, item in enumerate(data["entries"][:20]):
+            if not isinstance(item, dict):
+                entries.append({"id": None, "index": start + offset, "title": "Unavailable"})
+                continue
+            index = int(item.get("playlist_index") or start + offset)
+            # Keep unavailable rows so their positions can be reported without sending another track.
+            valid = re.fullmatch(r"[A-Za-z0-9_-]{11}", str(item.get("id") or ""))
+            available = bool(valid) and not item.get("is_live") and item.get("live_status") not in {"is_live", "is_upcoming"}
+            if start <= index <= end:
+                entries.append({"id": item.get("id") if available else None, "index": index,
+                                "title": str(item.get("title") or "Unavailable")[:180]})
+        if not entries:
+            raise ValueError("Empty playlist range")
+        return str(data.get("title") or "YouTube Playlist")[:180], entries
+    except (subprocess.SubprocessError, ValueError, TypeError, OSError) as exc:
+        raise app.UserVisibleError("❌ پلی‌لیست یا این بازه قابل دریافت نیست؛ لینک عمومی و بازهٔ درست را بفرست.") from exc
+
+
+def prepare_music_file(metadata: dict[str, Any], url: str, workdir: Path, query: str) -> tuple[Path, str, str, str]:
     source = download_audio(url, workdir, "hq")
     title = str(metadata.get("track") or metadata.get("title") or query)[:180]
     artist = str(metadata.get("artist") or metadata.get("creator") or metadata.get("uploader") or "").removesuffix(" - Topic")[:120]
@@ -782,7 +825,7 @@ def send_media_file(
     caption: str,
     *,
     reply: bool,
-) -> None:
+) -> Any:
     geometry = _probe_geometry(path)
     data: dict[str, Any] = {
         "chat_id": str(chat_id),
@@ -800,7 +843,7 @@ def send_media_file(
         data["reply_parameters"] = json.dumps({"message_id": request_message_id})
 
     with path.open("rb") as handle:
-        app.telegram_call(
+        return app.telegram_call(
             token, "sendVideo", data=data,
             files={"video": (path.name, handle, "video/mp4")}, timeout=1800,
         )

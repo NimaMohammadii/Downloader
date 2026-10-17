@@ -5,7 +5,7 @@ import test from 'node:test';
 const source = await readFile(new URL('../src/youtube-main.ts', import.meta.url), 'utf8');
 const story = await readFile(new URL('../src/story-main.ts', import.meta.url), 'utf8');
 const { outputFiles } = await build({
-  stdin: { contents: source + '\nexport {parseInstagramVideoTarget,parseInstagramAudioTarget,resolveInstagramVideo,instagramVideoErrorText};', loader: 'ts' },
+  stdin: { contents: source + '\nexport {parseInstagramVideoTarget,parseInstagramAudioTarget,resolveInstagramVideo,instagramVideoErrorText,parsePlaylist,mediaCacheKey};', loader: 'ts' },
   bundle: true, format: 'esm', write: false,
   plugins: [{ name: 'instagram-platform', setup(build) {
     build.onResolve({ filter: /.*/ }, a => ({ path: a.path, namespace: 'test' }));
@@ -22,7 +22,7 @@ const { outputFiles } = await build({
         export const getContainer=(_env,id)=>{globalThis.containerIds.push(id);return globalThis.container;};` };
       if (a.path === 'cloudflare:workers') return { contents: 'export class WorkflowEntrypoint {constructor(ctx,env){this.env=env;}}' };
       if (a.path === './admin') return { contents: `
-        export class AdminStatsStore{} export const ADMIN_USER_ID=1;
+        export const telegramFileCache=async(...args)=>globalThis.testFileCache ? globalThis.testFileCache(...args) : null; export class AdminStatsStore{} export const ADMIN_USER_ID=1;
         export const recordUserActivity=async()=>{};
         export const recordSuccessfulDelivery=async()=>{globalThis.delivered++;};` };
       throw Error(a.path);
@@ -309,4 +309,111 @@ test('recognition uses the same completion event and upload path without requiri
   assert.equal(globalThis.recognitionPayload.source.audioOnly,true);
   assert.ok(steps.some(s=>s.type==='instagram-ready'));
   assert.equal(globalThis.delivered,1);
+});
+
+test('playlist links and explicit ranges preserve watch-link single-video behavior',()=>{
+  const url='https://www.youtube.com/playlist?list=PLabcdef1234';
+  assert.deepEqual(mod.parsePlaylist(url),{url,start:1,end:20});
+  assert.deepEqual(mod.parsePlaylist('/playlist '+url+' 21-40'),{url,start:21,end:40});
+  assert.equal(mod.parsePlaylist('/playlist '+url+' 1-21'),null);
+  assert.equal(mod.parsePlaylist('/playlist '+url+' 0-19'),null);
+  assert.equal(mod.parsePlaylist('/playlist https://attacker.example/playlist?list=PLabcdef'),null);
+  assert.equal(mod.parsePlaylist('https://www.youtube.com/watch?v=abcdefghijk&list=PLabcdef'),null);
+  assert.equal(mod.parsePlaylist('/playlist https://www.youtube.com/watch?v=abcdefghijk&list=PLabcdef').url,'https://www.youtube.com/playlist?list=PLabcdef');
+});
+
+test('Instagram music buttons bind owner and selected carousel item; link commands queue recognition',async()=>{
+  const jobs=[];const workerEnv={...env,YOUTUBE_DOWNLOAD_WORKFLOW:{async create(job){jobs.push(job);}}};
+  globalThis.fetch=async()=>Response.json({ok:true,result:{message_id:10}});
+  await mediaWebhook({text:'/findmusic https://instagram.com/reel/B/?img_index=2'},workerEnv);
+  assert.equal(jobs[0].params.instagram.recognizeMusic,true);
+  assert.equal(jobs[0].params.instagram.videoIndex,1);
+  const req=from=>new Request('https://worker/telegram/webhook',{method:'POST',
+    headers:{'x-telegram-bot-api-secret-token':'dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1'},
+    body:JSON.stringify({update_id:20,callback_query:{id:'button',from:{id:from},data:'igm|s|123|0|42',message:{message_id:55,chat:{id:42}}}})});
+  await mod.default.fetch(req(99),workerEnv,{});assert.equal(jobs.length,1);
+  await mod.default.fetch(req(42),workerEnv,{});assert.equal(jobs[1].params.instagram.mediaId,'123');
+  assert.equal(jobs[1].params.instagram.recognizeMusic,true);
+  api({'/api/v1/media/1/info/':()=>Response.json({items:[{pk:'1',video_versions:[{url:liveUrl}]}]})});
+  assert.equal((await mod.resolveInstagramVideo({kind:'audio',shortcode:'B',recognizeMusic:true},env)).recognizeMusic,true);
+});
+
+test('playlist webhook uses the event-driven MP3 queue, not the individual quality route',async()=>{
+  const jobs=[];const workerEnv={...env,YOUTUBE_DOWNLOAD_WORKFLOW:{async create(job){jobs.push(job);}}};
+  await mediaWebhook({text:'https://www.youtube.com/playlist?list=PLabcdef'},workerEnv);
+  assert.equal(jobs[0].params.playlist.start,1);assert.equal(jobs[0].params.playlist.end,20);
+  assert.equal(jobs[0].params.instagram,undefined);
+});
+
+test('cache keys separate quality, bot-facing music query and private Instagram owners',async()=>{
+  assert.notEqual(await mod.mediaCacheKey({...job,instagram:undefined,url:'https://www.youtube.com/watch?v=abcdefghijk',quality:720}),await mod.mediaCacheKey({...job,instagram:undefined,url:'https://www.youtube.com/watch?v=abcdefghijk',quality:1080}));
+  const a=await mod.mediaCacheKey({...job,instagram:{kind:'music',query:'  ADELE   Hello '}});
+  const b=await mod.mediaCacheKey({...job,instagram:{kind:'music',query:'Adele Hello'}});
+  assert.equal(a,b);
+  assert.equal(a,'mq:d1a0fb389cfe7ce8610222f4fa46b0ea5260d847374dcc8f446b4cde23e0eb43');
+  assert.notEqual(await mod.mediaCacheKey({...job,instagram:{kind:'audio',mediaId:'123'}}),await mod.mediaCacheKey({...job,userId:99,instagram:{kind:'audio',mediaId:'123'}}));
+});
+
+test('a cache hit sends the Telegram file without booting the container',async()=>{
+  const messages=[];globalThis.delivered=0;globalThis.containerIds=[];
+  globalThis.fetch=async(url,init)=>{messages.push({url:String(url),body:JSON.parse(init.body)});return Response.json({ok:true,result:{message_id:10}});};
+  globalThis.testFileCache=async(_env,op)=>op==='get'?{method:'sendAudio',fileId:'stored_id',data:{caption:'Hello'}}:null;
+  const step={async do(name,options,fn){return (typeof options==='function'?options:fn)();}};
+  try {
+    await new mod.YoutubeDownloadWorkflow({},env).run({payload:{...job,instagram:{kind:'music',query:'Adele Hello'}}},step);
+    assert.equal(globalThis.containerIds.length,0);assert.equal(globalThis.delivered,1);
+    assert.equal(messages.find(m=>m.url.endsWith('/sendAudio')).body.audio,'stored_id');
+  } finally {delete globalThis.testFileCache;}
+});
+
+test('cache endpoint rejects forged writes and validates signed operations',async()=>{
+  await workflow();const token=globalThis.startedPayload.cacheToken;const ops=[];
+  globalThis.testFileCache=async(_env,op,key)=>{ops.push({op,key});return null;};
+  const req=(token,body)=>new Request('https://worker/media-cache/'+job.id,{method:'POST',headers:{'x-media-cache-token':token},body:JSON.stringify(body)});
+  try {
+    assert.equal((await mod.default.fetch(req('bad',{op:'put',key:'yt:test:mp3'}),env,{})).status,403);
+    assert.equal(ops.length,0);
+    assert.equal((await mod.default.fetch(req(token,{op:'get',key:'yt:test:mp3'}),env,{})).status,200);
+    assert.deepEqual(ops,[{op:'get',key:'yt:test:mp3'}]);
+    assert.equal((await mod.default.fetch(req(token,{op:'get',key:'../../private'}),env,{})).status,400);
+  } finally {delete globalThis.testFileCache;}
+});
+
+test('persistent Telegram cache sanitizes context, expires entries, bounds storage and leaves admin counters intact',async()=>{
+  const {DatabaseSync}=await import('node:sqlite');
+  const db=new DatabaseSync(':memory:');
+  const sql={exec(query,...params){
+    let rows=[],changes=0;
+    if(/^\s*SELECT/i.test(query)) rows=db.prepare(query).all(...params);
+    else if(params.length) changes=Number(db.prepare(query).run(...params).changes);
+    else db.exec(query);
+    return {toArray:()=>rows,one:()=>rows[0],rowsWritten:changes};
+  }};
+  const adminSource=await readFile(new URL('../src/admin.ts',import.meta.url),'utf8');
+  const result=await build({stdin:{contents:adminSource,loader:'ts'},bundle:true,format:'esm',write:false,
+    plugins:[{name:'durable-object',setup(b){b.onResolve({filter:/cloudflare:workers/},a=>({path:a.path,namespace:'stub'}));b.onLoad({filter:/.*/,namespace:'stub'},()=>({contents:'export class DurableObject {constructor(ctx,env){this.ctx=ctx;this.env=env;}}'}));}}]});
+  const admin=await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString('base64')}`);
+  const instance=new admin.AdminStatsStore({storage:{sql}},{});
+  const req=body=>instance.fetch(new Request('https://store/file-cache',{method:'POST',body:JSON.stringify(body)}));
+  const key='yt:abcdefghijk:mp3';
+  try {
+    assert.equal((await req({op:'put',key,value:{method:'sendAudio',fileId:'valid_id',data:{caption:'Hello',chat_id:99,reply_parameters:'private'}}})).status,200);
+    const hit=(await (await req({op:'get',key})).json()).value;
+    assert.deepEqual(hit.data,{caption:'Hello'});
+    db.prepare('UPDATE telegram_file_cache SET created_at=0 WHERE key=?').run(key);
+    assert.equal((await (await req({op:'get',key})).json()).value,null);
+    assert.equal((await req({op:'put',key,value:{method:'sendMessage',fileId:'valid'}})).status,400);
+    assert.equal((await req({op:'put',key:'../private'})).status,400);
+    const insert=db.prepare('INSERT OR REPLACE INTO telegram_file_cache VALUES (?,?,?)');
+    for(let i=0;i<10002;i++)insert.run('test:'+i,JSON.stringify(hit),Date.now()+i);
+    await req({op:'put',key,value:hit});
+    assert.equal(Number(db.prepare('SELECT COUNT(*) AS n FROM telegram_file_cache').get().n),10000);
+    assert.equal(Number(db.prepare("SELECT value FROM counters WHERE key='successful_downloads'").get().value),0);
+    await req({op:'delete',key});
+    assert.equal((await (await req({op:'get',key})).json()).value,null);
+    const names=[];
+    await admin.telegramFileCache({BOT_TOKEN:'123:secret',ADMIN_STATS:{getByName(name){names.push(name);return {fetch:async()=>Response.json({value:hit})};}}},'get',key);
+    assert.deepEqual(names,['telegram-files-123']);
+    assert.equal(await admin.telegramFileCache({BOT_TOKEN:'123:secret'},'get',key),null);
+  } finally {db.close();}
 });

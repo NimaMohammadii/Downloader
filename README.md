@@ -64,6 +64,22 @@ ShazamIO reuses the existing Workflow/Container and bot credentials; no Shazam a
 
 Tests cover private/group routing, bounded real FFmpeg samples, service failures, input cleanup and the shared complete-file sender. A live Shazam request from the development environment was blocked by DNS resolution; recognition and Telegram delivery from the production Container IP still need a live clip after deployment.
 
+## Instagram song identification
+
+Video posts/Reels and individual video Stories offer **🔎 پیداکردن آهنگ** alongside audio extraction. Use `/findmusic INSTAGRAM_URL` or `/shazam INSTAGRAM_URL` directly. Carousel buttons keep the selected item; `?img_index=2` selects the second item in a direct link. The connected Instagram session resolves the accessible video, FFmpeg samples at most 36 seconds from its CDN, and ShazamIO identifies the recording before the existing full-MP3 delivery path runs. Photos, silent clips, no-match and service failures remain explicit. No new login or API secret is required.
+
+## YouTube playlists
+
+Send a public `https://www.youtube.com/playlist?list=...` URL, or `/playlist URL`. Each request sends up to 20 tracks as separate MP3s in playlist order. Use `/playlist URL 21-40` for another range (maximum 20 items per request, indices 1–10000). A watch URL with `list=` keeps its single-video quality selector unless `/playlist` is explicit. Track URLs come from the playlist's exact video IDs, without a text search substitution.
+
+The existing event-driven media job sends one track at a time and removes that track's temporary files before the next. Private/unavailable entries are skipped and reported by position. Stop with **⏹ توقف پلی‌لیست**; a download already in progress may take time to finish, and pending tracks are not sent after the stop is observed. The queue has a 90-minute budget between items, in addition to existing per-file timeouts. An ambiguous Telegram send stops the queue without retrying that item. The final message reports delivered/failed positions and offers an appropriate next range when needed. A Container rollout can interrupt an unfinished playlist; it does not resume automatically.
+
+## Telegram file reuse
+
+Successful video/audio uploads save a reusable Telegram `file_id` with bounded display metadata in the existing `ADMIN_STATS` Durable Object class, using a separate named instance per bot. No new binding, storage bucket or raw media archive is added. Entries expire after 30 days and the store keeps at most 10,000 keys. User/chat IDs and reply context are excluded from the cached payload.
+
+Repeated YouTube quality selections, song-name searches and playlist tracks reuse the matching Telegram file without source download or file re-upload. Ordinary Instagram video posts/Stories also reuse Telegram IDs after their existing source-resolution checks; Instagram audio, published replay links and identified songs have per-requester keys. Public YouTube MP3s use a separate cache key from M4A and each video resolution. Live recordings are always new captures. A stale Telegram file ID is evicted and falls back to normal download; ambiguous delivery errors do not trigger a duplicate upload. Cache access uses an authenticated internal endpoint, and cache outages fall back to normal downloading. Existing metadata/Instagram access checks and cold starts on a cache miss can still take time.
+
 ## Telegram delivery
 
 Ordinary Instagram media does not show a download-link button. The Worker resolves the Instagram media and creates a short-lived signed media proxy URL. Telegram fetches that URL and posts the actual video/photo into the chat.

@@ -77,6 +77,23 @@ class ChatTests(unittest.TestCase):
         self.assertIsInstance(uploaded, types.InputFile)
         self.assertEqual(uploaded.md5_checksum, hashlib.md5(content).hexdigest())
 
+    def test_uploaded_document_returns_reusable_bot_file_id(self):
+        from datetime import datetime, timezone
+        from telethon import utils
+        from types import SimpleNamespace
+        class DocumentClient(FakeClient):
+            async def send_file(self,*args,**kwargs):
+                await super().send_file(*args,**kwargs)
+                document=types.Document(id=12345,access_hash=67890,file_reference=b'',
+                    date=datetime.now(timezone.utc),mime_type='video/mp4',size=100,dc_id=2,
+                    attributes=[types.DocumentAttributeFilename('video.mp4'),types.DocumentAttributeVideo(duration=1,w=32,h=32)])
+                return SimpleNamespace(id=123,document=document)
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'video.mp4';path.write_bytes(b'complete fixture')
+            with patch.dict(os.environ,{'API_ID':'123','API_HASH':'test'}),patch('telethon.TelegramClient',DocumentClient),path.open('rb') as handle:
+                result=asyncio.run(app.upload_complete_file('token','sendVideo',{'chat_id':'42'},(path.name,handle,'video/mp4')))
+        self.assertEqual(utils.resolve_bot_file_id(result['file_id']).id,12345)
+
     def test_oversized_file_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'big.mp4'

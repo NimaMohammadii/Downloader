@@ -9,6 +9,8 @@ import {
   ADMIN_USER_ID,
   recordSuccessfulDelivery,
   recordUserActivity,
+  telegramFileCache,
+  type CachedTelegramFile,
   type AdminStatsEnv,
   type TrackedUser,
 } from "./admin";
@@ -19,7 +21,8 @@ const SUPPORTED_QUALITIES = [360, 480, 720, 1080] as const;
 type YoutubeQuality = (typeof SUPPORTED_QUALITIES)[number];
 type YoutubeAudioMode = "low" | "hq";
 type RecognitionInput = { fileId: string; fileSize?: number };
-type MediaSource = InstagramVideoSource & { recognition?: RecognitionInput };
+type PlaylistInput = { url: string; start: number; end: number };
+type MediaSource = InstagramVideoSource & { recognition?: RecognitionInput; playlist?: PlaylistInput };
 const RECOGNITION_FILE_LIMIT = 20_000_000;
 
 type YoutubeDownloadJob = {
@@ -33,6 +36,7 @@ type YoutubeDownloadJob = {
   statusMessageId?: number;
   instagram?: InstagramVideoTarget;
   recognition?: RecognitionInput;
+  playlist?: PlaylistInput;
 };
 
 type Env = AdminStatsEnv & {
@@ -190,6 +194,50 @@ function equalSignature(a: string, b: string): boolean {
   return diff === 0;
 }
 
+async function mediaCacheContext(env: Env, job: YoutubeDownloadJob) {
+  return {
+    cacheUrl: `https://downloader.vexaagent.workers.dev/media-cache/${job.id}`,
+    cacheToken: await instagramSignature(env.BOT_TOKEN, `cache:${job.id}`),
+    mediaCacheKey: await mediaCacheKey(job),
+  };
+}
+
+async function mediaCacheKey(job: YoutubeDownloadJob): Promise<string | undefined> {
+  if (job.instagram?.kind === "music" && job.instagram.query) {
+    const query = job.instagram.query.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
+    const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(query));
+    return `mq:${[...new Uint8Array(hash)].map(b => b.toString(16).padStart(2, "0")).join("")}`;
+  }
+  const target = job.instagram;
+  const id = target?.shortcode || target?.mediaId;
+  if (target && id && target.kind !== "live") return `ig:${job.userId}:${id}:${target.videoIndex ?? 0}:${target.recognizeMusic ? "song" : target.kind}`;
+  if (job.quality || job.audioMode) {
+    const id = new URL(job.url).searchParams.get("v");
+    if (id && /^[A-Za-z0-9_-]{11}$/.test(id)) return `yt:${id}:${job.audioMode ? job.audioMode === "hq" ? "ah" : "al" : `v${job.quality}`}`;
+  }
+}
+
+async function sendCachedMedia(env: Env, job: YoutubeDownloadJob, statusId?: number): Promise<boolean> {
+  const key = await mediaCacheKey(job);
+  if (!key) return false;
+  const cached = await telegramFileCache(env, "get", key);
+  if (!cached) return false;
+  try {
+    await telegramCall(env.BOT_TOKEN, cached.method, {
+      ...cached.data, [cached.method === "sendAudio" ? "audio" : "video"]: cached.fileId,
+      chat_id: job.chatId, reply_parameters: { message_id: job.requestMessageId },
+    });
+  } catch (error) {
+    if (/wrong.*file|file.*(?:invalid|expired)|file_reference|failed to get.*file/i.test(error instanceof Error ? error.message : "")) {
+      await telegramFileCache(env, "delete", key);
+      return false;
+    }
+    throw error; // An ambiguous send must never trigger a duplicate upload.
+  }
+  if (statusId) await safeTelegramCall(env.BOT_TOKEN, "deleteMessage", { chat_id: job.chatId, message_id: statusId });
+  return true;
+}
+
 function redactDiagnostic(detail: string, env: Env): string {
   for (const secret of [env.BOT_TOKEN, env.API_HASH]) {
     if (secret) detail = detail.split(secret).join("[redacted]");
@@ -231,7 +279,7 @@ async function containerResult<T>(env: Env, job: YoutubeDownloadJob, request: Re
 export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDownloadJob> {
   async run(event: WorkflowEvent<YoutubeDownloadJob>, step: WorkflowStep) {
     const job = event.payload;
-    if (job.instagram || job.recognition) return this.runInstagram(job, step);
+    if (job.instagram || job.recognition || job.playlist) return this.runInstagram(job, step);
     let statusMessageId = job.statusMessageId;
     let phase = "startup";
     const startContainer = () => step.do(
@@ -355,6 +403,10 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       if (!/^\d+$/.test(this.env.API_ID || "") || !this.env.API_HASH?.trim()) {
         throw new Error("YT_CONFIG");
       }
+      if (await step.do("reuse telegram youtube file", { retries: { limit: 0, delay: "1 second" }, timeout: "1 minute" }, () => sendCachedMedia(this.env, job, statusMessageId))) {
+        await step.do("record cached youtube delivery", () => recordSuccessfulDelivery(this.env, `youtube:${job.id}`));
+        return;
+      }
       await startContainer();
       phase = "transfer";
       const result = await step.do(
@@ -368,7 +420,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
             new Request("http://container/download", {
               method: "POST",
               headers: { "content-type": "application/json" },
-              body: JSON.stringify({ ...job, statusMessageId, botToken: this.env.BOT_TOKEN }),
+              body: JSON.stringify({ ...job, statusMessageId, botToken: this.env.BOT_TOKEN, ...await mediaCacheContext(this.env, job) }),
             }),
           );
         },
@@ -418,15 +470,19 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       statusId = await step.do("show instagram video status", async () => {
         const message = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
           chat_id: job.chatId, reply_parameters: { message_id: job.requestMessageId },
-          text: job.recognition ? "🎧 دارم آهنگ داخل فایل را شناسایی می‌کنم…" : job.instagram?.kind === "music" ? "🔎 دارم آهنگ را پیدا می‌کنم…" : job.instagram?.kind === "audio" ? "🎵 دارم صدای ویدیوی اینستاگرام را آماده می‌کنم…" : "🔎 دارم لایو یا بازپخش اینستاگرام را بررسی می‌کنم…",
+          text: job.playlist ? `🎵 دارم آهنگ‌های ${job.playlist.start}-${job.playlist.end} پلی‌لیست را به‌صورت MP3 آماده می‌کنم…` : job.recognition || job.instagram?.recognizeMusic ? "🎧 دارم آهنگ داخل فایل را شناسایی می‌کنم…" : job.instagram?.kind === "music" ? "🔎 دارم آهنگ را پیدا می‌کنم…" : job.instagram?.kind === "audio" ? "🎵 دارم صدای ویدیوی اینستاگرام را آماده می‌کنم…" : "🔎 دارم لایو یا بازپخش اینستاگرام را بررسی می‌کنم…",
         });
         return message.message_id;
       });
+      if (await step.do("reuse telegram media file", { retries: { limit: 0, delay: "1 second" }, timeout: "1 minute" }, () => sendCachedMedia(this.env, job, statusId))) {
+        await step.do("record cached media delivery", () => recordSuccessfulDelivery(this.env, `instagram:${job.id}`));
+        return;
+      }
       if (!/^\d+$/.test(this.env.API_ID || "") || !this.env.API_HASH?.trim()) throw new Error("YT_CONFIG");
       // Return friendly failures durably, without retrying rejected Instagram sessions.
       const resolution = await step.do("resolve instagram live or replay", { retries: { limit: 0, delay: "1 second" }, timeout: "2 minutes" }, async () => {
         try {
-          const source: MediaSource = job.recognition
+          const source: MediaSource = job.playlist ? { mode: "replay", title: "YouTube Playlist", audioOnly: true, playlist: job.playlist } : job.recognition
             ? { mode: "replay", title: "Music recognition", audioOnly: true, recognition: job.recognition }
             : await resolveInstagramVideo(job.instagram!, this.env);
           return { source };
@@ -453,6 +509,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           stopData: `igs|${job.requestMessageId}|${job.userId}|${signature}`,
           completionUrl: `https://downloader.vexaagent.workers.dev/instagram/events/${job.id}`,
           completionToken: await instagramSignature(this.env.BOT_TOKEN, `event:${job.id}`),
+          ...await mediaCacheContext(this.env, job),
         });
         if (!result.ok) throw new Error("IG_START_FAILED");
         return true;
@@ -468,14 +525,16 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       const result = await step.do("send complete instagram recording", { retries: { limit: 0, delay: "1 second" }, timeout: "30 minutes" }, () =>
         instagramContainer(this.env, job).instagramRequest("send", { id: job.id }),
       );
-      if (result.ok) await step.do("record instagram video delivery", () => recordSuccessfulDelivery(this.env, `instagram:${job.id}`));
+      if (result.ok) await step.do("record instagram video delivery", async () => {
+        for (let i = 0; i < Math.min(20, result.parts || 1); i++) await recordSuccessfulDelivery(this.env, `instagram:${job.id}${i ? `:${i}` : ""}`);
+      });
       else throw new Error("IG_SEND_FAILED");
     } catch (error) {
       console.error("instagram video workflow failed", { jobId: job.id, type: error instanceof Error ? error.name : "error" });
       await step.do("notify instagram video failure", async () => {
         const text = error instanceof Error && error.message.includes("YT_CONFIG")
           ? workflowFailureMessage("YT_CONFIG", "startup")
-          : job.recognition || job.instagram?.kind === "music" || job.instagram?.kind === "audio" ? "❌ دریافت یا ارسال فایل صوتی کامل نشد؛ درخواست را دوباره بفرست." : "❌ ضبط یا ارسال لایو کامل نشد؛ لینک را دوباره بفرست. ممکن است سرور ری‌استارت شده باشد.";
+          : job.recognition || job.playlist || job.instagram?.kind === "music" || job.instagram?.kind === "audio" ? "❌ دریافت یا ارسال فایل صوتی کامل نشد؛ درخواست را دوباره بفرست." : "❌ ضبط یا ارسال لایو کامل نشد؛ لینک را دوباره بفرست. ممکن است سرور ری‌استارت شده باشد.";
         await safeTelegramCall(this.env.BOT_TOKEN, statusId ? "editMessageText" : "sendMessage", {
           chat_id: job.chatId, message_id: statusId, text, reply_markup: { inline_keyboard: [] },
         });
@@ -654,6 +713,25 @@ function extractYouTubeUrl(text: string): string | null {
   return null;
 }
 
+function parsePlaylist(text: string): PlaylistInput | null {
+  const explicit = /^\/playlist(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text);
+  const args = explicit ? text.replace(/^\/playlist(?:@[A-Za-z0-9_]+)?\s*/i, "").trim().split(/\s+/) : [extractYouTubeUrl(text) || text];
+  if (args.length > 2) return null;
+  try {
+    const url = new URL(args[0]);
+    if (url.protocol !== "https:" || url.username || url.password || url.port
+        || !["youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"].includes(url.hostname)) return null;
+    if (!explicit && url.pathname !== "/playlist") return null;
+    const id = url.searchParams.get("list");
+    if (!id || !/^[A-Za-z0-9_-]{6,150}$/.test(id)) return null;
+    const range = args[1] ? /^(\d+)-(\d+)$/.exec(args[1]) : null;
+    if (args[1] && !range) return null;
+    const start = range ? Number(range[1]) : 1, end = range ? Number(range[2]) : 20;
+    if (!Number.isSafeInteger(start) || start < 1 || end < start || end - start >= 20 || end > 10000) return null;
+    return { url: `https://www.youtube.com/playlist?list=${id}`, start, end };
+  } catch { return null; }
+}
+
 function isStartCommand(text: string): boolean {
   return /^\/start(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text.trim());
 }
@@ -775,7 +853,7 @@ async function handleQualityCallback(
   return Response.json({ ok: true });
 }
 
-async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target?: InstagramVideoTarget, recognition?: RecognitionInput): Promise<Response> {
+async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target?: InstagramVideoTarget, recognition?: RecognitionInput, playlist?: PlaylistInput): Promise<Response> {
   const message = update.message!;
   const user = trackedUser(message);
   const userId = user?.id ?? message.chat.id;
@@ -783,6 +861,7 @@ async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target?
     id: `igdl-${message.chat.id}-${message.message_id}-${userId}`, chatId: message.chat.id,
     requestMessageId: message.message_id, userId, url: "", instagram: target,
     ...(recognition ? { recognition } : {}),
+    ...(playlist ? { playlist } : {}),
   };
   try {
     await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id: job.id, params: job });
@@ -803,7 +882,7 @@ async function stopInstagramRecording(env: Env, callback: TelegramCallbackQuery)
     const signature = (await instagramSignature(env.BOT_TOKEN, `stop:${chatId}:${match[1]}:${match[2]}`)).slice(0, 16);
     if (equalSignature(signature, match[3])) {
       // Acknowledge immediately; the capture process finalizes its file separately.
-      await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "درخواست توقف ضبط ارسال شد…" });
+      await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "درخواست توقف ارسال شد…" });
       try {
         const result = await instagramContainer(env, { id: `igdl-${chatId}-${match[1]}-${match[2]}` }).instagramRequest("stop", { id: `igdl-${chatId}-${match[1]}-${match[2]}` });
         if (!result.ok) await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: result.message || "ضبط قبلاً تمام شده یا در حال ارسال است." });
@@ -847,19 +926,34 @@ async function recognizeMessage(env: Env, update: TelegramUpdate, media: Telegra
 }
 
 async function instagramAudioCallback(env: Env, update: TelegramUpdate, callback: TelegramCallbackQuery): Promise<Response> {
-  const match = /^iga\|(p|s)\|([A-Za-z0-9_-]{1,20})\|(\d{1,3})\|(\d+)$/.exec(callback.data || "");
+  const findMusic = callback.data?.startsWith("igm|");
+  const match = /^iga\|(p|s)\|([A-Za-z0-9_-]{1,20})\|(\d{1,3})\|(\d+)$/.exec((callback.data || "").replace(/^igm\|/, "iga|"));
   if (!match || !callback.message || callback.from.id !== Number(match[4]) || (match[1] === "s" && !/^\d+$/.test(match[2]))) {
     await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "این دکمه معتبر نیست یا برای شما نیست.", show_alert: true });
     return Response.json({ ok: true });
   }
   await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "در حال آماده‌سازی فایل صوتی…" });
   const target: InstagramVideoTarget = match[1] === "p" ? { kind: "audio", shortcode: match[2], videoIndex: Number(match[3]) } : { kind: "audio", mediaId: match[2] };
+  if (findMusic) target.recognizeMusic = true;
   return createInstagramWorkflow(env, { ...update, message: { ...callback.message, from: callback.from } }, target);
 }
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const requestUrl = new URL(request.url);
+
+    const cacheRequest = /^\/media-cache\/((?:igdl|ytdl)--?\d+-\d+-\d+)$/.exec(requestUrl.pathname);
+    if (request.method === "POST" && cacheRequest) {
+      const expected = await instagramSignature(env.BOT_TOKEN, `cache:${cacheRequest[1]}`);
+      if (!equalSignature(request.headers.get("x-media-cache-token") || "", expected)) return new Response("Forbidden", { status: 403 });
+      const text = await request.text();
+      if (text.length > 5000) return new Response("Too large", { status: 413 });
+      try {
+        const body = JSON.parse(text) as { op: "get" | "put" | "delete"; key: string; value?: CachedTelegramFile };
+        if (!["get", "put", "delete"].includes(body.op) || !/^[A-Za-z0-9:_-]{1,180}$/.test(body.key || "")) return new Response("Invalid cache request", { status: 400 });
+        return Response.json({ ok: true, value: await telegramFileCache(env, body.op, body.key, body.value) });
+      } catch { return new Response("Invalid cache request", { status: 400 }); }
+    }
 
     const completion = /^\/instagram\/events\/(igdl--?\d+-\d+-\d+)$/.exec(requestUrl.pathname);
     if (request.method === "POST" && completion) {
@@ -893,17 +987,28 @@ export default {
       }
       if (update?.callback_query?.data?.startsWith("igs|")) return stopInstagramRecording(env, update.callback_query);
       if (update?.callback_query?.data?.startsWith("iga|")) return instagramAudioCallback(env, update, update.callback_query);
+      if (update?.callback_query?.data?.startsWith("igm|")) return instagramAudioCallback(env, update, update.callback_query);
 
       const message = update?.message;
       if (update && message) {
         const text = (message.text || message.caption || "").trim();
 
-        const recognitionCommand = /^\/(?:recognize|shazam)(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text);
+        const recognitionCommand = /^\/(?:recognize|shazam|findmusic)(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text);
         const inputMedia = recognitionMedia(message) || (recognitionCommand && message.reply_to_message ? recognitionMedia(message.reply_to_message) : undefined);
         if (recognitionCommand || (inputMedia && (!message.chat.type || message.chat.type === "private") && !text.startsWith("/"))) {
           if (inputMedia) return recognizeMessage(env, update, inputMedia);
+          const instagram = parseInstagramAudioTarget(text);
+          if (instagram) return createInstagramWorkflow(env, update, { ...instagram, recognizeMusic: true });
           await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id,
-            text: "یک ویس، فایل صوتی یا ویدیو بفرست؛ یا روی فایل ریپلای کن و /shazam بنویس تا آهنگش را پیدا کنم." });
+            text: "یک ویس، فایل صوتی یا ویدیو بفرست؛ یا روی فایل ریپلای کن و /shazam بنویس. برای اینستاگرام: /findmusic و لینک Reel یا Story." });
+          return Response.json({ ok: true });
+        }
+
+        const playlist = parsePlaylist(text);
+        if (playlist) return createInstagramWorkflow(env, update, undefined, undefined, playlist);
+        if (/^\/playlist(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) {
+          await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id,
+            text: "لینک پلی‌لیست YouTube را بفرست؛ هر درخواست تا 20 آهنگ MP3 می‌فرستد.\nبرای ادامه: /playlist لینک 21-40" });
           return Response.json({ ok: true });
         }
 
@@ -914,7 +1019,7 @@ export default {
           }
           await telegramCall(env.BOT_TOKEN, "sendMessage", {
             chat_id: message.chat.id,
-            text: "لینک YouTube یا اینستاگرام رو بفرست؛ فایلش رو همین‌جا می‌فرستم ⚡️\n\n🎵 برای آهنگ، اسم آهنگ و خواننده را بنویس یا /music نام آهنگ\n🔎 تشخیص آهنگ: ویس، صدا یا ویدیو بفرست؛ در گروه روی فایل ریپلای کن و /shazam بنویس\n🎧 صدای اینستاگرام: دکمهٔ «فقط صدا» یا /audio و لینک ویدیو\nضبط لایو: /live username\nبازپخش: /replay و لینک بازپخش منتشرشده\nتوقف ضبط با دکمهٔ زیر پیام ضبط انجام می‌شود.",
+            text: "لینک YouTube یا اینستاگرام رو بفرست؛ فایلش رو همین‌جا می‌فرستم ⚡️\n\n🎵 برای آهنگ، اسم آهنگ و خواننده را بنویس یا /music نام آهنگ\n🔎 تشخیص آهنگ: ویس، صدا یا ویدیو بفرست؛ در گروه روی فایل ریپلای کن و /shazam بنویس\n🔎 آهنگ اینستاگرام: دکمهٔ «پیداکردن آهنگ» یا /findmusic و لینک\n🎼 پلی‌لیست YouTube: لینک پلی‌لیست یا /playlist لینک 1-20\n🎧 صدای اینستاگرام: دکمهٔ «فقط صدا» یا /audio و لینک ویدیو\nضبط لایو: /live username\nبازپخش: /replay و لینک بازپخش منتشرشده\nتوقف ضبط با دکمهٔ زیر پیام ضبط انجام می‌شود.",
           });
           return Response.json({ ok: true });
         }
