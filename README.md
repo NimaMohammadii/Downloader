@@ -46,6 +46,14 @@ Public Reel/Post downloads are attempted without an Instagram session first. A v
 - Container rollouts/restarts interrupt an active recording; temporary media is not durable across a restart. The bot reports the interruption. Container/Workflow usage is billable while recording.
 - Validation covers route/authentication, exact IDs, callback ownership, event delivery, lifecycle, and real FFmpeg stop/remux and DASH audio/video fixtures. A live Instagram broadcast with the production account still requires an end-to-end check.
 
+## Music search and Instagram audio
+
+Send a song name and artist as plain text, or use `/music Adele Hello` (also `/song`). The bot searches up to five YouTube results, prefers a matching official audio/Topic result over unrequested covers/remixes, checks availability, downloads the audio through the existing client fallback, and sends one MP3 with title/artist metadata. The selected source URL appears in the caption. Specify the artist/version when a name is ambiguous; availability is not guaranteed.
+
+Ordinary Instagram video posts/Reels and individual video Stories now offer a **🎵 فقط صدا** button. Use `/audio https://www.instagram.com/reel/SHORTCODE/` directly for a Reel/video post/TV, or a single video Story link. Carousel buttons select their own media item; the direct command accepts `?img_index=2` to select an item, otherwise it uses the first video. Photos and videos explicitly marked silent are rejected.
+
+Instagram audio is delivered as M4A, music search as MP3. Both reuse the event-driven download job, FFmpeg validation and complete-file MTProto sender. No new secrets or bindings are needed. Ordinary Instagram URLs and YouTube quality selection retain their routes; non-command text without a URL is treated as a song search.
+
 ## Telegram delivery
 
 Ordinary Instagram media does not show a download-link button. The Worker resolves the Instagram media and creates a short-lived signed media proxy URL. Telegram fetches that URL and posts the actual video/photo into the chat.

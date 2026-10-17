@@ -5,7 +5,7 @@ import test from 'node:test';
 const source = await readFile(new URL('../src/youtube-main.ts', import.meta.url), 'utf8');
 const story = await readFile(new URL('../src/story-main.ts', import.meta.url), 'utf8');
 const { outputFiles } = await build({
-  stdin: { contents: source + '\nexport {parseInstagramVideoTarget,resolveInstagramVideo,instagramVideoErrorText};', loader: 'ts' },
+  stdin: { contents: source + '\nexport {parseInstagramVideoTarget,parseInstagramAudioTarget,resolveInstagramVideo,instagramVideoErrorText};', loader: 'ts' },
   bundle: true, format: 'esm', write: false,
   plugins: [{ name: 'instagram-platform', setup(build) {
     build.onResolve({ filter: /.*/ }, a => ({ path: a.path, namespace: 'test' }));
@@ -195,4 +195,51 @@ test('live webhook creates one deterministic job while ordinary Reels keep the o
   assert.equal(jobs[0].id,job.id);assert.equal(jobs[0].params.instagram.username,'example');
   const response=await mod.default.fetch(request('https://instagram.com/reel/B/'),workerEnv,{});
   assert.equal((await response.json()).delegated,true);assert.equal(jobs.length,1);
+});
+
+test('Instagram audio links resolve the requested carousel child or Story',async()=>{
+  assert.deepEqual(mod.parseInstagramAudioTarget('/audio https://instagram.com/reel/B/?img_index=2'),{kind:'audio',shortcode:'B',videoIndex:1});
+  assert.deepEqual(mod.parseInstagramAudioTarget('/audio https://instagram.com/stories/example/123/'),{kind:'audio',mediaId:'123'});
+  assert.equal(mod.parseInstagramAudioTarget('/audio https://attacker.example/reel/B/'),null);
+  api({'/api/v1/media/1/info/':()=>Response.json({items:[{pk:'1',carousel_media:[
+    {video_versions:[{url:'https://scontent.cdninstagram.com/first.mp4'}]},
+    {video_duration:40,video_versions:[{url:'https://scontent.cdninstagram.com/second.mp4'}]},
+  ]}]})});
+  const result=await mod.resolveInstagramVideo({kind:'audio',shortcode:'B',videoIndex:1},env);
+  assert.equal(result.audioOnly,true);assert.equal(result.url,'https://scontent.cdninstagram.com/second.mp4');
+});
+
+test('silent Instagram videos are rejected and music does not require an Instagram session',async()=>{
+  api({'/api/v1/media/123/info/':()=>Response.json({items:[{pk:'123',has_audio:false,video_versions:[{url:liveUrl}]}]})});
+  await assert.rejects(()=>mod.resolveInstagramVideo({kind:'audio',mediaId:'123'},env),/صدا ندارد/);
+  const source=await mod.resolveInstagramVideo({kind:'music',query:'Adele Hello'},{BOT_TOKEN:'test'});
+  assert.equal(source.musicQuery,'Adele Hello');assert.equal(source.audioOnly,true);
+});
+
+test('song names and music commands queue music while URLs and admin commands keep their routes',async()=>{
+  const jobs=[];
+  const workerEnv={...env,YOUTUBE_DOWNLOAD_WORKFLOW:{async create(job){jobs.push(job);}}};
+  const request=(text,id)=>new Request('https://worker/telegram/webhook',{method:'POST',
+    headers:{'content-type':'application/json','x-telegram-bot-api-secret-token':'dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1'},
+    body:JSON.stringify({update_id:id,message:{message_id:id,chat:{id:42},from:{id:42},text}})});
+  await mod.default.fetch(request('Adele Hello',1),workerEnv,{});
+  await mod.default.fetch(request('/music آهنگ فارسی',2),workerEnv,{});
+  await mod.default.fetch(request('/audio https://instagram.com/reel/B/',3),workerEnv,{});
+  assert.deepEqual(jobs.map(j=>j.params.instagram.kind),['music','music','audio']);
+  assert.equal(jobs[0].params.instagram.query,'Adele Hello');
+  assert.equal((await (await mod.default.fetch(request('/admin',4),workerEnv,{})).json()).delegated,true);
+  assert.equal(jobs.length,3);
+});
+
+test('Instagram audio button enforces ownership and replies to the selected video',async()=>{
+  const jobs=[];
+  const original=env.YOUTUBE_DOWNLOAD_WORKFLOW;
+  env.YOUTUBE_DOWNLOAD_WORKFLOW={async create(job){jobs.push(job);}};
+  try {
+    await webhook({id:'other',from:{id:99},data:'iga|p|B|1|42',message:{message_id:55,chat:{id:42}}});
+    assert.equal(jobs.length,0);
+    await webhook({id:'owner',from:{id:42},data:'iga|p|B|1|42',message:{message_id:55,chat:{id:42}}});
+    assert.equal(jobs[0].params.requestMessageId,55);
+    assert.equal(jobs[0].params.instagram.videoIndex,1);
+  } finally {env.YOUTUBE_DOWNLOAD_WORKFLOW=original;}
 });

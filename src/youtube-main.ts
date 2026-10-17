@@ -4,7 +4,7 @@ import {
   type WorkflowEvent,
   type WorkflowStep,
 } from "cloudflare:workers";
-import storyWorker, { parseInstagramVideoTarget, resolveInstagramVideo, instagramVideoErrorText, type InstagramVideoTarget } from "./story-main";
+import storyWorker, { parseInstagramVideoTarget, parseInstagramAudioTarget, resolveInstagramVideo, instagramVideoErrorText, type InstagramVideoTarget } from "./story-main";
 import {
   ADMIN_USER_ID,
   recordSuccessfulDelivery,
@@ -147,7 +147,7 @@ export class YoutubeDownloaderContainer extends Container<Env> {
     const job = await this.ctx.storage.get<{ id: string }>("instagramJob");
     if (!job) return false;
     const instance = await this.env.YOUTUBE_DOWNLOAD_WORKFLOW.get(job.id);
-    await instance.sendEvent({ type: "instagram-ready", payload: { ok: false, message: "❌ سرور هنگام ضبط ری‌استارت شد؛ ضبط پیوسته نماند. لینک لایو را دوباره بفرست." } });
+    await instance.sendEvent({ type: "instagram-ready", payload: { ok: false, message: "❌ سرور هنگام دریافت فایل ری‌استارت شد؛ درخواست کامل نشد. دوباره درخواست را بفرست." } });
     return true;
   }
 
@@ -406,7 +406,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       statusId = await step.do("show instagram video status", async () => {
         const message = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
           chat_id: job.chatId, reply_parameters: { message_id: job.requestMessageId },
-          text: "🔎 دارم لایو یا بازپخش اینستاگرام را بررسی می‌کنم…",
+          text: job.instagram?.kind === "music" ? "🔎 دارم آهنگ را پیدا می‌کنم…" : job.instagram?.kind === "audio" ? "🎵 دارم صدای ویدیوی اینستاگرام را آماده می‌کنم…" : "🔎 دارم لایو یا بازپخش اینستاگرام را بررسی می‌کنم…",
         });
         return message.message_id;
       });
@@ -458,7 +458,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       await step.do("notify instagram video failure", async () => {
         const text = error instanceof Error && error.message.includes("YT_CONFIG")
           ? workflowFailureMessage("YT_CONFIG", "startup")
-          : "❌ ضبط یا ارسال لایو کامل نشد؛ لینک را دوباره بفرست. ممکن است سرور ری‌استارت شده باشد.";
+          : job.instagram?.kind === "music" || job.instagram?.kind === "audio" ? "❌ دریافت یا ارسال فایل صوتی کامل نشد؛ درخواست را دوباره بفرست." : "❌ ضبط یا ارسال لایو کامل نشد؛ لینک را دوباره بفرست. ممکن است سرور ری‌استارت شده باشد.";
         await safeTelegramCall(this.env.BOT_TOKEN, statusId ? "editMessageText" : "sendMessage", {
           chat_id: job.chatId, message_id: statusId, text, reply_markup: { inline_keyboard: [] },
         });
@@ -771,7 +771,7 @@ async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target:
     if (user && user.id !== ADMIN_USER_ID) await recordUserActivity(env, user, true);
   } catch (error) {
     if (!/already|exists|duplicate|conflict/i.test(error instanceof Error ? error.message : String(error))) {
-      await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id, text: "❌ شروع دریافت لایو ناموفق بود؛ لینک را دوباره بفرست." });
+      await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id, text: "❌ شروع دریافت فایل ناموفق بود؛ درخواست را دوباره بفرست." });
     }
   }
   return Response.json({ ok: true });
@@ -797,6 +797,25 @@ async function stopInstagramRecording(env: Env, callback: TelegramCallbackQuery)
   }
   await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text, show_alert: true });
   return Response.json({ ok: true });
+}
+
+function musicQuery(text: string): string | null {
+  if (/https?:\/\//i.test(text)) return null;
+  const explicit = /^\/(?:music|song)(?:@[A-Za-z0-9_]+)?\s+(.+)$/is.exec(text);
+  if (text.startsWith("/") && !explicit) return null;
+  const query = (explicit?.[1] || text.replace(/^(?:دانلود\s+)?(?:آهنگ|اهنگ|موزیک|موسیقی)\s+/u, "")).replace(/\s+/g, " ").trim();
+  return query.length >= 2 && query.length <= 200 ? query : null;
+}
+
+async function instagramAudioCallback(env: Env, update: TelegramUpdate, callback: TelegramCallbackQuery): Promise<Response> {
+  const match = /^iga\|(p|s)\|([A-Za-z0-9_-]{1,20})\|(\d{1,3})\|(\d+)$/.exec(callback.data || "");
+  if (!match || !callback.message || callback.from.id !== Number(match[4]) || (match[1] === "s" && !/^\d+$/.test(match[2]))) {
+    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "این دکمه معتبر نیست یا برای شما نیست.", show_alert: true });
+    return Response.json({ ok: true });
+  }
+  await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "در حال آماده‌سازی فایل صوتی…" });
+  const target: InstagramVideoTarget = match[1] === "p" ? { kind: "audio", shortcode: match[2], videoIndex: Number(match[3]) } : { kind: "audio", mediaId: match[2] };
+  return createInstagramWorkflow(env, { ...update, message: { ...callback.message, from: callback.from } }, target);
 }
 
 export default {
@@ -834,6 +853,7 @@ export default {
         return handleQualityCallback(env, update, update.callback_query);
       }
       if (update?.callback_query?.data?.startsWith("igs|")) return stopInstagramRecording(env, update.callback_query);
+      if (update?.callback_query?.data?.startsWith("iga|")) return instagramAudioCallback(env, update, update.callback_query);
 
       const message = update?.message;
       if (update && message) {
@@ -846,11 +866,17 @@ export default {
           }
           await telegramCall(env.BOT_TOKEN, "sendMessage", {
             chat_id: message.chat.id,
-            text: "لینک ویدیوی YouTube، Shorts، Reel، پست، Story یا Live اینستاگرام رو بفرست؛ فایلش رو همین‌جا برات می‌فرستم ⚡️\n\nضبط لایو: /live username\nبازپخش: /replay و لینک بازپخش منتشرشده\nتوقف ضبط با دکمهٔ زیر پیام ضبط انجام می‌شود.",
+            text: "لینک YouTube یا اینستاگرام رو بفرست؛ فایلش رو همین‌جا می‌فرستم ⚡️\n\n🎵 برای آهنگ، اسم آهنگ و خواننده را بنویس یا /music نام آهنگ\n🎧 صدای اینستاگرام: دکمهٔ «فقط صدا» یا /audio و لینک ویدیو\nضبط لایو: /live username\nبازپخش: /replay و لینک بازپخش منتشرشده\nتوقف ضبط با دکمهٔ زیر پیام ضبط انجام می‌شود.",
           });
           return Response.json({ ok: true });
         }
 
+        if (/^\/audio(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) {
+          const target = parseInstagramAudioTarget(text);
+          if (target) return createInstagramWorkflow(env, update, target);
+          await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id, text: "بعد از /audio لینک Reel، پست ویدیویی یا یک Story ویدیویی اینستاگرام را بفرست." });
+          return Response.json({ ok: true });
+        }
         const instagramTarget = parseInstagramVideoTarget(text);
         if (instagramTarget) return createInstagramWorkflow(env, update, instagramTarget);
         if (/^\/(live|replay)(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) {
@@ -860,6 +886,12 @@ export default {
         const youtubeUrl = extractYouTubeUrl(text);
         if (youtubeUrl) {
           return createYoutubeInspectWorkflow(env, update, youtubeUrl);
+        }
+        const query = musicQuery(text);
+        if (query) return createInstagramWorkflow(env, update, { kind: "music", query });
+        if (/^\/(music|song)(?:@[A-Za-z0-9_]+)?$/i.test(text)) {
+          await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id, text: "اسم آهنگ و خواننده را بعد از /music بنویس؛ مثلاً /music Adele Hello" });
+          return Response.json({ ok: true });
         }
       }
     }

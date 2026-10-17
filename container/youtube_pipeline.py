@@ -4,6 +4,7 @@ import tempfile
 import re
 import shutil
 import subprocess
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -692,6 +693,85 @@ def download_audio(url: str, workdir: Path, mode: str) -> Path:
     raise app.UserVisibleError(
         _final_attempt_message(errors, "❌ فایل صوتی قابل دانلود پیدا نشد. دوباره امتحان کن.")
     )
+
+
+def music_candidates(query: str) -> list[dict[str, Any]]:
+    query = " ".join(query.split())
+    if not 2 <= len(query) <= 200:
+        raise app.UserVisibleError("❌ نام آهنگ و خواننده را دقیق‌تر بنویس.")
+    try:
+        result = _run([app.REAL_YTDLP, "--ignore-config", "--force-ipv4", "--flat-playlist",
+                       "--skip-download", "--dump-single-json", "--no-warnings", "--socket-timeout", "15",
+                       "--retries", "1", "--extractor-retries", "1", "--playlist-end", "5", "--", f"ytsearch5:{query}"], 60)
+        data = json.loads(result.stdout)
+        if not isinstance(data, dict):
+            raise ValueError("Invalid search metadata")
+        entries = data.get("entries") or []
+    except (subprocess.SubprocessError, ValueError, OSError) as exc:
+        raise app.UserVisibleError("❌ جست‌وجوی آهنگ از YouTube کامل نشد؛ نام آهنگ و خواننده را دوباره بفرست.") from exc
+
+    def normalized(value: str) -> str:
+        return unicodedata.normalize("NFKC", value).casefold().replace("ي", "ی").replace("ك", "ک")
+
+    terms = set(re.findall(r"\w+", normalized(query)))
+    def score(item: dict[str, Any]) -> float:
+        title = normalized(str(item.get("title") or ""))
+        uploader = normalized(str(item.get("channel") or item.get("uploader") or ""))
+        words = set(re.findall(r"\w+", title + " " + uploader))
+        value = 20 * len(terms & words) / max(1, len(terms))
+        value += 2 if "official audio" in title else 1 if "official" in title or "topic" in uploader else 0
+        for variant in ("cover", "karaoke", "remix", "slowed", "sped", "live", "ریمیکس", "کاور"):
+            if variant not in terms and variant in words:
+                value -= 5
+        return value
+
+    seen, candidates = set(), []
+    for item in entries:
+        if not isinstance(item, dict) or not re.fullmatch(r"[A-Za-z0-9_-]{11}", str(item.get("id") or "")):
+            continue
+        if item.get("is_live") or item.get("live_status") in {"is_live", "is_upcoming"} or item["id"] in seen:
+            continue
+        seen.add(item["id"])
+        candidates.append(item)
+    # Preserve YouTube's order for ties; explicit remix/cover requests retain their variants.
+    return sorted(candidates, key=score, reverse=True)
+
+
+def prepare_music(query: str, workdir: Path) -> tuple[Path, str, str, str]:
+    candidates = music_candidates(query)
+    if not candidates:
+        raise app.UserVisibleError("❌ آهنگی با این نام پیدا نشد؛ نام خواننده را هم بنویس.")
+    selected = None
+    last_error = None
+    for item in candidates[:3]:
+        url = f"https://www.youtube.com/watch?v={item['id']}"
+        try:
+            metadata = fetch_metadata(url)
+            if not audio_formats(metadata):
+                continue
+            selected = metadata, url
+            break
+        except app.UserVisibleError as exc:
+            last_error = exc
+    if not selected:
+        raise last_error or app.UserVisibleError("❌ فایل صوتی قابل دریافت برای این آهنگ پیدا نشد.")
+    metadata, url = selected
+    source = download_audio(url, workdir, "hq")
+    title = str(metadata.get("track") or metadata.get("title") or query)[:180]
+    artist = str(metadata.get("artist") or metadata.get("creator") or metadata.get("uploader") or "").removesuffix(" - Topic")[:120]
+    target = workdir / "Music.mp3"
+    try:
+        _run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin", "-i", str(source),
+              "-map", "0:a:0", "-vn", "-c:a", "libmp3lame", "-b:a", "192k",
+              "-metadata", f"title={title}", "-metadata", f"artist={artist}", str(target)], 600)
+    except subprocess.SubprocessError as exc:
+        raise app.UserVisibleError("❌ آماده‌سازی فایل MP3 انجام نشد.") from exc
+    app.validate_file_size(target)
+    duration = app.probe_duration(target)
+    expected = float(metadata.get("duration") or 0)
+    if duration <= 0 or (expected and duration < expected - 2):
+        raise app.UserVisibleError("❌ فایل آهنگ کامل دریافت نشد؛ فایل ناقص ارسال نشد.")
+    return target, title, artist, url
 
 
 def send_media_file(

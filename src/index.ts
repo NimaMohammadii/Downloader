@@ -9,6 +9,7 @@ type Env = {
 
 type TelegramMessage = {
   message_id: number;
+  from?: { id: number };
   chat: { id: number };
   text?: string;
   caption?: string;
@@ -1468,6 +1469,9 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
           width: item.width || undefined,
           height: item.height || undefined,
           supports_streaming: true,
+          reply_markup: target.kind === "post" && message.from?.id ? { inline_keyboard: [[{
+            text: "🎵 فقط صدا", callback_data: `iga|p|${target.shortcode}|${index}|${message.from.id}`,
+          }]] } : undefined,
           reply_parameters: index === 0 ? { message_id: message.message_id } : undefined,
         });
       }

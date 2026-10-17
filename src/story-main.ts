@@ -502,10 +502,13 @@ async function privateResolve(target: StoryTarget, env: Env): Promise<MediaCandi
 
 // Live/replay resolution shares the working Story session and exact-ID parser.
 export type InstagramVideoTarget = {
-  kind: "live" | "replay";
+  kind: "live" | "replay" | "audio" | "music";
   username?: string;
   broadcastId?: string;
   shortcode?: string;
+  mediaId?: string;
+  videoIndex?: number;
+  query?: string;
 };
 export type InstagramVideoSource = {
   mode: "live" | "replay";
@@ -513,7 +516,25 @@ export type InstagramVideoSource = {
   manifest?: string;
   title: string;
   duration?: number;
+  audioOnly?: boolean;
+  musicQuery?: string;
 };
+
+export function parseInstagramAudioTarget(text: string): InstagramVideoTarget | null {
+  for (const raw of text.match(/https?:\/\/[^\s<>"']+/gi) || []) {
+    try {
+      const url = new URL(raw.replace(/[),.!?\]}]+$/g, ""));
+      if (url.hostname.toLowerCase().replace(/^www\./, "") !== "instagram.com") continue;
+      const parts = url.pathname.split("/").filter(Boolean);
+      if (["p", "reel", "reels", "tv"].includes(parts[0]) && /^[A-Za-z0-9_-]{1,20}$/.test(parts[1] || "")) {
+        const index = Number(url.searchParams.get("img_index"));
+        return { kind: "audio", shortcode: parts[1], ...(Number.isSafeInteger(index) && index > 0 && index <= 100 ? { videoIndex: index - 1 } : {}) };
+      }
+      if (parts[0] === "stories" && /^\d+$/.test(parts[2] || "")) return { kind: "audio", mediaId: parts[2] };
+    } catch { /* Keep scanning. */ }
+  }
+  return null;
+}
 
 export function parseInstagramVideoTarget(text: string): InstagramVideoTarget | null {
   const command = /^\/(live|replay)(?:@[A-Za-z0-9_]+)?(?:\s+(.+))?$/i.exec(text.trim());
@@ -580,17 +601,25 @@ function replayMediaSource(item: any): InstagramVideoSource | null {
 }
 
 export async function resolveInstagramVideo(target: InstagramVideoTarget, env: Env): Promise<InstagramVideoSource> {
+  if (target.kind === "music" && target.query) {
+    return { mode: "replay", title: target.query, audioOnly: true, musicQuery: target.query };
+  }
   const jar = createJar(env);
   if (!authParts(jar)) throw new StoryError("session_missing");
-  if (target.shortcode) {
+  if (target.shortcode || (target.kind === "audio" && target.mediaId)) {
     const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let id = 0n;
-    for (const char of target.shortcode) id = id * 64n + BigInt(alphabet.indexOf(char));
+    for (const char of target.shortcode || "") id = id * 64n + BigInt(alphabet.indexOf(char));
+    if (target.mediaId) id = BigInt(target.mediaId);
     const data = await instagramVideoRequest(`media/${id}/info/`, jar);
     const item = (Array.isArray(data.items) ? data.items : []).find((v: any) => [v.pk, v.id].some(value => String(value || "").split("_")[0] === String(id)));
-    const source = replayMediaSource(item);
+    const children = Array.isArray(item?.carousel_media) ? item.carousel_media : null;
+    const video = children ? (target.videoIndex === undefined ? children.find((v: any) => v?.video_versions?.length) : children[target.videoIndex]) : item;
+    if (target.kind === "audio" && video?.has_audio === false) throw new InstagramVideoError("❌ این ویدیو صدا ندارد.");
+    const source = replayMediaSource(video);
+    if (source && target.kind === "audio") return { ...source, audioOnly: true, title: "Instagram Audio" };
     if (source) return source;
-    throw new InstagramVideoError("❌ این لینک ویدیوی بازپخش قابل دانلود ندارد؛ لینک بازپخش منتشرشده را بفرست.");
+    throw new InstagramVideoError(target.kind === "audio" ? "❌ این لینک ویدیوی دارای صدا ندارد؛ عکس به فایل صوتی تبدیل نمی‌شود." : "❌ این لینک ویدیوی بازپخش قابل دانلود ندارد؛ لینک بازپخش منتشرشده را بفرست.");
   }
   let feed: any = null;
   let broadcast: any = null;
@@ -674,6 +703,9 @@ async function sendResolvedStory(env: Env, target: StoryTarget, update: Telegram
           width: item.width || undefined,
           height: item.height || undefined,
           supports_streaming: true,
+          reply_markup: target.kind === "story" && target.storyId && message.from?.id ? { inline_keyboard: [[{
+            text: "🎵 فقط صدا", callback_data: `iga|s|${target.storyId}|0|${message.from.id}`,
+          }]] } : undefined,
           reply_parameters: i === 0 ? { message_id: message.message_id } : undefined,
         });
       }

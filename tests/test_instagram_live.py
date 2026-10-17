@@ -113,9 +113,10 @@ class FFmpegTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.directory.cleanup()
 
-    def capture(self, mode, stop=False, expected=None, fail=False):
+    def capture(self, mode, stop=False, expected=None, fail=False, audio=False):
         data = payload(mode)
         data['source']['duration'] = expected
+        data['source']['audioOnly'] = audio
         job = app.InstagramCapture(data)
         recording = threading.Event()
 
@@ -167,6 +168,16 @@ class FFmpegTests(unittest.TestCase):
         job = self.capture('replay', expected=2)
         try:
             self.assert_video(job)
+        finally:
+            job.cleanup()
+
+    def test_instagram_audio_extraction_has_audio_without_video(self):
+        job = self.capture('replay', expected=2, audio=True)
+        try:
+            self.assertTrue(job.result['ok'], job.result)
+            self.assertEqual(job.path.suffix, '.m4a')
+            info = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-show_streams', '-of', 'json', str(job.path)]))
+            self.assertEqual([s['codec_type'] for s in info['streams']], ['audio'])
         finally:
             job.cleanup()
 

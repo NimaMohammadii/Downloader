@@ -17,7 +17,7 @@ const { outputFiles } = await build({
       if (args.path === 'cloudflare:workers') return { contents: `
         export class WorkflowEntrypoint { constructor(ctx, env) { this.env = env; } }
       ` };
-      if (args.path === './story-main') return { contents: 'export default { fetch() {} }; export const parseInstagramVideoTarget = () => null; export const resolveInstagramVideo = () => {}; export const instagramVideoErrorText = () => "error";' };
+      if (args.path === './story-main') return { contents: 'export default { fetch() {} }; export const parseInstagramVideoTarget = () => null; export const parseInstagramAudioTarget = () => null; export const resolveInstagramVideo = () => {}; export const instagramVideoErrorText = () => "error";' };
       if (args.path === './admin') return { contents: `
         export class AdminStatsStore {}
         export const ADMIN_USER_ID = 1;

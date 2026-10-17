@@ -610,6 +610,7 @@ async def upload_complete_file(token: str, method: str, data: dict[str, Any], fi
         elif method == "sendAudio":
             attributes.append(types.DocumentAttributeAudio(
                 duration=int(probe_duration(path)), title=str(data.get("title") or path.stem),
+                performer=str(data.get("performer") or "") or None,
             ))
         reply = json.loads(data.get("reply_parameters", "{}"))
         message = await client.send_file(
@@ -840,6 +841,7 @@ class InstagramCapture:
             raise ValueError("Invalid Instagram job ID")
         self.source = payload.get("source") or {}
         self.live = self.source.get("mode") == "live"
+        self.audio_only = bool(self.source.get("audioOnly"))
         if self.source.get("mode") not in {"live", "replay"}:
             raise ValueError("Invalid Instagram mode")
         if payload.get("completionUrl") != f"https://downloader.vexaagent.workers.dev/instagram/events/{self.id}":
@@ -847,7 +849,7 @@ class InstagramCapture:
         if not re.fullmatch(r"[a-f0-9]{64}", str(payload.get("completionToken") or "")):
             raise ValueError("Invalid event token")
         self.workdir = Path(tempfile.mkdtemp(prefix="instagram-capture-"))
-        self.path = self.workdir / "Instagram.mp4"
+        self.path = self.workdir / ("Instagram.m4a" if self.audio_only else "Instagram.mp4")
         self.process: subprocess.Popen | None = None
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
@@ -908,6 +910,17 @@ class InstagramCapture:
     def run(self) -> None:
         watchdog = wall_timer = None
         try:
+            if self.source.get("musicQuery"):
+                from youtube_pipeline import prepare_music
+                self.safe_status("🔎 دارم نتیجهٔ مناسب آهنگ را از YouTube پیدا و دانلود می‌کنم…")
+                self.path, title, artist, url = prepare_music(self.source["musicQuery"], self.workdir)
+                self.source.update({"title": title, "performer": artist, "musicUrl": url})
+                self.video = {"title": title, "performer": artist}
+                self.result = {"ok": True}
+                with self.lock:
+                    self.state = "ready"
+                self.safe_status(f"🎵 {title}\n📤 آهنگ پیدا شد؛ دارم فایل MP3 را آمادهٔ ارسال می‌کنم…")
+                return
             source_url = self.source.get("url")
             xml = self.source.get("manifest")
             if source_url:
@@ -932,11 +945,12 @@ class InstagramCapture:
                 raise UserVisibleError("❌ فایل پخش این لایو در دسترس نیست.")
             if self.stop_event.is_set():
                 raise UserVisibleError("ضبط پیش از دریافت تصویر متوقف شد؛ فایلی برای ارسال وجود ندارد.")
-            raw_path = self.workdir / "capture.mp4"
+            raw_path = self.workdir / ("capture.m4a" if self.audio_only else "capture.mp4")
             command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
                        "-rw_timeout", "45000000", "-protocol_whitelist", "file,https,tls,tcp",
-                       "-i", input_url,
-                       "-sn", "-dn", "-c", "copy"]
+                       "-i", input_url]
+            command += (["-map", "0:a:0", "-vn", "-c:a", "aac", "-b:a", "192k"] if self.audio_only
+                        else ["-sn", "-dn", "-c", "copy"])
             if self.live:
                 command += ["-t", str(INSTAGRAM_RECORD_SECONDS)]
             command += ["-fs", str(INSTAGRAM_FILE_LIMIT), "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
@@ -946,7 +960,7 @@ class InstagramCapture:
                 self.state = "recording"
                 if self.stop_event.is_set():
                     self.stop()
-            self.safe_status("🔴 ضبط Live شروع شد.\nاز این لحظه تا پایان پخش یا توقف ضبط ذخیره می‌شود.\nسقف هر ضبط: 2 ساعت یا 1.9 GB." if self.live else "⬇️ دارم بازپخش کامل لایو را دانلود می‌کنم…", button=self.live)
+            self.safe_status("🔴 ضبط Live شروع شد.\nاز این لحظه تا پایان پخش یا توقف ضبط ذخیره می‌شود.\nسقف هر ضبط: 2 ساعت یا 1.9 GB." if self.live else "🎧 دارم صدا را از ویدیوی اینستاگرام جدا می‌کنم…" if self.audio_only else "⬇️ دارم بازپخش کامل لایو را دانلود می‌کنم…", button=self.live)
             wall_timer = threading.Timer(INSTAGRAM_RECORD_SECONDS + 60 if self.live else 25 * 60, lambda: self.stop("time_limit"))
             wall_timer.daemon = True
             wall_timer.start()
@@ -970,30 +984,31 @@ class InstagramCapture:
             with self.lock:
                 self.state = "finalizing"
             if not raw_path.exists() or raw_path.stat().st_size < 100:
-                raise UserVisibleError("❌ تصویری از لایو دریافت نشد؛ ممکن است پخش پایان یافته یا آدرس آن منقضی شده باشد.")
+                raise UserVisibleError("❌ فایل صوتی دریافت نشد؛ این ویدیو ممکن است بی‌صدا یا فایل آن منقضی شده باشد." if self.audio_only else "❌ تصویری از لایو دریافت نشد؛ ممکن است پخش پایان یافته یا آدرس آن منقضی شده باشد.")
             capped = raw_path.stat().st_size >= INSTAGRAM_FILE_LIMIT
             if not self.live and (returncode != 0 or self.reason or capped):
-                raise UserVisibleError("❌ بازپخش کامل دریافت نشد یا حجم آن از سقف ارسال بیشتر است؛ فایل ناقص ارسال نشد.")
+                raise UserVisibleError("❌ فایل صوتی کامل دریافت نشد یا حجم آن از سقف ارسال بیشتر است؛ فایل ناقص ارسال نشد." if self.audio_only else "❌ بازپخش کامل دریافت نشد یا حجم آن از سقف ارسال بیشتر است؛ فایل ناقص ارسال نشد.")
             if self.live and not self.reason:
                 self.reason = "size_limit" if capped else ("interrupted" if returncode != 0 else "ended")
+            mapping = ["-map", "0:a:0", "-vn"] if self.audio_only else ["-map", "0:v:0", "-map", "0:a:0?"]
             subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin", "-i", str(raw_path),
-                            "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-movflags", "+faststart", str(self.path)],
+                            *mapping, "-c", "copy", "-movflags", "+faststart", str(self.path)],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=180)
             raw_path.unlink(missing_ok=True)
             validate_file_size(self.path)
             info = subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(self.path)],
                                   capture_output=True, text=True, check=True, timeout=45)
             metadata = json.loads(info.stdout)
-            video = next((stream for stream in metadata.get("streams", []) if stream.get("codec_type") == "video"), None)
+            video = next((stream for stream in metadata.get("streams", []) if stream.get("codec_type") == ("audio" if self.audio_only else "video")), None)
             duration = float(metadata.get("format", {}).get("duration") or 0)
             if not video or duration <= 0:
-                raise UserVisibleError("❌ فایل ویدیوی سالم برای ارسال ساخته نشد.")
+                raise UserVisibleError("❌ فایل صوتی سالم برای ارسال ساخته نشد." if self.audio_only else "❌ فایل ویدیوی سالم برای ارسال ساخته نشد.")
             expected = float(self.source.get("duration") or 0)
             if not self.live and expected and duration < expected - 2:
-                raise UserVisibleError("❌ بازپخش ناقص دریافت شد؛ فایل ناقص ارسال نشد.")
+                raise UserVisibleError("❌ صدا ناقص دریافت شد؛ فایل ناقص ارسال نشد." if self.audio_only else "❌ بازپخش ناقص دریافت شد؛ فایل ناقص ارسال نشد.")
             if self.live and self.reason == "ended" and duration >= INSTAGRAM_RECORD_SECONDS - 1:
                 self.reason = "time_limit"
-            self.video = {"width": str(video.get("width", 0)), "height": str(video.get("height", 0)), "duration": str(duration)}
+            self.video = {"width": str(video.get("width", 0)), "height": str(video.get("height", 0)), "duration": str(duration), "title": str(self.source.get("title") or "Instagram Audio")}
             self.result = {"ok": True}
             self.safe_status("📤 فایل آماده شد؛ در حال آماده‌سازی ارسال…")
             with self.lock:
@@ -1029,14 +1044,18 @@ class InstagramCapture:
         try:
             notes = {"user": "ضبط با درخواست شما متوقف شد.", "time_limit": "ضبط به سقف زمانی رسید.", "size_limit": "ضبط به سقف حجم رسید.", "interrupted": "ارتباط پخش قطع شد؛ بخش دریافت‌شده ارسال شد."}
             caption = str(self.source.get("title") or "Instagram Live")[:180]
-            caption += "\n" + ("Live Recording" if self.live else "Live Replay")
+            caption += "\n" + ("Music" if self.source.get("musicQuery") else "Instagram Audio" if self.audio_only else "Live Recording" if self.live else "Live Replay")
+            if self.source.get("musicUrl"):
+                caption += "\n" + self.source["musicUrl"]
             if self.live and self.reason in notes:
                 caption += "\n" + notes[self.reason]
             data = {"chat_id": str(self.payload["chatId"]), "caption": caption,
                     "reply_parameters": json.dumps({"message_id": self.payload["requestMessageId"]}), **self.video}
-            self.safe_status("📤 دارم فایل ویدیو را کامل در تلگرام ارسال می‌کنم…")
+            self.safe_status("📤 دارم فایل صوتی را کامل در تلگرام ارسال می‌کنم…" if self.audio_only else "📤 دارم فایل ویدیو را کامل در تلگرام ارسال می‌کنم…")
             with self.path.open("rb") as handle:
-                asyncio.run(asyncio.wait_for(upload_complete_file(self.payload["botToken"], "sendVideo", data, (self.path.name, handle, "video/mp4")), timeout=25 * 60))
+                method = "sendAudio" if self.audio_only else "sendVideo"
+                mime = "audio/mpeg" if self.path.suffix == ".mp3" else "audio/mp4" if self.audio_only else "video/mp4"
+                asyncio.run(asyncio.wait_for(upload_complete_file(self.payload["botToken"], method, data, (self.path.name, handle, mime)), timeout=25 * 60))
             with self.lock:
                 self.state = "sent"
             delete_status(self.payload["botToken"], self.payload["chatId"], self.payload["statusMessageId"])
