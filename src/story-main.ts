@@ -284,7 +284,18 @@ async function jsonRequest(url: string, headers: Headers, jar: CookieJar): Promi
     absorbState(response.headers, jar);
     // Authentication errors are frequently JSON on HTTP 400/401/403. Preserve
     // their meaning instead of turning them into an empty story response.
-    const data: any = await response.json().catch(() => null);
+    const raw = await response.text();
+    let data: any = null;
+    try {
+      // Instagram media IDs exceed Number.MAX_SAFE_INTEGER. Protect integer
+      // tokens before parsing; quoted strings, decimals and exponents stay intact.
+      const exactJson = raw.replace(/"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g, (token) =>
+        /^-?\d+$/.test(token) && !Number.isSafeInteger(Number(token)) ? JSON.stringify(token) : token,
+      );
+      data = JSON.parse(exactJson);
+    } catch {
+      // Non-JSON errors are handled by the response status below.
+    }
     const message = String(data?.message || data?.error_type || "").toLowerCase();
     const location = response.headers.get("location") || "";
     let failure: StoryFailure | null = null;
@@ -313,7 +324,7 @@ async function privateStoryOwnerId(storyId: string, jar: CookieJar): Promise<str
     `https://i.instagram.com/api/v1/media/${encodeURIComponent(storyId)}/info/`, headers, jar,
   );
   const items = Array.isArray(result.data?.items) ? result.data.items : [];
-  const item = items.find((value: any) => String(value?.pk || value?.id || "").split("_")[0] === storyId);
+  const item = items.find((value: any) => [value?.pk, value?.id].some((id) => String(id || "").split("_")[0] === storyId));
   return userIdFrom(item?.user);
 }
 
@@ -475,8 +486,9 @@ async function privateResolve(target: StoryTarget, env: Env): Promise<MediaCandi
 
   const allItems = Array.isArray(reel.items) ? reel.items : [];
   const items = storyId
-    ? allItems.filter((item: any) => String(item?.pk || item?.id || "").split("_")[0] === storyId)
+    ? allItems.filter((item: any) => [item?.pk, item?.id].some((id) => String(id || "").split("_")[0] === storyId))
     : allItems;
+  console.log("instagram story selection", { itemCount: allItems.length, matchedCount: items.length });
   if (!items.length) throw new StoryError("unavailable");
 
   const media: MediaCandidate[] = [];

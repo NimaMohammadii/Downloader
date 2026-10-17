@@ -112,3 +112,45 @@ test('non-story posts retain the existing route', async () => {
   const r = await run({ link: 'https://www.instagram.com/reel/example/' });
   assert.equal(r.legacy, 1); assert.equal(r.requests.length, 0);
 });
+
+test('raw 64-bit media IDs remain exact and select only the requested story', async () => {
+  const wanted = '3490123456789012345', sibling = '3490123456789012346';
+  assert.equal(Number(wanted), Number(sibling)); // Both collapse with response.json().
+  const exactResponse = (items, wrapper) => new Response(
+    JSON.stringify(wrapper(items)).replace(/"pk":"(\d{19})"/g, '"pk":$1'),
+    { headers: { 'content-type': 'application/json' } },
+  );
+  const wantedMedia = { ...media, pk: wanted, caption: { text: 'Keep 3490123456789012345 and "quotes" intact' } };
+  const r = await run({ link: `https://www.instagram.com/stories/example/${wanted}/`, routes: {
+    [`/api/v1/media/${wanted}/info/`]: () => exactResponse([wantedMedia], items => ({ items })),
+    '/api/v1/feed/user/77/story/': () => exactResponse([
+      { ...media, pk: sibling, video_versions: [{ url: 'https://cdn.instagram.com/wrong.mp4' }] }, wantedMedia,
+    ], items => ({ reel: { items } })),
+  } });
+  const sent = r.telegram.filter(t => t.method === 'sendVideo');
+  assert.equal(sent.length, 1);
+  assert.equal(new URL(sent[0].body.video).searchParams.get('src'), media.video_versions[0].url);
+  assert.ok(!r.requests.some(r => r.url.pathname.includes('usernameinfo')));
+});
+
+test('a composite string ID can match when pk is already rounded upstream', async () => {
+  const wanted = '3490123456789012345';
+  const item = { ...media, pk: Number(wanted), id: `${wanted}_77` };
+  const r = await run({ link: `https://www.instagram.com/stories/example/${wanted}/`, routes: {
+    [`/api/v1/media/${wanted}/info/`]: () => Response.json({ items: [item] }),
+    '/api/v1/feed/user/77/story/': () => Response.json({ reel: { items: [item] } }),
+  } });
+  assert.equal(r.telegram.filter(t => t.method === 'sendVideo').length, 1);
+});
+
+test('neighboring large ID is never mistaken for a missing requested story', async () => {
+  const wanted = '3490123456789012345';
+  const r = await run({ link: `https://www.instagram.com/stories/example/${wanted}/`, routes: {
+    [`/api/v1/media/${wanted}/info/`]: () => Response.json({ items: [{ ...media, pk: wanted }] }),
+    '/api/v1/feed/user/77/story/': () => new Response(
+      '{"reel":{"items":[{"pk":3490123456789012346}]}}',
+    ),
+  } });
+  assert.equal(r.telegram.filter(t => t.method === 'sendVideo').length, 0);
+  assert.match(r.telegram[0].body.text, /منقضی|قابل مشاهده/);
+});
