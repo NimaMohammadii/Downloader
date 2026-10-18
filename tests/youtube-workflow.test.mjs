@@ -11,7 +11,11 @@ const { outputFiles } = await build({
     build.onResolve({ filter: /.*/ }, args => ({ path: args.path, namespace: 'test' }));
     build.onLoad({ filter: /.*/, namespace: 'test' }, args => {
       if (args.path === '@cloudflare/containers') return { contents: `
-        export class Container { constructor(ctx, env) { this.env = env; } }
+        export class Container {
+          constructor(ctx, env) { this.ctx = ctx; this.env = env; }
+          renewActivityTimeout() { this.renewed = (this.renewed || 0) + 1; }
+          async onActivityExpired() { this.stopped = true; }
+        }
         export const getContainer = () => globalThis.container;
       ` };
       if (args.path === 'cloudflare:workers') return { contents: `
@@ -28,7 +32,40 @@ const { outputFiles } = await build({
     });
   } }],
 });
-const { YoutubeDownloadWorkflow, extractPornhubUrl, default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
+const { YoutubeDownloaderContainer, YoutubeDownloadWorkflow, extractPornhubUrl, default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
+
+test('idle containers stop after ten seconds and completed background jobs restore that timeout', async () => {
+  const values = new Map();
+  const ctx = { storage: {
+    async get(key) { return values.get(key); },
+    async put(key, value) { values.set(key, value); },
+    async delete(key) { values.delete(key); },
+  } };
+  const container = new YoutubeDownloaderContainer(ctx, {});
+  assert.equal(container.sleepAfter, '10s');
+  container.containerFetch = async () => {
+    assert.ok(values.get('instagramJob').until > Date.now());
+    return Response.json({ ok: true });
+  };
+  await container.instagramRequest('start', { id: 'active-job' });
+  await container.onActivityExpired();
+  assert.equal(container.stopped, undefined, 'background preparation/live capture must stay running');
+  assert.ok(container.sleepAfter > 0);
+  await container.releaseInstagram();
+  assert.equal(values.has('instagramJob'), false);
+  assert.equal(container.sleepAfter, '10s');
+  assert.equal(container.renewed, 2);
+  await container.onActivityExpired();
+  assert.equal(container.stopped, true);
+});
+
+test('an expired background lease no longer prevents idle shutdown', async () => {
+  const container = new YoutubeDownloaderContainer({ storage: {
+    async get() { return { id: 'expired-job', until: Date.now() - 1 }; },
+  } }, {});
+  await container.onActivityExpired();
+  assert.equal(container.stopped, true);
+});
 
 test('Pornhub URLs normalize direct, mobile, language and embed links', () => {
   for (const host of ['www.pornhub.com', 'm.pornhub.org', 'fr.pornhub.net']) {

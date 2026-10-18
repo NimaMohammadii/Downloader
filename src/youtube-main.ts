@@ -131,7 +131,7 @@ const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
 
 export class YoutubeDownloaderContainer extends Container<Env> {
   defaultPort = 8080;
-  sleepAfter: string | number = "5m";
+  sleepAfter: string | number = "10s";
   enableInternet = true;
   envVars = { API_ID: this.env.API_ID || "", API_HASH: this.env.API_HASH || "" };
 
@@ -149,7 +149,7 @@ export class YoutubeDownloaderContainer extends Container<Env> {
 
   async releaseInstagram(): Promise<void> {
     await this.ctx.storage.delete("instagramJob");
-    this.sleepAfter = "5m";
+    this.sleepAfter = "10s";
     this.renewActivityTimeout();
   }
 
