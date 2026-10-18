@@ -444,7 +444,7 @@ test('social parser rejects credentials, lookalike hosts, profiles, boards and o
     'https://soundcloud.com/artist/sets','https://soundcloud.com/artist/sets/playlist',
     'https://soundcloud.com/artist/tracks','https://soundcloud.com/search/sounds',
     'https://www.pinterest.evil/pin/123','https://vm.tiktok.com.evil/ABC123',
-    '/findmusic https://x.com/name/status/123','/audio https://x.com/name/status/123',
+    '/findmusic https://x.com/name/status/123',
     'https://www.youtube.com/watch?v=abcdefghijk','https://www.instagram.com/reel/B/'
   ]) assert.equal(mod.parseSocialUrl(text),null,text);
 });
@@ -486,4 +486,47 @@ test('social batch failure preserves confirmed count and warns against duplicate
   await new mod.YoutubeDownloadWorkflow({},env).run({payload:{...job,instagram:undefined,social:{platform:'x',url:'https://x.com/i/status/123'}}},step);
   assert.ok(messages.some(m=>m.text==='1 file confirmed; check chat before repeating'));
   assert.equal(globalThis.delivered,1);
+});
+
+test('Aparat video/embed links and social audio commands have exact routes',()=>{
+  for(const url of ['https://www.aparat.com/v/wP8On?playlist=123','http://aparat.com/v/wP8On/title','https://www.aparat.com/video/video/embed/videohash/wP8On/vt/frame'])
+    assert.deepEqual(mod.parseSocialUrl(url),{platform:'aparat',url:'https://www.aparat.com/v/wP8On'});
+  for(const url of ['https://aparat.com/name','https://aparat.com/live/name','https://aparat.com.evil/v/test','https://user@aparat.com/v/test']) assert.equal(mod.parseSocialUrl(url),null);
+  for(const url of ['https://x.com/name/status/123','https://www.tiktok.com/@name/video/123','https://www.pinterest.com/pin/123/','https://www.aparat.com/v/abc123'])
+    assert.equal(mod.parseSocialUrl('/audio '+url).audioOnly,true);
+});
+
+test('Aparat and /audio queue source jobs without changing Instagram audio routing',async()=>{
+  const jobs=[],workerEnv={...env,YOUTUBE_DOWNLOAD_WORKFLOW:{async create(job){jobs.push(job);}}};
+  globalThis.fetch=async()=>Response.json({ok:true,result:{message_id:10}});
+  await mediaWebhook({text:'https://www.aparat.com/v/abc123'},workerEnv);
+  await mediaWebhook({text:'/audio https://www.aparat.com/v/abc123'},workerEnv);
+  await mediaWebhook({text:'/audio https://www.tiktok.com/@name/video/123'},workerEnv);
+  await mediaWebhook({text:'/audio https://instagram.com/reel/B/'},workerEnv);
+  assert.deepEqual(jobs.slice(0,3).map(j=>j.params.social.platform),['aparat','aparat','tiktok']);
+  assert.equal(jobs[0].params.social.audioOnly,undefined);assert.equal(jobs[1].params.social.audioOnly,true);
+  assert.equal(jobs[3].params.instagram.kind,'audio');
+});
+
+test('social audio callback is signed for the owner, chat, canonical URL and exact item',async()=>{
+  const {createHmac}=await import('node:crypto');
+  const jobs=[],original=env.YOUTUBE_DOWNLOAD_WORKFLOW;
+  env.YOUTUBE_DOWNLOAD_WORKFLOW={async create(job){jobs.push(job);}};
+  const url='https://www.pinterest.com/pin/123/';
+  const sig=createHmac('sha256',env.BOT_TOKEN).update(`social-audio:42:42:1:${url}`).digest('hex').slice(0,16);
+  const callback={id:'audio',from:{id:42},data:`soa|1|42|${sig}`,message:{message_id:55,chat:{id:42},caption:`Fixture\nPinterest 2/3\n${url}`}};
+  globalThis.fetch=async()=>Response.json({ok:true,result:{message_id:10}});
+  try {
+    for(const invalid of [
+      {...callback,from:{id:99}}, {...callback,data:`soa|0|42|${sig}`},
+      {...callback,message:{...callback.message,chat:{id:99}}},
+      {...callback,message:{...callback.message,caption:'Fixture\nhttps://www.pinterest.com/pin/999/'}},
+      {...callback,message:{...callback.message,caption:'https://evil.example/video'}},
+    ]) await webhook(invalid);
+    assert.equal(jobs.length,0);
+    await webhook(callback);
+    assert.equal(jobs[0].params.requestMessageId,55);
+    assert.deepEqual(jobs[0].params.social,{platform:'pinterest',url,audioOnly:true,itemIndex:1});
+    assert.ok(callback.data.length<=64);
+  } finally {env.YOUTUBE_DOWNLOAD_WORKFLOW=original;}
 });

@@ -22,7 +22,7 @@ type YoutubeQuality = (typeof SUPPORTED_QUALITIES)[number];
 type YoutubeAudioMode = "low" | "hq";
 type RecognitionInput = { fileId: string; fileSize?: number };
 type PlaylistInput = { url: string; start: number; end: number };
-type SocialInput = { platform: "x" | "pinterest" | "tiktok" | "soundcloud"; url: string };
+type SocialInput = { platform: "x" | "pinterest" | "tiktok" | "soundcloud" | "aparat"; url: string; audioOnly?: boolean; itemIndex?: number };
 type MediaSource = InstagramVideoSource & { recognition?: RecognitionInput; playlist?: PlaylistInput; social?: SocialInput };
 const RECOGNITION_FILE_LIMIT = 20_000_000;
 
@@ -473,7 +473,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       statusId = await step.do("show instagram video status", async () => {
         const message = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
           chat_id: job.chatId, reply_parameters: { message_id: job.requestMessageId },
-          text: job.social ? `⬇️ دارم فایل ${socialName(job.social.platform)} را دریافت می‌کنم…` : job.playlist ? `🎵 دارم آهنگ‌های ${job.playlist.start}-${job.playlist.end} پلی‌لیست را به‌صورت MP3 آماده می‌کنم…` : job.recognition || job.instagram?.recognizeMusic ? "🎧 دارم آهنگ داخل فایل را شناسایی می‌کنم…" : job.instagram?.kind === "music" ? "🔎 دارم آهنگ را پیدا می‌کنم…" : job.instagram?.kind === "audio" ? "🎵 دارم صدای ویدیوی اینستاگرام را آماده می‌کنم…" : "🔎 دارم لایو یا بازپخش اینستاگرام را بررسی می‌کنم…",
+          text: job.social ? `⬇️ دارم ${job.social.audioOnly ? "صدای ویدیوی" : "فایل"} ${socialName(job.social.platform)} را دریافت می‌کنم…` : job.playlist ? `🎵 دارم آهنگ‌های ${job.playlist.start}-${job.playlist.end} پلی‌لیست را به‌صورت MP3 آماده می‌کنم…` : job.recognition || job.instagram?.recognizeMusic ? "🎧 دارم آهنگ داخل فایل را شناسایی می‌کنم…" : job.instagram?.kind === "music" ? "🔎 دارم آهنگ را پیدا می‌کنم…" : job.instagram?.kind === "audio" ? "🎵 دارم صدای ویدیوی اینستاگرام را آماده می‌کنم…" : "🔎 دارم لایو یا بازپخش اینستاگرام را بررسی می‌کنم…",
         });
         return message.message_id;
       });
@@ -507,7 +507,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       await step.do("begin instagram capture", { retries: { limit: 2, delay: "3 seconds" }, timeout: "1 minute" }, async () => {
         const signature = (await instagramSignature(this.env.BOT_TOKEN, `stop:${job.chatId}:${job.requestMessageId}:${job.userId}`)).slice(0, 16);
         const result = await instagramContainer(this.env, job).instagramRequest("start", {
-          id: job.id, source, botToken: this.env.BOT_TOKEN, chatId: job.chatId, requestMessageId: job.requestMessageId,
+          id: job.id, source, botToken: this.env.BOT_TOKEN, chatId: job.chatId, requestMessageId: job.requestMessageId, userId: job.userId,
           statusMessageId: statusId,
           stopData: `igs|${job.requestMessageId}|${job.userId}|${signature}`,
           completionUrl: `https://downloader.vexaagent.workers.dev/instagram/events/${job.id}`,
@@ -698,13 +698,14 @@ function parseQualityCallback(data: string | undefined): ParsedQualityCallback |
 }
 
 function socialName(platform: SocialInput["platform"]): string {
-  return { x: "X", pinterest: "Pinterest", tiktok: "TikTok", soundcloud: "SoundCloud" }[platform];
+  return { x: "X", pinterest: "Pinterest", tiktok: "TikTok", soundcloud: "SoundCloud", aparat: "Aparat" }[platform];
 }
 
 // Only individual posts/tracks, never profiles, boards, feeds or arbitrary URLs.
 function parseSocialUrl(text: string): SocialInput | null {
   const command = /^\/([a-z]+)(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.exec(text);
-  if (command && !["x", "twitter", "pinterest", "tiktok", "soundcloud"].includes(command[1].toLowerCase())) return null;
+  if (command && !["x", "twitter", "pinterest", "tiktok", "soundcloud", "aparat", "audio"].includes(command[1].toLowerCase())) return null;
+  const audio = command?.[1].toLowerCase() === "audio" ? { audioOnly: true as const } : {};
   for (const raw of text.match(/https?:\/\/[^\s<>"']+/gi) || []) {
     try {
       const u = new URL(raw.replace(/[),.!?\]}،؛]+$/g, ""));
@@ -712,25 +713,29 @@ function parseSocialUrl(text: string): SocialInput | null {
       const host = u.hostname.toLowerCase();
       const path = u.pathname;
       let m: RegExpExecArray | null;
+      if (["aparat.com", "www.aparat.com"].includes(host)
+          && (m = /^\/(?:v\/|video\/video\/embed\/videohash\/)([A-Za-z0-9]{1,32})(?:\/[^?#]*)?$/.exec(path))) {
+        return { platform: "aparat", url: `https://www.aparat.com/v/${m[1]}`, ...audio };
+      }
       if (["x.com", "www.x.com", "mobile.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com", "m.twitter.com"].includes(host)
           && (m = /^\/(?:[A-Za-z0-9_]+\/status|i\/web\/status|statuses)\/(\d{1,25})(?:\/video\/([1-9]\d?))?\/?$/.exec(path))) {
-        return { platform: "x", url: `https://x.com/i/status/${m[1]}${m[2] ? `/video/${m[2]}` : ""}` };
+        return { platform: "x", url: `https://x.com/i/status/${m[1]}${m[2] ? `/video/${m[2]}` : ""}`, ...audio };
       }
       if (/^(?:(?:www|[a-z]{2})\.)?pinterest\.(?:com|fr|de|ch|jp|cl|ca|it|co\.uk|nz|ru|com\.au|at|pt|co\.kr|es|com\.mx|dk|ph|th|com\.uy|co|nl|info|kr|ie|vn|com\.vn|ec|mx|in|pe|co\.at|hu|co\.in|co\.nz|id|com\.ec|com\.py|tw|be|uk|com\.bo|com\.pe)$/.test(host)
           && (m = /^\/pin\/(?:[\w-]+--)?(\d{1,25})\/?$/.exec(path))) {
-        return { platform: "pinterest", url: `https://www.pinterest.com/pin/${m[1]}/` };
+        return { platform: "pinterest", url: `https://www.pinterest.com/pin/${m[1]}/`, ...audio };
       }
       if (["pin.it", "vm.tiktok.com", "vt.tiktok.com", "on.soundcloud.com"].includes(host) && /^\/[A-Za-z0-9_-]{3,128}\/?$/.test(path)) {
-        return { platform: host === "pin.it" ? "pinterest" : host === "on.soundcloud.com" ? "soundcloud" : "tiktok", url: `https://${host}${path}` };
+        return { platform: host === "pin.it" ? "pinterest" : host === "on.soundcloud.com" ? "soundcloud" : "tiktok", url: `https://${host}${path}`, ...audio };
       }
       if (["tiktok.com", "www.tiktok.com", "m.tiktok.com"].includes(host)) {
-        if ((m = /^\/@([\w.-]+)\/(video|photo)\/(\d{1,25})\/?$/.exec(path))) return { platform: "tiktok", url: `https://www.tiktok.com/@${m[1]}/${m[2]}/${m[3]}` };
-        if (/^\/t\/[A-Za-z0-9_-]{3,128}\/?$/.test(path)) return { platform: "tiktok", url: `https://www.tiktok.com${path}` };
+        if ((m = /^\/@([\w.-]+)\/(video|photo)\/(\d{1,25})\/?$/.exec(path))) return { platform: "tiktok", url: `https://www.tiktok.com/@${m[1]}/${m[2]}/${m[3]}`, ...audio };
+        if (/^\/t\/[A-Za-z0-9_-]{3,128}\/?$/.test(path)) return { platform: "tiktok", url: `https://www.tiktok.com${path}`, ...audio };
       }
       if (["soundcloud.com", "www.soundcloud.com", "m.soundcloud.com"].includes(host) && /^\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+\/?$/.test(path)
           && !/^\/(?:discover|search|you|stations|charts|stream|upload)\//i.test(path)
           && !/\/(?:sets|tracks|albums|likes|reposts|popular-tracks|spotlight|comments)\/?$/i.test(path)) {
-        return { platform: "soundcloud", url: `https://soundcloud.com${path.replace(/\/$/, "")}` };
+        return { platform: "soundcloud", url: `https://soundcloud.com${path.replace(/\/$/, "")}`, ...audio };
       }
     } catch { /* Keep scanning message URLs. */ }
   }
@@ -1004,6 +1009,20 @@ async function instagramAudioCallback(env: Env, update: TelegramUpdate, callback
   return createInstagramWorkflow(env, { ...update, message: { ...callback.message, from: callback.from } }, target);
 }
 
+async function socialAudioCallback(env: Env, update: TelegramUpdate, callback: TelegramCallbackQuery): Promise<Response> {
+  const match = /^soa\|([0-9]|1[0-9])\|(\d+)\|([a-f0-9]{16})$/.exec(callback.data || "");
+  const message = callback.message;
+  const target = message ? parseSocialUrl((message.caption || "").split("\n").at(-1) || "") : null;
+  if (!match || !message || !target || target.platform === "soundcloud" || callback.from.id !== Number(match[2])
+      || !equalSignature((await instagramSignature(env.BOT_TOKEN, `social-audio:${message.chat.id}:${match[2]}:${match[1]}:${target.url}`)).slice(0, 16), match[3])) {
+    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "این دکمه معتبر نیست یا برای شما نیست.", show_alert: true });
+    return Response.json({ ok: true });
+  }
+  await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "در حال آماده‌سازی فایل صوتی…" });
+  return createInstagramWorkflow(env, { ...update, message: { ...message, from: callback.from } }, undefined, undefined, undefined,
+    { ...target, audioOnly: true, itemIndex: Number(match[1]) });
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const requestUrl = new URL(request.url);
@@ -1054,6 +1073,7 @@ export default {
       if (update?.callback_query?.data?.startsWith("igs|")) return stopInstagramRecording(env, update.callback_query);
       if (update?.callback_query?.data?.startsWith("iga|")) return instagramAudioCallback(env, update, update.callback_query);
       if (update?.callback_query?.data?.startsWith("igm|")) return instagramAudioCallback(env, update, update.callback_query);
+      if (update?.callback_query?.data?.startsWith("soa|")) return socialAudioCallback(env, update, update.callback_query);
 
       const message = update?.message;
       if (update && message) {
@@ -1072,9 +1092,9 @@ export default {
 
         const social = parseSocialUrl(text);
         if (social) return createInstagramWorkflow(env, update, undefined, undefined, undefined, social);
-        if (/^\/(?:x|twitter|pinterest|tiktok|soundcloud)(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) {
+        if (/^\/(?:x|twitter|pinterest|tiktok|soundcloud|aparat)(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) {
           await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id,
-            text: "لینک یک پست X، یک Pin پینترست، ویدیو یا پست عکسی TikTok، یا یک آهنگ SoundCloud را بفرست. لینک پروفایل، بورد و پلی‌لیست پشتیبانی نمی‌شود." });
+            text: "لینک یک پست X، یک Pin پینترست، ویدیو یا پست عکسی TikTok، یک آهنگ SoundCloud یا ویدیوی آپارات را بفرست. لینک پروفایل، بورد و پلی‌لیست پشتیبانی نمی‌شود." });
           return Response.json({ ok: true });
         }
 
@@ -1093,7 +1113,7 @@ export default {
           }
           await telegramCall(env.BOT_TOKEN, "sendMessage", {
             chat_id: message.chat.id,
-            text: "لینک YouTube، Pornhub یا اینستاگرام رو بفرست؛ فایلش رو همین‌جا می‌فرستم ⚡️\n\n⬇️ X، Pinterest، TikTok و SoundCloud: لینک پست یا آهنگ را بفرست\n\n🎵 برای آهنگ، اسم آهنگ و خواننده را بنویس یا /music نام آهنگ\n🔎 تشخیص آهنگ: ویس، صدا یا ویدیو بفرست؛ در گروه روی فایل ریپلای کن و /shazam بنویس\n🔎 آهنگ اینستاگرام: دکمهٔ «پیداکردن آهنگ» یا /findmusic و لینک\n🎼 پلی‌لیست YouTube: لینک پلی‌لیست یا /playlist لینک 1-20\n🎧 صدای اینستاگرام: دکمهٔ «فقط صدا» یا /audio و لینک ویدیو\nضبط لایو: /live username\nبازپخش: /replay و لینک بازپخش منتشرشده\nتوقف ضبط با دکمهٔ زیر پیام ضبط انجام می‌شود.",
+            text: "لینک YouTube، Pornhub یا اینستاگرام رو بفرست؛ فایلش رو همین‌جا می‌فرستم ⚡️\n\n⬇️ X، Pinterest، TikTok، SoundCloud و Aparat: لینک پست یا آهنگ را بفرست\n\n🎵 برای آهنگ، اسم آهنگ و خواننده را بنویس یا /music نام آهنگ\n🔎 تشخیص آهنگ: ویس، صدا یا ویدیو بفرست؛ در گروه روی فایل ریپلای کن و /shazam بنویس\n🔎 آهنگ اینستاگرام: دکمهٔ «پیداکردن آهنگ» یا /findmusic و لینک\n🎼 پلی‌لیست YouTube: لینک پلی‌لیست یا /playlist لینک 1-20\n🎧 صدای اینستاگرام: دکمهٔ «فقط صدا» یا /audio و لینک ویدیو\nضبط لایو: /live username\nبازپخش: /replay و لینک بازپخش منتشرشده\nتوقف ضبط با دکمهٔ زیر پیام ضبط انجام می‌شود.",
           });
           return Response.json({ ok: true });
         }
@@ -1101,7 +1121,7 @@ export default {
         if (/^\/audio(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) {
           const target = parseInstagramAudioTarget(text);
           if (target) return createInstagramWorkflow(env, update, target);
-          await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id, text: "بعد از /audio لینک Reel، پست ویدیویی یا یک Story ویدیویی اینستاگرام را بفرست." });
+          await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id, text: "بعد از /audio لینک ویدیوی اینستاگرام، X، TikTok، Pinterest یا آپارات را بفرست." });
           return Response.json({ ok: true });
         }
         const instagramTarget = parseInstagramVideoTarget(text);

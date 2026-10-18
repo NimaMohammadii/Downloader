@@ -855,7 +855,7 @@ def send_media_file(
         )
 
 
-SOCIAL_NAMES = {"x": "X", "pinterest": "Pinterest", "tiktok": "TikTok", "soundcloud": "SoundCloud"}
+SOCIAL_NAMES = {"x": "X", "pinterest": "Pinterest", "tiktok": "TikTok", "soundcloud": "SoundCloud", "aparat": "Aparat"}
 SOCIAL_MAX_ITEMS = 20
 PINTEREST_DOMAINS = "com fr de ch jp cl ca it co.uk nz ru com.au at pt co.kr es com.mx dk ph th com.uy co nl info kr ie vn com.vn ec mx in pe co.at hu co.in co.nz id com.ec com.py tw be uk com.bo com.pe".split()
 
@@ -866,6 +866,10 @@ def social_url(value: str, platform: str) -> str:
     if platform not in SOCIAL_NAMES or p.scheme not in {"http", "https"} or p.username or p.password or p.port:
         raise app.UserVisibleError("❌ لینک معتبر این سرویس را بفرست.")
     host, path = (p.hostname or "").lower(), p.path
+    if platform == "aparat" and host in {"aparat.com", "www.aparat.com"}:
+        m = re.fullmatch(r"/(?:v/|video/video/embed/videohash/)([A-Za-z0-9]{1,32})(?:/[^?#]*)?", path)
+        if m:
+            return f"https://www.aparat.com/v/{m[1]}"
     if platform == "x" and host in {"x.com", "www.x.com", "mobile.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com", "m.twitter.com"}:
         m = re.fullmatch(r"/(?:[A-Za-z0-9_]+/status|i/web/status|statuses)/(\d{1,25})(?:/video/([1-9]\d?))?/?", path)
         if m:
@@ -928,6 +932,7 @@ def resolve_social_url(value: str, platform: str) -> str:
 def social_cdn_url(value: str, platform: str) -> str:
     p = urlparse(value)
     roots = {"x": ("twimg.com",), "pinterest": ("pinimg.com",),
+             "aparat": ("aparat.com",),
              "soundcloud": ("sndcdn.com", "soundcloud.com", "media-streaming.soundcloud.cloud"),
              "tiktok": ("tiktokcdn.com", "tiktokcdn-us.com", "tiktokcdn-eu.com", "tiktokcdn-in.com", "tiktokv.com", "tiktok.com", "byteoversea.com", "ibytedtos.com", "ibyteimg.com", "byteimg.com", "muscdn.com")}
     host = (p.hostname or "").lower()
@@ -1001,6 +1006,43 @@ def social_ytdlp_entries(url: str, platform: str) -> list[dict[str, Any]]:
     return entries
 
 
+def aparat_entries(url: str) -> list[dict[str, Any]]:
+    """Use Aparat's current first-party rendition API; legacy embed extraction is broken."""
+    uid = social_url(url, "aparat").rsplit("/", 1)[-1]
+    try:
+        with requests.get(f"https://www.aparat.com/api/fa/v1/video/video/show/videohash/{uid}",
+                          stream=True, allow_redirects=False, timeout=(10, 20), headers={"User-Agent": "Mozilla/5.0"}) as response:
+            if response.status_code != 200:
+                raise social_error("aparat", str(response.status_code))
+            chunks, size, deadline = [], 0, time.monotonic() + 45
+            for chunk in response.iter_content(64 * 1024):
+                size += len(chunk)
+                if size > 2_000_000 or time.monotonic() > deadline:
+                    raise app.UserVisibleError("❌ اطلاعات ویدیوی آپارات بیش از سقف حجم یا زمان بود.")
+                chunks.append(chunk)
+            attributes = json.loads(b"".join(chunks))["data"]["attributes"]
+        if str(attributes.get("uid")) != uid or attributes.get("deleted") in {True, 1, "1", "true"}:
+            raise social_error("aparat", "unavailable")
+        if attributes.get("can_download") not in {True, 1, "1", "true"}:
+            raise app.UserVisibleError("❌ دانلود این ویدیوی آپارات فعال نیست یا به دسترسی بیشتری نیاز دارد.")
+        formats = []
+        for item in attributes.get("file_link_all") or []:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("profile") or item.get("text") or "")
+            height = re.search(r"(\d{3,4})[pP]?", label)
+            for candidate in item.get("urls") or []:
+                media_url = social_cdn_url(candidate, "aparat")
+                formats.append({"format_id": f"http-{len(formats)}", "url": media_url, "ext": "mp4", "protocol": "https",
+                                "height": int(height[1]) if height else None, "http_headers": {"User-Agent": "Mozilla/5.0"}})
+        if not formats:
+            raise social_error("aparat", "no video")
+        return [{"id": uid, "extractor_key": "Aparat", "title": str(attributes.get("title") or "Aparat")[:180],
+                 "duration": float(attributes.get("duration") or 0), "formats": formats}]
+    except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+        raise social_error("aparat", type(exc).__name__) from exc
+
+
 def social_gallery_entries(url: str, platform: str) -> list[dict[str, Any]]:
     data = social_json([sys.executable, "-m", "gallery_dl", "--config-ignore", "--no-input", "--dump-json",
                         "--range", f"1-{SOCIAL_MAX_ITEMS + 1}", "--retries", "1", "--http-timeout", "15",
@@ -1064,8 +1106,11 @@ def social_download_http(url: str, target: Path, platform: str, budget: int, dea
         raise social_error(platform, type(exc).__name__) from exc
 
 
-def social_prepare_entry(entry: dict[str, Any], platform: str, workdir: Path, budget: int, deadline: float) -> dict[str, Any]:
-    target = workdir / ("Image.jpg" if entry.get("image") else "Music.mp3" if platform == "soundcloud" else "Video.mp4")
+def social_prepare_entry(entry: dict[str, Any], platform: str, workdir: Path, budget: int, deadline: float, *, audio_only: bool = False) -> dict[str, Any]:
+    audio_request = audio_only or platform == "soundcloud"
+    if audio_request and entry.get("image"):
+        raise app.UserVisibleError("❌ این آیتم عکس است و صدای ویدیو ندارد.")
+    target = workdir / ("Image.jpg" if entry.get("image") else "Music.mp3" if audio_request else "Video.mp4")
     source = workdir / ("source." + (entry.get("ext", "bin") if entry.get("image") else "bin"))
     remaining = lambda: max(1, min(1200, int(deadline - time.monotonic())))
     try:
@@ -1086,7 +1131,7 @@ def social_prepare_entry(entry: dict[str, Any], platform: str, workdir: Path, bu
                     if fmt.get("has_drm"):
                         raise app.UserVisibleError("❌ نسخهٔ قابل دریافت این فایل محدود است؛ دانلود انجام نشد.")
             info_path.write_text(json.dumps(info), encoding="utf-8")
-            fmt = "bestaudio/best" if platform == "soundcloud" else "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b[height<=1080]/bv[height<=1080][ext=mp4]/bv[height<=1080]/b/bv"
+            fmt = "bestaudio/best" if audio_request else "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b[height<=1080]/bv[height<=1080][ext=mp4]/bv[height<=1080]/b/bv"
             _run([app.REAL_YTDLP, "--ignore-config", "--compat-options", "no-certifi", "--no-playlist", "--quiet", "--no-progress", "--socket-timeout", "15",
                   "--retries", "1", "--fragment-retries", "1", "--abort-on-unavailable-fragments", "--concurrent-fragments", "8",
                   "--max-filesize", str(budget), "--merge-output-format", "mp4", "--format", fmt,
@@ -1119,7 +1164,10 @@ def social_prepare_entry(entry: dict[str, Any], platform: str, workdir: Path, bu
                 raise app.UserVisibleError("❌ تصویر سالم برای ارسال ساخته نشد.")
             if target.stat().st_size > 10_000_000 or max(geometry[:2]) / min(geometry[:2]) > 20:
                 method = "sendDocument"
-        elif platform == "soundcloud":
+        elif audio_request:
+            probe = json.loads(_run(["ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-show_streams", "-of", "json", str(source)], 45).stdout)
+            if not any(s.get("codec_type") == "audio" for s in probe.get("streams", [])):
+                raise app.UserVisibleError("❌ این ویدیو صدا ندارد؛ فایل صوتی ساخته نشد.")
             _run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin", "-protocol_whitelist", "file,pipe", "-i", str(source),
                   "-map", "0:a:0", "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-metadata", f"title={title}", "-metadata", f"artist={artist}", str(target)], remaining())
             method, details = "sendAudio", {"title": title, "performer": artist}
@@ -1145,7 +1193,8 @@ def social_prepare_entry(entry: dict[str, Any], platform: str, workdir: Path, bu
             details["duration"] = int(round(duration))
         source.unlink(missing_ok=True)
         (workdir / "media.json").unlink(missing_ok=True)
-        return {"path": target, "method": method, "data": details, "title": title}
+        return {"path": target, "method": method, "data": details, "title": title,
+                "hasAudio": bool(audio) if method == "sendVideo" else False}
     except (subprocess.SubprocessError, OSError, ValueError, KeyError) as exc:
         raise social_error(platform, type(exc).__name__) from exc
 
@@ -1154,7 +1203,9 @@ def prepare_social_media(social: dict[str, Any], workdir: Path) -> tuple[str, li
     platform = str(social.get("platform") or "")
     url = resolve_social_url(str(social.get("url") or ""), platform)
     deadline = time.monotonic() + 1500
-    if platform == "pinterest" or (platform == "tiktok" and "/photo/" in url):
+    if platform == "aparat":
+        entries = aparat_entries(url)
+    elif platform == "pinterest" or (platform == "tiktok" and "/photo/" in url):
         entries = social_gallery_entries(url, platform)
     else:
         try:
@@ -1163,16 +1214,28 @@ def prepare_social_media(social: dict[str, Any], workdir: Path) -> tuple[str, li
             if platform != "tiktok":
                 raise
             entries = social_gallery_entries(url, platform)
+    audio_only = bool(social.get("audioOnly"))
+    indexed = list(enumerate(entries))
+    if "itemIndex" in social:
+        index = social["itemIndex"]
+        if not audio_only or type(index) is not int or not 0 <= index < len(entries):
+            raise app.UserVisibleError("❌ آیتم انتخاب‌شده در این پست وجود ندارد.")
+        indexed = [(index, entries[index])]
+    elif audio_only:
+        indexed = [(index, entry) for index, entry in indexed if not entry.get("image")]
+    if not indexed:
+        raise app.UserVisibleError("❌ این پست ویدیویی برای استخراج صدا ندارد.")
     prepared, total = [], 0
-    for index, entry in enumerate(entries):
+    for index, entry in indexed:
         if time.monotonic() >= deadline:
             raise app.UserVisibleError("❌ دریافت پست بیش از حد طول کشید؛ فایل‌ها ارسال نشدند.")
         directory = workdir / f"item-{index + 1}"
         directory.mkdir()
-        item = social_prepare_entry(entry, platform, directory, app.DIRECT_TELEGRAM_LIMIT - total, deadline)
+        item = social_prepare_entry(entry, platform, directory, app.DIRECT_TELEGRAM_LIMIT - total, deadline, audio_only=audio_only)
         total += item["path"].stat().st_size
         item["caption"] = f"{item['title']}\n{SOCIAL_NAMES[platform]} {index + 1}/{len(entries)}\n{url}"
-        item["cacheKey"] = "social:" + hashlib.sha256(f"{platform}:{url}:{index}:v1".encode()).hexdigest()
+        item["index"] = index
+        item["cacheKey"] = "social:" + hashlib.sha256(f"{platform}:{url}:{index}:{'audio:' if audio_only else ''}v1".encode()).hexdigest()
         prepared.append(item)
     return url, prepared
 

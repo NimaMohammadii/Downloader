@@ -198,6 +198,55 @@ class SocialExtractorTests(unittest.TestCase):
         config.clear()
 
 
+class AparatTests(unittest.TestCase):
+    def api(self,**changes):
+        attributes={'uid':'abc123','title':'Fixture','duration':'10','can_download':True,'deleted':False,
+                    'file_link_all':[{'profile':'360p','urls':['https://a.cdn.asset.aparat.com/360.mp4']},
+                                     {'profile':'1080p','urls':['https://a.cdn.asset.aparat.com/1080.mp4']}]}
+        attributes.update(changes)
+        return response(content=json.dumps({'data':{'attributes':attributes}}).encode())
+
+    def test_canonical_embed_and_renditions_use_only_first_party_https_api(self):
+        self.assertEqual(p.social_url('https://aparat.com/video/video/embed/videohash/abc123/vt/frame','aparat'),'https://www.aparat.com/v/abc123')
+        with patch.object(p.requests,'get',return_value=self.api()) as get:
+            entry=p.aparat_entries('https://www.aparat.com/v/abc123')[0]
+        self.assertEqual([f['height'] for f in entry['formats']],[360,1080]);self.assertEqual(entry['duration'],10)
+        self.assertEqual(get.call_args.args[0],'https://www.aparat.com/api/fa/v1/video/video/show/videohash/abc123')
+        self.assertFalse(get.call_args.kwargs['allow_redirects'])
+
+    def test_deleted_disabled_download_mismatched_id_and_external_media_are_rejected(self):
+        for changes in [{'deleted':True},{'can_download':False},{'uid':'different'},
+                        {'file_link_all':[{'urls':['https://evil.example/video.mp4']}]},{'file_link_all':[]}]:
+            with self.subTest(changes=changes),patch.object(p.requests,'get',return_value=self.api(**changes)),self.assertRaises(app.UserVisibleError):
+                p.aparat_entries('https://www.aparat.com/v/abc123')
+        for url in ['https://aparat.com/channel','https://aparat.com/live/name','https://aparat.com.evil/v/abc123']:
+            with self.assertRaises(app.UserVisibleError):p.social_url(url,'aparat')
+
+    def test_api_limits_errors_and_redirects_do_not_become_success(self):
+        for r in [response(status=403),response(status=302,location='https://evil.example'),response(content=b'invalid JSON'),response(content=b'x'*2000001)]:
+            with patch.object(p.requests,'get',return_value=r),self.assertRaises(app.UserVisibleError):p.aparat_entries('https://www.aparat.com/v/abc123')
+
+    def test_audio_selection_keeps_exact_gallery_item_and_distinct_cache_key(self):
+        entries=[{'image':True},{'title':'First'},{'title':'Second'}]
+        with tempfile.TemporaryDirectory() as d:
+            def prepare(entry,platform,directory,budget,deadline,*,audio_only):
+                self.assertTrue(audio_only);self.assertEqual(entry['title'],'Second')
+                path=directory/'Music.mp3';path.write_bytes(b'audio')
+                return {'path':path,'method':'sendAudio','title':entry['title'],'data':{}}
+            with patch.object(p,'social_gallery_entries',return_value=entries),patch.object(p,'social_prepare_entry',side_effect=prepare) as prep:
+                _,items=p.prepare_social_media({'platform':'pinterest','url':'https://www.pinterest.com/pin/123/','audioOnly':True,'itemIndex':2},Path(d))
+            self.assertEqual(items[0]['index'],2);prep.assert_called_once()
+            self.assertNotEqual(items[0]['cacheKey'],'social:'+__import__('hashlib').sha256(b'pinterest:https://www.pinterest.com/pin/123/:2:v1').hexdigest())
+        with tempfile.TemporaryDirectory() as d,patch.object(p,'social_gallery_entries',return_value=entries):
+            with self.assertRaises(app.UserVisibleError):p.prepare_social_media({'platform':'pinterest','url':'https://www.pinterest.com/pin/123/','audioOnly':True,'itemIndex':3},Path(d))
+
+    def test_photo_only_audio_request_fails_before_downloading(self):
+        with tempfile.TemporaryDirectory() as d,patch.object(p,'social_gallery_entries',return_value=[{'image':True}]),patch.object(p,'social_prepare_entry') as prepare:
+            with self.assertRaisesRegex(app.UserVisibleError,'ویدیویی'):
+                p.prepare_social_media({'platform':'pinterest','url':'https://www.pinterest.com/pin/123/','audioOnly':True},Path(d))
+            prepare.assert_not_called()
+
+
 @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'),'FFmpeg required')
 class SocialFileTests(unittest.TestCase):
     @classmethod
@@ -279,6 +328,26 @@ class SocialFileTests(unittest.TestCase):
             finally:server.shutdown();server.server_close();thread.join()
 
 
+    def test_social_audio_outputs_real_tagged_mp3_for_all_video_services(self):
+        for platform,host in [('x','video.twimg.com'),('tiktok','v.tiktokcdn.com'),('pinterest','v.pinimg.com'),('aparat','a.asset.aparat.com')]:
+            with self.subTest(platform=platform),tempfile.TemporaryDirectory() as d:
+                def download(url,target,*args):shutil.copyfile(self.root/'fixture.mp4',target)
+                with patch.object(p,'social_download_http',side_effect=download):
+                    item=p.social_prepare_entry({'url':f'https://{host}/a.mp4','title':'Clip audio','duration':1},platform,Path(d),1000000,time.monotonic()+60,audio_only=True)
+                self.assertEqual(item['method'],'sendAudio');self.assertEqual(item['data']['duration'],1)
+                probe=json.loads(subprocess.run(['ffprobe','-v','error','-show_streams','-show_format','-of','json',str(item['path'])],capture_output=True,text=True,check=True).stdout)
+                self.assertEqual([x['codec_type'] for x in probe['streams']],['audio'])
+                self.assertEqual(probe['streams'][0]['codec_name'],'mp3');self.assertEqual(probe['format']['tags']['title'],'Clip audio')
+
+    def test_silent_video_and_selected_photo_do_not_create_fake_audio(self):
+        with tempfile.TemporaryDirectory() as d:
+            def download(url,target,*args):shutil.copyfile(self.root/'silent.mp4',target)
+            with patch.object(p,'social_download_http',side_effect=download),self.assertRaisesRegex(app.UserVisibleError,'صدا ندارد'):
+                p.social_prepare_entry({'url':'https://video.twimg.com/a.mp4'},'x',Path(d),1000000,time.monotonic()+60,audio_only=True)
+            with self.assertRaisesRegex(app.UserVisibleError,'عکس'):
+                p.social_prepare_entry({'image':True},'pinterest',Path(d),1000000,time.monotonic()+60,audio_only=True)
+
+
 class SocialLifecycleTests(unittest.TestCase):
     def test_social_prepare_uses_existing_completion_event_and_no_instagram_session(self):
         job=app.InstagramCapture(payload())
@@ -319,6 +388,39 @@ class SocialLifecycleTests(unittest.TestCase):
             self.assertEqual(job.state,'failed');self.assertEqual(job.result['message'],'fixture failure')
             notify.assert_called_once();send.assert_not_called()
         finally:job.cleanup()
+
+
+    def test_audio_button_is_owner_chat_item_and_url_signed_on_upload_and_cache_hits(self):
+        import hashlib,hmac
+        url='https://www.pinterest.com/pin/123/'
+        for cached in [False,True]:
+            job=app.InstagramCapture(payload('pinterest'));job.state='ready';job.social_sent=0;job.social_url=url
+            path=job.workdir/'Video.mp4';path.write_bytes(b'fixture')
+            job.social_items=[{'path':path,'method':'sendVideo','title':'Fixture','data':{},'caption':f'Fixture\n{url}','cacheKey':'test:video','hasAudio':True,'index':1}]
+            captured=[]
+            async def upload(token,method,data,file):captured.append(json.loads(data['reply_markup']));return {'message_id':10}
+            try:
+                with patch.object(app,'reuse_cached_file',return_value=cached) as reuse,patch.object(app,'upload_complete_file',side_effect=upload) as up,patch.object(app,'delete_status'),patch.object(job,'safe_status'):
+                    self.assertTrue(job.send()['ok'])
+                markup=reuse.call_args.kwargs['reply_markup'];button=markup['inline_keyboard'][0][0]
+                sig=hmac.new(b'fake',f'social-audio:42:42:1:{url}'.encode(),hashlib.sha256).hexdigest()[:16]
+                self.assertEqual(button['callback_data'],f'soa|1|42|{sig}');self.assertLessEqual(len(button['callback_data'].encode()),64)
+                self.assertEqual(up.call_count,0 if cached else 1)
+                if not cached:self.assertEqual(captured,[markup])
+            finally:job.cleanup()
+
+    def test_mtproto_sender_attaches_actual_inline_button_markup(self):
+        from test_youtube_chat import FakeClient
+        from telethon import types
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'Video.mp4';path.write_bytes(b'fixture')
+            markup={'inline_keyboard':[[{'text':'🎵 فقط صدا','callback_data':'soa|0|42|0123456789abcdef'}]]}
+            with patch.dict(os.environ,{'API_ID':'123','API_HASH':'test'}),patch('telethon.TelegramClient',FakeClient),path.open('rb') as handle:
+                asyncio.run(app.upload_complete_file('fake','sendVideo',{'chat_id':'42','reply_markup':json.dumps(markup)},(path.name,handle,'video/mp4')))
+            button=FakeClient.instances[-1].sent[1]['buttons'][0][0]
+            self.assertIsInstance(button,types.KeyboardInlineButton)
+            self.assertIsInstance(button.type,types.InlineButtonTypeCallback)
+            self.assertEqual(button.type.data,b'soa|0|42|0123456789abcdef')
 
 
 if __name__=='__main__':unittest.main()

@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import hmac
 import json
 import secrets
 import os
@@ -554,7 +555,7 @@ def validate_file_size(path: Path) -> None:
 
 
 async def upload_complete_file(token: str, method: str, data: dict[str, Any], file: tuple) -> Any:
-    from telethon import TelegramClient, functions, types, utils
+    from telethon import Button, TelegramClient, functions, types, utils
     from telethon.errors import FloodWaitError
 
     filename, handle, mime = file
@@ -617,6 +618,11 @@ async def upload_complete_file(token: str, method: str, data: dict[str, Any], fi
                 performer=str(data.get("performer") or "") or None,
             ))
         reply = json.loads(data.get("reply_parameters", "{}"))
+        markup = data.get("reply_markup")
+        if isinstance(markup, str):
+            markup = json.loads(markup)
+        buttons = [[Button.inline(button["text"], data=button["callback_data"].encode()) for button in row]
+                   for row in markup["inline_keyboard"]] if markup else None
         message = await client.send_file(
             int(data["chat_id"]), uploaded,
             caption=data.get("caption", ""), parse_mode=None,
@@ -624,6 +630,7 @@ async def upload_complete_file(token: str, method: str, data: dict[str, Any], fi
             supports_streaming=method == "sendVideo",
             force_document=method == "sendDocument",
             reply_to=reply.get("message_id"),
+            buttons=buttons,
         )
         return {"message_id": message.id, "file_id": utils.pack_bot_file_id(getattr(message, "document", None))}
 
@@ -800,13 +807,15 @@ def file_cache(payload: dict[str, Any], op: str, key: str | None, value: dict[st
     return None
 
 
-def reuse_cached_file(payload: dict[str, Any], key: str | None, caption: str | None = None) -> bool:
+def reuse_cached_file(payload: dict[str, Any], key: str | None, caption: str | None = None, *, reply_markup: dict[str, Any] | None = None) -> bool:
     cached = file_cache(payload, "get", key)
     if not isinstance(cached, dict) or cached.get("method") not in {"sendAudio", "sendVideo"} or not cached.get("fileId"):
         return False
     data = dict(cached.get("data") or {})
     if caption is not None:
         data["caption"] = caption[:1024]
+    if reply_markup is not None:
+        data["reply_markup"] = reply_markup
     data.update({"chat_id": payload["chatId"], "reply_parameters": {"message_id": payload["requestMessageId"]},
                  "audio" if cached["method"] == "sendAudio" else "video": cached["fileId"]})
     try:
@@ -1383,9 +1392,18 @@ class InstagramCapture:
                 if self.cleanup_requested or time.monotonic() >= deadline:
                     raise UserVisibleError("ارسال به سقف زمان رسید.")
                 method = item["method"]
+                markup = None
+                if method == "sendVideo" and item.get("hasAudio"):
+                    owner = int(self.payload.get("userId") or self.id.rsplit("-", 1)[-1])
+                    index = int(item.get("index", 0))
+                    signature = hmac.new(self.payload["botToken"].encode(),
+                        f"social-audio:{self.payload['chatId']}:{owner}:{index}:{self.social_url}".encode(), hashlib.sha256).hexdigest()[:16]
+                    markup = {"inline_keyboard": [[{"text": "🎵 فقط صدا", "callback_data": f"soa|{index}|{owner}|{signature}"}]]}
                 data = {"chat_id": str(self.payload["chatId"]), "caption": item["caption"][:1024],
                         "reply_parameters": json.dumps({"message_id": self.payload["requestMessageId"]}), **item["data"]}
-                if method not in {"sendAudio", "sendVideo"} or not reuse_cached_file(self.payload, item["cacheKey"], item["caption"]):
+                if markup:
+                    data["reply_markup"] = json.dumps(markup)
+                if method not in {"sendAudio", "sendVideo"} or not reuse_cached_file(self.payload, item["cacheKey"], item["caption"], reply_markup=markup):
                     mime = {"sendPhoto": "image/jpeg", "sendDocument": "image/jpeg", "sendAudio": "audio/mpeg", "sendVideo": "video/mp4"}[method]
                     self.safe_status(f"📤 در حال ارسال فایل {self.social_sent + 1}/{len(self.social_items)}…")
                     with item["path"].open("rb") as handle:
