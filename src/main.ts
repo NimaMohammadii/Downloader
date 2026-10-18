@@ -19,6 +19,7 @@ export { AdminStatsStore };
 
 type Env = AdminStatsEnv & {
   BOT_TOKEN: string;
+  WEBHOOK_SECRET?: string;
   INSTAGRAM_SESSIONID?: string;
   INSTAGRAM_CSRFTOKEN?: string;
   INSTAGRAM_DS_USER_ID?: string;
@@ -192,7 +193,7 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "POST" && url.pathname === "/telegram/webhook") {
-      if (request.headers.get("x-telegram-bot-api-secret-token") !== WEBHOOK_SECRET) {
+      if (request.headers.get("x-telegram-bot-api-secret-token") !== (env.WEBHOOK_SECRET || WEBHOOK_SECRET)) {
         return downloaderWorker.fetch(request, env);
       }
 

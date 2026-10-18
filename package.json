@@ -7,7 +7,8 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "types": "wrangler types",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "webhook:set": "node scripts/set-webhook.mjs"
   },
   "dependencies": {
     "@cloudflare/containers": "^0.3.7"

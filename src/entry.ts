@@ -2,6 +2,7 @@ import legacyWorker from "./index";
 
 type Env = {
   BOT_TOKEN: string;
+  WEBHOOK_SECRET?: string;
   INSTAGRAM_SESSIONID?: string;
   INSTAGRAM_CSRFTOKEN?: string;
   INSTAGRAM_DS_USER_ID?: string;
@@ -669,7 +670,7 @@ async function handleStoryWebhook(
   target: StoryTarget,
   update: TelegramUpdate,
 ): Promise<Response> {
-  if (request.headers.get("x-telegram-bot-api-secret-token") !== WEBHOOK_SECRET) {
+  if (request.headers.get("x-telegram-bot-api-secret-token") !== (env.WEBHOOK_SECRET || WEBHOOK_SECRET)) {
     return new Response("Forbidden", { status: 403 });
   }
 
@@ -749,6 +750,7 @@ export default {
         mode: "cloudflare-only",
         resolver: "instagram-v13-instagrapi-exact-public-session",
         botConfigured: Boolean(env.BOT_TOKEN),
+        webhookSecretConfigured: Boolean(env.WEBHOOK_SECRET),
         instagramSessionConfigured: Boolean(env.INSTAGRAM_SESSIONID?.trim()),
       });
     }

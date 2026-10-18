@@ -14,6 +14,7 @@ import time
 import wave
 import unicodedata
 from array import array
+from contextvars import ContextVar
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,10 +34,22 @@ SUPPORTED_QUALITIES = (360, 480, 720, 1080)
 SUPPORTED_AUDIO_MODES = ("low", "hq")
 REAL_YTDLP = shutil.which("yt-dlp") or "yt-dlp"
 METADATA_CACHE_PATH = Path("/tmp/vexa-youtube-info.json")
+YOUTUBE_JOB_SECONDS = 25 * 60  # Leave cleanup/error reporting time within the 30-minute Workflow step.
+JOB_DEADLINE: ContextVar[float | None] = ContextVar("youtube_job_deadline", default=None)
 
 
 class UserVisibleError(Exception):
     pass
+
+
+def job_timeout(seconds: float) -> float:
+    deadline = JOB_DEADLINE.get()
+    if deadline is None:
+        return seconds
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise UserVisibleError("❌ زمان دریافت و ارسال این فایل تمام شد؛ کیفیت پایین‌تر یا فایل کوتاه‌تری را انتخاب کن.")
+    return min(seconds, remaining)
 
 
 def telegram_call(
@@ -49,13 +62,15 @@ def telegram_call(
     timeout: int = 900,
 ) -> Any:
     if files:
-        return asyncio.run(upload_complete_file(token, method, data or {}, next(iter(files.values()))))
+        upload_timeout = job_timeout(timeout)
+        return asyncio.run(asyncio.wait_for(
+            upload_complete_file(token, method, data or {}, next(iter(files.values()))), timeout=upload_timeout))
     response = requests.post(
         f"https://api.telegram.org/bot{token}/{method}",
         json=json_payload,
         data=data,
         files=files,
-        timeout=(20, timeout),
+        timeout=(min(20, job_timeout(timeout)), job_timeout(timeout)),
     )
     try:
         payload = response.json()
@@ -542,7 +557,7 @@ def probe_duration(path: Path) -> float:
             text=True,
             capture_output=True,
             check=True,
-            timeout=60,
+            timeout=job_timeout(60),
         )
         return max(0.0, float(result.stdout.strip()))
     except Exception:
@@ -702,6 +717,7 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Choose exactly one YouTube download mode")
 
     workdir = Path(tempfile.mkdtemp(prefix="youtube-download-"))
+    deadline_token = JOB_DEADLINE.set(time.monotonic() + YOUTUBE_JOB_SECONDS)
     try:
         if reuse_cached_file(payload, payload.get("mediaCacheKey")):
             delete_status(token, chat_id, status_message_id)
@@ -755,13 +771,15 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "parts": 1, "title": title, "quality": quality}
 
     except UserVisibleError as exc:
+        JOB_DEADLINE.set(None)  # Error reporting has the Workflow's reserved cleanup time.
         try:
             edit_status(token, chat_id, status_message_id, str(exc))
         except Exception:
             pass
         return {"ok": False, "message": str(exc)}
     except Exception as exc:
-        print(f"youtube job failed: {type(exc).__name__}: {exc}", flush=True)
+        JOB_DEADLINE.set(None)
+        print(f"youtube job failed: {type(exc).__name__}", flush=True)
         try:
             edit_status(
                 token,
@@ -774,6 +792,7 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "message": "unexpected error"}
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+        JOB_DEADLINE.reset(deadline_token)
 
 
 INSTAGRAM_RECORD_SECONDS = 2 * 60 * 60
@@ -795,7 +814,7 @@ def file_cache(payload: dict[str, Any], op: str, key: str | None, value: dict[st
     if not key or not re.fullmatch(r"[A-Za-z0-9:_-]{1,180}", key):
         return None
     url = str(payload.get("cacheUrl") or "")
-    if not re.fullmatch(r"https://downloader\.vexaagent\.workers\.dev/media-cache/(?:igdl|ytdl)--?\d+-\d+-\d+", url):
+    if not re.fullmatch(r"https://downloader\.vexaagent\.workers\.dev/media-cache/(?:igdl|ytdl)--?\d+-\d+-\d+(?:-(?:audio|song))?", url):
         return None
     try:
         response = requests.post(url, headers={"x-media-cache-token": payload["cacheToken"]},
@@ -1030,7 +1049,7 @@ class InstagramCapture:
     def __init__(self, payload: dict[str, Any]):
         self.payload = payload
         self.id = str(payload.get("id") or "")
-        if not re.fullmatch(r"igdl--?\d+-\d+-\d+", self.id):
+        if not re.fullmatch(r"igdl--?\d+-\d+-\d+(?:-(?:audio|song))?", self.id):
             raise ValueError("Invalid Instagram job ID")
         self.source = payload.get("source") or {}
         self.live = self.source.get("mode") == "live"
@@ -1504,7 +1523,7 @@ class Handler(BaseHTTPRequestHandler):
                     result = process_job(payload)
             self._send_json(200, result)
         except Exception as exc:
-            print(f"youtube container request failed: {type(exc).__name__}: {exc}", flush=True)
+            print(f"youtube container request failed: {type(exc).__name__}", flush=True)
             self._send_json(500, {"ok": False, "error": "internal error"})
 
     def log_message(self, fmt: str, *args: Any) -> None:

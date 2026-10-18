@@ -5,7 +5,7 @@ import test from 'node:test';
 const source = await readFile(new URL('../src/youtube-main.ts', import.meta.url), 'utf8');
 const story = await readFile(new URL('../src/story-main.ts', import.meta.url), 'utf8');
 const { outputFiles } = await build({
-  stdin: { contents: source + '\nexport {parseInstagramVideoTarget,parseInstagramAudioTarget,resolveInstagramVideo,instagramVideoErrorText,parsePlaylist,mediaCacheKey,parseSocialUrl};', loader: 'ts' },
+  stdin: { contents: source + '\nexport {parseInstagramVideoTarget,parseInstagramAudioTarget,resolveInstagramVideo,instagramVideoErrorText,parsePlaylist,mediaCacheKey,parseSocialUrl,extractYouTubeUrl};', loader: 'ts' },
   bundle: true, format: 'esm', write: false,
   plugins: [{ name: 'instagram-platform', setup(build) {
     build.onResolve({ filter: /.*/ }, a => ({ path: a.path, namespace: 'test' }));
@@ -244,6 +244,47 @@ test('Instagram audio button enforces ownership and replies to the selected vide
   } finally {env.YOUTUBE_DOWNLOAD_WORKFLOW=original;}
 });
 
+test('audio and song buttons on one video create independent, individually deduplicated jobs', async()=>{
+  const original=env.YOUTUBE_DOWNLOAD_WORKFLOW, ids=new Set(), jobs=[];
+  env.YOUTUBE_DOWNLOAD_WORKFLOW={async create(job){
+    if(ids.has(job.id)) throw Error('already exists');
+    ids.add(job.id);jobs.push(job);
+  }};
+  globalThis.fetch=async()=>Response.json({ok:true,result:true});
+  try {
+    const message={message_id:55,chat:{id:42}};
+    for(const data of ['iga|p|B|1|42','igm|p|B|1|42','iga|p|B|1|42','igm|p|B|1|42'])
+      await webhook({id:data,from:{id:42},data,message});
+    assert.equal(jobs.length,2);
+    assert.notEqual(jobs[0].id,jobs[1].id);
+    assert.equal(jobs[0].params.requestMessageId,55);
+    assert.equal(jobs[1].params.instagram.recognizeMusic,true);
+  } finally {env.YOUTUBE_DOWNLOAD_WORKFLOW=original;}
+});
+
+test('Instagram cache reuse requires a fresh successful source access check', async()=>{
+  const step={async do(name,options,fn){return (typeof options==='function'?options:fn)();}};
+  try {
+    for(const allowed of [false,true]) {
+      const sent=[],lookups=[];globalThis.containerIds=[];
+      globalThis.testFileCache=async()=>({method:'sendAudio',fileId:'stored_id',data:{caption:'Audio'}});
+      globalThis.fetch=async(url,init)=>{
+        if(String(url).includes('api.telegram.org')) {
+          sent.push({method:new URL(url).pathname.split('/').at(-1),body:JSON.parse(init.body)});
+          return Response.json({ok:true,result:{message_id:10}});
+        }
+        lookups.push(String(url));
+        return allowed ? Response.json({items:[{pk:'1',video_versions:[{url:liveUrl}],has_audio:true}]})
+          : Response.json({message:'login_required'}, {status:401});
+      };
+      await new mod.YoutubeDownloadWorkflow({},env).run({payload:{...job,instagram:{kind:'audio',shortcode:'B'}}},step);
+      assert.ok(lookups.length>0,'source must be checked even on a cache hit');
+      assert.equal(sent.filter(x=>x.method==='sendAudio').length,allowed?1:0);
+      assert.equal(globalThis.containerIds.length,0);
+    }
+  } finally {delete globalThis.testFileCache;}
+});
+
 async function mediaWebhook(message, workerEnv) {
   return mod.default.fetch(new Request('https://worker/telegram/webhook', { method:'POST',
     headers:{'content-type':'application/json','x-telegram-bot-api-secret-token':'dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1'},
@@ -314,6 +355,7 @@ test('recognition uses the same completion event and upload path without requiri
 test('playlist links and explicit ranges preserve watch-link single-video behavior',()=>{
   const url='https://www.youtube.com/playlist?list=PLabcdef1234';
   assert.deepEqual(mod.parsePlaylist(url),{url,start:1,end:20});
+  assert.deepEqual(mod.parsePlaylist('این پلی‌لیست '+url+'،'),{url,start:1,end:20});
   assert.deepEqual(mod.parsePlaylist('/playlist '+url+' 21-40'),{url,start:21,end:40});
   assert.equal(mod.parsePlaylist('/playlist '+url+' 1-21'),null);
   assert.equal(mod.parsePlaylist('/playlist '+url+' 0-19'),null);
@@ -447,6 +489,18 @@ test('social parser rejects credentials, lookalike hosts, profiles, boards and o
     '/findmusic https://x.com/name/status/123',
     'https://www.youtube.com/watch?v=abcdefghijk','https://www.instagram.com/reel/B/'
   ]) assert.equal(mod.parseSocialUrl(text),null,text);
+});
+
+test('YouTube video extraction normalizes individual videos and never scans a channel or search page',()=>{
+  for(const url of ['https://youtu.be/abcdefghijk?si=tracking','http://m.youtube.com/shorts/abcdefghijk',
+    'https://www.youtube-nocookie.com/embed/abcdefghijk','https://www.youtube.com/live/abcdefghijk',
+    'https://music.youtube.com/watch?v=abcdefghijk&list=PLabcdef'])
+    assert.equal(mod.extractYouTubeUrl('لینک '+url+'،'),'https://www.youtube.com/watch?v=abcdefghijk');
+  for(const url of ['https://youtube.com/@creator','https://youtube.com/channel/UCabcdef',
+    'https://youtube.com/results?search_query=hello','https://youtube.com/playlist?list=PLabcdef',
+    'https://user:pass@youtube.com/watch?v=abcdefghijk','https://youtube.com:8443/watch?v=abcdefghijk',
+    'https://youtube.com.evil/watch?v=abcdefghijk','https://youtube.com/watch?v=short'])
+    assert.equal(mod.extractYouTubeUrl(url),null,url);
 });
 
 test('social webhook dispatches all providers into existing media job without music or YouTube substitution',async()=>{

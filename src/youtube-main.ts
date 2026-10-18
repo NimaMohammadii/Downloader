@@ -44,6 +44,7 @@ type YoutubeDownloadJob = {
 
 type Env = AdminStatsEnv & {
   BOT_TOKEN: string;
+  WEBHOOK_SECRET?: string;
   API_ID?: string;
   API_HASH?: string;
   YOUTUBE_DOWNLOAD_WORKFLOW: Workflow<YoutubeDownloadJob>;
@@ -477,11 +478,13 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         });
         return message.message_id;
       });
-      if (await step.do("reuse telegram media file", { retries: { limit: 0, delay: "1 second" }, timeout: "1 minute" }, () => sendCachedMedia(this.env, job, statusId))) {
+      // Private Instagram media must still be visible to the connected account.
+      // Public song-query cache hits can be delivered without source resolution.
+      const needsAccessCheck = Boolean(job.instagram && job.instagram.kind !== "music");
+      if (!needsAccessCheck && await step.do("reuse telegram media file", { retries: { limit: 0, delay: "1 second" }, timeout: "1 minute" }, () => sendCachedMedia(this.env, job, statusId))) {
         await step.do("record cached media delivery", () => recordSuccessfulDelivery(this.env, `instagram:${job.id}`));
         return;
       }
-      if (!/^\d+$/.test(this.env.API_ID || "") || !this.env.API_HASH?.trim()) throw new Error("YT_CONFIG");
       // Return friendly failures durably, without retrying rejected Instagram sessions.
       const resolution = await step.do("resolve instagram live or replay", { retries: { limit: 0, delay: "1 second" }, timeout: "2 minutes" }, async () => {
         try {
@@ -499,6 +502,11 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         return;
       }
       const source = resolution.source;
+      if (needsAccessCheck && await step.do("reuse accessible instagram file", { retries: { limit: 0, delay: "1 second" }, timeout: "1 minute" }, () => sendCachedMedia(this.env, job, statusId))) {
+        await step.do("record cached media delivery", () => recordSuccessfulDelivery(this.env, `instagram:${job.id}`));
+        return;
+      }
+      if (!/^\d+$/.test(this.env.API_ID || "") || !this.env.API_HASH?.trim()) throw new Error("YT_CONFIG");
       await step.do("start instagram container", { retries: { limit: 2, delay: "5 seconds", backoff: "linear" }, timeout: "2 minutes" }, async () => {
         await instagramContainer(this.env, job).startAndWaitForPorts({ ports: [8080], cancellationOptions: { instanceGetTimeoutMS: 45_000, portReadyTimeoutMS: 60_000 } });
         return true;
@@ -746,20 +754,17 @@ function extractYouTubeUrl(text: string): string | null {
   const matches = text.match(/https?:\/\/[^\s<>"']+/gi) ?? [];
 
   for (const raw of matches) {
-    const candidate = raw.replace(/[),.!?\]}]+$/g, "");
+    const candidate = raw.replace(/[),.!?\]}،؛]+$/g, "");
     try {
       const url = new URL(candidate);
-      const host = url.hostname.toLowerCase().replace(/^www\./, "");
-      const isYoutube =
-        host === "youtu.be" ||
-        host === "youtube.com" ||
-        host.endsWith(".youtube.com") ||
-        host === "youtube-nocookie.com" ||
-        host.endsWith(".youtube-nocookie.com");
-
-      if (isYoutube && (url.protocol === "https:" || url.protocol === "http:")) {
-        return url.toString();
-      }
+      if (!["https:", "http:"].includes(url.protocol) || url.username || url.password || url.port) continue;
+      const host = url.hostname.toLowerCase();
+      if (!["youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "www.youtu.be",
+            "youtube-nocookie.com", "www.youtube-nocookie.com"].includes(host)) continue;
+      const id = host.endsWith("youtu.be") ? /^\/([A-Za-z0-9_-]{11})\/?$/.exec(url.pathname)?.[1]
+        : url.pathname === "/watch" ? url.searchParams.get("v")
+        : /^\/(?:shorts|live|embed|v)\/([A-Za-z0-9_-]{11})\/?$/.exec(url.pathname)?.[1];
+      if (id && /^[A-Za-z0-9_-]{11}$/.test(id)) return `https://www.youtube.com/watch?v=${id}`;
     } catch {
       // Keep scanning URLs in the message.
     }
@@ -783,7 +788,8 @@ function extractPornhubUrl(text: string): string | null {
 
 function parsePlaylist(text: string): PlaylistInput | null {
   const explicit = /^\/playlist(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text);
-  const args = explicit ? text.replace(/^\/playlist(?:@[A-Za-z0-9_]+)?\s*/i, "").trim().split(/\s+/) : [extractYouTubeUrl(text) || text];
+  const args = explicit ? text.replace(/^\/playlist(?:@[A-Za-z0-9_]+)?\s*/i, "").trim().split(/\s+/)
+    : [(text.match(/https?:\/\/[^\s<>"']+/i)?.[0] || text).replace(/[),.!?\]}،؛]+$/g, "")];
   if (args.length > 2) return null;
   try {
     const url = new URL(args[0]);
@@ -928,7 +934,7 @@ async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target?
   const user = trackedUser(message);
   const userId = user?.id ?? message.chat.id;
   const job: YoutubeDownloadJob = {
-    id: `igdl-${message.chat.id}-${message.message_id}-${userId}`, chatId: message.chat.id,
+    id: `igdl-${message.chat.id}-${message.message_id}-${userId}${target?.kind === "audio" ? target.recognizeMusic ? "-song" : "-audio" : ""}`, chatId: message.chat.id,
     requestMessageId: message.message_id, userId, url: "", instagram: target,
     ...(recognition ? { recognition } : {}),
     ...(playlist ? { playlist } : {}),
@@ -1027,7 +1033,7 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const requestUrl = new URL(request.url);
 
-    const cacheRequest = /^\/media-cache\/((?:igdl|ytdl)--?\d+-\d+-\d+)$/.exec(requestUrl.pathname);
+    const cacheRequest = /^\/media-cache\/((?:igdl|ytdl)--?\d+-\d+-\d+(?:-(?:audio|song))?)$/.exec(requestUrl.pathname);
     if (request.method === "POST" && cacheRequest) {
       const expected = await instagramSignature(env.BOT_TOKEN, `cache:${cacheRequest[1]}`);
       if (!equalSignature(request.headers.get("x-media-cache-token") || "", expected)) return new Response("Forbidden", { status: 403 });
@@ -1040,7 +1046,7 @@ export default {
       } catch { return new Response("Invalid cache request", { status: 400 }); }
     }
 
-    const completion = /^\/instagram\/events\/(igdl--?\d+-\d+-\d+)$/.exec(requestUrl.pathname);
+    const completion = /^\/instagram\/events\/(igdl--?\d+-\d+-\d+(?:-(?:audio|song))?)$/.exec(requestUrl.pathname);
     if (request.method === "POST" && completion) {
       const expected = await instagramSignature(env.BOT_TOKEN, `event:${completion[1]}`);
       if (!equalSignature(request.headers.get("x-instagram-event-token") || "", expected)) return new Response("Forbidden", { status: 403 });
@@ -1058,7 +1064,7 @@ export default {
     if (
       request.method === "POST" &&
       requestUrl.pathname === "/telegram/webhook" &&
-      request.headers.get("x-telegram-bot-api-secret-token") === WEBHOOK_SECRET
+      request.headers.get("x-telegram-bot-api-secret-token") === (env.WEBHOOK_SECRET || WEBHOOK_SECRET)
     ) {
       let update: TelegramUpdate | null = null;
       try {

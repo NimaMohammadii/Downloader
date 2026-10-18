@@ -1,9 +1,9 @@
-import { getContainer } from "@cloudflare/containers";
+import { getContainer, type Container } from "@cloudflare/containers";
 import { MINI_APP_HTML } from "./mini-app-ui";
 
 type MiniAppEnv = {
   BOT_TOKEN: string;
-  YOUTUBE_DOWNLOADER_CONTAINER: DurableObjectNamespace<any>;
+  YOUTUBE_DOWNLOADER_CONTAINER: DurableObjectNamespace<Container>;
 };
 type TelegramIdentity = { userId: number };
 type MetadataResult = {
@@ -58,7 +58,7 @@ function constantTimeEqual(a: string, b: string): boolean {
 async function hmacSha256(key: Uint8Array, data: string): Promise<Uint8Array> {
   const cryptoKey = await crypto.subtle.importKey(
     "raw",
-    key,
+    new Uint8Array(key),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"],

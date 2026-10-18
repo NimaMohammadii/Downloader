@@ -1,9 +1,11 @@
 import json
 import hashlib
 import math
+import os
 import tempfile
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -56,13 +58,23 @@ def _download_args(client: str) -> list[str]:
 
 
 def _run(command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        command,
-        text=True,
-        capture_output=True,
-        check=True,
-        timeout=timeout,
-    )
+    timeout = app.job_timeout(timeout)
+    # yt-dlp can spawn FFmpeg. Stop the whole process group on timeout so an
+    # expired Workflow cannot leave a child downloading/converting in the VM.
+    with subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          start_new_session=True) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate(timeout=5)
+            raise
+        if process.returncode:
+            raise subprocess.CalledProcessError(process.returncode, command, stdout, stderr)
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def _classify_ytdlp_error(stderr: str) -> tuple[str, str]:

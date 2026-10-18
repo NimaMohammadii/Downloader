@@ -7,6 +7,7 @@ import { applyWebViewport } from "./web-viewport";
 
 type Env = {
   BOT_TOKEN: string;
+  WEBHOOK_SECRET?: string;
   INSTAGRAM_SESSIONID?: string;
   INSTAGRAM_CSRFTOKEN?: string;
   INSTAGRAM_DS_USER_ID?: string;

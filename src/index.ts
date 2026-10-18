@@ -2,6 +2,7 @@ import { telegramFileCache, type AdminStatsEnv } from "./admin";
 
 type Env = Partial<AdminStatsEnv> & {
   BOT_TOKEN: string;
+  WEBHOOK_SECRET?: string;
   INSTAGRAM_SESSIONID?: string;
   INSTAGRAM_CSRFTOKEN?: string;
   INSTAGRAM_DS_USER_ID?: string;
@@ -1407,7 +1408,7 @@ function friendlyError(detail: string): string {
 }
 
 async function handleTelegramWebhook(request: Request, env: Env): Promise<Response> {
-  if (request.headers.get("x-telegram-bot-api-secret-token") !== WEBHOOK_SECRET) {
+  if (request.headers.get("x-telegram-bot-api-secret-token") !== (env.WEBHOOK_SECRET || WEBHOOK_SECRET)) {
     return new Response("Forbidden", { status: 403 });
   }
 
@@ -1532,6 +1533,7 @@ export default {
           mode: "cloudflare-only",
           resolver: "instagram-multistrategy-v11-cobalt-story-graphql",
           botConfigured: Boolean(env.BOT_TOKEN),
+          webhookSecretConfigured: Boolean(env.WEBHOOK_SECRET),
           instagramSessionConfigured: Boolean(env.INSTAGRAM_SESSIONID?.trim()),
           instagramMidConfigured: Boolean(env.INSTAGRAM_MID?.trim()),
           instagramIgDidConfigured: Boolean(env.INSTAGRAM_IG_DID?.trim()),

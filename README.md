@@ -157,10 +157,20 @@ Webhook URL remains unchanged:
 
 `https://downloader.vexaagent.workers.dev/telegram/webhook`
 
-Webhook verification value remains:
+Set a fresh random `WEBHOOK_SECRET` as a Cloudflare Worker secret (32–256 characters, using letters, digits, `_` or `-`). Then register **the same value** as Telegram's `setWebhook.secret_token`. The former verification value was committed publicly and must be rotated; it cannot authenticate a trusted Telegram sender.
 
-`dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1`
+For compatibility, installations without `WEBHOOK_SECRET` still accept the former value until rotation. Once `WEBHOOK_SECRET` is set, every active handler rejects that old value. Merely deploying this code does **not** complete rotation. `/health` reports `webhookSecretConfigured`; it cannot verify Telegram's remote setting.
 
-You do not need to set the webhook again just because the downloader changed from YouTube to Instagram.
+With `BOT_TOKEN` and the same `WEBHOOK_SECRET` supplied privately in your local environment, run `npm run webhook:set` after deploying the Worker secret. The script registers the existing URL, keeps pending updates, times out after 20 seconds, and does not print credentials. Coordinate the two settings: deliveries using the old value will be rejected between changing the Worker secret and registering Telegram's new value. Do not store either credential in GitHub or command-line arguments.
+
+## Repository audit checks
+
+`src/app-main.ts` is the production entry point. Chat downloads use the existing Worker/Workflow/Container chain. The web and Mini App pages are served, but their `/web/*` and `/mini-app/*` backend routes are explicitly disabled with 503 responses; the older Mini App Python entry points are not copied into the production image. This audit does not enable those backends.
+
+YouTube file jobs now share a 25-minute deadline across extraction, both client attempts, conversion and upload, leaving cleanup/reporting time within the 30-minute Workflow step. Timed-out downloader subprocess groups are terminated, including FFmpeg children. The single-video route canonicalizes watch/Shorts/live/embed links and rejects channel/profile/search pages before extraction; `--no-playlist` alone does not prevent channel scans. Playlist links retain their separate bounded route. A Telegram send interrupted at an ambiguous point is not automatically replayed; check the chat before requesting it again.
+
+Instagram audio and song identification have separate deterministic job IDs, so either button can be used once on the same source message. Both retain authenticated completion/cache routes and reply to that source message. Cached Instagram audio/replays/identified songs require a fresh successful source access check; public song-query reuse remains fast.
+
+Local checks: `npm run check`; `node --test tests/*.test.mjs`; and `python -m unittest discover -s tests -p 'test_*.py' -q` in an environment with the Dockerfile's Python dependencies and FFmpeg installed. Tests use local media fixtures and simulated provider/Telegram responses. They do not establish live production-IP extraction, Instagram session validity, Shazam availability or an actual Telegram delivery.
 
 Only download content when you have permission to do so and comply with the source platform's applicable terms.

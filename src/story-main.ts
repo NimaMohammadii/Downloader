@@ -11,6 +11,7 @@ export { AdminStatsStore } from "./admin";
 
 type Env = AdminStatsEnv & {
   BOT_TOKEN: string;
+  WEBHOOK_SECRET?: string;
   INSTAGRAM_SESSIONID?: string;
   INSTAGRAM_CSRFTOKEN?: string;
   INSTAGRAM_DS_USER_ID?: string;
@@ -749,7 +750,7 @@ export default {
     if (
       request.method === "POST" &&
       url.pathname === "/telegram/webhook" &&
-      request.headers.get("x-telegram-bot-api-secret-token") === WEBHOOK_SECRET
+      request.headers.get("x-telegram-bot-api-secret-token") === (env.WEBHOOK_SECRET || WEBHOOK_SECRET)
     ) {
       let update: TelegramUpdate | null = null;
       try {
