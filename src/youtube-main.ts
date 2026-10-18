@@ -31,6 +31,7 @@ type YoutubeDownloadJob = {
   requestMessageId: number;
   userId: number;
   url: string;
+  source?: "pornhub";
   quality?: YoutubeQuality;
   audioMode?: YoutubeAudioMode;
   statusMessageId?: number;
@@ -299,7 +300,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
     );
 
     try {
-      if (!job.quality && !job.audioMode) {
+      if (!job.quality && !job.audioMode && job.source !== "pornhub") {
         statusMessageId = await step.do(
           "show youtube quality status",
           {
@@ -392,7 +393,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           async () => {
             const status = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
               chat_id: job.chatId,
-              text: `⏳ ${selectionText} انتخاب شد؛ دانلود شروع شد…`,
+              text: job.source === "pornhub" ? "⬇️ دارم ویدیوی Pornhub را دانلود می‌کنم…" : `⏳ ${selectionText} انتخاب شد؛ دانلود شروع شد…`,
               reply_parameters: { message_id: job.requestMessageId },
             });
             return status.message_id;
@@ -713,6 +714,19 @@ function extractYouTubeUrl(text: string): string | null {
   return null;
 }
 
+function extractPornhubUrl(text: string): string | null {
+  for (const raw of text.match(/https?:\/\/[^\s<>"']+/gi) ?? []) {
+    try {
+      const url = new URL(raw.replace(/[),.!?\]}]+$/g, ""));
+      if (url.username || url.password || url.port || !/(^|\.)pornhub\.(com|org|net)$/i.test(url.hostname)) continue;
+      const id = url.pathname === "/view_video.php" ? url.searchParams.get("viewkey") : /^\/embed\/([A-Za-z0-9_-]+)\/?$/.exec(url.pathname)?.[1];
+      if (!id || !/^[A-Za-z0-9_-]{1,64}$/.test(id)) continue;
+      return `https://${url.hostname.toLowerCase()}/view_video.php?viewkey=${id}`;
+    } catch { /* Keep scanning URLs in the message. */ }
+  }
+  return null;
+}
+
 function parsePlaylist(text: string): PlaylistInput | null {
   const explicit = /^\/playlist(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text);
   const args = explicit ? text.replace(/^\/playlist(?:@[A-Za-z0-9_]+)?\s*/i, "").trim().split(/\s+/) : [extractYouTubeUrl(text) || text];
@@ -751,6 +765,7 @@ async function createYoutubeInspectWorkflow(
   env: Env,
   update: TelegramUpdate,
   url: string,
+  source?: "pornhub",
 ): Promise<Response> {
   const message = update.message!;
   const user = trackedUser(message);
@@ -760,11 +775,12 @@ async function createYoutubeInspectWorkflow(
 
   const userId = user?.id ?? message.chat.id;
   const job: YoutubeDownloadJob = {
-    id: `ytq-${update.update_id}`,
+    id: source === "pornhub" ? `ytdl-${message.chat.id}-${message.message_id}-${userId}` : `ytq-${update.update_id}`,
     chatId: message.chat.id,
     requestMessageId: message.message_id,
     userId,
     url,
+    ...(source ? { source } : {}),
   };
 
   try {
@@ -775,7 +791,7 @@ async function createYoutubeInspectWorkflow(
       console.error("youtube inspect workflow create failed", { jobId: job.id, detail });
       await safeTelegramCall(env.BOT_TOKEN, "sendMessage", {
         chat_id: message.chat.id,
-        text: "❌ نتونستم کیفیت‌های YouTube رو بررسی کنم. دوباره لینک رو بفرست.",
+        text: source === "pornhub" ? "❌ شروع دانلود Pornhub ناموفق بود؛ دوباره لینک را بفرست." : "❌ نتونستم کیفیت‌های YouTube رو بررسی کنم. دوباره لینک رو بفرست.",
         reply_parameters: { message_id: message.message_id },
       });
     }
@@ -1019,7 +1035,7 @@ export default {
           }
           await telegramCall(env.BOT_TOKEN, "sendMessage", {
             chat_id: message.chat.id,
-            text: "لینک YouTube یا اینستاگرام رو بفرست؛ فایلش رو همین‌جا می‌فرستم ⚡️\n\n🎵 برای آهنگ، اسم آهنگ و خواننده را بنویس یا /music نام آهنگ\n🔎 تشخیص آهنگ: ویس، صدا یا ویدیو بفرست؛ در گروه روی فایل ریپلای کن و /shazam بنویس\n🔎 آهنگ اینستاگرام: دکمهٔ «پیداکردن آهنگ» یا /findmusic و لینک\n🎼 پلی‌لیست YouTube: لینک پلی‌لیست یا /playlist لینک 1-20\n🎧 صدای اینستاگرام: دکمهٔ «فقط صدا» یا /audio و لینک ویدیو\nضبط لایو: /live username\nبازپخش: /replay و لینک بازپخش منتشرشده\nتوقف ضبط با دکمهٔ زیر پیام ضبط انجام می‌شود.",
+            text: "لینک YouTube، Pornhub یا اینستاگرام رو بفرست؛ فایلش رو همین‌جا می‌فرستم ⚡️\n\n🎵 برای آهنگ، اسم آهنگ و خواننده را بنویس یا /music نام آهنگ\n🔎 تشخیص آهنگ: ویس، صدا یا ویدیو بفرست؛ در گروه روی فایل ریپلای کن و /shazam بنویس\n🔎 آهنگ اینستاگرام: دکمهٔ «پیداکردن آهنگ» یا /findmusic و لینک\n🎼 پلی‌لیست YouTube: لینک پلی‌لیست یا /playlist لینک 1-20\n🎧 صدای اینستاگرام: دکمهٔ «فقط صدا» یا /audio و لینک ویدیو\nضبط لایو: /live username\nبازپخش: /replay و لینک بازپخش منتشرشده\nتوقف ضبط با دکمهٔ زیر پیام ضبط انجام می‌شود.",
           });
           return Response.json({ ok: true });
         }
@@ -1036,6 +1052,8 @@ export default {
           await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id, text: "ضبط لایو: /live username\nبازپخش: /replay و لینک پست، Reel یا TV\nهمچنین می‌توانی لینک مستقیم Live را بفرستی." });
           return Response.json({ ok: true });
         }
+        const pornhubUrl = extractPornhubUrl(text);
+        if (pornhubUrl) return createYoutubeInspectWorkflow(env, update, pornhubUrl, "pornhub");
         const youtubeUrl = extractYouTubeUrl(text);
         if (youtubeUrl) {
           return createYoutubeInspectWorkflow(env, update, youtubeUrl);

@@ -22,6 +22,12 @@ The Docker image and Container/Workflow bindings must be deployed with `npx wran
 
 The YouTube runtime matches ai-configa: image `friedrichrehren/yt-dlp:2026.08.19`, Deno, and isolated `web_embedded` then `android_vr` clients. Metadata loads the normal YouTube webpage/configuration; the selected client is reused when downloading. No browser token-provider service or floating prerelease yt-dlp install is used in this path. YouTube can still require authentication or reject a server's network; matching the runtime does not guarantee that every public video is accessible.
 
+## Pornhub in bot chat
+
+Send a direct Pornhub video URL (`view_video.php?viewkey=...` or `/embed/...`) on `pornhub.com`, `pornhub.org` or `pornhub.net`, including mobile/language subdomains. The bot downloads immediately using yt-dlp, preferring the best available resolution up to 1080p, and sends one complete MP4 through the existing Telegram sender. No new secrets or bindings are required. Deploy both the Worker and rebuilt Container to enable it.
+
+The 2,000,000,000-byte limit still applies. Failed fragments, unreadable video and incomplete duration checks prevent sending a partial file. Private/deleted videos and login, region or server-access restrictions can prevent downloads. Channel, search and playlist links are not supported.
+
 ## Supported Instagram links
 
 - Instagram Reel

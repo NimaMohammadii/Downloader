@@ -5,7 +5,7 @@ import test from 'node:test';
 
 const source = await readFile(new URL('../src/youtube-main.ts', import.meta.url), 'utf8');
 const { outputFiles } = await build({
-  stdin: { contents: source, loader: 'ts', resolveDir: process.cwd() },
+  stdin: { contents: source + '\nexport {extractPornhubUrl};', loader: 'ts', resolveDir: process.cwd() },
   bundle: true, format: 'esm', write: false,
   plugins: [{ name: 'cloudflare-test-bindings', setup(build) {
     build.onResolve({ filter: /.*/ }, args => ({ path: args.path, namespace: 'test' }));
@@ -28,9 +28,47 @@ const { outputFiles } = await build({
     });
   } }],
 });
-const { YoutubeDownloadWorkflow } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
+const { YoutubeDownloadWorkflow, extractPornhubUrl, default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
 
-async function run({ inspect = false, startupError, httpError, sizes, credentials = true } = {}) {
+test('Pornhub URLs normalize direct, mobile, language and embed links', () => {
+  for (const host of ['www.pornhub.com', 'm.pornhub.org', 'fr.pornhub.net']) {
+    assert.equal(extractPornhubUrl(`download (http://${host}/view_video.php?viewkey=ph123&tracking=x).`), `https://${host}/view_video.php?viewkey=ph123`);
+    assert.equal(extractPornhubUrl(`https://${host}/embed/ph123`), `https://${host}/view_video.php?viewkey=ph123`);
+  }
+  for (const url of ['https://pornhub.com.attacker.test/view_video.php?viewkey=ph123',
+    'https://evilpornhub.com/view_video.php?viewkey=ph123', 'https://pornhub.com/video/search',
+    'https://user:pass@pornhub.com/view_video.php?viewkey=ph123', 'https://pornhub.com:444/view_video.php?viewkey=ph123',
+    'https://pornhub.com/view_video.php?viewkey=../../bad']) assert.equal(extractPornhubUrl(url), null);
+});
+
+test('Pornhub starts download without YouTube inspection or quality buttons', async () => {
+  const r = await run({ pornhub: true });
+  assert.deepEqual(r.calls.map(c => c[0]), ['start', '/download']);
+  assert.equal(r.delivered, 1);
+  assert.ok(r.messages.some(m => m.text?.includes('Pornhub')));
+  assert.ok(!r.messages.some(m => m.reply_markup?.inline_keyboard?.length));
+});
+
+test('text and caption Pornhub links queue a deterministic direct-download job', async () => {
+  const jobs = [];
+  const env = { BOT_TOKEN: 'fictional', YOUTUBE_DOWNLOAD_WORKFLOW: { async create(job) { jobs.push(job); } } };
+  for (const field of ['text', 'caption']) {
+    const request = new Request('https://worker/telegram/webhook', { method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-telegram-bot-api-secret-token': 'dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1' },
+      body: JSON.stringify({ update_id: 100, message: { message_id: 7, from: { id: 42 }, chat: { id: -42 },
+        [field]: 'https://pornhub.com/embed/ph123' } }),
+    });
+    assert.equal((await worker.fetch(request, env, {})).status, 200);
+  }
+  assert.equal(jobs.length, 2);
+  assert.equal(jobs[0].id, 'ytdl--42-7-42');
+  assert.equal(jobs[0].id, jobs[1].id);
+  assert.equal(jobs[0].params.source, 'pornhub');
+  assert.equal(jobs[0].params.url, 'https://pornhub.com/view_video.php?viewkey=ph123');
+  assert.equal(jobs[0].params.quality, undefined);
+});
+
+async function run({ inspect = false, startupError, httpError, sizes, credentials = true, pornhub = false } = {}) {
   const messages = [];
   const calls = [];
   const steps = [];
@@ -58,7 +96,7 @@ async function run({ inspect = false, startupError, httpError, sizes, credential
   } };
   const job = { id: 'test-job', chatId: 42, userId: 42, requestMessageId: 7,
     url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
-    ...(inspect ? {} : { quality: 720, statusMessageId: 10 }),
+    ...(pornhub ? { source: 'pornhub', url: 'https://www.pornhub.com/view_video.php?viewkey=ph123' } : inspect ? {} : { quality: 720, statusMessageId: 10 }),
   };
   await new YoutubeDownloadWorkflow({}, { BOT_TOKEN: 'secret-token', ...(credentials ? { API_ID: '123', API_HASH: 'secret-hash' } : {}) }).run({ payload: job }, step);
   return { calls, messages, steps, delivered: globalThis.delivered };

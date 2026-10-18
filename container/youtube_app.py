@@ -672,6 +672,9 @@ def send_audio_file(
 
 
 def process_job(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("source") == "pornhub":
+        from pornhub import process_job as process_pornhub_job
+        return process_pornhub_job(payload)
     token = str(payload.get("botToken") or "")
     url = str(payload.get("url") or "")
     chat_id = int(payload.get("chatId"))
