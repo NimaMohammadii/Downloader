@@ -442,6 +442,12 @@ test('persistent Telegram cache sanitizes context, expires entries, bounds stora
     assert.equal((await req({op:'put',key,value:{method:'sendAudio',fileId:'valid_id',data:{caption:'Hello',chat_id:99,reply_parameters:'private'}}})).status,200);
     const hit=(await (await req({op:'get',key})).json()).value;
     assert.deepEqual(hit.data,{caption:'Hello'});
+    await req({op:'put',key,value:{...hit,fileSize:12345,hasAudio:false}});
+    const reusable=(await (await req({op:'get',key})).json()).value;
+    assert.equal(reusable.fileSize,12345);assert.equal(reusable.hasAudio,false);
+    await req({op:'put',key,value:{...hit,fileSize:-1,hasAudio:'true'}});
+    const incomplete=(await (await req({op:'get',key})).json()).value;
+    assert.equal(incomplete.fileSize,undefined);assert.equal(incomplete.hasAudio,undefined);
     db.prepare('UPDATE telegram_file_cache SET created_at=0 WHERE key=?').run(key);
     assert.equal((await (await req({op:'get',key})).json()).value,null);
     assert.equal((await req({op:'put',key,value:{method:'sendMessage',fileId:'valid'}})).status,400);

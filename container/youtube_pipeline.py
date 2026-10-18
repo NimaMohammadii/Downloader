@@ -12,7 +12,7 @@ import time
 import unicodedata
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, parse_qsl, urlencode
 
 import requests
 
@@ -1211,7 +1211,29 @@ def social_prepare_entry(entry: dict[str, Any], platform: str, workdir: Path, bu
         raise social_error(platform, type(exc).__name__) from exc
 
 
-def prepare_social_media(social: dict[str, Any], workdir: Path) -> tuple[str, list[dict[str, Any]]]:
+def social_cache_key(platform: str, url: str, index: int, entry: dict[str, Any], audio_only: bool) -> str:
+    # Bind reuse to the freshly extracted item, not just its position in a post.
+    # Ignore signing parameters, but keep content selectors in query strings.
+    def asset_key(value: str) -> str:
+        parsed = urlparse(value)
+        auth_keys = {"token", "sig", "signature", "expires", "expire", "policy", "key-pair-id", "x-signature", "x-expires"}
+        query = sorted((key, val) for key, val in parse_qsl(parsed.query, keep_blank_values=True)
+                       if key.lower() not in auth_keys and not key.lower().startswith(("x-amz-", "x-goog-")))
+        return parsed._replace(query=urlencode(query), fragment="").geturl()
+    urls = [str(f.get("url") or "") for f in entry.get("formats", [])] if entry.get("formats") else [str(entry.get("url") or "")]
+    assets = sorted({asset_key(value) for value in urls if value})
+    formats = sorted(json.dumps({key: fmt.get(key) for key in ("format_id", "vcodec", "acodec", "ext", "width", "height", "filesize")}, sort_keys=True)
+                     for fmt in entry.get("formats", []))
+    identity = {"platform": platform, "url": url, "index": index, "assets": assets,
+                "id": str(entry.get("id") or ""), "image": bool(entry.get("image")),
+                "title": str(entry.get("track") or entry.get("title") or SOCIAL_NAMES[platform])[:180],
+                "artist": str(entry.get("artist") or entry.get("uploader") or "")[:120],
+                "duration": entry.get("duration") or 0, "formats": formats, "hasAudio": entry.get("has_audio"),
+                "mode": "audio" if audio_only or platform == "soundcloud" else "video", "version": 2}
+    return "social:" + hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def prepare_social_media(social: dict[str, Any], workdir: Path, *, cache_payload: dict[str, Any] | None = None) -> tuple[str, list[dict[str, Any]]]:
     platform = str(social.get("platform") or "")
     url = resolve_social_url(str(social.get("url") or ""), platform)
     deadline = time.monotonic() + 1500
@@ -1241,13 +1263,30 @@ def prepare_social_media(social: dict[str, Any], workdir: Path) -> tuple[str, li
     for index, entry in indexed:
         if time.monotonic() >= deadline:
             raise app.UserVisibleError("❌ دریافت پست بیش از حد طول کشید؛ فایل‌ها ارسال نشدند.")
+        if total >= app.DIRECT_TELEGRAM_LIMIT:
+            raise app.UserVisibleError("❌ مجموع حجم فایل‌های پست از سقف 2 گیگابایت بیشتر است.")
         directory = workdir / f"item-{index + 1}"
         directory.mkdir()
-        item = social_prepare_entry(entry, platform, directory, app.DIRECT_TELEGRAM_LIMIT - total, deadline, audio_only=audio_only)
-        total += item["path"].stat().st_size
+        key = social_cache_key(platform, url, index, entry, audio_only)
+        expected_method = "sendAudio" if audio_only or platform == "soundcloud" else "sendVideo"
+        cached = app.file_cache(cache_payload, "get", key) if cache_payload and not entry.get("image") else None
+        if (isinstance(cached, dict) and cached.get("method") == expected_method
+                and isinstance(cached.get("fileId"), str) and re.fullmatch(r"[A-Za-z0-9_-]{1,1024}", cached["fileId"])
+                and isinstance(cached.get("data"), dict)
+                and type(cached.get("fileSize")) is int and 0 < cached["fileSize"] <= app.DIRECT_TELEGRAM_LIMIT
+                and (expected_method != "sendVideo" or type(cached.get("hasAudio")) is bool)):
+            item = {"cached": cached, "method": expected_method, "data": cached["data"], "fileSize": cached["fileSize"],
+                    "hasAudio": cached.get("hasAudio", False),
+                    "title": str(entry.get("track") or entry.get("title") or SOCIAL_NAMES[platform])[:180]}
+        else:
+            item = social_prepare_entry(entry, platform, directory, app.DIRECT_TELEGRAM_LIMIT - total, deadline, audio_only=audio_only)
+            item["fileSize"] = item["path"].stat().st_size
+        total += item["fileSize"]
+        if total > app.DIRECT_TELEGRAM_LIMIT:
+            raise app.UserVisibleError("❌ مجموع حجم فایل‌های پست از سقف 2 گیگابایت بیشتر است.")
         item["caption"] = f"{item['title']}\n{SOCIAL_NAMES[platform]} {index + 1}/{len(entries)}\n{url}"
         item["index"] = index
-        item["cacheKey"] = "social:" + hashlib.sha256(f"{platform}:{url}:{index}:{'audio:' if audio_only else ''}v1".encode()).hexdigest()
+        item.update({"cacheKey": key, "entry": entry, "directory": directory})
         prepared.append(item)
     return url, prepared
 

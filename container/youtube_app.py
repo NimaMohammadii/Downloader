@@ -826,8 +826,8 @@ def file_cache(payload: dict[str, Any], op: str, key: str | None, value: dict[st
     return None
 
 
-def reuse_cached_file(payload: dict[str, Any], key: str | None, caption: str | None = None, *, reply_markup: dict[str, Any] | None = None) -> bool:
-    cached = file_cache(payload, "get", key)
+def reuse_cached_file(payload: dict[str, Any], key: str | None, caption: str | None = None, *, reply_markup: dict[str, Any] | None = None, cached: dict[str, Any] | None = None) -> bool:
+    cached = cached if cached is not None else file_cache(payload, "get", key)
     if not isinstance(cached, dict) or cached.get("method") not in {"sendAudio", "sendVideo"} or not cached.get("fileId"):
         return False
     data = dict(cached.get("data") or {})
@@ -847,11 +847,15 @@ def reuse_cached_file(payload: dict[str, Any], key: str | None, caption: str | N
         raise UserVisibleError("❌ ارسال فایل ذخیره‌شده کامل نشد؛ برای جلوگیری از ارسال تکراری، آپلود دوباره شروع نشد.") from exc
 
 
-def store_uploaded_file(payload: dict[str, Any], keys: list[str | None], method: str, data: dict[str, Any], result: Any) -> None:
+def store_uploaded_file(payload: dict[str, Any], keys: list[str | None], method: str, data: dict[str, Any], result: Any, *, file_size: int | None = None, has_audio: bool | None = None) -> None:
     if not isinstance(result, dict) or not result.get("file_id"):
         return
     allowed = {key: data[key] for key in ("caption", "title", "performer", "width", "height", "duration", "supports_streaming") if key in data}
     value = {"method": method, "fileId": result["file_id"], "data": allowed}
+    if type(file_size) is int and 0 < file_size <= DIRECT_TELEGRAM_LIMIT:
+        value["fileSize"] = file_size
+    if type(has_audio) is bool:
+        value["hasAudio"] = has_audio
     for key in dict.fromkeys(keys):
         if key:
             file_cache(payload, "put", key, value)
@@ -1128,7 +1132,7 @@ class InstagramCapture:
                 return
             if self.source.get("social"):
                 from youtube_pipeline import prepare_social_media
-                self.social_url, self.social_items = prepare_social_media(self.source["social"], self.workdir)
+                self.social_url, self.social_items = prepare_social_media(self.source["social"], self.workdir, cache_payload=self.payload)
                 self.social_sent = 0
                 self.result = {"ok": True}
                 with self.lock:
@@ -1402,36 +1406,57 @@ class InstagramCapture:
                 self.state = "failed"
             return {"ok": False}
 
+    def social_delivery_options(self, item: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        markup = None
+        if item["method"] == "sendVideo" and item.get("hasAudio"):
+            owner = int(self.payload.get("userId") or self.id.rsplit("-", 1)[-1])
+            index = int(item.get("index", 0))
+            signature = hmac.new(self.payload["botToken"].encode(),
+                f"social-audio:{self.payload['chatId']}:{owner}:{index}:{self.social_url}".encode(), hashlib.sha256).hexdigest()[:16]
+            markup = {"inline_keyboard": [[{"text": "🎵 فقط صدا", "callback_data": f"soa|{index}|{owner}|{signature}"}]]}
+        data = {"chat_id": str(self.payload["chatId"]), "caption": item["caption"][:1024],
+                "reply_parameters": json.dumps({"message_id": self.payload["requestMessageId"]}), **item["data"]}
+        if markup:
+            data["reply_markup"] = json.dumps(markup)
+        return data, markup
+
     def send_social(self) -> dict[str, Any]:
-        # Preparing all files precedes sending any. A failed/ambiguous send stops
-        # the batch; neither the Workflow nor this method retries publishing it.
+        # Resolve every item and prepare cache misses before publishing. An
+        # explicitly rejected cached ID can be replaced from its fresh metadata;
+        # an ambiguous send stops the batch without another publish attempt.
         deadline = time.monotonic() + 25 * 60
         try:
             for item in self.social_items:
                 if self.cleanup_requested or time.monotonic() >= deadline:
                     raise UserVisibleError("ارسال به سقف زمان رسید.")
                 method = item["method"]
-                markup = None
-                if method == "sendVideo" and item.get("hasAudio"):
-                    owner = int(self.payload.get("userId") or self.id.rsplit("-", 1)[-1])
-                    index = int(item.get("index", 0))
-                    signature = hmac.new(self.payload["botToken"].encode(),
-                        f"social-audio:{self.payload['chatId']}:{owner}:{index}:{self.social_url}".encode(), hashlib.sha256).hexdigest()[:16]
-                    markup = {"inline_keyboard": [[{"text": "🎵 فقط صدا", "callback_data": f"soa|{index}|{owner}|{signature}"}]]}
-                data = {"chat_id": str(self.payload["chatId"]), "caption": item["caption"][:1024],
-                        "reply_parameters": json.dumps({"message_id": self.payload["requestMessageId"]}), **item["data"]}
-                if markup:
-                    data["reply_markup"] = json.dumps(markup)
-                if method not in {"sendAudio", "sendVideo"} or not reuse_cached_file(self.payload, item["cacheKey"], item["caption"], reply_markup=markup):
+                data, markup = self.social_delivery_options(item)
+                cached = item.get("cached")
+                reused = cached is not None and reuse_cached_file(self.payload, item["cacheKey"], item["caption"], reply_markup=markup, cached=cached)
+                if not reused:
+                    if "path" not in item:
+                        from youtube_pipeline import social_prepare_entry
+                        remaining_size = DIRECT_TELEGRAM_LIMIT - sum(other.get("fileSize", 0) for other in self.social_items if other is not item)
+                        if remaining_size <= 0:
+                            raise UserVisibleError("❌ مجموع حجم فایل‌های پست از سقف 2 گیگابایت بیشتر است.")
+                        social = self.source["social"]
+                        item.update(social_prepare_entry(item["entry"], social["platform"], item["directory"], remaining_size, deadline,
+                                                         audio_only=bool(social.get("audioOnly"))))
+                        item["fileSize"] = item["path"].stat().st_size
+                        method = item["method"]
+                        data, markup = self.social_delivery_options(item)
                     mime = {"sendPhoto": "image/jpeg", "sendDocument": "image/jpeg", "sendAudio": "audio/mpeg", "sendVideo": "video/mp4"}[method]
                     self.safe_status(f"📤 در حال ارسال فایل {self.social_sent + 1}/{len(self.social_items)}…")
                     with item["path"].open("rb") as handle:
                         sent = asyncio.run(asyncio.wait_for(upload_complete_file(self.payload["botToken"], method, data,
                             (item["path"].name, handle, mime)), timeout=max(1, deadline - time.monotonic())))
                     if method in {"sendAudio", "sendVideo"}:
-                        store_uploaded_file(self.payload, [item["cacheKey"]], method, data, sent)
+                        store_uploaded_file(self.payload, [item["cacheKey"]], method, data, sent,
+                                            file_size=item.get("fileSize") or item["path"].stat().st_size,
+                                            has_audio=item.get("hasAudio"))
                 self.social_sent += 1
-                item["path"].unlink(missing_ok=True)
+                if "path" in item:
+                    item["path"].unlink(missing_ok=True)
             with self.lock:
                 self.state = "sent"
             delete_status(self.payload["botToken"], self.payload["chatId"], self.payload["statusMessageId"])

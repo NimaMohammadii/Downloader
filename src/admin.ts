@@ -49,6 +49,8 @@ export type CachedTelegramFile = {
   method: "sendAudio" | "sendVideo";
   fileId: string;
   data: Record<string, string | number | boolean>;
+  fileSize?: number;
+  hasAudio?: boolean;
 };
 
 function cleanCachedFile(value: any): CachedTelegramFile | null {
@@ -60,7 +62,10 @@ function cleanCachedFile(value: any): CachedTelegramFile | null {
     if (typeof item === "string") data[key] = item.slice(0, key === "caption" ? 1024 : 180);
     else if (typeof item === "boolean" || (typeof item === "number" && Number.isFinite(item))) data[key] = item;
   }
-  return { method: value.method, fileId: value.fileId, data };
+  return { method: value.method, fileId: value.fileId, data,
+    ...(Number.isSafeInteger(value.fileSize) && value.fileSize > 0 && value.fileSize <= 2_000_000_000 ? { fileSize: value.fileSize } : {}),
+    ...(typeof value.hasAudio === "boolean" ? { hasAudio: value.hasAudio } : {}),
+  };
 }
 
 type SummarySqlRow = {

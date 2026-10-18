@@ -348,6 +348,196 @@ class SocialFileTests(unittest.TestCase):
                 p.social_prepare_entry({'image':True},'pinterest',Path(d),1000000,time.monotonic()+60,audio_only=True)
 
 
+class SocialEarlyCacheTests(unittest.TestCase):
+    @staticmethod
+    def cached(**changes):
+        return {'method':'sendVideo','fileId':'cached_id','fileSize':1234,'hasAudio':True,
+                'data':{'duration':1,'caption':'old'},**changes}
+
+    @staticmethod
+    def prepare(entry,platform,directory,budget,deadline,*,audio_only):
+        method='sendAudio' if audio_only or platform=='soundcloud' else 'sendPhoto' if entry.get('image') else 'sendVideo'
+        path=directory/'fixture';path.write_bytes(b'complete')
+        return {'path':path,'method':method,'data':{},'title':entry.get('title','Fixture'),'hasAudio':method=='sendVideo'}
+
+    def test_fresh_metadata_cache_hit_skips_media_download_for_every_service(self):
+        cases=[('x','https://x.com/i/status/123','social_ytdlp_entries'),
+               ('tiktok','https://www.tiktok.com/@a/video/123','social_ytdlp_entries'),
+               ('pinterest','https://www.pinterest.com/pin/123/','social_gallery_entries'),
+               ('aparat','https://www.aparat.com/v/abc123','aparat_entries'),
+               ('soundcloud','https://soundcloud.com/artist/song','social_ytdlp_entries')]
+        for platform,url,extractor in cases:
+            with self.subTest(platform=platform),tempfile.TemporaryDirectory() as d:
+                cached={'method':'sendAudio' if platform=='soundcloud' else 'sendVideo','fileId':'cached_id',
+                        'fileSize':1234,'hasAudio':True,'data':{'duration':1}}
+                with patch.object(p,extractor,return_value=[metadata('x')]) as resolve, \
+                     patch.object(app,'file_cache',return_value=cached) as cache, \
+                     patch.object(p,'social_prepare_entry') as prepare:
+                    _,items=p.prepare_social_media({'platform':platform,'url':url},Path(d),cache_payload=payload())
+                resolve.assert_called_once();cache.assert_called_once();prepare.assert_not_called()
+                self.assertEqual(items[0]['cached']['fileId'],'cached_id')
+                self.assertNotIn('path',items[0]);self.assertEqual(items[0]['fileSize'],1234)
+
+    def test_source_rejection_is_checked_before_reading_a_cached_file(self):
+        with tempfile.TemporaryDirectory() as d, \
+             patch.object(p,'aparat_entries',side_effect=app.UserVisibleError('download disabled')) as resolve, \
+             patch.object(app,'file_cache',return_value=self.cached()) as cache,patch.object(p,'social_prepare_entry') as prepare:
+            with self.assertRaisesRegex(app.UserVisibleError,'download disabled'):
+                p.prepare_social_media({'platform':'aparat','url':'https://www.aparat.com/v/abc123'},Path(d),cache_payload=payload())
+            resolve.assert_called_once();cache.assert_not_called();prepare.assert_not_called()
+
+    def test_a_previously_cached_song_cannot_bypass_a_current_preview_only_restriction(self):
+        entry=metadata('soundcloud');entry['formats'][0]['format_id']='hls_mp3_preview'
+        with tempfile.TemporaryDirectory() as d,patch.object(p,'social_json',return_value=entry), \
+             patch.object(app,'file_cache',return_value=self.cached(method='sendAudio')) as cache, \
+             patch.object(p,'social_prepare_entry') as prepare:
+            with self.assertRaisesRegex(app.UserVisibleError,'پیش‌نمایش'):
+                p.prepare_social_media({'platform':'soundcloud','url':'https://soundcloud.com/artist/song'},Path(d),cache_payload=payload())
+            cache.assert_not_called();prepare.assert_not_called()
+
+    def test_source_identity_modes_and_indices_control_reuse_but_rotating_signatures_do_not(self):
+        entry=metadata();entry['formats'][0]['url']='https://video.twimg.com/play.mp4?item=first&token=old&Expires=1'
+        key=lambda e,**kw:p.social_cache_key('x','https://x.com/i/status/123',kw.get('index',0),e,kw.get('audio',False))
+        original=key(entry)
+        rotated=copy.deepcopy(entry);rotated['formats'][0]['url']='https://video.twimg.com/play.mp4?Expires=2&token=new&item=first'
+        self.assertEqual(original,key(rotated))
+        changed=copy.deepcopy(entry);changed['formats'][0]['url']='https://video.twimg.com/play.mp4?item=second&token=old'
+        self.assertNotEqual(original,key(changed))
+        for changes in [{'id':'124'},{'title':'Updated title'},{'duration':2}]:
+            self.assertNotEqual(original,key({**entry,**changes}))
+        silent=copy.deepcopy(entry);silent['formats'][0]['acodec']='none'
+        self.assertNotEqual(original,key(silent))
+        self.assertNotEqual(original,key(entry,index=1));self.assertNotEqual(original,key(entry,audio=True))
+
+    def test_old_incomplete_wrong_type_and_unavailable_cache_entries_download_normally(self):
+        old=self.cached();old.pop('fileSize')
+        old_audio=self.cached();old_audio.pop('hasAudio')
+        for cached in [None,old,old_audio,self.cached(fileSize=True),self.cached(hasAudio='true'),
+                       self.cached(fileId='../invalid'),self.cached(method='sendAudio'),self.cached(data=None)]:
+            with self.subTest(cached=cached),tempfile.TemporaryDirectory() as d, \
+                 patch.object(p,'social_ytdlp_entries',return_value=[metadata()]), \
+                 patch.object(app,'file_cache',return_value=cached), \
+                 patch.object(p,'social_prepare_entry',side_effect=self.prepare) as prepare:
+                _,items=p.prepare_social_media({'platform':'x','url':'https://x.com/i/status/123'},Path(d),cache_payload=payload())
+                prepare.assert_called_once();self.assertTrue(items[0]['path'].is_file());self.assertNotIn('cached',items[0])
+
+    def test_gallery_keeps_original_order_and_prepares_only_misses_and_photos(self):
+        entries=[{'id':str(i),'title':f'item {i}','url':f'https://v.pinimg.com/{i}.mp4','image':i==1} for i in range(4)]
+        with tempfile.TemporaryDirectory() as d,patch.object(p,'social_gallery_entries',return_value=entries), \
+             patch.object(app,'file_cache',side_effect=[self.cached(),None,self.cached()]) as cache, \
+             patch.object(p,'social_prepare_entry',side_effect=self.prepare) as prepare:
+            _,items=p.prepare_social_media({'platform':'pinterest','url':'https://www.pinterest.com/pin/123/'},Path(d),cache_payload=payload())
+            self.assertEqual([i['index'] for i in items],[0,1,2,3]);self.assertEqual(cache.call_count,3)
+            self.assertEqual([c.args[0]['id'] for c in prepare.call_args_list],['1','2'])
+            self.assertEqual(['cached' in i for i in items],[True,False,False,True])
+
+    def test_cached_sizes_preserve_the_combined_post_limit_before_any_send(self):
+        with tempfile.TemporaryDirectory() as d,patch.object(p,'social_ytdlp_entries',return_value=[metadata(),metadata()]), \
+             patch.object(app,'file_cache',return_value=self.cached(fileSize=1_500_000_000)), \
+             patch.object(p,'social_prepare_entry') as prepare,patch.object(app,'telegram_call') as send:
+            with self.assertRaisesRegex(app.UserVisibleError,'2 گیگابایت'):
+                p.prepare_social_media({'platform':'x','url':'https://x.com/i/status/123'},Path(d),cache_payload=payload())
+            prepare.assert_not_called();send.assert_not_called()
+
+    def test_selected_gallery_audio_cache_never_prepares_neighboring_items(self):
+        entries=[{'id':str(i),'title':f'item {i}','url':f'https://v.pinimg.com/{i}.mp4'} for i in range(3)]
+        with tempfile.TemporaryDirectory() as d,patch.object(p,'social_gallery_entries',return_value=entries), \
+             patch.object(app,'file_cache',return_value=self.cached(method='sendAudio')) as cache, \
+             patch.object(p,'social_prepare_entry') as prepare:
+            _,items=p.prepare_social_media({'platform':'pinterest','url':'https://www.pinterest.com/pin/123/',
+                                            'audioOnly':True,'itemIndex':2},Path(d),cache_payload=payload())
+            self.assertEqual([i['index'] for i in items],[2]);prepare.assert_not_called();cache.assert_called_once()
+            self.assertEqual(cache.call_args.args[2],items[0]['cacheKey'])
+
+    def run_cached_job(self, *, rejection=None, mixed=False, has_audio=True):
+        job=app.InstagramCapture({**payload(),'userId':42})
+        calls=[];puts=[];prepares=[]
+        entries=[metadata(),{**metadata(),'id':'124','title':'Second'}] if mixed else [metadata()]
+        def cache(payload,op,key,value=None):
+            if op=='get':
+                if mixed and key==p.social_cache_key('x','https://x.com/i/status/123',1,entries[1],False):return None
+                return self.cached(hasAudio=has_audio)
+            puts.append((op,key,value));return None
+        def prepare(*args,**kwargs):
+            prepares.append(args[0]['id']);return self.prepare(*args,**kwargs)
+        def telegram(token,method,*,json_payload,timeout):
+            calls.append(('cached',json_payload))
+            if rejection:raise rejection
+            return {'message_id':10}
+        async def upload(token,method,data,file):
+            calls.append(('upload',data));return {'message_id':11,'file_id':'new_id'}
+        try:
+            with patch.object(p,'social_ytdlp_entries',return_value=entries),patch.object(app,'file_cache',side_effect=cache), \
+                 patch.object(p,'social_prepare_entry',side_effect=prepare),patch.object(job,'notify'), \
+                 patch.object(job,'safe_status'),patch.object(app,'delete_status'), \
+                 patch.object(app,'telegram_call',side_effect=telegram),patch.object(app,'upload_complete_file',side_effect=upload):
+                job.run();self.assertEqual(job.state,'ready');result=job.send();again=job.send()
+            return result,again,calls,puts,prepares,job.social_items
+        finally:job.cleanup()
+
+    def test_valid_cache_sends_without_files_and_refreshes_owner_bound_audio_button(self):
+        import hashlib,hmac
+        result,again,calls,puts,prepares,items=self.run_cached_job()
+        self.assertTrue(result['ok']);self.assertTrue(again['ok']);self.assertEqual(prepares,[])
+        self.assertEqual([x[0] for x in calls],['cached']);self.assertNotIn('path',items[0])
+        data=calls[0][1];self.assertEqual(data['chat_id'],42);self.assertEqual(data['reply_parameters'],{'message_id':7})
+        signature=hmac.new(b'fake',b'social-audio:42:42:0:https://x.com/i/status/123',hashlib.sha256).hexdigest()[:16]
+        self.assertEqual(data['reply_markup']['inline_keyboard'][0][0]['callback_data'],f'soa|0|42|{signature}')
+        result,_,calls,_,prepares,_=self.run_cached_job(has_audio=False)
+        self.assertTrue(result['ok']);self.assertEqual(prepares,[]);self.assertNotIn('reply_markup',calls[0][1])
+
+    def test_explicit_invalid_id_evicts_and_prepares_only_that_item_then_refreshes_cache(self):
+        result,again,calls,puts,prepares,_=self.run_cached_job(rejection=RuntimeError('wrong file identifier'))
+        self.assertTrue(result['ok']);self.assertTrue(again['ok']);self.assertEqual(prepares,['123'])
+        self.assertEqual([x[0] for x in calls],['cached','upload'])
+        self.assertEqual([x[0] for x in puts],['delete','put'])
+        refreshed=puts[-1][2];self.assertEqual(refreshed['fileId'],'new_id');self.assertEqual(refreshed['fileSize'],8)
+        self.assertTrue(refreshed['hasAudio']);self.assertNotIn('chat_id',refreshed['data'])
+
+    def test_ambiguous_cached_send_never_downloads_uploads_or_repeats(self):
+        result,again,calls,puts,prepares,_=self.run_cached_job(rejection=TimeoutError('ambiguous'))
+        self.assertFalse(result['ok']);self.assertFalse(again['ok']);self.assertEqual(result['parts'],0)
+        self.assertEqual([x[0] for x in calls],['cached']);self.assertEqual(prepares,[]);self.assertEqual(puts,[])
+
+    def test_mixed_cached_and_new_items_deliver_in_order_without_repreparing_the_hit(self):
+        result,again,calls,puts,prepares,_=self.run_cached_job(mixed=True)
+        self.assertTrue(result['ok']);self.assertTrue(again['ok']);self.assertEqual(result['parts'],2)
+        self.assertEqual(prepares,['124']);self.assertEqual([x[0] for x in calls],['cached','upload'])
+        self.assertTrue(calls[0][1]['caption'].startswith('Fixture'))
+        self.assertTrue(calls[1][1]['caption'].startswith('Second'))
+
+    def test_first_request_warms_cache_and_later_users_reuse_video_and_audio_independently(self):
+        stored={};delivered=[]
+        def cache(payload,op,key,value=None):
+            if op=='get':return copy.deepcopy(stored.get(key))
+            if op=='put':stored[key]=copy.deepcopy(value)
+        async def upload(token,method,data,file):
+            delivered.append(('upload',method,data));return {'message_id':10,'file_id':'stored_'+method}
+        def telegram(token,method,*,json_payload,timeout):
+            delivered.append(('cached',method,json_payload));return {'message_id':11}
+        with patch.object(app,'file_cache',side_effect=cache), \
+             patch.object(p,'social_ytdlp_entries',side_effect=lambda *args:[metadata()]) as resolve, \
+             patch.object(p,'social_prepare_entry',side_effect=self.prepare) as prepare, \
+             patch.object(app,'upload_complete_file',side_effect=upload),patch.object(app,'telegram_call',side_effect=telegram), \
+             patch.object(app,'delete_status'):
+            for index,audio in enumerate([False,True,False,True]):
+                owner=42 if index<2 else 99;chat=42 if index<2 else 77
+                job_id=f'igdl-{chat}-{index+7}-{owner}'
+                request={**payload(),'id':job_id,'userId':owner,'chatId':chat,'requestMessageId':index+7,
+                         'completionUrl':f'https://downloader.vexaagent.workers.dev/instagram/events/{job_id}'}
+                request['source']['social']['audioOnly']=audio
+                job=app.InstagramCapture(request)
+                try:
+                    with patch.object(job,'notify'),patch.object(job,'safe_status'):
+                        job.run();self.assertEqual(job.state,'ready');self.assertTrue(job.send()['ok'])
+                finally:job.cleanup()
+        self.assertEqual(resolve.call_count,4);self.assertEqual(prepare.call_count,2);self.assertEqual(len(stored),2)
+        self.assertEqual([(x[0],x[1]) for x in delivered],[('upload','sendVideo'),('upload','sendAudio'),('cached','sendVideo'),('cached','sendAudio')])
+        self.assertEqual(delivered[2][2]['chat_id'],77)
+        self.assertEqual(delivered[2][2]['reply_parameters'],{'message_id':9})
+        self.assertIn('|99|',delivered[2][2]['reply_markup']['inline_keyboard'][0][0]['callback_data'])
+
+
 class SocialLifecycleTests(unittest.TestCase):
     def test_social_prepare_uses_existing_completion_event_and_no_instagram_session(self):
         job=app.InstagramCapture(payload())
@@ -397,12 +587,14 @@ class SocialLifecycleTests(unittest.TestCase):
             job=app.InstagramCapture(payload('pinterest'));job.state='ready';job.social_sent=0;job.social_url=url
             path=job.workdir/'Video.mp4';path.write_bytes(b'fixture')
             job.social_items=[{'path':path,'method':'sendVideo','title':'Fixture','data':{},'caption':f'Fixture\n{url}','cacheKey':'test:video','hasAudio':True,'index':1}]
+            if cached:
+                job.social_items[0]['cached']={'fileId':'cached_id'}
             captured=[]
             async def upload(token,method,data,file):captured.append(json.loads(data['reply_markup']));return {'message_id':10}
             try:
                 with patch.object(app,'reuse_cached_file',return_value=cached) as reuse,patch.object(app,'upload_complete_file',side_effect=upload) as up,patch.object(app,'delete_status'),patch.object(job,'safe_status'):
                     self.assertTrue(job.send()['ok'])
-                markup=reuse.call_args.kwargs['reply_markup'];button=markup['inline_keyboard'][0][0]
+                markup=reuse.call_args.kwargs['reply_markup'] if cached else captured[0];button=markup['inline_keyboard'][0][0]
                 sig=hmac.new(b'fake',f'social-audio:42:42:1:{url}'.encode(),hashlib.sha256).hexdigest()[:16]
                 self.assertEqual(button['callback_data'],f'soa|1|42|{sig}');self.assertLessEqual(len(button['callback_data'].encode()),64)
                 self.assertEqual(up.call_count,0 if cached else 1)
