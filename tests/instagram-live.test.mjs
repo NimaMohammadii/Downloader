@@ -5,7 +5,7 @@ import test from 'node:test';
 const source = await readFile(new URL('../src/youtube-main.ts', import.meta.url), 'utf8');
 const story = await readFile(new URL('../src/story-main.ts', import.meta.url), 'utf8');
 const { outputFiles } = await build({
-  stdin: { contents: source + '\nexport {parseInstagramVideoTarget,parseInstagramAudioTarget,resolveInstagramVideo,instagramVideoErrorText,parsePlaylist,mediaCacheKey};', loader: 'ts' },
+  stdin: { contents: source + '\nexport {parseInstagramVideoTarget,parseInstagramAudioTarget,resolveInstagramVideo,instagramVideoErrorText,parsePlaylist,mediaCacheKey,parseSocialUrl};', loader: 'ts' },
   bundle: true, format: 'esm', write: false,
   plugins: [{ name: 'instagram-platform', setup(build) {
     build.onResolve({ filter: /.*/ }, a => ({ path: a.path, namespace: 'test' }));
@@ -416,4 +416,74 @@ test('persistent Telegram cache sanitizes context, expires entries, bounds stora
     assert.deepEqual(names,['telegram-files-123']);
     assert.equal(await admin.telegramFileCache({BOT_TOKEN:'123:secret'},'get',key),null);
   } finally {db.close();}
+});
+
+test('four social services accept individual links, normalize hosts and preserve exact IDs',()=>{
+  const cases=[
+    ['https://twitter.com/name/status/1234567890123456789?s=20','x','https://x.com/i/status/1234567890123456789'],
+    ['https://x.com/i/web/status/123/video/2','x','https://x.com/i/status/123/video/2'],
+    ['https://de.pinterest.com/pin/some-title--123456789/','pinterest','https://www.pinterest.com/pin/123456789/'],
+    ['https://pin.it/AbC123','pinterest','https://pin.it/AbC123'],
+    ['https://vm.tiktok.com/ABC123/','tiktok','https://vm.tiktok.com/ABC123/'],
+    ['https://www.tiktok.com/t/ABC123/','tiktok','https://www.tiktok.com/t/ABC123/'],
+    ['https://www.tiktok.com/@creator/photo/1234567890123456789?x=1','tiktok','https://www.tiktok.com/@creator/photo/1234567890123456789'],
+    ['https://www.tiktok.com/@creator/video/1234567890123456789','tiktok','https://www.tiktok.com/@creator/video/1234567890123456789'],
+    ['/soundcloud https://m.soundcloud.com/artist/track?utm=x','soundcloud','https://soundcloud.com/artist/track'],
+    ['https://on.soundcloud.com/AbC123','soundcloud','https://on.soundcloud.com/AbC123'],
+  ];
+  for(const [text,platform,url] of cases) assert.deepEqual(mod.parseSocialUrl(text),{platform,url});
+  assert.equal(mod.parseSocialUrl('این رو بفرست https://x.com/name/status/123،').platform,'x');
+});
+
+test('social parser rejects credentials, lookalike hosts, profiles, boards and other command routes',()=>{
+  for(const text of [
+    'https://x.com.evil/name/status/123','https://x.com@evil/name/status/123',
+    'https://user:pass@x.com/name/status/123','https://x.com:8443/name/status/123',
+    'https://x.com/name','https://x.com/i/spaces/123','https://www.pinterest.com/name/board/',
+    'https://www.tiktok.com/@creator','https://www.tiktok.com/@creator/live',
+    'https://soundcloud.com/artist/sets','https://soundcloud.com/artist/sets/playlist',
+    'https://soundcloud.com/artist/tracks','https://soundcloud.com/search/sounds',
+    'https://www.pinterest.evil/pin/123','https://vm.tiktok.com.evil/ABC123',
+    '/findmusic https://x.com/name/status/123','/audio https://x.com/name/status/123',
+    'https://www.youtube.com/watch?v=abcdefghijk','https://www.instagram.com/reel/B/'
+  ]) assert.equal(mod.parseSocialUrl(text),null,text);
+});
+
+test('social webhook dispatches all providers into existing media job without music or YouTube substitution',async()=>{
+  const jobs=[],workerEnv={...env,YOUTUBE_DOWNLOAD_WORKFLOW:{async create(job){jobs.push(job);}}};
+  globalThis.fetch=async()=>Response.json({ok:true,result:{message_id:10}});
+  for(const text of ['https://x.com/name/status/123','https://pin.it/ABC123','https://www.tiktok.com/@name/photo/123','https://soundcloud.com/artist/song']) await mediaWebhook({text},workerEnv);
+  assert.deepEqual(jobs.map(j=>j.params.social.platform),['x','pinterest','tiktok','soundcloud']);
+  assert.ok(jobs.every(j=>j.id.startsWith('igdl-')&&!j.params.instagram&&!j.params.quality&&!j.params.playlist));
+  await mediaWebhook({text:'/soundcloud artist song'},workerEnv);
+  assert.equal(jobs.length,4);
+});
+
+test('social workflow sends signed source, waits for event and uploads batch without publish retries',async()=>{
+  const calls=[],messages=[],steps=[];globalThis.delivered=0;globalThis.containerIds=[];
+  const social={platform:'pinterest',url:'https://www.pinterest.com/pin/123/'};
+  globalThis.container={async startAndWaitForPorts(){calls.push('boot');},
+    async instagramRequest(action,payload){calls.push(action);if(action==='start')globalThis.startedPayload=payload;return {ok:true,parts:3};},
+    async releaseInstagram(){calls.push('release');}};
+  globalThis.fetch=async(url,init)=>{messages.push(JSON.parse(init.body));return Response.json({ok:true,result:{message_id:10}});};
+  const step={async do(name,options,fn){if(typeof options==='function'){fn=options;options={};}steps.push({name,options});return fn();},
+    async waitForEvent(name,options){steps.push({name,options});return {payload:{ok:true}};}};
+  await new mod.YoutubeDownloadWorkflow({},{...env,INSTAGRAM_SESSIONID:undefined}).run({payload:{...job,instagram:undefined,social}},step);
+  assert.deepEqual(calls,['boot','start','send','cleanup','release']);
+  assert.deepEqual(globalThis.startedPayload.source.social,social);
+  assert.match(globalThis.startedPayload.completionToken,/^[a-f0-9]{64}$/);
+  assert.ok(!JSON.stringify(globalThis.startedPayload.source).includes(env.INSTAGRAM_SESSIONID));
+  assert.ok(steps.some(s=>s.options.type==='instagram-ready'));
+  assert.equal(steps.find(s=>s.name==='send complete instagram recording').options.retries.limit,0);
+  assert.equal(globalThis.delivered,3);assert.match(messages[0].text,/Pinterest/);
+});
+
+test('social batch failure preserves confirmed count and warns against duplicate sends',async()=>{
+  const messages=[];globalThis.delivered=0;globalThis.containerIds=[];
+  globalThis.container={async startAndWaitForPorts(){},async instagramRequest(action){return action==='send'?{ok:false,parts:1,message:'1 file confirmed; check chat before repeating'}:{ok:true};},async releaseInstagram(){}};
+  globalThis.fetch=async(url,init)=>{messages.push(JSON.parse(init.body));return Response.json({ok:true,result:{message_id:10}});};
+  const step={async do(name,options,fn){return (typeof options==='function'?options:fn)();},async waitForEvent(){return {payload:{ok:true}};}};
+  await new mod.YoutubeDownloadWorkflow({},env).run({payload:{...job,instagram:undefined,social:{platform:'x',url:'https://x.com/i/status/123'}}},step);
+  assert.ok(messages.some(m=>m.text==='1 file confirmed; check chat before repeating'));
+  assert.equal(globalThis.delivered,1);
 });

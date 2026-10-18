@@ -1,12 +1,18 @@
 import json
+import hashlib
 import math
 import tempfile
 import re
 import shutil
 import subprocess
+import sys
+import time
 import unicodedata
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse, urljoin
+
+import requests
 
 import youtube_app as app
 
@@ -847,6 +853,328 @@ def send_media_file(
             token, "sendVideo", data=data,
             files={"video": (path.name, handle, "video/mp4")}, timeout=1800,
         )
+
+
+SOCIAL_NAMES = {"x": "X", "pinterest": "Pinterest", "tiktok": "TikTok", "soundcloud": "SoundCloud"}
+SOCIAL_MAX_ITEMS = 20
+PINTEREST_DOMAINS = "com fr de ch jp cl ca it co.uk nz ru com.au at pt co.kr es com.mx dk ph th com.uy co nl info kr ie vn com.vn ec mx in pe co.at hu co.in co.nz id com.ec com.py tw be uk com.bo com.pe".split()
+
+
+def social_url(value: str, platform: str) -> str:
+    """Validate the same individual-post contract at both trust boundaries."""
+    p = urlparse(value)
+    if platform not in SOCIAL_NAMES or p.scheme not in {"http", "https"} or p.username or p.password or p.port:
+        raise app.UserVisibleError("❌ لینک معتبر این سرویس را بفرست.")
+    host, path = (p.hostname or "").lower(), p.path
+    if platform == "x" and host in {"x.com", "www.x.com", "mobile.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com", "m.twitter.com"}:
+        m = re.fullmatch(r"/(?:[A-Za-z0-9_]+/status|i/web/status|statuses)/(\d{1,25})(?:/video/([1-9]\d?))?/?", path)
+        if m:
+            return f"https://x.com/i/status/{m[1]}" + (f"/video/{m[2]}" if m[2] else "")
+    if platform == "pinterest" and any(host in {f"pinterest.{d}", f"www.pinterest.{d}"} or re.fullmatch(r"[a-z]{2}\.pinterest\." + re.escape(d), host) for d in PINTEREST_DOMAINS):
+        m = re.fullmatch(r"/pin/(?:[\w-]+--)?(\d{1,25})/?", path)
+        if m:
+            return f"https://www.pinterest.com/pin/{m[1]}/"
+    short_hosts = {"pinterest": {"pin.it"}, "tiktok": {"vm.tiktok.com", "vt.tiktok.com"}, "soundcloud": {"on.soundcloud.com"}}
+    if host in short_hosts.get(platform, set()) and re.fullmatch(r"/[A-Za-z0-9_-]{3,128}/?", path):
+        return f"https://{host}{path}"
+    if platform == "tiktok" and host in {"tiktok.com", "www.tiktok.com", "m.tiktok.com"}:
+        m = re.fullmatch(r"/@([\w.-]+)/(video|photo)/(\d{1,25})/?", path)
+        if m:
+            return f"https://www.tiktok.com/@{m[1]}/{m[2]}/{m[3]}"
+        if re.fullmatch(r"/t/[A-Za-z0-9_-]{3,128}/?", path):
+            return f"https://www.tiktok.com{path}"
+    if platform == "soundcloud" and host in {"soundcloud.com", "www.soundcloud.com", "m.soundcloud.com"}:
+        if (re.fullmatch(r"/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/?", path)
+            and not re.match(r"/(?:discover|search|you|stations|charts|stream|upload)/", path, re.I)
+            and not re.search(r"/(?:sets|tracks|albums|likes|reposts|popular-tracks|spotlight|comments)/?$", path, re.I)):
+            return "https://soundcloud.com" + path.rstrip("/")
+    raise app.UserVisibleError("❌ لینک یک پست یا آهنگ را بفرست؛ پروفایل، بورد و پلی‌لیست پشتیبانی نمی‌شود.")
+
+
+def social_error(platform: str, detail: str) -> app.UserVisibleError:
+    name = SOCIAL_NAMES[platform]
+    s = detail.lower()
+    if any(x in s for x in ("429", "rate limit", "ip address is blocked", "captcha", "challenge", "403", "sign in", "login", "log in", "authorization", "private")):
+        return app.UserVisibleError(f"❌ {name} دسترسی این سرور به پست را نپذیرفت یا پست نیاز به ورود دارد؛ دانلود انجام نشد.")
+    if any(x in s for x in ("404", "not found", "deleted", "unavailable", "no video", "empty")):
+        return app.UserVisibleError(f"❌ پست {name} حذف شده، در دسترس نیست یا رسانهٔ قابل دانلود ندارد.")
+    return app.UserVisibleError(f"❌ دریافت فایل {name} کامل نشد؛ لینک عمومی پست یا آهنگ را دوباره بفرست.")
+
+
+def resolve_social_url(value: str, platform: str) -> str:
+    current = social_url(value, platform)
+    p = urlparse(current)
+    if p.hostname not in {"pin.it", "vm.tiktok.com", "vt.tiktok.com", "on.soundcloud.com"} and not p.path.startswith("/t/"):
+        return current
+    try:
+        for _ in range(6):
+            # Validate every hop before requesting it; requests must not follow redirects.
+            with requests.get(current, stream=True, allow_redirects=False, timeout=(10, 15),
+                              headers={"User-Agent": "Mozilla/5.0"}) as response:
+                if response.is_redirect:
+                    current = social_url(urljoin(current, response.headers.get("Location", "")), platform)
+                elif response.ok:
+                    result = social_url(current, platform)
+                    if urlparse(result).hostname in {"pin.it", "vm.tiktok.com", "vt.tiktok.com", "on.soundcloud.com"} or urlparse(result).path.startswith("/t/"):
+                        raise app.UserVisibleError("❌ لینک کوتاه باز نشد؛ لینک کامل پست را بفرست.")
+                    return result
+                else:
+                    raise social_error(platform, str(response.status_code))
+        raise app.UserVisibleError("❌ لینک کوتاه بیش از حد تغییر مسیر دارد؛ لینک کامل را بفرست.")
+    except requests.RequestException as exc:
+        raise social_error(platform, type(exc).__name__) from exc
+
+
+def social_cdn_url(value: str, platform: str) -> str:
+    p = urlparse(value)
+    roots = {"x": ("twimg.com",), "pinterest": ("pinimg.com",),
+             "soundcloud": ("sndcdn.com", "soundcloud.com", "media-streaming.soundcloud.cloud"),
+             "tiktok": ("tiktokcdn.com", "tiktokcdn-us.com", "tiktokcdn-eu.com", "tiktokcdn-in.com", "tiktokv.com", "tiktok.com", "byteoversea.com", "ibytedtos.com", "ibyteimg.com", "byteimg.com", "muscdn.com")}
+    host = (p.hostname or "").lower()
+    if p.scheme != "https" or p.username or p.password or p.port or not any(host == root or host.endswith("." + root) for root in roots[platform]):
+        raise app.UserVisibleError("❌ آدرس فایل خارج از میزبان‌های معتبر این سرویس بود؛ دانلود متوقف شد.")
+    return value
+
+
+def social_json(command: list[str], platform: str, timeout: int = 90) -> Any:
+    # Metadata can contain signed URLs; keep it bounded and never log stdout/stderr.
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+        try:
+            result = subprocess.run(command, stdout=output, stderr=errors, timeout=timeout, check=False)
+            errors.seek(0)
+            detail = errors.read(16384).decode("utf-8", "replace")
+            if result.returncode:
+                raise social_error(platform, detail)
+            if output.tell() > 12_000_000:
+                raise app.UserVisibleError("❌ اطلاعات این پست بیش از حد بزرگ است.")
+            output.seek(0)
+            data = json.load(output)
+            if isinstance(data, list):
+                for row in data:
+                    if isinstance(row, list) and row and row[0] == -1:
+                        raise social_error(platform, str(row[-1]))
+                if not any(isinstance(row, list) and len(row) == 3 and row[0] == 3 for row in data) and detail:
+                    raise social_error(platform, detail)
+            return data
+        except (subprocess.SubprocessError, OSError, ValueError) as exc:
+            raise social_error(platform, type(exc).__name__) from exc
+
+
+def social_ytdlp_entries(url: str, platform: str) -> list[dict[str, Any]]:
+    # Honor the runtime's OS/SSL_CERT_FILE trust store; TLS verification stays on.
+    common = [app.REAL_YTDLP, "--ignore-config", "--compat-options", "no-certifi", "--no-playlist", "--playlist-end", str(SOCIAL_MAX_ITEMS + 1),
+              "--use-extractors", "Twitter,TikTok,Soundcloud", "--socket-timeout", "15", "--retries", "1", "--extractor-retries", "1",
+              "--skip-download", "--dump-single-json", "--no-warnings"]
+    try:
+        data = social_json([*common, "--", url], platform)
+    except app.UserVisibleError:
+        if platform != "x":
+            raise
+        # A second official extractor mode, not an untrusted third-party proxy.
+        data = social_json([*common, "--extractor-args", "twitter:api=syndication", "--", url], platform)
+    entries = data.get("entries") if data.get("_type") in {"playlist", "multi_video"} else [data]
+    if not isinstance(entries, list) or not entries:
+        raise social_error(platform, "empty")
+    if len(entries) > SOCIAL_MAX_ITEMS:
+        raise app.UserVisibleError("❌ این پست بیش از 20 فایل دارد؛ فایل‌ها ارسال نشدند.")
+    expected = {"x": "Twitter", "tiktok": "TikTok", "soundcloud": "Soundcloud"}[platform]
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("extractor_key", data.get("extractor_key")) != expected or not entry.get("formats"):
+            raise social_error(platform, "no video")
+        if entry.get("is_live") or entry.get("live_status") in {"is_live", "is_upcoming"}:
+            raise app.UserVisibleError("❌ این مسیر برای پست منتشرشده است؛ لایو این سرویس پشتیبانی نمی‌شود.")
+        formats = [f for f in entry["formats"] if not f.get("has_drm")]
+        if platform == "soundcloud":
+            formats = [f for f in formats if "preview" not in str(f.get("format_id", "")).lower() and not f.get("is_preview")
+                       and "/preview/" not in str(f.get("url", "")) and not re.search(r"/(?:preview|playlist)/0/30/", str(f.get("url", "")))]
+        if not formats:
+            raise app.UserVisibleError("❌ فقط پیش‌نمایش یا نسخهٔ محدود آهنگ در دسترس است؛ فایل کامل ارسال نشد." if platform == "soundcloud" else "❌ نسخهٔ قابل دریافت این ویدیو محدود است؛ فایل ارسال نشد.")
+        for fmt in formats:
+            social_cdn_url(fmt["url"], platform)
+            for fragment in fmt.get("fragments") or []:
+                social_cdn_url(urljoin(fmt["url"], fragment.get("url", "")), platform)
+            fmt["http_headers"] = {"User-Agent": "Mozilla/5.0"}
+        entry["formats"] = formats
+        entry["http_headers"] = {"User-Agent": "Mozilla/5.0"}
+        entry.pop("requested_downloads", None)
+        entry.pop("requested_formats", None)
+    return entries
+
+
+def social_gallery_entries(url: str, platform: str) -> list[dict[str, Any]]:
+    data = social_json([sys.executable, "-m", "gallery_dl", "--config-ignore", "--no-input", "--dump-json",
+                        "--range", f"1-{SOCIAL_MAX_ITEMS + 1}", "--retries", "1", "--http-timeout", "15",
+                        "-o", "extractor.tiktok.audio=false", "-o", "extractor.tiktok.covers=false",
+                        "-o", "output.private=true", "--", url], platform)
+    entries = []
+    for row in data if isinstance(data, list) else []:
+        if not isinstance(row, list) or len(row) != 3 or row[0] != 3 or not isinstance(row[2], dict):
+            continue
+        media_url, info = str(row[1]).removeprefix("ytdl:"), row[2]
+        ext = str(info.get("extension") or "").lower()
+        if ext not in {"jpg", "jpeg", "png", "webp", "avif", "mp4", "m3u8", "webm", "mov"}:
+            continue
+        if info.get("category") != platform:
+            raise social_error(platform, "invalid extractor")
+        social_cdn_url(media_url, platform)
+        fallbacks = [social_cdn_url(f, platform) for f in info.get("_fallback", []) if isinstance(f, str)]
+        manifest = info.get("_ytdl_manifest") == "hls"
+        # Prefer Pinterest's native MP4 alternative over fetching many HLS parts.
+        # Keep HLS only when no complete MP4 rendition is exposed by the extractor.
+        if platform == "pinterest" and manifest:
+            direct = next((f for f in fallbacks if urlparse(f).path.lower().endswith(".mp4")), None)
+            if direct:
+                media_url, fallbacks, manifest = direct, [], False
+        entries.append({"url": media_url, "fallbacks": fallbacks, "ext": "m3u8" if manifest else ext,
+                        "image": ext in {"jpg", "jpeg", "png", "webp", "avif"},
+                        "title": str(info.get("title") or info.get("description") or SOCIAL_NAMES[platform])[:180],
+                        "id": str(info.get("id") or ""), "duration": info.get("duration", 0) if platform == "tiktok" else 0})
+    if not entries:
+        raise social_error(platform, "empty")
+    if len(entries) > SOCIAL_MAX_ITEMS:
+        raise app.UserVisibleError("❌ این پست بیش از 20 فایل دارد؛ فایل‌ها ارسال نشدند.")
+    return entries
+
+
+def social_download_http(url: str, target: Path, platform: str, budget: int, deadline: float) -> None:
+    current = social_cdn_url(url, platform)
+    try:
+        for _ in range(6):
+            with requests.get(current, stream=True, timeout=(10, 30), allow_redirects=False,
+                              headers={"User-Agent": "Mozilla/5.0"}) as response:
+                if response.is_redirect:
+                    current = social_cdn_url(urljoin(current, response.headers.get("Location", "")), platform)
+                    continue
+                if not response.ok:
+                    raise social_error(platform, str(response.status_code))
+                if int(response.headers.get("Content-Length") or 0) > budget:
+                    raise app.UserVisibleError("❌ مجموع حجم فایل‌های پست از سقف 2 گیگابایت بیشتر است.")
+                received = 0
+                with target.open("wb") as output:
+                    for chunk in response.iter_content(256 * 1024):
+                        received += len(chunk)
+                        if received > budget or time.monotonic() > deadline:
+                            raise app.UserVisibleError("❌ دریافت فایل از سقف حجم یا زمان گذشت؛ فایل ناقص ارسال نشد.")
+                        output.write(chunk)
+                if not received or (response.headers.get("Content-Length") and not response.headers.get("Content-Encoding") and received != int(response.headers["Content-Length"])):
+                    raise app.UserVisibleError("❌ فایل کامل دریافت نشد؛ فایل ناقص ارسال نشد.")
+                return
+        raise social_error(platform, "redirect limit")
+    except (requests.RequestException, ValueError) as exc:
+        raise social_error(platform, type(exc).__name__) from exc
+
+
+def social_prepare_entry(entry: dict[str, Any], platform: str, workdir: Path, budget: int, deadline: float) -> dict[str, Any]:
+    target = workdir / ("Image.jpg" if entry.get("image") else "Music.mp3" if platform == "soundcloud" else "Video.mp4")
+    source = workdir / ("source." + (entry.get("ext", "bin") if entry.get("image") else "bin"))
+    remaining = lambda: max(1, min(1200, int(deadline - time.monotonic())))
+    try:
+        if "formats" in entry or entry.get("ext") == "m3u8":
+            info_path = workdir / "media.json"
+            info = entry
+            if "formats" not in entry:
+                # A master playlist must be expanded, not downloaded as a media
+                # fragment. This Generic extraction is limited to a validated CDN
+                # manifest, never a user-supplied webpage or embedded provider.
+                info = social_json([app.REAL_YTDLP, "--ignore-config", "--compat-options", "no-certifi", "--no-playlist",
+                                    "--use-extractors", "Generic", "--socket-timeout", "15", "--retries", "1",
+                                    "--skip-download", "--dump-single-json", "--no-warnings", "--", social_cdn_url(entry["url"], platform)], platform)
+                if not isinstance(info, dict) or not info.get("formats"):
+                    raise social_error(platform, "empty HLS")
+                for fmt in info["formats"]:
+                    social_cdn_url(fmt["url"], platform)
+                    if fmt.get("has_drm"):
+                        raise app.UserVisibleError("❌ نسخهٔ قابل دریافت این فایل محدود است؛ دانلود انجام نشد.")
+            info_path.write_text(json.dumps(info), encoding="utf-8")
+            fmt = "bestaudio/best" if platform == "soundcloud" else "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b[height<=1080]/bv[height<=1080][ext=mp4]/bv[height<=1080]/b/bv"
+            _run([app.REAL_YTDLP, "--ignore-config", "--compat-options", "no-certifi", "--no-playlist", "--quiet", "--no-progress", "--socket-timeout", "15",
+                  "--retries", "1", "--fragment-retries", "1", "--abort-on-unavailable-fragments", "--concurrent-fragments", "8",
+                  "--max-filesize", str(budget), "--merge-output-format", "mp4", "--format", fmt,
+                  "--output", str(workdir / "download.%(ext)s"), "--load-info-json", str(info_path)], remaining())
+            files = [p for p in workdir.glob("download.*") if p.suffix not in {".part", ".ytdl", ".json"} and ".f" not in p.stem]
+            if len(files) != 1:
+                raise app.UserVisibleError("❌ فایل کامل پیدا نشد؛ ممکن است حجم آن از سقف ارسال بیشتر باشد.")
+            source = files[0]
+        else:
+            urls = [entry["url"], *entry.get("fallbacks", [])]
+            for index, url in enumerate(dict.fromkeys(urls)):
+                try:
+                    social_download_http(url, source, platform, budget, deadline)
+                    break
+                except app.UserVisibleError:
+                    if index + 1 == len(dict.fromkeys(urls)):
+                        raise
+                    source.unlink(missing_ok=True)
+        if not source.is_file() or not 0 < source.stat().st_size <= budget:
+            raise app.UserVisibleError("❌ فایل خالی یا بیش از حد بزرگ بود؛ ارسال نشد.")
+        title = str(entry.get("track") or entry.get("title") or SOCIAL_NAMES[platform])[:180]
+        artist = str(entry.get("artist") or entry.get("uploader") or "")[:120]
+        if entry.get("image"):
+            _run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin", "-protocol_whitelist", "file,pipe",
+                  "-format_whitelist", "image2,jpeg_pipe,png_pipe,webp_pipe,avif,mov",
+                  "-i", str(source), "-frames:v", "1", "-vf", "scale=w='min(2560,iw)':h='min(2560,ih)':force_original_aspect_ratio=decrease", "-q:v", "2", str(target)], remaining())
+            method, details = "sendPhoto", {}
+            geometry = _probe_geometry(target)
+            if not geometry:
+                raise app.UserVisibleError("❌ تصویر سالم برای ارسال ساخته نشد.")
+            if target.stat().st_size > 10_000_000 or max(geometry[:2]) / min(geometry[:2]) > 20:
+                method = "sendDocument"
+        elif platform == "soundcloud":
+            _run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin", "-protocol_whitelist", "file,pipe", "-i", str(source),
+                  "-map", "0:a:0", "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-metadata", f"title={title}", "-metadata", f"artist={artist}", str(target)], remaining())
+            method, details = "sendAudio", {"title": title, "performer": artist}
+        else:
+            probe = json.loads(_run(["ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-show_streams", "-of", "json", str(source)], 45).stdout)
+            streams = probe.get("streams", [])
+            video = next((s for s in streams if s.get("codec_type") == "video"), None)
+            if not video:
+                raise social_error(platform, "no video")
+            audio = next((s for s in streams if s.get("codec_type") == "audio"), {})
+            codecs = ["-c:v", "copy"] if video.get("codec_name") == "h264" else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"]
+            codecs += ["-c:a", "copy"] if audio.get("codec_name") in {None, "aac"} else ["-c:a", "aac", "-b:a", "192k"]
+            _run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin", "-protocol_whitelist", "file,pipe", "-i", str(source),
+                  "-map", "0:v:0", "-map", "0:a:0?", *codecs, "-movflags", "+faststart", str(target)], remaining())
+            method, details = "sendVideo", {"width": int(video["width"]), "height": int(video["height"]), "supports_streaming": "true"}
+        if not 0 < target.stat().st_size <= min(budget, app.DIRECT_TELEGRAM_LIMIT):
+            raise app.UserVisibleError("❌ حجم خروجی بیش از سقف ارسال است؛ فایل ارسال نشد.")
+        if method in {"sendAudio", "sendVideo"}:
+            duration = app.probe_duration(target)
+            expected = float(entry.get("duration") or 0)
+            if duration <= 0 or (expected and duration < expected - 2):
+                raise app.UserVisibleError("❌ فایل کامل دریافت نشد؛ فایل ناقص ارسال نشد.")
+            details["duration"] = int(round(duration))
+        source.unlink(missing_ok=True)
+        (workdir / "media.json").unlink(missing_ok=True)
+        return {"path": target, "method": method, "data": details, "title": title}
+    except (subprocess.SubprocessError, OSError, ValueError, KeyError) as exc:
+        raise social_error(platform, type(exc).__name__) from exc
+
+
+def prepare_social_media(social: dict[str, Any], workdir: Path) -> tuple[str, list[dict[str, Any]]]:
+    platform = str(social.get("platform") or "")
+    url = resolve_social_url(str(social.get("url") or ""), platform)
+    deadline = time.monotonic() + 1500
+    if platform == "pinterest" or (platform == "tiktok" and "/photo/" in url):
+        entries = social_gallery_entries(url, platform)
+    else:
+        try:
+            entries = social_ytdlp_entries(url, platform)
+        except app.UserVisibleError:
+            if platform != "tiktok":
+                raise
+            entries = social_gallery_entries(url, platform)
+    prepared, total = [], 0
+    for index, entry in enumerate(entries):
+        if time.monotonic() >= deadline:
+            raise app.UserVisibleError("❌ دریافت پست بیش از حد طول کشید؛ فایل‌ها ارسال نشدند.")
+        directory = workdir / f"item-{index + 1}"
+        directory.mkdir()
+        item = social_prepare_entry(entry, platform, directory, app.DIRECT_TELEGRAM_LIMIT - total, deadline)
+        total += item["path"].stat().st_size
+        item["caption"] = f"{item['title']}\n{SOCIAL_NAMES[platform]} {index + 1}/{len(entries)}\n{url}"
+        item["cacheKey"] = "social:" + hashlib.sha256(f"{platform}:{url}:{index}:v1".encode()).hexdigest()
+        prepared.append(item)
+    return url, prepared
 
 
 def install() -> None:

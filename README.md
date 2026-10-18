@@ -28,6 +28,21 @@ Send a direct Pornhub video URL (`view_video.php?viewkey=...` or `/embed/...`) o
 
 The 2,000,000,000-byte limit still applies. Failed fragments, unreadable video and incomplete duration checks prevent sending a partial file. Private/deleted videos and login, region or server-access restrictions can prevent downloads. Channel, search and playlist links are not supported.
 
+## X, Pinterest, TikTok and SoundCloud in bot chat
+
+Send an individual public post/track link, including `twitter.com`/`x.com`, regional Pinterest domains and the short links `pin.it`, `vm.tiktok.com`, `vt.tiktok.com`, `tiktok.com/t/...` and `on.soundcloud.com`. Optional commands are `/x URL`, `/pinterest URL`, `/tiktok URL` and `/soundcloud URL` (`/twitter URL` is also accepted).
+
+- **X:** videos and animated GIFs, delivered as MP4. Multiple videos retain their order; `/video/2` selects that exact video. Photo-only tweets, Spaces and broadcasts are outside this route.
+- **Pinterest:** photo/video Pins, carousel Pins and media exposed in an individual story Pin. Photos are decoded to Telegram-compatible JPEG; videos are remuxed to streamable MP4. External embedded sites, boards and profiles are not followed.
+- **TikTok:** individual videos and photo posts, including ordered slideshows. Audio/cover sidecars are disabled, so a photo post does not produce an extra music file. A video extraction failure gets one gallery extractor fallback.
+- **SoundCloud:** individual accessible full tracks, delivered as tagged 192 kbps MP3. Preview/snipped formats are filtered out; known duration shortfalls are rejected. This does not unlock Go+, subscription-only or private tracks. Profiles, sets and search links are not accepted.
+
+The four services reuse the existing event-driven media Workflow/Container and the same MTProto complete-file sender. No new API keys, bindings, buckets or application polling are added. All media in a post is prepared and checked before sending; up to 20 files and 2,000,000,000 bytes **combined output per request** are accepted. Requests have a 25-minute preparation budget after metadata resolution and a 25-minute send budget. Failed/ambiguous publishing stops a batch without automatic retries and reports the confirmed count; already-delivered files should be checked before repeating the request. Temporary files are removed during cleanup. Successful audio/video files use the existing Telegram cache on the send path; source resolution/preparation still runs, and photos are not cached.
+
+The existing pinned yt-dlp/YouTube runtime is preserved. `gallery-dl==1.32.17` adds native Pinterest and TikTok gallery extraction in the same Container; rebuild/deploy both Worker and Container to activate it. Metadata output is bounded, individual source URLs are validated in Worker and Container, short-link redirects are checked before every hop, and direct media downloads are restricted to the relevant service's CDN hosts. Social yt-dlp calls honor the runtime OS certificate store with TLS verification enabled. Signed media URLs and provider responses are not logged.
+
+Tests cover provider routing, exact large IDs, hostile redirects/hosts, real pinned extractor output for Pinterest/TikTok galleries, preview rejection, ordered/ambiguous uploads, and real FFmpeg JPEG/MP3/MP4 fixtures. Platform login, geographic/IP restrictions and upstream changes can still block a public link; production-IP extraction and Telegram delivery require a post-deployment check.
+
 ## Supported Instagram links
 
 - Instagram Reel

@@ -1098,6 +1098,15 @@ class InstagramCapture:
             if self.source.get("playlist"):
                 self.run_playlist()
                 return
+            if self.source.get("social"):
+                from youtube_pipeline import prepare_social_media
+                self.social_url, self.social_items = prepare_social_media(self.source["social"], self.workdir)
+                self.social_sent = 0
+                self.result = {"ok": True}
+                with self.lock:
+                    self.state = "ready"
+                self.safe_status(f"📤 {len(self.social_items)} فایل آمادهٔ ارسال است…")
+                return
             if reuse_cached_file(self.payload, self.payload.get("mediaCacheKey")):
                 self.cached = True
                 self.result = {"ok": True}
@@ -1229,6 +1238,8 @@ class InstagramCapture:
             self.result = {"ok": False, "message": str(exc) if isinstance(exc, UserVisibleError) else "❌ دریافت یا آماده‌سازی لایو کامل نشد؛ لینک را دوباره بفرست."}
             if self.source.get("playlist") and not isinstance(exc, UserVisibleError):
                 self.result["message"] = "❌ پردازش پلی‌لیست کامل نشد؛ فایل‌های ارسال‌شده را قبل از درخواست دوباره بررسی کن."
+            if self.source.get("social") and not isinstance(exc, UserVisibleError):
+                self.result["message"] = "❌ دریافت یا آماده‌سازی فایل کامل نشد؛ لینک عمومی پست یا آهنگ را دوباره بفرست."
             if self.source.get("recognition") or self.source.get("recognizeMusic"):
                 self.result["message"] = str(exc) if isinstance(exc, UserVisibleError) else "❌ دریافت فایل آهنگ کامل نشد؛ دوباره امتحان کن."
                 if self.source.get("recognizedTitle"):
@@ -1321,7 +1332,7 @@ class InstagramCapture:
     def send(self) -> dict[str, Any]:
         with self.lock:
             if self.state == "sent":
-                return {"ok": True}
+                return {"ok": True, "parts": self.social_sent} if self.source.get("social") else {"ok": True}
             if self.state != "ready":
                 return {"ok": False, "message": "فایل آمادهٔ ارسال نیست یا قبلاً ارسال آن شروع شده است."}
             if self.source.get("playlist"):
@@ -1333,6 +1344,8 @@ class InstagramCapture:
                 return {"ok": True}
             self.state = "sending"
         try:
+            if self.source.get("social"):
+                return self.send_social()
             notes = {"user": "ضبط با درخواست شما متوقف شد.", "time_limit": "ضبط به سقف زمانی رسید.", "size_limit": "ضبط به سقف حجم رسید.", "interrupted": "ارتباط پخش قطع شد؛ بخش دریافت‌شده ارسال شد."}
             caption = str(self.source.get("title") or "Instagram Live")[:180]
             if self.source.get("recognizedTitle"):
@@ -1360,6 +1373,39 @@ class InstagramCapture:
             with self.lock:
                 self.state = "failed"
             return {"ok": False}
+
+    def send_social(self) -> dict[str, Any]:
+        # Preparing all files precedes sending any. A failed/ambiguous send stops
+        # the batch; neither the Workflow nor this method retries publishing it.
+        deadline = time.monotonic() + 25 * 60
+        try:
+            for item in self.social_items:
+                if self.cleanup_requested or time.monotonic() >= deadline:
+                    raise UserVisibleError("ارسال به سقف زمان رسید.")
+                method = item["method"]
+                data = {"chat_id": str(self.payload["chatId"]), "caption": item["caption"][:1024],
+                        "reply_parameters": json.dumps({"message_id": self.payload["requestMessageId"]}), **item["data"]}
+                if method not in {"sendAudio", "sendVideo"} or not reuse_cached_file(self.payload, item["cacheKey"], item["caption"]):
+                    mime = {"sendPhoto": "image/jpeg", "sendDocument": "image/jpeg", "sendAudio": "audio/mpeg", "sendVideo": "video/mp4"}[method]
+                    self.safe_status(f"📤 در حال ارسال فایل {self.social_sent + 1}/{len(self.social_items)}…")
+                    with item["path"].open("rb") as handle:
+                        sent = asyncio.run(asyncio.wait_for(upload_complete_file(self.payload["botToken"], method, data,
+                            (item["path"].name, handle, mime)), timeout=max(1, deadline - time.monotonic())))
+                    if method in {"sendAudio", "sendVideo"}:
+                        store_uploaded_file(self.payload, [item["cacheKey"]], method, data, sent)
+                self.social_sent += 1
+                item["path"].unlink(missing_ok=True)
+            with self.lock:
+                self.state = "sent"
+            delete_status(self.payload["botToken"], self.payload["chatId"], self.payload["statusMessageId"])
+            return {"ok": True, "parts": self.social_sent}
+        except Exception as exc:
+            print(f"social upload failed: {type(exc).__name__}", flush=True)
+            with self.lock:
+                self.state = "failed"
+            # Preserve this message for the Workflow, including confirmed count.
+            return {"ok": False, "parts": self.social_sent,
+                    "message": f"❌ ارسال کامل نشد؛ {self.social_sent} فایل تأیید شده است. برای جلوگیری از تکرار، ارسال متوقف شد؛ پیش از درخواست دوباره چت را بررسی کن."}
 
     def cleanup(self) -> None:
         self.cleanup_requested = True

@@ -22,7 +22,8 @@ type YoutubeQuality = (typeof SUPPORTED_QUALITIES)[number];
 type YoutubeAudioMode = "low" | "hq";
 type RecognitionInput = { fileId: string; fileSize?: number };
 type PlaylistInput = { url: string; start: number; end: number };
-type MediaSource = InstagramVideoSource & { recognition?: RecognitionInput; playlist?: PlaylistInput };
+type SocialInput = { platform: "x" | "pinterest" | "tiktok" | "soundcloud"; url: string };
+type MediaSource = InstagramVideoSource & { recognition?: RecognitionInput; playlist?: PlaylistInput; social?: SocialInput };
 const RECOGNITION_FILE_LIMIT = 20_000_000;
 
 type YoutubeDownloadJob = {
@@ -38,6 +39,7 @@ type YoutubeDownloadJob = {
   instagram?: InstagramVideoTarget;
   recognition?: RecognitionInput;
   playlist?: PlaylistInput;
+  social?: SocialInput;
 };
 
 type Env = AdminStatsEnv & {
@@ -280,7 +282,7 @@ async function containerResult<T>(env: Env, job: YoutubeDownloadJob, request: Re
 export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDownloadJob> {
   async run(event: WorkflowEvent<YoutubeDownloadJob>, step: WorkflowStep) {
     const job = event.payload;
-    if (job.instagram || job.recognition || job.playlist) return this.runInstagram(job, step);
+    if (job.instagram || job.recognition || job.playlist || job.social) return this.runInstagram(job, step);
     let statusMessageId = job.statusMessageId;
     let phase = "startup";
     const startContainer = () => step.do(
@@ -471,7 +473,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       statusId = await step.do("show instagram video status", async () => {
         const message = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
           chat_id: job.chatId, reply_parameters: { message_id: job.requestMessageId },
-          text: job.playlist ? `🎵 دارم آهنگ‌های ${job.playlist.start}-${job.playlist.end} پلی‌لیست را به‌صورت MP3 آماده می‌کنم…` : job.recognition || job.instagram?.recognizeMusic ? "🎧 دارم آهنگ داخل فایل را شناسایی می‌کنم…" : job.instagram?.kind === "music" ? "🔎 دارم آهنگ را پیدا می‌کنم…" : job.instagram?.kind === "audio" ? "🎵 دارم صدای ویدیوی اینستاگرام را آماده می‌کنم…" : "🔎 دارم لایو یا بازپخش اینستاگرام را بررسی می‌کنم…",
+          text: job.social ? `⬇️ دارم فایل ${socialName(job.social.platform)} را دریافت می‌کنم…` : job.playlist ? `🎵 دارم آهنگ‌های ${job.playlist.start}-${job.playlist.end} پلی‌لیست را به‌صورت MP3 آماده می‌کنم…` : job.recognition || job.instagram?.recognizeMusic ? "🎧 دارم آهنگ داخل فایل را شناسایی می‌کنم…" : job.instagram?.kind === "music" ? "🔎 دارم آهنگ را پیدا می‌کنم…" : job.instagram?.kind === "audio" ? "🎵 دارم صدای ویدیوی اینستاگرام را آماده می‌کنم…" : "🔎 دارم لایو یا بازپخش اینستاگرام را بررسی می‌کنم…",
         });
         return message.message_id;
       });
@@ -483,7 +485,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       // Return friendly failures durably, without retrying rejected Instagram sessions.
       const resolution = await step.do("resolve instagram live or replay", { retries: { limit: 0, delay: "1 second" }, timeout: "2 minutes" }, async () => {
         try {
-          const source: MediaSource = job.playlist ? { mode: "replay", title: "YouTube Playlist", audioOnly: true, playlist: job.playlist } : job.recognition
+          const source: MediaSource = job.social ? { mode: "replay", title: socialName(job.social.platform), social: job.social } : job.playlist ? { mode: "replay", title: "YouTube Playlist", audioOnly: true, playlist: job.playlist } : job.recognition
             ? { mode: "replay", title: "Music recognition", audioOnly: true, recognition: job.recognition }
             : await resolveInstagramVideo(job.instagram!, this.env);
           return { source };
@@ -529,13 +531,20 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       if (result.ok) await step.do("record instagram video delivery", async () => {
         for (let i = 0; i < Math.min(20, result.parts || 1); i++) await recordSuccessfulDelivery(this.env, `instagram:${job.id}${i ? `:${i}` : ""}`);
       });
-      else throw new Error("IG_SEND_FAILED");
+      else if (job.social && result.message) {
+        if (result.parts) await step.do("record partial social delivery", async () => {
+          for (let i = 0; i < Math.min(20, result.parts || 0); i++) await recordSuccessfulDelivery(this.env, `instagram:${job.id}${i ? `:${i}` : ""}`);
+        });
+        await step.do("show social delivery failure", () => telegramCall<boolean>(this.env.BOT_TOKEN, "editMessageText", {
+          chat_id: job.chatId, message_id: statusId, text: result.message,
+        }));
+      } else throw new Error("IG_SEND_FAILED");
     } catch (error) {
       console.error("instagram video workflow failed", { jobId: job.id, type: error instanceof Error ? error.name : "error" });
       await step.do("notify instagram video failure", async () => {
         const text = error instanceof Error && error.message.includes("YT_CONFIG")
           ? workflowFailureMessage("YT_CONFIG", "startup")
-          : job.recognition || job.playlist || job.instagram?.kind === "music" || job.instagram?.kind === "audio" ? "❌ دریافت یا ارسال فایل صوتی کامل نشد؛ درخواست را دوباره بفرست." : "❌ ضبط یا ارسال لایو کامل نشد؛ لینک را دوباره بفرست. ممکن است سرور ری‌استارت شده باشد.";
+          : job.social ? `❌ دریافت یا ارسال فایل ${socialName(job.social.platform)} کامل نشد؛ اگر فایلی دریافت کرده‌ای، پیش از درخواست دوباره بررسی کن.` : job.recognition || job.playlist || job.instagram?.kind === "music" || job.instagram?.kind === "audio" ? "❌ دریافت یا ارسال فایل صوتی کامل نشد؛ درخواست را دوباره بفرست." : "❌ ضبط یا ارسال لایو کامل نشد؛ لینک را دوباره بفرست. ممکن است سرور ری‌استارت شده باشد.";
         await safeTelegramCall(this.env.BOT_TOKEN, statusId ? "editMessageText" : "sendMessage", {
           chat_id: job.chatId, message_id: statusId, text, reply_markup: { inline_keyboard: [] },
         });
@@ -686,6 +695,46 @@ function parseQualityCallback(data: string | undefined): ParsedQualityCallback |
     requestMessageId,
     userId,
   };
+}
+
+function socialName(platform: SocialInput["platform"]): string {
+  return { x: "X", pinterest: "Pinterest", tiktok: "TikTok", soundcloud: "SoundCloud" }[platform];
+}
+
+// Only individual posts/tracks, never profiles, boards, feeds or arbitrary URLs.
+function parseSocialUrl(text: string): SocialInput | null {
+  const command = /^\/([a-z]+)(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.exec(text);
+  if (command && !["x", "twitter", "pinterest", "tiktok", "soundcloud"].includes(command[1].toLowerCase())) return null;
+  for (const raw of text.match(/https?:\/\/[^\s<>"']+/gi) || []) {
+    try {
+      const u = new URL(raw.replace(/[),.!?\]}،؛]+$/g, ""));
+      if (!["http:", "https:"].includes(u.protocol) || u.username || u.password || u.port) continue;
+      const host = u.hostname.toLowerCase();
+      const path = u.pathname;
+      let m: RegExpExecArray | null;
+      if (["x.com", "www.x.com", "mobile.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com", "m.twitter.com"].includes(host)
+          && (m = /^\/(?:[A-Za-z0-9_]+\/status|i\/web\/status|statuses)\/(\d{1,25})(?:\/video\/([1-9]\d?))?\/?$/.exec(path))) {
+        return { platform: "x", url: `https://x.com/i/status/${m[1]}${m[2] ? `/video/${m[2]}` : ""}` };
+      }
+      if (/^(?:(?:www|[a-z]{2})\.)?pinterest\.(?:com|fr|de|ch|jp|cl|ca|it|co\.uk|nz|ru|com\.au|at|pt|co\.kr|es|com\.mx|dk|ph|th|com\.uy|co|nl|info|kr|ie|vn|com\.vn|ec|mx|in|pe|co\.at|hu|co\.in|co\.nz|id|com\.ec|com\.py|tw|be|uk|com\.bo|com\.pe)$/.test(host)
+          && (m = /^\/pin\/(?:[\w-]+--)?(\d{1,25})\/?$/.exec(path))) {
+        return { platform: "pinterest", url: `https://www.pinterest.com/pin/${m[1]}/` };
+      }
+      if (["pin.it", "vm.tiktok.com", "vt.tiktok.com", "on.soundcloud.com"].includes(host) && /^\/[A-Za-z0-9_-]{3,128}\/?$/.test(path)) {
+        return { platform: host === "pin.it" ? "pinterest" : host === "on.soundcloud.com" ? "soundcloud" : "tiktok", url: `https://${host}${path}` };
+      }
+      if (["tiktok.com", "www.tiktok.com", "m.tiktok.com"].includes(host)) {
+        if ((m = /^\/@([\w.-]+)\/(video|photo)\/(\d{1,25})\/?$/.exec(path))) return { platform: "tiktok", url: `https://www.tiktok.com/@${m[1]}/${m[2]}/${m[3]}` };
+        if (/^\/t\/[A-Za-z0-9_-]{3,128}\/?$/.test(path)) return { platform: "tiktok", url: `https://www.tiktok.com${path}` };
+      }
+      if (["soundcloud.com", "www.soundcloud.com", "m.soundcloud.com"].includes(host) && /^\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+\/?$/.test(path)
+          && !/^\/(?:discover|search|you|stations|charts|stream|upload)\//i.test(path)
+          && !/\/(?:sets|tracks|albums|likes|reposts|popular-tracks|spotlight|comments)\/?$/i.test(path)) {
+        return { platform: "soundcloud", url: `https://soundcloud.com${path.replace(/\/$/, "")}` };
+      }
+    } catch { /* Keep scanning message URLs. */ }
+  }
+  return null;
 }
 
 function extractYouTubeUrl(text: string): string | null {
@@ -869,7 +918,7 @@ async function handleQualityCallback(
   return Response.json({ ok: true });
 }
 
-async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target?: InstagramVideoTarget, recognition?: RecognitionInput, playlist?: PlaylistInput): Promise<Response> {
+async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target?: InstagramVideoTarget, recognition?: RecognitionInput, playlist?: PlaylistInput, social?: SocialInput): Promise<Response> {
   const message = update.message!;
   const user = trackedUser(message);
   const userId = user?.id ?? message.chat.id;
@@ -878,6 +927,7 @@ async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target?
     requestMessageId: message.message_id, userId, url: "", instagram: target,
     ...(recognition ? { recognition } : {}),
     ...(playlist ? { playlist } : {}),
+    ...(social ? { social } : {}),
   };
   try {
     await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id: job.id, params: job });
@@ -1020,6 +1070,14 @@ export default {
           return Response.json({ ok: true });
         }
 
+        const social = parseSocialUrl(text);
+        if (social) return createInstagramWorkflow(env, update, undefined, undefined, undefined, social);
+        if (/^\/(?:x|twitter|pinterest|tiktok|soundcloud)(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) {
+          await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id,
+            text: "لینک یک پست X، یک Pin پینترست، ویدیو یا پست عکسی TikTok، یا یک آهنگ SoundCloud را بفرست. لینک پروفایل، بورد و پلی‌لیست پشتیبانی نمی‌شود." });
+          return Response.json({ ok: true });
+        }
+
         const playlist = parsePlaylist(text);
         if (playlist) return createInstagramWorkflow(env, update, undefined, undefined, playlist);
         if (/^\/playlist(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) {
@@ -1035,7 +1093,7 @@ export default {
           }
           await telegramCall(env.BOT_TOKEN, "sendMessage", {
             chat_id: message.chat.id,
-            text: "لینک YouTube، Pornhub یا اینستاگرام رو بفرست؛ فایلش رو همین‌جا می‌فرستم ⚡️\n\n🎵 برای آهنگ، اسم آهنگ و خواننده را بنویس یا /music نام آهنگ\n🔎 تشخیص آهنگ: ویس، صدا یا ویدیو بفرست؛ در گروه روی فایل ریپلای کن و /shazam بنویس\n🔎 آهنگ اینستاگرام: دکمهٔ «پیداکردن آهنگ» یا /findmusic و لینک\n🎼 پلی‌لیست YouTube: لینک پلی‌لیست یا /playlist لینک 1-20\n🎧 صدای اینستاگرام: دکمهٔ «فقط صدا» یا /audio و لینک ویدیو\nضبط لایو: /live username\nبازپخش: /replay و لینک بازپخش منتشرشده\nتوقف ضبط با دکمهٔ زیر پیام ضبط انجام می‌شود.",
+            text: "لینک YouTube، Pornhub یا اینستاگرام رو بفرست؛ فایلش رو همین‌جا می‌فرستم ⚡️\n\n⬇️ X، Pinterest، TikTok و SoundCloud: لینک پست یا آهنگ را بفرست\n\n🎵 برای آهنگ، اسم آهنگ و خواننده را بنویس یا /music نام آهنگ\n🔎 تشخیص آهنگ: ویس، صدا یا ویدیو بفرست؛ در گروه روی فایل ریپلای کن و /shazam بنویس\n🔎 آهنگ اینستاگرام: دکمهٔ «پیداکردن آهنگ» یا /findmusic و لینک\n🎼 پلی‌لیست YouTube: لینک پلی‌لیست یا /playlist لینک 1-20\n🎧 صدای اینستاگرام: دکمهٔ «فقط صدا» یا /audio و لینک ویدیو\nضبط لایو: /live username\nبازپخش: /replay و لینک بازپخش منتشرشده\nتوقف ضبط با دکمهٔ زیر پیام ضبط انجام می‌شود.",
           });
           return Response.json({ ok: true });
         }
