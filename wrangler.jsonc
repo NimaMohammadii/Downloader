@@ -51,8 +51,8 @@
       "name": "downloader-youtube-chat-v6",
       "class_name": "YoutubeDownloaderContainer",
       "image": "./Dockerfile",
-      "max_instances": 2,
-      "instance_type": "standard-4",
+      "max_instances": 20,
+      "instance_type": "standard-1",
       "rollout_step_percentage": [100]
     }
   ],
