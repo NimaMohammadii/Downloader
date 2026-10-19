@@ -31,6 +31,9 @@ class FakeClient:
     async def __aexit__(self, *args):
         pass
 
+    async def disconnect(self):
+        self.disconnected = True
+
     async def __call__(self, request):
         self.active += 1
         self.peak = max(self.peak, self.active)
@@ -129,6 +132,53 @@ class ChatTests(unittest.TestCase):
             self.assertNotIn(secret,diagnostic['diagnostic'])
         with patch.dict(os.environ,{'API_HASH':'SUPER_SECRET'}):
             self.assertNotIn('SUPER_SECRET',str(app.upload_error_diagnostic(RuntimeError('SUPER_SECRET'),'bot-secret')))
+
+    def test_flood_retains_method_and_wait_without_serializing_the_request(self):
+        from telethon import functions
+        from telethon.errors import FloodWaitError
+        request=functions.auth.ImportBotAuthorizationRequest(flags=0,api_id=123,api_hash='api-secret',bot_auth_token='bot-secret')
+        error=FloodWaitError(request,capture=137)
+        diagnostic=app.upload_error_diagnostic(ExceptionGroup('upload failed',[error]),'bot-secret')
+        self.assertEqual(diagnostic['errorCode'],'FLOOD_WAIT')
+        self.assertEqual(diagnostic['errorType'],'FloodWaitError')
+        self.assertEqual(diagnostic['rpcMethod'],'ImportBotAuthorizationRequest')
+        self.assertEqual(diagnostic['retryAfterSeconds'],137)
+        for secret in ['api-secret','bot-secret']:
+            self.assertNotIn(secret,str(diagnostic))
+
+    def test_upload_starts_once_and_disconnects_even_when_login_is_rate_limited(self):
+        from telethon import functions
+        from telethon.errors import FloodWaitError
+        class AuthClient(FakeClient):
+            failure=None
+            async def start(self,**kwargs):
+                self.starts=getattr(self,'starts',0)+1
+                if self.failure:raise self.failure
+                return self
+            async def __aenter__(self):
+                # Match Telethon's context manager, which starts the client again.
+                return await self.start()
+        self.upload(600_001,AuthClient)
+        client=AuthClient.instances[-1]
+        self.assertEqual(client.starts,1);self.assertTrue(client.disconnected)
+        AuthClient.failure=FloodWaitError(functions.auth.ImportBotAuthorizationRequest(flags=0,api_id=123,api_hash='hash',bot_auth_token='token'),capture=137)
+        with self.assertRaises(FloodWaitError):self.upload(600_001,AuthClient)
+        client=AuthClient.instances[-1]
+        self.assertEqual(client.starts,1);self.assertTrue(client.disconnected)
+        self.assertEqual(client.parts,{});self.assertIsNone(client.sent)
+
+    def test_part_flood_is_not_retried_by_a_second_application_retry_loop(self):
+        from telethon.errors import FloodWaitError
+        class FloodClient(FakeClient):
+            async def __call__(self,request):
+                self.attempts=getattr(self,'attempts',{})
+                self.attempts[request.file_part]=self.attempts.get(request.file_part,0)+1
+                raise FloodWaitError(request,capture=1)
+        with patch.object(app.asyncio,'sleep',new_callable=AsyncMock),self.assertRaises(ExceptionGroup):
+            self.upload(600_001,FloodClient)
+        client=FloodClient.instances[-1]
+        self.assertTrue(all(count==1 for count in client.attempts.values()))
+        self.assertIsNone(client.sent);self.assertTrue(client.disconnected)
 
     def test_file_caption_and_button_use_native_custom_emoji_without_changing_media(self):
         import json
@@ -301,6 +351,19 @@ class YouTubeJobTests(unittest.TestCase):
         result=self.run_job(send_error=TimeoutError('delivery unknown'))
         self.assertEqual(result['phase'],'upload');self.send.assert_called_once();self.download.assert_called_once()
         self.assertIn('تأیید',result['message'])
+
+    def test_flood_reports_telegram_wait_instead_of_ambiguous_delivery(self):
+        from telethon import functions
+        from telethon.errors import FloodWaitError,RPCError
+        error=FloodWaitError(functions.upload.SaveFilePartRequest(1,0,b'private bytes'),capture=137)
+        result=self.run_job(send_error=ExceptionGroup('upload parts',[error]))
+        self.assertEqual(result['errorCode'],'FLOOD_WAIT')
+        self.assertEqual(result['retryAfterSeconds'],137)
+        self.assertIn('137',result['message']);self.assertIn('تلگرام',result['message'])
+        self.assertNotIn('تأیید نشد',result['message']);self.send.assert_called_once()
+        result=self.run_job(send_error=RPCError(None,'FLOOD',420))
+        self.assertNotIn('retryAfterSeconds',result)
+        self.assertIn('محدود',result['message']);self.send.assert_called_once()
 
 
 if __name__ == '__main__':

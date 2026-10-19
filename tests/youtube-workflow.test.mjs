@@ -403,3 +403,19 @@ test('a rejected YouTube job reports the exact stage and safe cause without repl
     assert.equal(globalThis.downloadHistory.at(-1).status,'failed');
   }finally{console.error=previous;}
 });
+
+test('Telegram flood preserves the RPC method and server wait without replaying the job',async()=>{
+  const logs=[],previous=console.error;
+  try{
+    console.error=(message,detail)=>logs.push({message,detail});
+    const result=await run({result:{ok:false,phase:'upload',errorCode:'FLOOD_WAIT',errorType:'FloodWaitError',
+      rpcMethod:'ImportBotAuthorizationRequest',rpcCode:420,retryAfterSeconds:137,
+      diagnostic:'FloodWaitError: wait 137 seconds',message:'تلگرام ارسال را محدود کرده'}});
+    const failure=logs.find(x=>x.message==='youtube download rejected');
+    assert.equal(failure.detail.rpcMethod,'ImportBotAuthorizationRequest');
+    assert.equal(failure.detail.rpcCode,420);assert.equal(failure.detail.retryAfterSeconds,137);
+    assert.equal(failure.detail.type,'FloodWaitError');assert.equal(failure.detail.code,'FLOOD_WAIT');
+    assert.equal(result.calls.filter(x=>x[0]==='/download').length,1);assert.equal(result.delivered,0);
+    assert.equal(globalThis.downloadHistory.at(-1).status,'failed');
+  }finally{console.error=previous;}
+});

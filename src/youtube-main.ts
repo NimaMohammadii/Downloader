@@ -118,6 +118,10 @@ type ContainerResult = {
   errorCode?: string;
   diagnostic?: string;
   phase?: string;
+  errorType?: string;
+  rpcMethod?: string;
+  rpcCode?: number;
+  retryAfterSeconds?: number;
 };
 
 type YoutubeFileSize = { bytes: number; estimated: boolean };
@@ -553,6 +557,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       } else {
         console.error("youtube download rejected", { jobId: job.id, phase: result.phase || "transfer",
           code: result.errorCode || "SOURCE_REJECTED",
+          type: result.errorType, rpcMethod: result.rpcMethod, rpcCode: result.rpcCode, retryAfterSeconds: result.retryAfterSeconds,
           detail: redactDiagnostic(result.diagnostic || result.message || "download failed", this.env) });
         await step.do("track youtube rejection", () => trackJob(this.env, job, "failed", { title: result.title, detail: result.message || "دریافت یا ارسال فایل ناموفق بود." }));
       }

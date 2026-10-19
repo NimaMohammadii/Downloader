@@ -139,6 +139,9 @@ class ConcurrentJobsTests(unittest.TestCase):
             async def __aexit__(self, *args):
                 pass
 
+            async def disconnect(self):
+                self.disconnected = True
+
             async def __call__(self, request):
                 self.parts[request.file_part] = request.bytes
                 await asyncio.sleep(0)
@@ -165,6 +168,7 @@ class ConcurrentJobsTests(unittest.TestCase):
         self.assertEqual(len({id(client.session) for client in clients}), 5)
         for client in clients:
             self.assertIsInstance(client.session, MemorySession)
+            self.assertTrue(client.disconnected)
             self.assertEqual(b"".join(client.parts[i] for i in sorted(client.parts)), bytes([client.destination]) * 600_001)
 
 

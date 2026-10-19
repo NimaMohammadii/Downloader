@@ -163,12 +163,12 @@ class UserVisibleError(Exception):
     pass
 
 
-def upload_error_diagnostic(exc: BaseException, token: str) -> dict[str, str]:
+def upload_error_diagnostic(exc: BaseException, token: str) -> dict[str, Any]:
     if isinstance(exc, BaseExceptionGroup):
         children = [upload_error_diagnostic(child, token) for child in exc.exceptions[:3]]
-        return {"errorCode": children[0]["errorCode"] if children else type(exc).__name__,
+        return {**(children[0] if children else {"errorCode": type(exc).__name__}),
                 "diagnostic": "; ".join(f"{child['errorCode']}: {child['diagnostic']}" for child in children)[:1200]}
-    detail = str(getattr(exc, "message", str(exc)))
+    detail = str(getattr(exc, "message", None) or str(exc))
     if isinstance(exc, subprocess.SubprocessError):
         detail = "subprocess failed"  # Commands can contain signed URLs and account headers.
     for secret in (token, os.environ.get("API_HASH", ""), os.environ.get("INSTAGRAM_SESSIONID", "")):
@@ -178,7 +178,29 @@ def upload_error_diagnostic(exc: BaseException, token: str) -> dict[str, str]:
     detail = re.sub(r"(?i)\b(authorization|cookie|sessionid)\b[\"']?\s*[:=]\s*[^\r\n]+", r"\1=[redacted]", detail)
     detail = re.sub(r"[\x00-\x1f\x7f]", " ", detail)
     code = detail if re.fullmatch(r"[A-Z][A-Z0-9_]{1,95}", detail) else type(exc).__name__
-    return {"errorCode": code, "diagnostic": detail[:1200]}
+    diagnostic: dict[str, Any] = {"errorCode": code, "diagnostic": detail[:1200], "errorType": type(exc).__name__}
+    # Never serialize the request itself: auth requests contain the bot token.
+    request = getattr(exc, "request", None)
+    if request is not None:
+        diagnostic["rpcMethod"] = type(request).__name__
+    if getattr(exc, "code", None) == 420:
+        diagnostic["rpcCode"] = 420
+        seconds = getattr(exc, "seconds", None)
+        if type(seconds) is int and seconds >= 0:
+            diagnostic["retryAfterSeconds"] = seconds
+            diagnostic["errorCode"] = "SLOWMODE_WAIT" if type(exc).__name__ == "SlowModeWaitError" else "FLOOD_WAIT"
+            diagnostic["diagnostic"] = f"{type(exc).__name__}: wait {seconds} seconds"
+    return diagnostic
+
+
+def telegram_flood_message(diagnostic: dict[str, Any]) -> str | None:
+    if diagnostic.get("rpcCode") != 420:
+        return None
+    subject = "این گفت‌وگو" if diagnostic.get("errorCode") == "SLOWMODE_WAIT" else "تلگرام"
+    seconds = diagnostic.get("retryAfterSeconds")
+    if type(seconds) is int:
+        return f"❌ {subject} ارسال فایل را موقتاً محدود کرده؛ {max(1, seconds)} ثانیه بعد دوباره امتحان کن."
+    return f"❌ {subject} ارسال فایل را موقتاً محدود کرده؛ زمان رفع محدودیت را اعلام نکرده است."
 
 
 def job_timeout(seconds: float) -> float:
@@ -839,7 +861,7 @@ def validate_file_size(path: Path) -> None:
 
 async def upload_complete_file(token: str, method: str, data: dict[str, Any], file: tuple) -> Any:
     from telethon import Button, TelegramClient, functions, types, utils
-    from telethon.errors import FloodWaitError, RPCError
+    from telethon.errors import RPCError
     from telethon.sessions import MemorySession
 
     filename, handle, mime = file
@@ -851,10 +873,12 @@ async def upload_complete_file(token: str, method: str, data: dict[str, Any], fi
         raise UserVisibleError("❌ تنظیمات API_ID و API_HASH برای ارسال فایل آماده نیست.")
 
     # This MTProto bot session leaves the existing Bot API webhook intact.
-    async with await TelegramClient(
+    client = TelegramClient(
         MemorySession(), int(api_id), api_hash,
-        receive_updates=False, flood_sleep_threshold=60,
-    ).start(bot_token=token) as client:
+        receive_updates=False, flood_sleep_threshold=60, raise_last_call_error=True,
+    )
+    try:
+        await client.start(bot_token=token)
         size = path.stat().st_size
         part_size = 512 * 1024
         count = (size + part_size - 1) // part_size
@@ -863,17 +887,12 @@ async def upload_complete_file(token: str, method: str, data: dict[str, Any], fi
         big = size > 10 * 1024 * 1024
 
         async def save_part(index: int, chunk: bytes) -> None:
-            for attempt in range(3):
-                try:
-                    request = (functions.upload.SaveBigFilePartRequest(file_id, index, count, chunk)
-                               if big else functions.upload.SaveFilePartRequest(file_id, index, chunk))
-                    if not await client(request):
-                        raise RuntimeError("Telegram rejected an upload part")
-                    return
-                except FloodWaitError as exc:
-                    if attempt == 2 or exc.seconds > 60:
-                        raise
-                    await asyncio.sleep(exc.seconds)
+            # Telethon already handles short FloodWait responses. Do not add a
+            # second retry loop that repeats a request after its retry budget.
+            request = (functions.upload.SaveBigFilePartRequest(file_id, index, count, chunk)
+                       if big else functions.upload.SaveFilePartRequest(file_id, index, chunk))
+            if not await client(request):
+                raise RuntimeError("Telegram rejected an upload part")
 
         # Keep eight parts in flight without a batch barrier: a slow part must
         # not leave completed slots idle. Read/hash in file order before await,
@@ -936,6 +955,8 @@ async def upload_complete_file(token: str, method: str, data: dict[str, Any], fi
             options["reply_to"] = None
             message = await client.send_file(int(data["chat_id"]), uploaded, **options)
         return {"message_id": message.id, "file_id": utils.pack_bot_file_id(getattr(message, "document", None))}
+    finally:
+        await client.disconnect()
 
 
 def send_media_file(
@@ -1077,7 +1098,7 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
         diagnostic = upload_error_diagnostic(exc, token)
         print(json.dumps({"message": "youtube job failed", "jobId": payload.get("id"),
                           "phase": phase, **diagnostic}, ensure_ascii=False), flush=True)
-        message = ("❌ ارسال فایل در تلگرام تأیید نشد؛ اگر فایلی دریافت کرده‌ای، پیش از درخواست دوباره بررسی کن."
+        message = telegram_flood_message(diagnostic) or ("❌ ارسال فایل در تلگرام تأیید نشد؛ اگر فایلی دریافت کرده‌ای، پیش از درخواست دوباره بررسی کن."
                    if phase in {"upload", "cache"} else "❌ دریافت اطلاعات ویدیو کامل نشد؛ دوباره امتحان کن."
                    if phase == "metadata" else "❌ دریافت فایل از منبع کامل نشد؛ دوباره امتحان کن.")
         status(message)
