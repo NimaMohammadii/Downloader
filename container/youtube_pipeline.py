@@ -18,9 +18,9 @@ import requests
 
 import youtube_app as app
 
-# Match ai-configa's pinned runtime and client strategy. Keep the client that
-# produced the quality catalog for the subsequent download as well.
-CLIENTS = ("web_embedded", "android_vr")
+# Prefer upstream's maintained selection. Embedded is limited to embeddable
+# videos; Safari HLS is a bounded fallback supported without a GVS token.
+CLIENTS = ("default", "web_embedded", "web_safari")
 SESSION_STATE_PATH = Path("/tmp/vexa-youtube-session.json")
 ASPECT_TOLERANCE = 0.06
 QUALITY_TOLERANCE = 18
@@ -47,10 +47,12 @@ def _client_args(client: str) -> list[str]:
         "--ignore-config",
         "--no-playlist",
         "--force-ipv4",
+        "--compat-options", "no-certifi",
         "--js-runtimes", "deno",
         "--extractor-args", f"youtube:player_client={client}",
         "--socket-timeout", "15",
         "--retries", "2",
+        "--extractor-retries", "1",
         "--fragment-retries", "2",
     ]
 
@@ -85,8 +87,14 @@ def _run(command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
 def _classify_ytdlp_error(stderr: str) -> tuple[str, str]:
     value = (stderr or "").lower()
 
+    if "http error 429" in value or "429: too many requests" in value:
+        return "rate_limit", "❌ YouTube تعداد درخواست‌های این سرور را محدود کرده؛ کمی بعد دوباره امتحان کن."
+    if "this content isn't available, try again later" in value or "this content is not available, try again later" in value:
+        return "session_limit", "❌ YouTube فعلاً درخواست‌های این نشست را نمی‌پذیرد؛ کمی بعد دوباره امتحان کن."
+    if any(marker in value for marker in ("challenge solving failed", "signature extraction failed", "no supported javascript runtime")):
+        return "challenge", "❌ اطلاعات پخش YouTube کامل دریافت نشد؛ دریافت فایل این بار ممکن نبود."
     # Specific format errors MUST be checked before generic "not available".
-    if "requested format is not available" in value or "only images are available" in value:
+    if any(marker in value for marker in ("requested format is not available", "only images are available", "no video formats found")):
         return "format", "❌ این کیفیت از مسیر فعلی YouTube قابل دریافت نبود."
     if "private video" in value or "this video is private" in value:
         return "private", "❌ این ویدیو Private هست و بدون دسترسی به اکانت قابل دانلود نیست."
@@ -101,7 +109,9 @@ def _classify_ytdlp_error(stderr: str) -> tuple[str, str]:
     if "sign in to confirm" in value or "not a bot" in value:
         return "botcheck", "❌ YouTube برای این درخواست تأیید ورود می‌خواهد؛ دریافت ویدیو از این سرور فعلاً ممکن نیست."
     if "http error 403" in value or "403: forbidden" in value:
-        return "forbidden", "❌ YouTube دسترسی دانلود این ویدیو رو موقتاً بسته. دوباره امتحان کن."
+        return "forbidden", "❌ لینک پخش YouTube این بار قابل دریافت نبود؛ دوباره امتحان کن."
+    if "http error 410" in value or "410: gone" in value:
+        return "expired", "❌ لینک موقت فایل YouTube اعتبار ندارد؛ دوباره لینک ویدیو را بفرست."
 
     unavailable_markers = (
         "video unavailable",
@@ -342,7 +352,10 @@ def _client_order(cached: str | None) -> list[str]:
 
 
 def _log_attempt_failure(kind: str, error: ClientAttemptError) -> None:
-    detail = error.detail.replace("\n", " ")[-1200:]
+    # The useful category survives, but signed CDN URLs and headers must not.
+    detail = re.sub(r"https?://\S+", "[URL]", error.detail)
+    detail = re.sub(r"(?im)(cookie|authorization|po_token|visitor_data)\s*[:=][^\r\n]*", r"\1=[REDACTED]", detail)
+    detail = detail.replace("\n", " ")[-1200:]
     print(
         f"youtube {kind} client={error.client} failed category={error.category}: "
         f"{error.message} detail={detail}",
@@ -351,7 +364,7 @@ def _log_attempt_failure(kind: str, error: ClientAttemptError) -> None:
 
 
 def _terminal_category(category: str) -> bool:
-    return category in {"private", "members", "age", "copyright", "unsupported"}
+    return category in {"private", "members", "age", "copyright", "unsupported", "rate_limit", "session_limit"}
 
 
 def _final_attempt_message(errors: list[ClientAttemptError], fallback: str) -> str:
@@ -365,10 +378,16 @@ def _final_attempt_message(errors: list[ClientAttemptError], fallback: str) -> s
     categories = {error.category for error in errors}
     if categories and categories <= {"unavailable"}:
         return "❌ این ویدیو در دسترس نیست یا برای این منطقه محدود شده."
+    if "botcheck" in categories and categories - {"botcheck", "unavailable"}:
+        return "❌ دریافت اطلاعات پخش از مسیرهای YouTube کامل نشد؛ دوباره امتحان کن."
     if "botcheck" in categories:
         return "❌ YouTube برای این درخواست تأیید ورود می‌خواهد؛ دریافت ویدیو از این سرور فعلاً ممکن نیست."
     if "forbidden" in categories:
-        return "❌ YouTube دسترسی دانلود این ویدیو رو موقتاً بسته. دوباره امتحان کن."
+        return next(error.message for error in errors if error.category == "forbidden")
+    if "challenge" in categories:
+        return next(error.message for error in errors if error.category == "challenge")
+    if "expired" in categories:
+        return next(error.message for error in errors if error.category == "expired")
     if "timeout" in categories:
         return "❌ ارتباط با YouTube بیشتر از حد معمول طول کشید. دوباره امتحان کن."
     if "format" in categories:
@@ -377,14 +396,23 @@ def _final_attempt_message(errors: list[ClientAttemptError], fallback: str) -> s
 
 
 def fetch_metadata(url: str) -> dict[str, Any]:
+    # HTTP request_cache already limits catalog reuse to five minutes and owns
+    # private copies. Repeated quality requests need not hit the player again.
+    if app.REQUEST_CACHE.get() is not None:
+        cached = app.load_metadata_cache(url)
+        expected = app.youtube_video_id(url)
+        if (cached and expected and str(cached.get("id") or "") == expected
+                and _load_session_client(cached) in CLIENTS):
+            app.validate_video_metadata(cached)
+            if available_qualities(cached) or audio_formats(cached):
+                return cached
     errors: list[ClientAttemptError] = []
     for client in CLIENTS:
         try:
             metadata = _fetch_metadata_for_client(url, client)
             app.validate_video_metadata(metadata)
             if not available_qualities(metadata) and not audio_formats(metadata):
-                print(f"youtube metadata client={client} returned no playable formats", flush=True)
-                continue
+                raise ClientAttemptError(client, "format", "❌ اطلاعات پخش قابل دریافت این ویدیو کامل نبود.")
             _save_session(metadata, client)
             print(f"youtube metadata selected client={client}", flush=True)
             return metadata
@@ -536,15 +564,44 @@ def _verify_video(path: Path, quality: int, expected_ratio: float | None) -> tup
     return True, f"{width}x{height}"
 
 
+def _download_input(url: str, client: str, workdir: Path, fresh: bool) -> list[str]:
+    """Reuse only this video's catalog and its matching extraction policy."""
+    if not fresh:
+        metadata = app.load_metadata_cache(url)
+        expected = app.youtube_video_id(url)
+        if (metadata and expected and str(metadata.get("id") or "") == expected
+                and metadata.get("formats") and _load_session_client(metadata) == client):
+            info = workdir / "catalog.json"
+            info.write_text(json.dumps(metadata), encoding="utf-8")
+            return ["--load-info-json", str(info)]
+    return [url]
+
+
+def _invalidate_download_catalog(url: str) -> None:
+    path = app.metadata_cache_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+        with app.CATALOG_LOCK:
+            cached = app.CATALOG_CACHE.get(url)
+            if cached and cached[1] == text:
+                del app.CATALOG_CACHE[url]
+    except OSError:
+        pass
+    path.unlink(missing_ok=True)
+    session_state_path().unlink(missing_ok=True)
+
+
 def _download_video_with_client(
     url: str,
     client: str,
     workdir: Path,
     quality: int,
     expected_ratio: float | None,
+    *, fresh: bool = False,
 ) -> Path:
     _clean_workdir(workdir)
     output_template = str(workdir / "%(title).100B [%(id)s].%(ext)s")
+    source = _download_input(url, client, workdir, fresh)
 
     try:
         result = _run(
@@ -567,14 +624,19 @@ def _download_video_with_client(
                 "--quiet",
                 "--print",
                 "after_move:%(filepath)s",
-                url,
+                *source,
             ],
             app.DOWNLOAD_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
         raise ClientAttemptError(client, "timeout", "❌ دانلود بیشتر از حد معمول طول کشید.") from exc
     except subprocess.CalledProcessError as exc:
-        raise _attempt_error(client, exc) from exc
+        error = _attempt_error(client, exc)
+        if source[0] == "--load-info-json" and error.category in {"forbidden", "expired", "format"}:
+            _log_attempt_failure("cached-video-refresh", error)
+            _invalidate_download_catalog(url)
+            return _download_video_with_client(url, client, workdir, quality, expected_ratio, fresh=True)
+        raise error from exc
 
     path = app.result_path(result, workdir)
     if path is None:
@@ -621,8 +683,9 @@ def download_video(url: str, workdir: Path, quality: int, metadata: dict[str, An
     )
 
 
-def _download_audio_with_client(url: str, client: str, workdir: Path, mode: str) -> Path:
+def _download_audio_with_client(url: str, client: str, workdir: Path, mode: str, *, fresh: bool = False) -> Path:
     _clean_workdir(workdir)
+    source_args = _download_input(url, client, workdir, fresh)
     if mode == "low":
         selector = "ba[abr<=80][ext=m4a]/ba[abr<=80]/worstaudio[ext=m4a]/worstaudio"
         fallback_bitrate = "64k"
@@ -644,14 +707,19 @@ def _download_audio_with_client(url: str, client: str, workdir: Path, mode: str)
                 "--quiet",
                 "--print",
                 "after_move:%(filepath)s",
-                url,
+                *source_args,
             ],
             app.DOWNLOAD_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
         raise ClientAttemptError(client, "timeout", "❌ دانلود صدا بیشتر از حد معمول طول کشید.") from exc
     except subprocess.CalledProcessError as exc:
-        raise _attempt_error(client, exc) from exc
+        error = _attempt_error(client, exc)
+        if source_args[0] == "--load-info-json" and error.category in {"forbidden", "expired", "format"}:
+            _log_attempt_failure("cached-audio-refresh", error)
+            _invalidate_download_catalog(url)
+            return _download_audio_with_client(url, client, workdir, mode, fresh=True)
+        raise error from exc
 
     source = app.result_path(result, workdir, prefix="audio-source.")
     if source is None:
@@ -1344,5 +1412,7 @@ def install() -> None:
 
 
 if __name__ == "__main__":
+    from yt_dlp.version import __version__
+    print(f"youtube runtime version={__version__} clients={','.join(CLIENTS)} policy=upstream-catalog-v2", flush=True)
     install()
     app.serve()

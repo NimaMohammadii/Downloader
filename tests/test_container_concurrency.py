@@ -21,7 +21,7 @@ class ConcurrentJobsTests(unittest.TestCase):
         url = "https://www.youtube.com/watch?v=abcdefghijk"
         with patch.object(app, "CATALOG_CACHE", {}):
             with app.request_cache(url):
-                pipeline._save_session({"id": "abcdefghijk"}, "android_vr")
+                pipeline._save_session({"id": "abcdefghijk"}, "web_safari")
                 first = app.metadata_cache_path()
             self.assertFalse(first.exists())
             expires = app.CATALOG_CACHE[url][0]
@@ -29,7 +29,7 @@ class ConcurrentJobsTests(unittest.TestCase):
                 self.assertNotEqual(app.metadata_cache_path(), first)
                 metadata = app.load_metadata_cache(url)
                 self.assertEqual(metadata["id"], "abcdefghijk")
-                self.assertEqual(pipeline._load_session_client(metadata), "android_vr")
+                self.assertEqual(pipeline._load_session_client(metadata), "web_safari")
             self.assertEqual(app.CATALOG_CACHE[url][0], expires)
             for i in range(25):
                 with app.request_cache(f"https://youtu.be/{i}"):
@@ -46,7 +46,7 @@ class ConcurrentJobsTests(unittest.TestCase):
 
         def download(payload):
             key = payload["id"]
-            client = "web_embedded" if int(key) % 2 else "android_vr"
+            client = "web_embedded" if int(key) % 2 else "web_safari"
             pipeline._save_session({"id": key}, client)
             paths.append(app.metadata_cache_path())
             barrier.wait(timeout=4)

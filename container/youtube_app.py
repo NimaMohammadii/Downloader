@@ -269,26 +269,9 @@ def delete_status(token: str, chat_id: int, message_id: int | None) -> None:
 
 
 def friendly_ytdlp_error(stderr: str) -> str:
-    value = stderr.lower()
-    if "private video" in value or "this video is private" in value:
-        return "❌ این ویدیو Private هست و بدون دسترسی به اکانت قابل دانلود نیست."
-    if "members-only" in value or "join this channel" in value:
-        return "❌ این ویدیو فقط برای اعضای کانال قابل مشاهده است."
-    if "video unavailable" in value or "not available" in value:
-        return "❌ این ویدیو در دسترس نیست یا برای این منطقه محدود شده."
-    if "sign in to confirm" in value or "not a bot" in value:
-        return "❌ YouTube این IP رو موقتاً محدود کرده. چند لحظه بعد دوباره امتحان کن."
-    if "http error 403" in value or "403: forbidden" in value:
-        return "❌ YouTube دسترسی دانلود این ویدیو رو موقتاً بسته. دوباره امتحان کن."
-    if "age" in value and ("restricted" in value or "confirm" in value or "sign in" in value):
-        return "❌ این ویدیو محدودیت سنی داره و بدون ورود به YouTube قابل دانلود نیست."
-    if "copyright" in value:
-        return "❌ این ویدیو به‌خاطر محدودیت صاحب محتوا قابل دانلود نیست."
-    if "unsupported url" in value:
-        return "❌ این لینک YouTube قابل دانلود نیست. لینک مستقیم ویدیو یا Shorts رو بفرست."
-    if "requested format is not available" in value:
-        return "❌ این کیفیت برای این ویدیو موجود نیست. یک گزینه دیگه رو انتخاب کن."
-    return "❌ نتونستم این فایل رو از YouTube بگیرم. دوباره همین لینک یا یک لینک دیگه رو امتحان کن."
+    # One classifier for the HTTP server and the active YouTube pipeline.
+    from youtube_pipeline import _classify_ytdlp_error
+    return _classify_ytdlp_error(stderr)[1]
 
 
 def run_command(command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
