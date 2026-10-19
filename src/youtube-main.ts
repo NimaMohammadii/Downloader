@@ -115,6 +115,8 @@ type ContainerResult = {
   parts?: number;
   quality?: number;
   audioMode?: YoutubeAudioMode;
+  errorCode?: string;
+  diagnostic?: string;
 };
 
 type YoutubeFileSize = { bytes: number; estimated: boolean };
@@ -307,7 +309,7 @@ async function sendCachedMedia(env: Env, job: YoutubeDownloadJob, statusId?: num
   try {
     await telegramCall(env.BOT_TOKEN, cached.method, {
       ...cached.data, [cached.method === "sendAudio" ? "audio" : "video"]: cached.fileId,
-      chat_id: job.chatId, reply_parameters: { message_id: job.requestMessageId },
+      chat_id: job.chatId, reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
     });
   } catch (error) {
     if (/wrong.*file|file.*(?:invalid|expired)|file_reference|failed to get.*file/i.test(error instanceof Error ? error.message : "")) {
@@ -321,10 +323,11 @@ async function sendCachedMedia(env: Env, job: YoutubeDownloadJob, statusId?: num
 }
 
 function redactDiagnostic(detail: string, env: Env): string {
-  for (const secret of [env.BOT_TOKEN, env.API_HASH]) {
+  for (const secret of [env.BOT_TOKEN, env.API_HASH, env.INSTAGRAM_SESSIONID]) {
     if (secret) detail = detail.split(secret).join("[redacted]");
   }
-  return detail.slice(0, 2000);
+  return detail.replace(/https?:\/\/[^\s"'<>]+/gi, "[url]")
+    .replace(/\b(?:authorization|cookie|sessionid)\b["']?\s*[:=]\s*[^\r\n]+/gi, "[redacted]").slice(0, 2000);
 }
 
 function workflowFailureMessage(detail: string, phase: string): string {
@@ -418,7 +421,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
             const status = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
               chat_id: job.chatId,
               text: "🔎 دارم کیفیت‌های موجود این ویدیو رو بررسی می‌کنم…",
-              reply_parameters: { message_id: job.requestMessageId },
+              reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
             });
             return status.message_id;
           },
@@ -504,7 +507,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
             const status = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
               chat_id: job.chatId,
               text: job.source === "pornhub" ? "⬇️ دارم ویدیوی Pornhub را دانلود می‌کنم…" : `⏳ ${selectionText} انتخاب شد؛ دانلود شروع شد…`,
-              reply_parameters: { message_id: job.requestMessageId },
+              reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
             });
             return status.message_id;
           },
@@ -572,7 +575,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
             await safeTelegramCall(this.env.BOT_TOKEN, "sendMessage", {
               chat_id: job.chatId,
               text: failureMessage,
-              reply_parameters: { message_id: job.requestMessageId },
+              reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
             });
           }
           return true;
@@ -587,10 +590,11 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
     let statusId: number | undefined;
     let started = false;
     let lease: PoolLease | undefined;
+    let phase = "status";
     try {
       statusId = await step.do("show instagram video status", async () => {
         const message = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
-          chat_id: job.chatId, reply_parameters: { message_id: job.requestMessageId },
+          chat_id: job.chatId, reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
           text: job.social ? `⬇️ دارم ${job.social.audioOnly ? "صدای ویدیوی" : "فایل"} ${socialName(job.social.platform)} را دریافت می‌کنم…` : job.playlist ? `🎵 دارم آهنگ‌های ${job.playlist.start}-${job.playlist.end} پلی‌لیست را به‌صورت MP3 آماده می‌کنم…` : job.recognition || job.instagram?.recognizeMusic ? "🎧 دارم آهنگ داخل فایل را شناسایی می‌کنم…" : job.instagram?.kind === "music" ? "🔎 دارم آهنگ را پیدا می‌کنم…" : job.instagram?.kind === "audio" ? "🎵 دارم صدای ویدیوی اینستاگرام را آماده می‌کنم…" : "🔎 دارم لایو یا بازپخش اینستاگرام را بررسی می‌کنم…",
         });
         return message.message_id;
@@ -606,6 +610,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         return;
       }
       // Return friendly failures durably, without retrying rejected Instagram sessions.
+      phase = "resolution";
       const resolution = await step.do("resolve instagram live or replay", { retries: { limit: 0, delay: "1 second" }, timeout: "2 minutes" }, async () => {
         try {
           const source: MediaSource = job.social ? { mode: "replay", title: socialName(job.social.platform), social: job.social } : job.playlist ? { mode: "replay", title: "YouTube Playlist", audioOnly: true, playlist: job.playlist } : job.recognition
@@ -630,6 +635,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         });
         return;
       }
+      phase = "startup";
       if (!/^\d+$/.test(this.env.API_ID || "") || !this.env.API_HASH?.trim()) throw new Error("YT_CONFIG");
       const assignment = await step.do("reserve download capacity", { retries: { limit: 0, delay: "1 second" } }, () => downloadPool(this.env).acquire(job.id));
       if (!assignment) throw new Error("DOWNLOAD_POOL_FULL");
@@ -640,6 +646,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         return true;
       });
       started = true;
+      phase = "capture";
       await step.do("begin instagram capture", { retries: { limit: 2, delay: "3 seconds" }, timeout: "1 minute" }, async () => {
         const signature = (await instagramSignature(this.env.BOT_TOKEN, `stop:${job.chatId}:${job.requestMessageId}:${job.userId}`)).slice(0, 16);
         const result = await pooledContainer(this.env, job).instagramRequest("start", {
@@ -654,6 +661,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         return true;
       });
       // A completion event may arrive before this call; Workflows buffers it.
+      phase = "wait";
       const ready = await step.waitForEvent<ContainerResult>("await instagram recording", { type: "instagram-ready", timeout: "150 minutes" });
       if (!ready.payload.ok) {
         await step.do("track capture failure", () => trackJob(this.env, job, "failed", { title: source.title, detail: ready.payload.message || "دریافت محتوا کامل نشد." }));
@@ -662,6 +670,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         }));
         return;
       }
+      phase = "upload";
       const result = await step.do("send complete instagram recording", { retries: { limit: 0, delay: "1 second" }, timeout: "30 minutes" }, () =>
         pooledContainer(this.env, job).instagramRequest("send", { id: job.id }),
       );
@@ -685,9 +694,11 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         await step.do("show social delivery failure", () => telegramCall<boolean>(this.env.BOT_TOKEN, "editMessageText", {
           chat_id: job.chatId, message_id: statusId, text: result.message,
         }));
-      } else throw new Error("IG_SEND_FAILED");
+      } else throw new Error(`IG_SEND_FAILED ${redactDiagnostic([result.errorCode, result.diagnostic, result.message].filter(Boolean).join(": "), this.env)}`);
     } catch (error) {
-      console.error("instagram video workflow failed", { jobId: job.id, type: error instanceof Error ? error.name : "error" });
+      console.error("instagram video workflow failed", { jobId: job.id, phase,
+        type: error instanceof Error ? error.name : "error",
+        detail: redactDiagnostic(error instanceof Error ? error.message : String(error), this.env) });
       await step.do("track media failure", () => trackJob(this.env, job, "failed", {
         detail: "دریافت یا ارسال کامل نشد؛ تحویل فایل تأیید نشده است.",
       }));
@@ -997,7 +1008,7 @@ async function createYoutubeInspectWorkflow(
       await safeTelegramCall(env.BOT_TOKEN, "sendMessage", {
         chat_id: message.chat.id,
         text: source === "pornhub" ? "❌ شروع دانلود Pornhub ناموفق بود؛ دوباره لینک را بفرست." : "❌ نتونستم کیفیت‌های YouTube رو بررسی کنم. دوباره لینک رو بفرست.",
-        reply_parameters: { message_id: message.message_id },
+        reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
       });
     }
   }
@@ -1163,7 +1174,7 @@ async function recognizeMessage(env: Env, update: TelegramUpdate, media: Telegra
   if (typeof media.file_id !== "string" || !/^[A-Za-z0-9_-]{1,1024}$/.test(media.file_id)
       || (media.file_size !== undefined && (!Number.isSafeInteger(media.file_size) || media.file_size <= 0 || media.file_size > RECOGNITION_FILE_LIMIT))) {
     await safeTelegramCall(env.BOT_TOKEN, "sendMessage", {
-      chat_id: update.message!.chat.id, reply_parameters: { message_id: update.message!.message_id },
+      chat_id: update.message!.chat.id, reply_parameters: { message_id: update.message!.message_id, allow_sending_without_reply: true },
       text: "برای تشخیص آهنگ یک تکهٔ صوتی یا ویدیویی با حجم حداکثر 20 MB بفرست؛ 10 تا 30 ثانیه از بخش واضح آهنگ کافی است.",
     });
     return Response.json({ ok: true });

@@ -226,6 +226,25 @@ test('production admin callbacks open the usage list and return to it; non-admin
   } finally { globalThis.fetch = previousFetch; f.close(); }
 });
 
+test('production webhook still responds when the original request message has been deleted', async () => {
+  const f=fixture(),sent=[],previousFetch=globalThis.fetch;
+  try{
+    globalThis.fetch=async(input,init)=>{
+      const method=String(input).split('/').at(-1),body=JSON.parse(init.body);
+      if(method==='sendMessage'){
+        sent.push(body);
+        if(body.reply_parameters?.message_id && !body.reply_parameters.allow_sending_without_reply)
+          return Response.json({ok:false,description:'Bad Request: message to be replied not found'},{status:400});
+      }
+      return Response.json({ok:true,result:{message_id:10}});
+    };
+    const response=await admin.worker.fetch(webhook({update_id:3,message:{message_id:7,from:{id:42},chat:{id:42},text:'https://example.org/unsupported'}}),f.env,{});
+    assert.equal(response.status,200);assert.equal(sent.length,1);
+    assert.equal(sent[0].reply_parameters.message_id,7);
+    assert.equal(sent[0].reply_parameters.allow_sending_without_reply,true);
+  }finally{globalThis.fetch=previousFetch;f.close();}
+});
+
 const webhook = (update, secret = 'private-test-secret') => new Request('https://worker/telegram/webhook', {
   method: 'POST', headers: { 'x-telegram-bot-api-secret-token': secret }, body: JSON.stringify(update),
 });

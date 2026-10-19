@@ -121,12 +121,12 @@ test('untrusted stream URLs never reach the recorder', async () => {
   await assert.rejects(()=>mod.resolveInstagramVideo({kind:'live',broadcastId:'123'},env), /در دسترس/);
 });
 
-async function workflow(ready = {ok:true}, input = job) {
+async function workflow(ready = {ok:true}, input = job, sendResult = {ok:true}) {
   const calls=[],steps=[],messages=[];
   globalThis.delivered=0; globalThis.containerIds=[]; globalThis.downloadHistory=[];
   globalThis.container={
     async startShared(){calls.push('start');},
-    async instagramRequest(action,payload){calls.push(action);if(action==='start') globalThis.startedPayload=payload;return {ok:true};},
+    async instagramRequest(action,payload){calls.push(action);if(action==='start') globalThis.startedPayload=payload;return action==='send'?sendResult:{ok:true};},
     async releaseInstagram(){calls.push('release');},
   };
   globalThis.fetch=async(url,init)=>{
@@ -149,6 +149,32 @@ test('recording waits for a completion event and sends one whole file', async()=
   assert.ok(r.steps.every(s=>!s.options.timeout?.endsWith('minutes')||s.options.type||parseInt(s.options.timeout)<=30));
   assert.ok(!JSON.stringify(globalThis.startedPayload).includes(env.INSTAGRAM_SESSIONID));
   assert.ok(Buffer.byteLength(globalThis.startedPayload.stopData)<=64);
+  assert.equal(r.messages[0].reply_parameters.allow_sending_without_reply,true);
+});
+
+test('workflow failure diagnostics retain the failing phase and redact credentials and URLs',async()=>{
+  const previousError=console.error,previousFetch=globalThis.fetch,logs=[];
+  globalThis.downloadHistory=[];
+  try{
+    console.error=(message,detail)=>logs.push({message,detail});
+    globalThis.fetch=async()=>{throw Error(`Bad Request: message to be replied not found ${env.BOT_TOKEN} ${env.API_HASH} ${env.INSTAGRAM_SESSIONID} https://signed.example/private?secret=value`);};
+    const step={async do(name,options,fn){return (typeof options==='function'?options:fn)();}};
+    await new mod.YoutubeDownloadWorkflow({},env).run({payload:job},step);
+    const failure=logs.find(x=>x.message==='instagram video workflow failed');
+    assert.equal(failure.detail.phase,'status');assert.match(failure.detail.detail,/message to be replied not found/);
+    for(const secret of [env.BOT_TOKEN,env.API_HASH,env.INSTAGRAM_SESSIONID,'signed.example','secret=value'])assert.ok(!JSON.stringify(failure).includes(secret));
+  }finally{console.error=previousError;globalThis.fetch=previousFetch;}
+});
+
+test('a rejected audio or music upload retains the container cause without replaying delivery',async()=>{
+  const previous=console.error,logs=[];
+  try{
+    console.error=(message,detail)=>logs.push({message,detail});
+    const result=await workflow({ok:true},job,{ok:false,errorCode:'AUTH_KEY_UNREGISTERED',diagnostic:'Telegram rejected the upload'});
+    const failure=logs.find(x=>x.message==='instagram video workflow failed');
+    assert.equal(failure.detail.phase,'upload');assert.match(failure.detail.detail,/AUTH_KEY_UNREGISTERED/);
+    assert.equal(result.calls.filter(x=>x==='send').length,1);assert.equal(globalThis.delivered,0);
+  }finally{console.error=previous;}
 });
 
 test('music search releases its container after listing results and never records a file delivery',async()=>{

@@ -684,7 +684,7 @@ async function handleStoryWebhook(
     const status = await telegramCall<TelegramMessage>(env.BOT_TOKEN, "sendMessage", {
       chat_id: message.chat.id,
       text: "⏳ لینک Instagram رو گرفتم، دارم Story رو آماده می‌کنم…",
-      reply_parameters: { message_id: message.message_id },
+      reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
     });
     statusMessageId = status.message_id;
 
@@ -698,7 +698,7 @@ async function handleStoryWebhook(
           chat_id: message.chat.id,
           photo: proxyUrl,
           caption,
-          reply_parameters: index === 0 ? { message_id: message.message_id } : undefined,
+          reply_parameters: index === 0 ? { message_id: message.message_id, allow_sending_without_reply: true } : undefined,
         });
       } else {
         await telegramCall(env.BOT_TOKEN, "sendVideo", {
@@ -708,7 +708,7 @@ async function handleStoryWebhook(
           width: item.width || undefined,
           height: item.height || undefined,
           supports_streaming: true,
-          reply_parameters: index === 0 ? { message_id: message.message_id } : undefined,
+          reply_parameters: index === 0 ? { message_id: message.message_id, allow_sending_without_reply: true } : undefined,
         });
       }
     }
@@ -733,7 +733,7 @@ async function handleStoryWebhook(
       await safeTelegramCall(env.BOT_TOKEN, "sendMessage", {
         chat_id: message.chat.id,
         text,
-        reply_parameters: { message_id: message.message_id },
+        reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
       });
     }
   }

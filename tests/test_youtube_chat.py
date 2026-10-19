@@ -45,24 +45,24 @@ class FakeClient:
 
 
 class ChatTests(unittest.TestCase):
-    def upload(self, size):
+    def upload(self, size, client_type=FakeClient, expected_reply=7):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'video.mp4'
             content = (bytes(range(256)) * ((size + 255) // 256))[:size]
             path.write_bytes(content)
             with patch.dict(os.environ, {'API_ID': '123', 'API_HASH': 'test'}), \
-                 patch('telethon.TelegramClient', FakeClient), path.open('rb') as handle:
+                 patch('telethon.TelegramClient', client_type), path.open('rb') as handle:
                 result = app.telegram_call('token', 'sendVideo', data={
                     'chat_id': '42', 'caption': 'literal *title*', 'width': '1280',
                     'height': '720', 'duration': '31',
                     'reply_parameters': '{"message_id": 7}',
                 }, files={'video': (path.name, handle, 'video/mp4')})
-        client = FakeClient.instances[-1]
+        client = client_type.instances[-1]
         self.assertEqual(result['message_id'], 123)
         self.assertEqual(b''.join(client.parts[i] for i in sorted(client.parts)), content)
         self.assertLessEqual(client.peak, 8)
         args, options = client.sent
-        self.assertEqual(options['reply_to'], 7)
+        self.assertEqual(options['reply_to'], expected_reply)
         self.assertIsNone(options['parse_mode'])
         self.assertEqual(options['attributes'][1].w, 1280)
         return args[1], content
@@ -76,6 +76,59 @@ class ChatTests(unittest.TestCase):
         uploaded, content = self.upload(600_001)
         self.assertIsInstance(uploaded, types.InputFile)
         self.assertEqual(uploaded.md5_checksum, hashlib.md5(content).hexdigest())
+
+    def test_missing_reply_reuses_uploaded_file_once_without_reuploading_parts(self):
+        from telethon.errors import RPCError
+        class MissingReplyClient(FakeClient):
+            async def send_file(self,*args,**kwargs):
+                self.attempts=getattr(self,'attempts',[])+[(args,kwargs)]
+                if kwargs.get('reply_to'):
+                    raise RPCError(None,'REPLY_MESSAGE_ID_INVALID',400)
+                return await super().send_file(*args,**kwargs)
+        self.upload(600_001,MissingReplyClient,None)
+        client=MissingReplyClient.instances[-1]
+        self.assertEqual(len(client.attempts),2)
+        self.assertEqual(client.attempts[0][1]['reply_to'],7);self.assertIsNone(client.attempts[1][1]['reply_to'])
+        self.assertIs(client.attempts[0][0][1],client.attempts[1][0][1])
+        self.assertEqual(len(client.parts),2)
+        self.assertEqual(client.attempts[0][1]['caption'],client.attempts[1][1]['caption'])
+
+    def test_upload_does_not_retry_ambiguous_or_unrelated_send_failures(self):
+        from telethon.errors import RPCError
+        for error in [TimeoutError('delivery unknown'),RPCError(None,'BUTTON_DATA_INVALID',400),RPCError(None,'MSG_ID_INVALID',400)]:
+            class FailedClient(FakeClient):
+                async def send_file(self,*args,**kwargs):
+                    self.attempts=getattr(self,'attempts',0)+1
+                    raise error
+            with self.subTest(error=type(error).__name__),self.assertRaises(type(error)):
+                self.upload(600_001,FailedClient)
+            self.assertEqual(FailedClient.instances[-1].attempts,1)
+
+    def test_bot_api_replies_allow_deleted_request_without_mutating_the_original_payload(self):
+        import json
+        from unittest.mock import MagicMock
+        response=MagicMock();response.ok=True;response.json.return_value={'ok':True,'result':{'message_id':8}}
+        for use_form in [False,True]:
+            body={'chat_id':42,'audio':'cached-file','reply_parameters':json.dumps({'message_id':7}) if use_form else {'message_id':7}}
+            with patch.object(app.requests,'post',return_value=response) as post:
+                result=app.telegram_call('fake','sendAudio',**({'data':body} if use_form else {'json_payload':body}))
+            sent=post.call_args.kwargs['data' if use_form else 'json']
+            reply=json.loads(sent['reply_parameters']) if use_form else sent['reply_parameters']
+            self.assertEqual(reply,{'message_id':7,'allow_sending_without_reply':True})
+            original=json.loads(body['reply_parameters']) if use_form else body['reply_parameters']
+            self.assertEqual(original,{'message_id':7});self.assertEqual(result,{'message_id':8})
+            post.assert_called_once()
+
+    def test_upload_diagnostics_preserve_nested_rpc_cause_without_exposing_credentials(self):
+        from telethon.errors import RPCError
+        diagnostic=app.upload_error_diagnostic(ExceptionGroup('parts failed',[RPCError(None,'AUTH_KEY_UNREGISTERED',401)]),'bot-secret')
+        self.assertEqual(diagnostic['errorCode'],'AUTH_KEY_UNREGISTERED')
+        with patch.dict(os.environ,{'API_HASH':'api-secret','INSTAGRAM_SESSIONID':'session-secret'}):
+            diagnostic=app.upload_error_diagnostic(RuntimeError('bot-secret api-secret session-secret https://cdn.example/private?token=secret cookie=hidden'),'bot-secret')
+        for secret in ['bot-secret','api-secret','session-secret','cdn.example','token=secret','hidden']:
+            self.assertNotIn(secret,diagnostic['diagnostic'])
+        with patch.dict(os.environ,{'API_HASH':'SUPER_SECRET'}):
+            self.assertNotIn('SUPER_SECRET',str(app.upload_error_diagnostic(RuntimeError('SUPER_SECRET'),'bot-secret')))
 
     def test_file_caption_and_button_use_native_custom_emoji_without_changing_media(self):
         import json

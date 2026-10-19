@@ -163,6 +163,24 @@ class UserVisibleError(Exception):
     pass
 
 
+def upload_error_diagnostic(exc: BaseException, token: str) -> dict[str, str]:
+    if isinstance(exc, BaseExceptionGroup):
+        children = [upload_error_diagnostic(child, token) for child in exc.exceptions[:3]]
+        return {"errorCode": children[0]["errorCode"] if children else type(exc).__name__,
+                "diagnostic": "; ".join(f"{child['errorCode']}: {child['diagnostic']}" for child in children)[:1200]}
+    detail = str(getattr(exc, "message", str(exc)))
+    if isinstance(exc, subprocess.SubprocessError):
+        detail = "subprocess failed"  # Commands can contain signed URLs and account headers.
+    for secret in (token, os.environ.get("API_HASH", ""), os.environ.get("INSTAGRAM_SESSIONID", "")):
+        if secret:
+            detail = detail.replace(secret, "[redacted]")
+    detail = re.sub(r"https?://[^\s\"'<>]+", "[url]", detail)
+    detail = re.sub(r"(?i)\b(authorization|cookie|sessionid)\b[\"']?\s*[:=]\s*[^\r\n]+", r"\1=[redacted]", detail)
+    detail = re.sub(r"[\x00-\x1f\x7f]", " ", detail)
+    code = detail if re.fullmatch(r"[A-Z][A-Z0-9_]{1,95}", detail) else type(exc).__name__
+    return {"errorCode": code, "diagnostic": detail[:1200]}
+
+
 def job_timeout(seconds: float) -> float:
     deadline = JOB_DEADLINE.get()
     if deadline is None:
@@ -302,6 +320,16 @@ def telegram_text_motion(token: str, method: str, payload: dict[str, Any]) -> No
         pass  # Optional effect must never prevent the complete message.
 
 
+def telegram_reply_payload(payload: dict[str, Any], *, form: bool = False) -> dict[str, Any]:
+    reply = payload.get("reply_parameters")
+    if isinstance(reply, str):
+        reply = json.loads(reply)
+    if not isinstance(reply, dict) or not reply.get("message_id") or reply.get("chat_id"):
+        return payload
+    reply = {"allow_sending_without_reply": True, **reply}
+    return {**payload, "reply_parameters": json.dumps(reply) if form else reply}
+
+
 def telegram_call(
     token: str,
     method: str,
@@ -311,6 +339,10 @@ def telegram_call(
     files: dict[str, Any] | None = None,
     timeout: int = 900,
 ) -> Any:
+    if json_payload is not None:
+        json_payload = telegram_reply_payload(json_payload)
+    if data is not None:
+        data = telegram_reply_payload(data, form=True)
     if files:
         upload_timeout = job_timeout(timeout)
         return asyncio.run(asyncio.wait_for(
@@ -807,7 +839,7 @@ def validate_file_size(path: Path) -> None:
 
 async def upload_complete_file(token: str, method: str, data: dict[str, Any], file: tuple) -> Any:
     from telethon import Button, TelegramClient, functions, types, utils
-    from telethon.errors import FloodWaitError
+    from telethon.errors import FloodWaitError, RPCError
     from telethon.sessions import MemorySession
 
     filename, handle, mime = file
@@ -888,16 +920,21 @@ async def upload_complete_file(token: str, method: str, data: dict[str, Any], fi
             caption_entities = json.loads(caption_entities)
         formatting_entities = [types.MessageEntityCustomEmoji(e["offset"], e["length"], int(e["custom_emoji_id"]))
                                for e in caption_entities if e.get("type") == "custom_emoji"]
-        message = await client.send_file(
-            int(data["chat_id"]), uploaded,
-            caption=data.get("caption", ""), parse_mode=None,
-            formatting_entities=formatting_entities or None,
-            mime_type=mime, attributes=attributes,
-            supports_streaming=method == "sendVideo",
-            force_document=method == "sendDocument",
-            reply_to=reply.get("message_id"),
-            buttons=buttons,
-        )
+        options = dict(caption=data.get("caption", ""), parse_mode=None,
+                       formatting_entities=formatting_entities or None,
+                       mime_type=mime, attributes=attributes,
+                       supports_streaming=method == "sendVideo",
+                       force_document=method == "sendDocument",
+                       reply_to=reply.get("message_id"), buttons=buttons)
+        try:
+            message = await client.send_file(int(data["chat_id"]), uploaded, **options)
+        except RPCError as exc:
+            # A definitive reply rejection has not published a message. Reuse the uploaded file once.
+            if (not options["reply_to"] or not reply.get("allow_sending_without_reply", True) or reply.get("chat_id") or
+                    exc.code != 400 or exc.message != "REPLY_MESSAGE_ID_INVALID"):
+                raise
+            options["reply_to"] = None
+            message = await client.send_file(int(data["chat_id"]), uploaded, **options)
         return {"message_id": message.id, "file_id": utils.pack_bot_file_id(getattr(message, "document", None))}
 
 
@@ -1693,10 +1730,11 @@ class InstagramCapture:
             delete_status(self.payload["botToken"], self.payload["chatId"], self.payload["statusMessageId"])
             return {"ok": True, "title": self.source.get("recognizedTitle") or self.source.get("title")}
         except Exception as exc:
-            print(f"instagram upload failed: {type(exc).__name__}", flush=True)
+            diagnostic = upload_error_diagnostic(exc, self.payload["botToken"])
+            print(json.dumps({"message": "instagram upload failed", "jobId": self.id, **diagnostic}, ensure_ascii=False), flush=True)
             with self.lock:
                 self.state = "failed"
-            return {"ok": False}
+            return {"ok": False, **diagnostic}
 
     def social_delivery_options(self, item: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
         markup = None

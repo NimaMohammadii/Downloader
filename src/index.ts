@@ -1437,7 +1437,7 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
     await telegramCall(env.BOT_TOKEN, "sendMessage", {
       chat_id: message.chat.id,
       text: "یه لینک معتبر Instagram بفرست 👇",
-      reply_parameters: { message_id: message.message_id },
+      reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
     });
     return Response.json({ ok: true });
   }
@@ -1451,7 +1451,7 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
     const status = await telegramCall<TelegramMessage>(env.BOT_TOKEN, "sendMessage", {
       chat_id: message.chat.id,
       text: "⏳ لینک اینستاگرام رو گرفتم، دارم فایل رو آماده می‌کنم…",
-      reply_parameters: { message_id: message.message_id },
+      reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
     });
     statusMessageId = status.message_id;
 
@@ -1468,7 +1468,7 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
           chat_id: message.chat.id,
           photo: proxyUrl,
           caption,
-          reply_parameters: index === 0 ? { message_id: message.message_id } : undefined,
+          reply_parameters: index === 0 ? { message_id: message.message_id, allow_sending_without_reply: true } : undefined,
         });
       } else {
         const cacheKey = target.kind === "post" ? `ig:${message.from?.id || message.chat.id}:${target.shortcode}:${index}:video` : undefined;
@@ -1483,7 +1483,7 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
           reply_markup: target.kind === "post" && message.from?.id ? { inline_keyboard: [[{
             text: "🎵 فقط صدا", callback_data: `iga|p|${target.shortcode}|${index}|${message.from.id}`,
           }, { text: "🔎 پیداکردن آهنگ", callback_data: `igm|p|${target.shortcode}|${index}|${message.from.id}` }]] } : undefined,
-          reply_parameters: index === 0 ? { message_id: message.message_id } : undefined,
+          reply_parameters: index === 0 ? { message_id: message.message_id, allow_sending_without_reply: true } : undefined,
         };
         let sent: TelegramMessage;
         try { sent = await telegramCall<TelegramMessage>(env.BOT_TOKEN, "sendVideo", payload); }
@@ -1522,7 +1522,7 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
       await safeTelegramCall(env.BOT_TOKEN, "sendMessage", {
         chat_id: message.chat.id,
         text: friendly,
-        reply_parameters: { message_id: message.message_id },
+        reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
       });
     }
   }

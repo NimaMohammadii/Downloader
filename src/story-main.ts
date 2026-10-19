@@ -684,7 +684,7 @@ async function sendResolvedStory(env: Env, target: StoryTarget, update: Telegram
     const status = await telegramCall<TelegramMessage>(env.BOT_TOKEN, "sendMessage", {
       chat_id: message.chat.id,
       text: "⏳ لینک Instagram رو گرفتم، دارم Story رو آماده می‌کنم…",
-      reply_parameters: { message_id: message.message_id },
+      reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
     });
     statusMessageId = status.message_id;
 
@@ -697,7 +697,7 @@ async function sendResolvedStory(env: Env, target: StoryTarget, update: Telegram
           chat_id: message.chat.id,
           photo: mediaUrl,
           caption,
-          reply_parameters: i === 0 ? { message_id: message.message_id } : undefined,
+          reply_parameters: i === 0 ? { message_id: message.message_id, allow_sending_without_reply: true } : undefined,
         });
       } else {
         const cacheKey = target.kind === "story" && target.storyId ? `ig:${message.from?.id || message.chat.id}:${target.storyId}:0:video` : undefined;
@@ -712,7 +712,7 @@ async function sendResolvedStory(env: Env, target: StoryTarget, update: Telegram
           reply_markup: target.kind === "story" && target.storyId && message.from?.id ? { inline_keyboard: [[{
             text: "🎵 فقط صدا", callback_data: `iga|s|${target.storyId}|0|${message.from.id}`,
           }, { text: "🔎 پیداکردن آهنگ", callback_data: `igm|s|${target.storyId}|0|${message.from.id}` }]] } : undefined,
-          reply_parameters: i === 0 ? { message_id: message.message_id } : undefined,
+          reply_parameters: i === 0 ? { message_id: message.message_id, allow_sending_without_reply: true } : undefined,
         };
         let sent: TelegramMessage;
         try { sent = await telegramCall<TelegramMessage>(env.BOT_TOKEN, "sendVideo", payload); }
@@ -782,7 +782,7 @@ export default {
           await safeTelegramCall(env.BOT_TOKEN, "sendMessage", {
             chat_id: message.chat.id,
             text: storyErrorText(error),
-            reply_parameters: { message_id: message.message_id },
+            reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
           });
         }
         return Response.json({ ok: true });
