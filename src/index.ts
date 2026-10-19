@@ -693,11 +693,14 @@ async function resolveViaOembedMobile(
 
   const media = await fetchJson(
     `https://i.instagram.com/api/v1/media/${mediaId}/info/`,
-    mobileHeaders(jar),
+    jar.has("sessionid") ? privateMobileHeaders(jar) : mobileHeaders(jar),
     jar,
   );
   const product = media.data?.items?.[0];
-  if (!product) return null;
+  if (!product) {
+    if (media.status !== 200) throw new Error(`INSTAGRAM_MOBILE_HTTP_${media.status}`);
+    return null;
+  }
 
   const groups = candidatesFromProduct(product);
   if (groups.length) {
@@ -705,6 +708,15 @@ async function resolveViaOembedMobile(
     return groups;
   }
   return null;
+}
+
+function throwPostGraphqlFailure(data: any): void {
+  const error = Array.isArray(data?.errors) ? data.errors[0] : null;
+  if (!error) return;
+  if (error.code === 1675004 || /rate limit exceeded/i.test(String(error.message || ""))) {
+    throw new Error("INSTAGRAM_RATE_LIMIT_429");
+  }
+  throw new Error(`INSTAGRAM_GRAPHQL_ERROR_${Number.isSafeInteger(error.code) ? error.code : "UNSPECIFIED"}`);
 }
 
 async function resolveViaInstaloaderGraphql(
@@ -735,7 +747,10 @@ async function resolveViaInstaloaderGraphql(
     { method: "POST", body },
   );
   const product = response.data?.data?.xdt_api__v1__media__shortcode__web_info?.items?.[0];
-  if (!product) return null;
+  if (!product) {
+    throwPostGraphqlFailure(response.data);
+    return null;
+  }
 
   const groups = candidatesFromProduct(product);
   if (groups.length) {
@@ -797,6 +812,7 @@ async function resolveViaCobaltGraphql(
     console.log("instagram resolver success", { resolver: "graphql-post-action", authenticated: jar.has("sessionid") });
     return groups;
   }
+  throwPostGraphqlFailure(response.data);
   return null;
 }
 
@@ -884,6 +900,7 @@ async function resolveViaLegacyGraphql(
     console.log("instagram resolver success", { resolver: "legacy-graphql", authenticated: jar.has("sessionid") });
     return groups;
   }
+  throwPostGraphqlFailure(response.data);
   return null;
 }
 
@@ -933,6 +950,7 @@ async function resolveAuthenticatedMediaInfo(
 async function tryPublicResolvers(
   target: Extract<InstagramTarget, { kind: "post" }>,
   jar: CookieJar,
+  diagnostics: string[],
 ): Promise<MediaCandidate[][] | null> {
   const mediaId = shortcodeToMediaId(target.shortcode);
   const resolvers: Array<[string, () => Promise<MediaCandidate[][] | null>]> = [
@@ -947,9 +965,12 @@ async function tryPublicResolvers(
     try {
       const result = await run();
       if (result?.length) return result;
+      diagnostics.push(`${jar.has("sessionid") ? "session" : "public"}/${name}:EMPTY`);
       console.warn("instagram resolver empty", { resolver: name, authenticated: jar.has("sessionid") });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
+      const code = /^INSTAGRAM_[A-Z0-9_]+$/.test(detail) ? detail : "REQUEST_ERROR";
+      diagnostics.push(`${jar.has("sessionid") ? "session" : "public"}/${name}:${code}`);
       console.warn("instagram resolver failed", { resolver: name, authenticated: jar.has("sessionid"), detail });
       if (detail === "INSTAGRAM_RATE_LIMIT_429") throw error;
     }
@@ -961,21 +982,23 @@ async function resolvePost(
   target: Extract<InstagramTarget, { kind: "post" }>,
   env: Env,
 ): Promise<MediaCandidate[][]> {
-  const anonymous = await tryPublicResolvers(target, new Map());
+  const diagnostics: string[] = [];
+  const anonymous = await tryPublicResolvers(target, new Map(), diagnostics);
   if (anonymous?.length) return anonymous;
 
   if (env.INSTAGRAM_SESSIONID?.trim()) {
     const sessionJar = secretCookies(env);
 
-    const withSession = await tryPublicResolvers(target, sessionJar);
+    const withSession = await tryPublicResolvers(target, sessionJar, diagnostics);
     if (withSession?.length) return withSession;
 
     const mediaId = shortcodeToMediaId(target.shortcode);
     const authenticatedInfo = await resolveAuthenticatedMediaInfo(target, mediaId, cloneJar(sessionJar));
     if (authenticatedInfo?.length) return authenticatedInfo;
+    diagnostics.push("session/authenticated-media-info:EMPTY");
   }
 
-  throw new Error("INSTAGRAM_ALL_RESOLVERS_FAILED");
+  throw new Error(`INSTAGRAM_ALL_RESOLVERS_FAILED [${diagnostics.join(",")}]`);
 }
 
 function cobaltStoryHeaders(jar: CookieJar): Headers {
