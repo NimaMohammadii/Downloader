@@ -153,6 +153,7 @@ export type AdminUsersPage = {
   page: number;
   pageSize: number;
   totalPages: number;
+  usedOnly?: boolean;
 };
 
 type RecordPayload = {
@@ -441,8 +442,11 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
     if (request.method === "GET" && url.pathname === "/users") {
       const rawPage = Number(url.searchParams.get("page") || "0");
       const page = Number.isSafeInteger(rawPage) && rawPage >= 0 ? rawPage : 0;
+      const usedOnly = url.searchParams.get("used") === "1";
+      // Include legacy link counters as well as newer non-link requests; /start alone is not usage.
+      const filter = usedOnly ? "WHERE links_sent > 0 OR EXISTS (SELECT 1 FROM download_history WHERE user_id = users.id)" : "";
       const count = this.ctx.storage.sql.exec(
-        "SELECT COUNT(*) AS total_users FROM users",
+        `SELECT COUNT(*) AS total_users FROM users ${filter}`,
       ).one() as CountSqlRow;
       const totalUsers = asNumber(count.total_users);
       const totalPages = Math.max(1, Math.ceil(totalUsers / ADMIN_USERS_PAGE_SIZE));
@@ -451,6 +455,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       const rows = this.ctx.storage.sql.exec(
         `SELECT id, username, first_name, last_name, links_sent, first_seen, last_seen
          FROM users
+         ${filter}
          ORDER BY last_seen DESC, id ASC
          LIMIT ? OFFSET ?`,
         ADMIN_USERS_PAGE_SIZE,
@@ -473,6 +478,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         page: safePage,
         pageSize: ADMIN_USERS_PAGE_SIZE,
         totalPages,
+        ...(usedOnly ? { usedOnly: true } : {}),
       } satisfies AdminUsersPage);
     }
 
@@ -545,9 +551,10 @@ export async function getAdminSummary(env: AdminStatsEnv): Promise<AdminSummary>
   return (await response.json()) as AdminSummary;
 }
 
-export async function getAdminUsersPage(env: AdminStatsEnv, page: number): Promise<AdminUsersPage> {
+export async function getAdminUsersPage(env: AdminStatsEnv, page: number, usedOnly = false): Promise<AdminUsersPage> {
   const url = new URL("https://admin-stats/users");
   url.searchParams.set("page", String(Math.max(0, Math.floor(page))));
+  if (usedOnly) url.searchParams.set("used", "1");
   const response = await statsStub(env).fetch(url.toString());
   if (!response.ok) throw new Error(`ADMIN_USERS_${response.status}`);
   return (await response.json()) as AdminUsersPage;
@@ -591,25 +598,32 @@ export function adminDashboardKeyboard(): Record<string, unknown> {
   return {
     inline_keyboard: [
       [{ text: "👥 لیست کاربران", callback_data: "admin:users:0" }],
+      [{ text: "کاربران استفاده‌کننده", callback_data: "admin:used:0" }],
       [{ text: "🔄 بروزرسانی آمار", callback_data: "admin:stats" }],
     ],
   };
 }
 
 export function formatAdminUsers(page: AdminUsersPage): string {
-  return [`👥 لیست کاربران (${page.totalUsers})`, `صفحه ${page.page + 1}/${page.totalPages}`, "",
-    page.users.length ? "برای مشاهده آمار و سابقه دانلود، کاربر را انتخاب کنید:" : "هنوز کاربری ثبت نشده."].join("\n");
+  return [page.usedOnly ? `کاربران استفاده‌کننده (${page.totalUsers})` : `👥 لیست کاربران (${page.totalUsers})`,
+    `صفحه ${page.page + 1}/${page.totalPages}`, "",
+    ...(page.usedOnly ? ["ارسال لینک یا درخواست ثبت‌شدهٔ دانلود، جست‌وجو، استخراج صدا یا تشخیص آهنگ.",
+      "کاربران قدیمی بر اساس اطلاعات ذخیره‌شده نمایش داده می‌شوند؛ صرفاً /start کافی نیست.", ""] : []),
+    page.users.length ? "برای مشاهده آمار و سابقه دانلود، کاربر را انتخاب کنید:"
+      : page.usedOnly ? "هنوز استفاده‌ای در اطلاعات ذخیره‌شده یافت نشد." : "هنوز کاربری ثبت نشده."].join("\n");
 }
 
 export function adminUsersKeyboard(page: AdminUsersPage): Record<string, unknown> {
+  const list = page.usedOnly ? "used" : "users";
+  const suffix = page.usedOnly ? ":used" : "";
   const rows = page.users.map(user => [{
     text: `${displayText(userDisplayName(user), 35)} • ${user.id}`,
-    callback_data: `admin:user:${user.id}:${page.page}:0`,
+    callback_data: `admin:user:${user.id}:${page.page}:0${suffix}`,
   }]);
   const nav: Array<{ text: string; callback_data: string }> = [];
-  if (page.page > 0) nav.push({ text: "‹ قبلی", callback_data: `admin:users:${page.page - 1}` });
+  if (page.page > 0) nav.push({ text: "‹ قبلی", callback_data: `admin:${list}:${page.page - 1}` });
   nav.push({ text: "🏠 آمار", callback_data: "admin:stats" });
-  if (page.page + 1 < page.totalPages) nav.push({ text: "بعدی ›", callback_data: `admin:users:${page.page + 1}` });
+  if (page.page + 1 < page.totalPages) nav.push({ text: "بعدی ›", callback_data: `admin:${list}:${page.page + 1}` });
   return { inline_keyboard: [...rows, nav] };
 }
 
@@ -674,14 +688,14 @@ export function formatAdminUserDetail(detail: AdminUserDetail): string {
   return lines.join("\n");
 }
 
-export function adminUserDetailKeyboard(detail: AdminUserDetail, usersPage: number): Record<string, unknown> {
-  const callback = (page: number) => `admin:user:${detail.user.id}:${usersPage}:${page}`;
+export function adminUserDetailKeyboard(detail: AdminUserDetail, usersPage: number, usedOnly = false): Record<string, unknown> {
+  const callback = (page: number) => `admin:user:${detail.user.id}:${usersPage}:${page}${usedOnly ? ":used" : ""}`;
   const nav: Array<{ text: string; callback_data: string }> = [];
   if (detail.page > 0) nav.push({ text: "‹ جدیدتر", callback_data: callback(detail.page - 1) });
   if (detail.page + 1 < detail.totalPages) nav.push({ text: "قدیمی‌تر ›", callback_data: callback(detail.page + 1) });
   return { inline_keyboard: [
     ...(nav.length ? [nav] : []),
     [{ text: "🔄 بروزرسانی", callback_data: callback(detail.page) }],
-    [{ text: "👥 بازگشت به کاربران", callback_data: `admin:users:${usersPage}` }, { text: "🏠 آمار", callback_data: "admin:stats" }],
+    [{ text: usedOnly ? "بازگشت به استفاده‌کنندگان" : "👥 بازگشت به کاربران", callback_data: `admin:${usedOnly ? "used" : "users"}:${usersPage}` }, { text: "🏠 آمار", callback_data: "admin:stats" }],
   ] };
 }

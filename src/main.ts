@@ -147,21 +147,21 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
       return Response.json({ ok: true });
     }
 
-    const userMatch = /^admin:user:([1-9]\d{0,15}):(\d{1,8}):(\d{1,8})$/.exec(data);
+    const userMatch = /^admin:user:([1-9]\d{0,15}):(\d{1,8}):(\d{1,8})(:used)?$/.exec(data);
     if (userMatch) {
       const detail = await getAdminUserDetail(env, userMatch[1], Number(userMatch[3]));
       await telegramCall(env.BOT_TOKEN, "editMessageText", {
         chat_id: message.chat.id, message_id: message.message_id,
         text: detail ? formatAdminUserDetail(detail) : "این کاربر پیدا نشد.",
-        reply_markup: detail ? adminUserDetailKeyboard(detail, Number(userMatch[2])) : adminDashboardKeyboard(),
+        reply_markup: detail ? adminUserDetailKeyboard(detail, Number(userMatch[2]), Boolean(userMatch[4])) : adminDashboardKeyboard(),
         link_preview_options: { is_disabled: true },
       });
       return Response.json({ ok: true });
     }
 
-    const usersMatch = /^admin:users:(\d+)$/.exec(data);
+    const usersMatch = /^admin:(users|used):(\d+)$/.exec(data);
     if (usersMatch) {
-      const page = await getAdminUsersPage(env, Number(usersMatch[1]));
+      const page = await getAdminUsersPage(env, Number(usersMatch[2]), usersMatch[1] === "used");
       await telegramCall(env.BOT_TOKEN, "editMessageText", {
         chat_id: message.chat.id,
         message_id: message.message_id,

@@ -159,6 +159,73 @@ test('user buttons and per-user download pagination remain bounded and isolated'
   } finally { f.close(); }
 });
 
+test('usage list includes legacy links and non-link requests, excludes start-only users and counts each user once', async () => {
+  const f = fixture(true);
+  try {
+    await f.record(1, { user: { id: 99 }, start: true });
+    await f.record(2, { user: { id: 77, firstName: 'جست‌وجوی آهنگ' } });
+    await f.record(3, { user: { id: 88 }, start: true });
+    await f.record(4, { user: { id: 66 }, start: false });
+    await f.request('/download', { ...base, key: 'music-search', userId: 77, source: 'Music', request: 'song name', status: 'results' });
+    await f.request('/download', { ...base, key: 'music-download', userId: 77, source: 'Music', request: 'song name', status: 'success', delivered: 1 });
+    await f.request('/download', { ...base, key: 'failed-shazam', userId: 88, source: 'Shazam', request: 'voice', status: 'failed' });
+    const used = await admin.getAdminUsersPage(f.env, 0, true);
+    assert.equal(used.usedOnly, true); assert.equal(used.totalUsers, 3);
+    assert.deepEqual(used.users.map(u => u.id).sort(), ['42','77','88']);
+    assert.equal(used.users.find(u => u.id === '42').linksSent, 12);
+    assert.equal((await f.detail()).counts.total, 0);
+    assert.equal((await admin.getAdminUsersPage(f.env, 0)).totalUsers, 5);
+    assert.match(admin.formatAdminUsers(used), /کاربران استفاده‌کننده \(3\)/);
+    assert.ok(admin.adminDashboardKeyboard().inline_keyboard.flat().some(b => b.callback_data === 'admin:used:0'));
+  } finally { f.close(); }
+});
+
+test('usage pagination and detail navigation retain their filter without changing the ordinary user list', async () => {
+  const f = fixture();
+  try {
+    const empty = await admin.getAdminUsersPage(f.env, 500, true);
+    assert.equal(empty.page, 0); assert.equal(empty.totalPages, 1); assert.equal(empty.users.length, 0);
+    assert.match(admin.formatAdminUsers(empty), /هنوز استفاده‌ای/);
+    for (let i = 0; i < 13; i++) await f.record(i, { user: { id: 42 + i }, linkSent: i < 10 });
+    const first = await admin.getAdminUsersPage(f.env, 0, true);
+    const last = await admin.getAdminUsersPage(f.env, 500, true);
+    assert.equal(first.totalUsers, 10); assert.equal(first.users.length, 8);
+    assert.equal(last.page, 1); assert.equal(last.users.length, 2);
+    assert.ok(!first.users.some(a => last.users.some(b => a.id === b.id)));
+    const buttons = admin.adminUsersKeyboard(first).inline_keyboard.flat();
+    assert.ok(buttons.some(b => b.callback_data === 'admin:used:1'));
+    assert.ok(buttons.some(b => /^admin:user:\d+:0:0:used$/.test(b.callback_data)));
+    const detail = await f.detail();
+    assert.ok(admin.adminUserDetailKeyboard(detail, 1, true).inline_keyboard.flat().some(b => b.callback_data === 'admin:used:1'));
+    const ordinary = await admin.getAdminUsersPage(f.env, 0);
+    assert.equal(ordinary.totalUsers, 13); assert.equal(ordinary.usedOnly, undefined);
+    assert.ok(admin.adminUsersKeyboard(ordinary).inline_keyboard.flat().some(b => b.callback_data === 'admin:users:1'));
+  } finally { f.close(); }
+});
+
+test('production admin callbacks open the usage list and return to it; non-admins cannot access it', async () => {
+  const f = fixture(); const calls = []; const previousFetch = globalThis.fetch;
+  try {
+    await f.record(1, { linkSent: true });
+    globalThis.fetch = async (input, init) => {
+      calls.push({ url: String(input), body: JSON.parse(init.body) });
+      return Response.json({ ok: true, result: { message_id: 10 } });
+    };
+    const callback = (id, data) => ({ update_id: 2, callback_query: { id: 'panel', from: { id }, data,
+      message: { message_id: 10, chat: { id } } } });
+    await admin.worker.fetch(webhook(callback(99, 'admin:used:0')), f.env, {});
+    assert.equal(calls.length, 0);
+    await admin.worker.fetch(webhook(callback(admin.ADMIN_USER_ID, 'admin:used:0')), f.env, {});
+    let edit = calls.filter(c => c.url.endsWith('/editMessageText')).at(-1).body;
+    assert.match(edit.text, /کاربران استفاده‌کننده \(1\)/);
+    assert.ok(edit.reply_markup.inline_keyboard.flat().some(b => b.callback_data === 'admin:user:42:0:0:used'));
+    await admin.worker.fetch(webhook(callback(admin.ADMIN_USER_ID, 'admin:user:42:0:0:used')), f.env, {});
+    edit = calls.filter(c => c.url.endsWith('/editMessageText')).at(-1).body;
+    assert.match(edit.text, /شناسه: 42/);
+    assert.ok(edit.reply_markup.inline_keyboard.flat().some(b => b.callback_data === 'admin:used:0'));
+  } finally { globalThis.fetch = previousFetch; f.close(); }
+});
+
 const webhook = (update, secret = 'private-test-secret') => new Request('https://worker/telegram/webhook', {
   method: 'POST', headers: { 'x-telegram-bot-api-secret-token': secret }, body: JSON.stringify(update),
 });
