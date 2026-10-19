@@ -242,36 +242,62 @@ def telegram_custom_emoji(method: str, payload: dict[str, Any], *, form: bool = 
 
 def telegram_text_motion(token: str, method: str, payload: dict[str, Any]) -> None:
     text = payload.get("text")
-    if method not in {"sendMessage", "editMessageText"} or not isinstance(text, str) or len(text) < 24:
+    if method != "sendMessage" or not isinstance(text, str) or len(text) < 2 or payload.get("parse_mode"):
         return
     if payload.get("inline_message_id") or payload.get("business_connection_id"):
         return
     try:
         chat = int(payload["chat_id"])
+        if chat <= 0:
+            return
         key, now = (token.split(":")[0], chat), time.monotonic()
         with TEXT_MOTION_LOCK:
             if now < TEXT_MOTION_CHATS.get(key, -10):
                 return
             if len(TEXT_MOTION_CHATS) >= 512:
                 TEXT_MOTION_CHATS.pop(next(iter(TEXT_MOTION_CHATS)))
-            TEXT_MOTION_CHATS[key] = now + 3
-        if method == "sendMessage" and chat > 0:
-            action = "sendMessageDraft"
-            body = {k: payload[k] for k in ("chat_id", "message_thread_id", "text", "parse_mode", "entities") if k in payload}
-            body["draft_id"] = secrets.randbelow(2147483646) + 1
-        elif method == "editMessageText" and payload.get("message_id") and not payload.get("parse_mode") and not payload.get("entities"):
-            action = method
-            body = {"chat_id": chat, "message_id": payload["message_id"], "text": text[:max(12, (len(text) * 55 + 99) // 100)] + "…"}
-        else:
+            TEXT_MOTION_CHATS[key] = now + 10
+        # Keep Persian combining marks, joiners and animated emoji together.
+        chars: list[str] = []
+        for char in text:
+            if chars and (unicodedata.combining(char) or char in "\ufe0f\ufe0e\u200d\u200c" or
+                          chars[-1].endswith(("\u200d", "\u200c")) or 0x1F3FB <= ord(char) <= 0x1F3FF or
+                          (0x1F1E6 <= ord(char) <= 0x1F1FF and len(chars[-1]) == 1 and 0x1F1E6 <= ord(chars[-1]) <= 0x1F1FF)):
+                chars[-1] += char
+            else:
+                chars.append(char)
+        if len(chars) < 2:
             return
-        response = requests.post(f"https://api.telegram.org/bot{token}/{action}", json=telegram_custom_emoji(action, body), timeout=(0.4, 0.4))
-        result = response.json()
-        if response.status_code == 429:
-            retry = max(3, min(3600, float(result.get("parameters", {}).get("retry_after") or 30)))
-            with TEXT_MOTION_LOCK:
-                TEXT_MOTION_CHATS[key] = time.monotonic() + retry
-        if response.ok and result.get("ok"):
-            time.sleep(min(0.4, job_timeout(0.4)))
+        frames = min(6, max(2, (len(chars) + 7) // 8))
+        draft_id, deadline = secrets.randbelow(2147483646) + 1, now + 4.5
+        for frame in range(frames):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            end = 1 if frame == 0 else (len(chars) * frame + frames - 2) // (frames - 1)
+            prefix = "".join(chars[:end])
+            if not prefix.strip():
+                continue
+            body = {"chat_id": chat, "draft_id": draft_id, "text": prefix}
+            if "message_thread_id" in payload:
+                body["message_thread_id"] = payload["message_thread_id"]
+            length = len(prefix.encode("utf-16-le")) // 2
+            original = payload.get("entities", [])
+            entities = json.loads(original) if isinstance(original, str) else original
+            body["entities"] = [{**e, "length": min(e["length"], length - e["offset"])} for e in entities
+                                if e["offset"] < length and (e.get("type") != "custom_emoji" or e["offset"] + e["length"] <= length)]
+            request_timeout = min(0.4, remaining / 2, job_timeout(0.4))
+            sent_at = time.monotonic()
+            response = requests.post(f"https://api.telegram.org/bot{token}/sendMessageDraft",
+                                     json=telegram_custom_emoji("sendMessageDraft", body), timeout=(request_timeout, request_timeout))
+            result = response.json()
+            if response.status_code == 429:
+                retry = max(3, min(3600, float(result.get("parameters", {}).get("retry_after") or 30)))
+                with TEXT_MOTION_LOCK:
+                    TEXT_MOTION_CHATS[key] = time.monotonic() + retry
+            if not response.ok or not result.get("ok"):
+                break
+            time.sleep(max(0, min(0.4 - (time.monotonic() - sent_at), deadline - time.monotonic(), job_timeout(0.4))))
     except Exception:
         pass  # Optional effect must never prevent the complete message.
 

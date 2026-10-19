@@ -197,13 +197,18 @@ class TextMotionTests(unittest.TestCase):
         body={'chat_id':42,'text':'متن کامل تست برای نمایش نرم و درست پیام 🎵','reply_markup':{'inline_keyboard':[[{'text':'Download','callback_data':'test'}]]}}
         with patch.object(app.requests,'post',return_value=reply) as post,patch.object(app.time,'sleep'):
             result=app.telegram_call('fictional','sendMessage',json_payload=body)
-        self.assertEqual(result,{'message_id':8});self.assertEqual(len(post.call_args_list),2)
-        self.assertTrue(post.call_args_list[0].args[0].endswith('/sendMessageDraft'))
-        self.assertEqual(post.call_args_list[0].kwargs['json']['text'],body['text'])
+        self.assertEqual(result,{'message_id':8})
+        drafts=[call.kwargs['json'] for call in post.call_args_list[:-1]]
+        self.assertTrue(all(call.args[0].endswith('/sendMessageDraft') for call in post.call_args_list[:-1]))
+        self.assertGreater(len(drafts),1);self.assertLessEqual(len(drafts),6)
+        self.assertEqual(drafts[0]['text'],body['text'][0]);self.assertEqual(drafts[-1]['text'],body['text'])
+        self.assertEqual(len({d['draft_id'] for d in drafts}),1)
+        self.assertEqual([len(d['text']) for d in drafts],sorted({len(d['text']) for d in drafts}))
+        self.assertTrue(all(body['text'].startswith(d['text']) for d in drafts))
         sent=post.call_args_list[-1].kwargs['json']
         self.assertEqual(sent['text'],body['text']);self.assertEqual(sent['reply_markup'],body['reply_markup'])
         self.assertEqual(sent['entities'],[{'type':'custom_emoji','offset':len(body['text'][:-1].encode('utf-16-le'))//2,'length':2,'custom_emoji_id':'5463107823946717464'}])
-        self.assertEqual(post.call_args_list[0].kwargs['json']['entities'],sent['entities'])
+        self.assertEqual(drafts[-1]['entities'],sent['entities'])
         self.assertNotIn('entities',body)
 
     def test_custom_emoji_ids_utf16_offsets_variants_and_buttons_preserve_payload(self):
@@ -234,10 +239,10 @@ class TextMotionTests(unittest.TestCase):
     def test_failed_motion_still_sends_final_and_back_to_back_messages_skip_effect(self):
         from unittest.mock import MagicMock
         reply=MagicMock();reply.ok=True;reply.json.return_value={'ok':True,'result':True}
-        body={'chat_id':42,'message_id':8,'text':'Complete text for the edited message, unchanged.'}
+        body={'chat_id':42,'text':'Complete text for the new message, unchanged.'}
         with patch.object(app.requests,'post',side_effect=[app.requests.Timeout(),reply,reply]) as post:
-            app.telegram_call('fictional','editMessageText',json_payload=body)
-            app.telegram_call('fictional','editMessageText',json_payload=body)
+            app.telegram_call('fictional','sendMessage',json_payload=body)
+            app.telegram_call('fictional','sendMessage',json_payload=body)
         self.assertEqual(len(post.call_args_list),3)
         self.assertEqual(post.call_args_list[1].kwargs['json'],body)
         self.assertEqual(post.call_args_list[2].kwargs['json'],body)
@@ -246,6 +251,8 @@ class TextMotionTests(unittest.TestCase):
         with patch.object(app.requests,'post') as post:
             app.telegram_text_motion('a','answerCallbackQuery',{'text':'Very long callback notification text','chat_id':42})
             app.telegram_text_motion('a','editMessageText',{'chat_id':42,'message_id':3,'text':'<b>A complete formatted message for editing</b>','parse_mode':'HTML'})
+            app.telegram_text_motion('a','editMessageText',{'chat_id':42,'message_id':3,'text':'Plain delivered text must never shrink during an update.'})
+            app.telegram_text_motion('a','sendMessage',{'chat_id':42,'text':'<b>A complete formatted message</b>','parse_mode':'HTML'})
             app.telegram_text_motion('b','sendMessage',{'chat_id':-42,'text':'Group message with a complete original body.'})
         post.assert_not_called()
 
@@ -258,6 +265,27 @@ class TextMotionTests(unittest.TestCase):
             with patch.object(app.time,'monotonic',return_value=100):app.telegram_text_motion('fictional','sendMessage',body)
             with patch.object(app.time,'monotonic',return_value=104):app.telegram_text_motion('fictional','sendMessage',body)
         post.assert_called_once()
+
+    def test_draft_frames_preserve_graphemes_entities_and_have_a_total_deadline(self):
+        from unittest.mock import MagicMock
+        reply=MagicMock();reply.ok=True;reply.status_code=200;reply.json.return_value={'ok':True}
+        text='👩‍💻 ⚠️ می‌روم و متن فارسی با اَعراب برای آزمایش نمایش تدریجی'
+        body={'chat_id':42,'message_thread_id':5,'text':text,'entities':[{'type':'bold','offset':0,'length':len(text.encode('utf-16-le'))//2}]}
+        with patch.object(app.requests,'post',return_value=reply) as post,patch.object(app.time,'sleep'):
+            app.telegram_text_motion('fictional','sendMessage',body)
+        drafts=[c.kwargs['json'] for c in post.call_args_list]
+        self.assertEqual(drafts[0]['text'],'👩‍💻');self.assertEqual(drafts[-1]['text'],text)
+        for draft in drafts:
+            self.assertEqual(draft['message_thread_id'],5)
+            length=len(draft['text'].encode('utf-16-le'))//2
+            self.assertTrue(all(e['offset']+e['length']<=length for e in draft['entities']))
+            self.assertFalse(draft['text'].endswith(('\u200c','\u200d')))
+        clock=[100.0];app.TEXT_MOTION_CHATS.clear()
+        def slow_post(*args,**kwargs):clock[0]+=1.7;return reply
+        def advance(seconds):clock[0]+=seconds
+        with patch.object(app.time,'monotonic',side_effect=lambda:clock[0]),patch.object(app.time,'sleep',side_effect=advance),patch.object(app.requests,'post',side_effect=slow_post) as post:
+            app.telegram_text_motion('fictional','sendMessage',body)
+        self.assertLessEqual(post.call_count,3)
 
 
 class RecognitionDownloadTests(unittest.TestCase):

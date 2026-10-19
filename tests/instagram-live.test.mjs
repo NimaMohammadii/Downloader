@@ -212,20 +212,33 @@ test('native text motion is bounded, preserves formatting and final delivery sur
   const media=telegramCustomEmoji('sendMediaGroup',{media:[{type:'video',media:'file-id',caption:'🎬 title'}]});
   assert.equal(media.media[0].caption_entities[0].custom_emoji_id,ids[10]);
   const calls=[];globalThis.fetch=async(url,init)=>{calls.push({method:String(url).split('/').at(-1),body:JSON.parse(init.body)});return Response.json({ok:true,result:true});};
-  const body={chat_id:444,text:'متن کامل آهنگ و خواننده برای نمایش نرم 🎵',parse_mode:'HTML',reply_markup:{inline_keyboard:[]}};
+  const body={chat_id:444,text:'متن کامل آهنگ و خواننده برای نمایش نرم 🎵',reply_markup:{inline_keyboard:[]}};
   await telegramTextMotion('fictional','sendMessage',body);
-  assert.equal(calls.length,1);assert.equal(calls[0].method,'sendMessageDraft');
-  assert.equal(calls[0].body.text,body.text);assert.equal(calls[0].body.parse_mode,'HTML');assert.ok(calls[0].body.draft_id>0);
-  await telegramTextMotion('fictional','sendMessage',body);assert.equal(calls.length,1);
-  await telegramTextMotion('fictional','editMessageText',{...body,chat_id:445,message_id:7});assert.equal(calls.length,1);
-  await telegramTextMotion('fictional','sendAudio',{chat_id:446,text:body.text});assert.equal(calls.length,1);
-  await telegramTextMotion('fictional','editMessageText',{chat_id:447,message_id:7,text:body.text});
-  assert.equal(calls.length,2);assert.equal(calls[1].method,'editMessageText');assert.notEqual(calls[1].body.text,body.text);
-  const plain={chat_id:449,text:'🎵 یک متن کامل دیگر برای نمایش نرم و ایموجی سفارشی'};
+  assert.ok(calls.length>1 && calls.length<=6);assert.ok(calls.every(c=>c.method==='sendMessageDraft'));
+  assert.equal(calls[0].body.text,'م');assert.equal(calls.at(-1).body.text,body.text);
+  assert.equal(new Set(calls.map(c=>c.body.draft_id)).size,1);assert.ok(calls[0].body.draft_id>0);
+  assert.ok(calls.every((c,i)=>body.text.startsWith(c.body.text) && (!i || c.body.text.length>calls[i-1].body.text.length)));
+  const count=calls.length;
+  await telegramTextMotion('fictional','sendMessage',body);assert.equal(calls.length,count);
+  await telegramTextMotion('fictional','editMessageText',{...body,chat_id:445,message_id:7});assert.equal(calls.length,count);
+  await telegramTextMotion('fictional','sendMessage',{...body,chat_id:445,parse_mode:'HTML'});assert.equal(calls.length,count);
+  await telegramTextMotion('fictional','sendAudio',{chat_id:446,text:body.text});assert.equal(calls.length,count);
+  await telegramTextMotion('fictional','sendMessage',{...body,chat_id:-447});assert.equal(calls.length,count);
+  const plain={chat_id:449,message_thread_id:5,text:'👩‍💻 ⚠️ می‌روم و متن فارسی با اَعراب برای نمایش نرم 🎵'};
+  const limit=plain.text.length;plain.entities=[{type:'bold',offset:0,length:limit}];
   await telegramTextMotion('fictional','sendMessage',plain);
+  const unicode=calls.slice(count);assert.equal(unicode[0].body.text,'👩‍💻');
+  assert.equal(unicode.at(-1).body.text,plain.text);assert.ok(unicode.length<=6);
+  for(const frame of unicode){
+    assert.equal(frame.body.message_thread_id,5);assert.ok(!/[\u200c\u200d]$/u.test(frame.body.text));
+    assert.ok(frame.body.entities.every(e=>e.offset+e.length<=frame.body.text.length));
+  }
   assert.deepEqual(calls.at(-1).body.entities,telegramCustomEmoji('sendMessage',plain).entities);
   globalThis.fetch=async()=>{throw Error('draft unavailable');};
   await assert.doesNotReject(()=>telegramTextMotion('fictional','sendMessage',{...body,chat_id:448}));
+  let limited=0;globalThis.fetch=async()=>{limited++;return Response.json({ok:false,parameters:{retry_after:30}},{status:429});};
+  await telegramTextMotion('fictional','sendMessage',{...body,chat_id:450});
+  await telegramTextMotion('fictional','sendMessage',{...body,chat_id:450});assert.equal(limited,1);
 });
 
 test('a restart event does not upload a missing or partial replay',async()=>{

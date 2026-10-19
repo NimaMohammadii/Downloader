@@ -51,39 +51,43 @@ export function telegramCustomEmoji(method: string, payload: Record<string, unkn
 
 const textMotionChats = new Map<string, number>();
 
-// One bounded transition per chat, never a polling loop or character-by-character edits.
+// Telegram animates newly appended draft characters. Never truncate a delivered message.
 export async function telegramTextMotion(token: string, method: string, payload: Record<string, unknown>): Promise<void> {
-  if (!["sendMessage", "editMessageText"].includes(method) || typeof payload.text !== "string" ||
-      payload.text.length < 24 || payload.inline_message_id || payload.business_connection_id) return;
+  if (method !== "sendMessage" || typeof payload.text !== "string" || payload.parse_mode ||
+      payload.text.length < 2 || payload.inline_message_id || payload.business_connection_id) return;
   const chat = Number(payload.chat_id);
-  if (!Number.isSafeInteger(chat) || !chat) return;
+  if (!Number.isSafeInteger(chat) || chat <= 0) return;
   const key = `${token.split(":")[0]}:${chat}`;
   const now = Date.now();
   if (now < (textMotionChats.get(key) || 0)) return;
   if (textMotionChats.size >= 512) textMotionChats.delete(textMotionChats.keys().next().value!);
-  textMotionChats.set(key, now + 3000);
+  textMotionChats.set(key, now + 10000);
+  const deadline = performance.now() + 4500;
   const post = async (action: string, body: Record<string, unknown>) => {
     const response = await fetch(`https://api.telegram.org/bot${token}/${action}`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(telegramCustomEmoji(action, body)),
-      signal: AbortSignal.timeout(800),
+      signal: AbortSignal.timeout(Math.max(1, Math.min(800, Math.ceil(deadline - performance.now())))),
     });
     const result = await response.json() as { ok?: boolean; parameters?: { retry_after?: number } };
     if (response.status === 429) textMotionChats.set(key, Date.now() + Math.max(3000, Math.min(3600, Number(result.parameters?.retry_after) || 30) * 1000));
     if (!response.ok || !result.ok) throw new Error("TEXT_MOTION_UNAVAILABLE");
   };
   try {
-    if (method === "sendMessage" && chat > 0) {
-      // Native drafts fade in on supported Telegram clients. Persist with sendMessage.
-      const draft_id = crypto.getRandomValues(new Uint32Array(1))[0] % 2147483646 + 1;
-      await post("sendMessageDraft", { chat_id: chat, message_thread_id: payload.message_thread_id, draft_id,
-        text: payload.text, parse_mode: payload.parse_mode, entities: payload.entities });
-      await new Promise(resolve => setTimeout(resolve, 400));
-    } else if (method === "editMessageText" && payload.message_id && !payload.parse_mode && !payload.entities) {
-      // Existing messages have no native animation API. Use one short transition.
-      const chars = Array.from(payload.text);
-      const text = chars.slice(0, Math.max(12, Math.ceil(chars.length * 0.55))).join("") + "…";
-      await post("editMessageText", { chat_id: chat, message_id: payload.message_id, text });
-      await new Promise(resolve => setTimeout(resolve, 400));
+    const chars = Array.from(new Intl.Segmenter("fa", { granularity: "grapheme" }).segment(payload.text), part => part.segment);
+    if (chars.length < 2) return;
+    const frames = Math.min(6, Math.max(2, Math.ceil(chars.length / 8)));
+    const draft_id = crypto.getRandomValues(new Uint32Array(1))[0] % 2147483646 + 1;
+    for (let frame = 0; frame < frames; frame++) {
+      if (performance.now() >= deadline) break;
+      const end = frame === 0 ? 1 : Math.ceil(chars.length * frame / (frames - 1));
+      const text = chars.slice(0, end).join("");
+      if (!text.trim()) continue;
+      const entities = Array.isArray(payload.entities) ? (payload.entities as Record<string, unknown>[])
+        .filter(e => Number(e.offset) < text.length && (e.type !== "custom_emoji" || Number(e.offset) + Number(e.length) <= text.length))
+        .map(e => ({ ...e, length: Math.min(Number(e.length), text.length - Number(e.offset)) })) : undefined;
+      const sentAt = performance.now();
+      await post("sendMessageDraft", { chat_id: chat, message_thread_id: payload.message_thread_id, draft_id, text, entities });
+      await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(400 - (performance.now() - sentAt), deadline - performance.now()))));
     }
   } catch { /* Motion is optional; the complete original send/edit must always run. */ }
 }
