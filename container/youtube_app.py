@@ -1529,7 +1529,7 @@ class InstagramCapture:
         resume = pending if pending is not None else playlist["end"] + 1
         if resume <= 10000 and (pending is not None or len(entries) == playlist["end"] - playlist["start"] + 1):
             summary += f"\nادامه: /playlist {playlist['url']} {resume}-{min(10000, resume + 19)}"
-        self.playlist_result = {"ok": sent > 0, "parts": sent, "message": summary[:1000]}
+        self.playlist_result = {"ok": sent > 0, "parts": sent, "partial": sent < len(entries), "title": title, "message": summary[:1000]}
         self.result = self.playlist_result
         self.safe_status(summary[:3000])
         with self.lock:
@@ -1594,7 +1594,7 @@ class InstagramCapture:
             with self.lock:
                 self.state = "sent"
             delete_status(self.payload["botToken"], self.payload["chatId"], self.payload["statusMessageId"])
-            return {"ok": True}
+            return {"ok": True, "title": self.source.get("recognizedTitle") or self.source.get("title")}
         except Exception as exc:
             print(f"instagram upload failed: {type(exc).__name__}", flush=True)
             with self.lock:

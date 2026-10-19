@@ -1,4 +1,4 @@
-import { telegramTextMotion, telegramFileCache, type AdminStatsEnv } from "./admin";
+import { telegramTextMotion, telegramFileCache, recordDownload, recordSuccessfulDelivery, type AdminStatsEnv } from "./admin";
 
 type Env = Partial<AdminStatsEnv> & {
   BOT_TOKEN: string;
@@ -1442,6 +1442,10 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
     return Response.json({ ok: true });
   }
 
+  const history = { key: `ig:${message.chat.id}:${message.message_id}:${message.from?.id || message.chat.id}`,
+    userId: message.from?.id || message.chat.id, source: `Instagram ${target.kind}`, request: target.url };
+  let delivered = 0;
+  await recordDownload(env, { ...history, status: "processing" });
   let statusMessageId: number | undefined;
   try {
     const status = await telegramCall<TelegramMessage>(env.BOT_TOKEN, "sendMessage", {
@@ -1492,7 +1496,10 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
           method: "sendVideo", fileId: sent.video.file_id, data: { caption, supports_streaming: true },
         });
       }
+      delivered++;
+      if (env.ADMIN_STATS) await recordSuccessfulDelivery(env as AdminStatsEnv, `${history.key}:${index}`);
     }
+    await recordDownload(env, { ...history, status: "success", delivered });
 
     if (statusMessageId) {
       await safeTelegramCall(env.BOT_TOKEN, "deleteMessage", {
@@ -1501,6 +1508,7 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
       });
     }
   } catch (error) {
+    await recordDownload(env, { ...history, status: delivered ? "partial" : "failed", delivered, detail: "دریافت یا ارسال کامل محتوا تأیید نشد." });
     const detail = error instanceof Error ? error.message : String(error);
     console.error("instagram download failed", { target: target.kind, detail });
     const friendly = friendlyError(detail);

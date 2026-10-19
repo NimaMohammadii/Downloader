@@ -9,7 +9,7 @@ const { outputFiles } = await build({
     build.onResolve({ filter: /.*/ }, a => ({ path: a.path, namespace: 'test' }));
     build.onLoad({ filter: /.*/, namespace: 'test' }, a => ({ contents: a.path === './main'
       ? 'export default { fetch() { globalThis.legacy++; return Response.json({delegated: true}); } };'
-      : 'export const telegramTextMotion=async()=>{}; export const telegramFileCache=async(...args)=>globalThis.storyFileCache ? globalThis.storyFileCache(...args) : null; export class AdminStatsStore {} export const ADMIN_USER_ID = 1; export async function recordUserActivity() {}' }));
+      : 'export const telegramTextMotion=async()=>{}; export const telegramFileCache=async(...args)=>globalThis.storyFileCache ? globalThis.storyFileCache(...args) : null; export class AdminStatsStore {} export const ADMIN_USER_ID = 1; export async function recordDownload(_env,record) {(globalThis.downloadHistory ||= []).push(record);} export async function recordSuccessfulDelivery() {}' }));
   } }],
 });
 const { default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
@@ -17,7 +17,7 @@ const session = '12345%3Afictional-test-session';
 const media = { pk: '999', user: { pk: '77' }, video_versions: [{ url: 'https://cdn.instagram.com/test.mp4', width: 720, height: 1280 }] };
 async function run({ routes = {}, env = {}, link = 'https://www.instagram.com/stories/example/999/' } = {}) {
   const requests = [], telegram = [];
-  globalThis.legacy = 0;
+  globalThis.legacy = 0; globalThis.downloadHistory = [];
   globalThis.fetch = async (input, init = {}) => {
     const url = new URL(typeof input === 'string' ? input : input.url);
     const headers = new Headers(init.headers);
@@ -43,6 +43,7 @@ test('missing session fails explicitly without Instagram requests or legacy retr
   const r = await run({ env: { INSTAGRAM_SESSIONID: '' } });
   assert.equal(r.requests.length, 0); assert.equal(r.legacy, 0);
   assert.match(r.telegram[0].body.text, /INSTAGRAM_SESSIONID/);
+  assert.equal(globalThis.downloadHistory.at(-1).status,'failed');
 });
 
 test('expired-session JSON is recognized on non-2xx and stops the resolver chain', async () => {
@@ -70,6 +71,8 @@ test('story ID resolves owner and sends only the matching story without username
   assert.equal(r.telegram.filter(t => t.method === 'sendVideo').length, 1);
   assert.ok(!r.requests.some(r => r.url.pathname.includes('usernameinfo')));
   assert.equal(r.legacy, 0);
+  assert.equal(globalThis.downloadHistory.at(-1).status,'success');
+  assert.equal(globalThis.downloadHistory.at(-1).delivered,1);
 });
 
 test('empty story-feed response falls back to authenticated reels with the same cookie jar', async () => {

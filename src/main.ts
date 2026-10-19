@@ -5,12 +5,14 @@ import {
   AdminStatsStore,
   adminDashboardKeyboard,
   adminUsersKeyboard,
+  adminUserDetailKeyboard,
+  formatAdminUserDetail,
+  getAdminUserDetail,
   formatAdminDashboard,
   formatAdminUsers,
   getAdminSummary,
   getAdminUsersPage,
   isInstagramDownloadLink,
-  recordSuccessfulDelivery,
   recordUserActivity,
   type AdminStatsEnv,
   type TrackedUser,
@@ -144,6 +146,18 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
       return Response.json({ ok: true });
     }
 
+    const userMatch = /^admin:user:([1-9]\d{0,15}):(\d{1,8}):(\d{1,8})$/.exec(data);
+    if (userMatch) {
+      const detail = await getAdminUserDetail(env, userMatch[1], Number(userMatch[3]));
+      await telegramCall(env.BOT_TOKEN, "editMessageText", {
+        chat_id: message.chat.id, message_id: message.message_id,
+        text: detail ? formatAdminUserDetail(detail) : "این کاربر پیدا نشد.",
+        reply_markup: detail ? adminUserDetailKeyboard(detail, Number(userMatch[2])) : adminDashboardKeyboard(),
+        link_preview_options: { is_disabled: true },
+      });
+      return Response.json({ ok: true });
+    }
+
     const usersMatch = /^admin:users:(\d+)$/.exec(data);
     if (usersMatch) {
       const page = await getAdminUsersPage(env, Number(usersMatch[1]));
@@ -218,23 +232,11 @@ export default {
 
         const user = trackedUserFromMessage(message);
         if (user && user.id !== ADMIN_USER_ID) {
-          await recordUserActivity(env, user, isInstagramDownloadLink(text));
+          await recordUserActivity(env, user, isInstagramDownloadLink(text), update.update_id, /^\/start(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text));
         }
       }
 
       return downloaderWorker.fetch(request, env);
-    }
-
-    if (request.method === "GET" && url.pathname === "/media") {
-      const response = await downloaderWorker.fetch(request, env);
-      if (response.ok) {
-        const signature = url.searchParams.get("sig") || "";
-        const expires = url.searchParams.get("exp") || "";
-        if (signature) {
-          ctx.waitUntil(recordSuccessfulDelivery(env, `${expires}:${signature}`));
-        }
-      }
-      return response;
     }
 
     return downloaderWorker.fetch(request, env);

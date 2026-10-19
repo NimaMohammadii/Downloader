@@ -533,6 +533,8 @@ class PlaylistAndCacheTests(unittest.TestCase):
                  patch.object(job,'safe_status'),patch.object(job,'notify'):
                 job.run()
             self.assertEqual(job.result['parts'],2)
+            self.assertTrue(job.result['partial'])
+            self.assertEqual(job.result['title'],'Playlist')
             self.assertIn('دریافت نشد: 2',job.result['message'])
             self.assertEqual([c[0] for c in calls],['cache','cache','prepare','upload'])
             self.assertNotIn('Playlist',store.call_args.args[3]['caption'])
@@ -571,6 +573,7 @@ class PlaylistAndCacheTests(unittest.TestCase):
                 job.run()
             cached.assert_called_once();prepare.assert_not_called()
             self.assertEqual(job.result['parts'],1)
+            self.assertTrue(job.result['partial'])
             self.assertIn('22-41',job.result['message'])
         finally: job.cleanup()
 

@@ -23,6 +23,8 @@ const { outputFiles } = await build({
         export const getContainer=(_env,id)=>{globalThis.containerIds.push(id);return globalThis.container;};` };
       if (a.path === 'cloudflare:workers') return { contents: 'export class DurableObject {constructor(ctx,env){this.ctx=ctx;this.env=env;}} export class WorkflowEntrypoint {constructor(ctx,env){this.env=env;}}' };
       if (a.path === './admin') return { contents: `
+        export const recordDownload = async(_env,record)=>{(globalThis.downloadHistory ||= []).push(record);};
+        export const isInstagramDownloadLink = text=>/instagram.com\\//.test(text);
         export const telegramTextMotion=async()=>{};
         export const telegramFileCache=async(...args)=>globalThis.testFileCache ? globalThis.testFileCache(...args) : null; export class AdminStatsStore{} export const ADMIN_USER_ID=1;
         export const recordUserActivity=async()=>{};
@@ -120,7 +122,7 @@ test('untrusted stream URLs never reach the recorder', async () => {
 
 async function workflow(ready = {ok:true}, input = job) {
   const calls=[],steps=[],messages=[];
-  globalThis.delivered=0; globalThis.containerIds=[];
+  globalThis.delivered=0; globalThis.containerIds=[]; globalThis.downloadHistory=[];
   globalThis.container={
     async startShared(){calls.push('start');},
     async instagramRequest(action,payload){calls.push(action);if(action==='start') globalThis.startedPayload=payload;return {ok:true};},
@@ -140,6 +142,8 @@ test('recording waits for a completion event and sends one whole file', async()=
   const r=await workflow();
   assert.deepEqual(r.calls,['start','start','send','cleanup','release']);
   assert.equal(globalThis.delivered,1);
+  assert.equal(globalThis.downloadHistory.at(-1).status,'success');
+  assert.equal(globalThis.downloadHistory.at(-1).delivered,1);
   assert.ok(r.steps.some(s=>s.options.type==='instagram-ready'&&s.options.timeout==='150 minutes'));
   assert.ok(r.steps.every(s=>!s.options.timeout?.endsWith('minutes')||s.options.type||parseInt(s.options.timeout)<=30));
   assert.ok(!JSON.stringify(globalThis.startedPayload).includes(env.INSTAGRAM_SESSIONID));
@@ -149,6 +153,8 @@ test('recording waits for a completion event and sends one whole file', async()=
 test('music search releases its container after listing results and never records a file delivery',async()=>{
   const result=await workflow({ok:true},{...job,instagram:{kind:'music',query:'Artist Title'}});
   assert.ok(result.calls.includes('cleanup'));assert.ok(result.calls.includes('release'));
+  assert.equal(globalThis.downloadHistory.at(-1).status,'results');
+  assert.equal(globalThis.downloadHistory.at(-1).delivered,0);
   assert.equal(globalThis.startedPayload.source.musicSearch,true);
   assert.equal(globalThis.startedPayload.source.musicQuery,'Artist Title');
   assert.equal(globalThis.delivered,0);
@@ -619,6 +625,8 @@ test('social batch failure preserves confirmed count and warns against duplicate
   await new mod.YoutubeDownloadWorkflow({},env).run({payload:{...job,instagram:undefined,social:{platform:'x',url:'https://x.com/i/status/123'}}},step);
   assert.ok(messages.some(m=>m.text==='1 file confirmed; check chat before repeating'));
   assert.equal(globalThis.delivered,1);
+  assert.equal(globalThis.downloadHistory.at(-1).status,'partial');
+  assert.equal(globalThis.downloadHistory.at(-1).delivered,1);
 });
 
 test('Aparat video/embed links and social audio commands have exact routes',()=>{
@@ -662,4 +670,19 @@ test('social audio callback is signed for the owner, chat, canonical URL and exa
     assert.deepEqual(jobs[0].params.social,{platform:'pinterest',url,audioOnly:true,itemIndex:1});
     assert.ok(callback.data.length<=64);
   } finally {env.YOUTUBE_DOWNLOAD_WORKFLOW=original;}
+});
+
+
+test('partly delivered playlist is retained as partial history with its requested range',async()=>{
+  globalThis.delivered=0;globalThis.containerIds=[];globalThis.downloadHistory=[];
+  globalThis.container={async startShared(){},async instagramRequest(action){return action==='send'
+    ?{ok:true,parts:2,partial:true,title:'Playlist',message:'2 of 3 tracks sent'}:{ok:true};},async releaseInstagram(){}};
+  globalThis.fetch=async()=>Response.json({ok:true,result:{message_id:10}});
+  const step={async do(name,options,fn){return (typeof options==='function'?options:fn)();},async waitForEvent(){return {payload:{ok:true}};}};
+  await new mod.YoutubeDownloadWorkflow({},env).run({payload:{...job,instagram:undefined,
+    playlist:{url:'https://www.youtube.com/playlist?list=PLabcdef',start:1,end:3}}},step);
+  assert.equal(globalThis.downloadHistory.at(-1).status,'partial');
+  assert.equal(globalThis.downloadHistory.at(-1).delivered,2);
+  assert.match(globalThis.downloadHistory.at(-1).request,/1-3/);
+  assert.equal(globalThis.delivered,2);
 });
