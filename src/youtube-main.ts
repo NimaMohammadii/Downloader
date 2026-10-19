@@ -137,6 +137,8 @@ export class YoutubeDownloaderContainer extends Container<Env> {
 
   async instagramRequest(action: string, payload: Record<string, unknown>): Promise<ContainerResult> {
     if (!["start", "stop", "send", "cleanup"].includes(action)) throw new Error("IG_ACTION");
+    // Cleanup must not start a fresh instance after a crash or rollout.
+    if (action === "cleanup" && !this.ctx.container?.running) return { ok: true };
     if (action === "start") {
       await this.ctx.storage.put("instagramJob", { id: String(payload.id), until: Date.now() + 3 * 60 * 60 * 1000 });
     }
@@ -160,7 +162,11 @@ export class YoutubeDownloaderContainer extends Container<Env> {
       this.renewActivityTimeout();
       return;
     }
-    await super.onActivityExpired();
+    // The Python HTTP server runs as PID 1 without a SIGTERM handler. The
+    // default stop() only signals it and can leave idle instances occupying
+    // capacity. The SDK excludes in-flight HTTP requests before this hook;
+    // the lease above separately protects background capture/preparation.
+    await this.destroy();
   }
 
   private async instagramInterrupted(): Promise<boolean> {

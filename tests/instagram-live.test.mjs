@@ -17,6 +17,7 @@ const { outputFiles } = await build({
           constructor(ctx,env){this.ctx=ctx;this.env=env;}
           renewActivityTimeout(){globalThis.renewed++;}
           async onActivityExpired(){globalThis.expired++;}
+          async destroy(){globalThis.expired++;}
           onError(error){throw error;}
         }
         export const getContainer=(_env,id)=>{globalThis.containerIds.push(id);return globalThis.container;};` };
@@ -170,7 +171,7 @@ test('only leased Instagram containers stay awake and release clears the lease',
   globalThis.renewed=0;globalThis.expired=0;
   const container=new mod.YoutubeDownloaderContainer({storage},env);
   await container.onActivityExpired();assert.equal(globalThis.expired,0);assert.ok(globalThis.renewed);
-  await container.releaseInstagram();assert.equal(container.sleepAfter,'5m');
+  await container.releaseInstagram();assert.equal(container.sleepAfter,'10s');
   await container.onActivityExpired();assert.equal(globalThis.expired,1);
 });
 

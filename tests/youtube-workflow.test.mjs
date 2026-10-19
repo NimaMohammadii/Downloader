@@ -15,6 +15,7 @@ const { outputFiles } = await build({
           constructor(ctx, env) { this.ctx = ctx; this.env = env; }
           renewActivityTimeout() { this.renewed = (this.renewed || 0) + 1; }
           async onActivityExpired() { this.stopped = true; }
+          async destroy() { this.stopped = true; this.destroyed = true; }
         }
         export const getContainer = () => globalThis.container;
       ` };
@@ -34,6 +35,41 @@ const { outputFiles } = await build({
 });
 const { YoutubeDownloaderContainer, YoutubeDownloadWorkflow, extractPornhubUrl, default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
 
+const sdkBuild = await build({
+  stdin: { contents: 'export { Container } from "@cloudflare/containers";', loader: 'js', resolveDir: process.cwd() },
+  bundle: true, format: 'esm', write: false,
+  plugins: [{ name: 'sdk-workers-binding', setup(build) {
+    build.onResolve({ filter: /^cloudflare:workers$/ }, () => ({ path: 'workers', namespace: 'sdk-test' }));
+    build.onLoad({ filter: /.*/, namespace: 'sdk-test' }, () => ({ contents: 'export class DurableObject {}; export class WorkerEntrypoint {};' }));
+  } }],
+});
+const { Container: SDKContainer } = await import(`data:text/javascript;base64,${Buffer.from(sdkBuild.outputFiles[0].text).toString('base64')}`);
+
+test('real SDK signals cannot retain an idle instance whose PID 1 ignores SIGTERM', async () => {
+  const runtime = { running: true, signal() {}, async destroy() { this.running = false; } };
+  const sdk = Object.create(SDKContainer.prototype);
+  sdk.container = runtime;
+  sdk.syncPendingStoppedEvents = async () => {};
+  await sdk.onActivityExpired();
+  assert.equal(runtime.running, true, 'the default stop only signals the process');
+  const container = new YoutubeDownloaderContainer({ storage: { async get() {} } }, {});
+  container.destroy = () => sdk.destroy();
+  await container.onActivityExpired();
+  assert.equal(runtime.running, false, 'idle destruction must actually release the instance');
+});
+
+test('real SDK does not expire an active HTTP transfer', () => {
+  const sdk = Object.create(SDKContainer.prototype);
+  sdk.sleepAfter = '10s';
+  sdk.sleepAfterMs = 0;
+  sdk.inflightRequests = 1;
+  assert.equal(sdk.isActivityExpired(), false);
+  assert.ok(sdk.sleepAfterMs > Date.now());
+  sdk.inflightRequests = 0;
+  sdk.sleepAfterMs = 0;
+  assert.equal(sdk.isActivityExpired(), true);
+});
+
 test('idle containers stop after ten seconds and completed background jobs restore that timeout', async () => {
   const values = new Map();
   const ctx = { storage: {
@@ -50,6 +86,7 @@ test('idle containers stop after ten seconds and completed background jobs resto
   await container.instagramRequest('start', { id: 'active-job' });
   await container.onActivityExpired();
   assert.equal(container.stopped, undefined, 'background preparation/live capture must stay running');
+  assert.equal(container.destroyed, undefined, 'an active background lease must never be destroyed');
   assert.ok(container.sleepAfter > 0);
   await container.releaseInstagram();
   assert.equal(values.has('instagramJob'), false);
@@ -57,6 +94,7 @@ test('idle containers stop after ten seconds and completed background jobs resto
   assert.equal(container.renewed, 2);
   await container.onActivityExpired();
   assert.equal(container.stopped, true);
+  assert.equal(container.destroyed, true, 'idle shutdown must release capacity even if SIGTERM is ignored');
 });
 
 test('an expired background lease no longer prevents idle shutdown', async () => {
@@ -65,6 +103,24 @@ test('an expired background lease no longer prevents idle shutdown', async () =>
   } }, {});
   await container.onActivityExpired();
   assert.equal(container.stopped, true);
+  assert.equal(container.destroyed, true);
+});
+
+test('cleanup of a stopped container does not allocate a new instance', async () => {
+  const container = new YoutubeDownloaderContainer({ container: { running: false } }, {});
+  container.containerFetch = async () => { throw Error('cleanup must not restart a stopped container'); };
+  assert.deepEqual(await container.instagramRequest('cleanup', { id: 'finished-job' }), { ok: true });
+});
+
+test('cleanup still removes temporary files in a running container', async () => {
+  const calls = [];
+  const container = new YoutubeDownloaderContainer({ container: { running: true } }, {});
+  container.containerFetch = async (url, options) => {
+    calls.push([url, JSON.parse(options.body)]);
+    return Response.json({ ok: true });
+  };
+  assert.deepEqual(await container.instagramRequest('cleanup', { id: 'finished-job' }), { ok: true });
+  assert.deepEqual(calls, [['http://container/instagram/cleanup', { id: 'finished-job' }]]);
 });
 
 test('Pornhub URLs normalize direct, mobile, language and embed links', () => {
