@@ -287,6 +287,34 @@ test('Pornhub starts download without YouTube inspection or quality buttons', as
   assert.ok(!r.messages.some(m => m.reply_markup?.inline_keyboard?.length));
 });
 
+test('Pornhub failure preserves the container stage and Telegram cause without replaying delivery', async () => {
+  const logs = [], previous = console.error;
+  try {
+    console.error = (message, detail) => logs.push({ message, detail });
+    const result = await run({ pornhub: true, result: { ok: false, phase: 'upload',
+      errorCode: 'FLOOD_WAIT', errorType: 'FloodWaitError', rpcMethod: 'ImportBotAuthorizationRequest',
+      rpcCode: 420, retryAfterSeconds: 137, diagnostic: 'secret-token secret-hash https://cdn.test/file?secret=value',
+      message: 'تلگرام ارسال فایل را موقتاً محدود کرده' } });
+    const failure = logs.find(x => x.message === 'pornhub download rejected');
+    assert.equal(failure.detail.source, 'pornhub');
+    assert.equal(failure.detail.phase, 'upload');
+    assert.equal(failure.detail.code, 'FLOOD_WAIT');
+    assert.equal(failure.detail.rpcMethod, 'ImportBotAuthorizationRequest');
+    assert.equal(failure.detail.retryAfterSeconds, 137);
+    for (const secret of ['secret-token', 'secret-hash', 'cdn.test', 'secret=value']) {
+      assert.ok(!JSON.stringify(failure).includes(secret));
+    }
+    assert.equal(result.calls.filter(x => x[0] === '/download').length, 1);
+    assert.equal(result.delivered, 0);
+    assert.equal(result.steps.find(([name]) => name === 'download and send youtube video')[1].retries.limit, 0);
+    assert.ok(result.steps.some(([name]) => name === 'release download capacity'));
+    assert.equal(globalThis.downloadHistory.at(-1).source, 'Pornhub');
+    assert.equal(globalThis.downloadHistory.at(-1).status, 'failed');
+  } finally {
+    console.error = previous;
+  }
+});
+
 test('text and caption Pornhub links queue a deterministic direct-download job', async () => {
   const jobs = [];
   const env = { BOT_TOKEN: 'fictional', YOUTUBE_DOWNLOAD_WORKFLOW: { async create(job) { jobs.push(job); } } };

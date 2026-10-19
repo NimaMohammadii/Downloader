@@ -5,10 +5,54 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import youtube_app as app
+import youtube_pipeline as pipeline
+
+
+class DownloadError(app.UserVisibleError):
+    def __init__(self, code: str, phase: str, message: str, detail: str = "") -> None:
+        super().__init__(message)
+        self.error_code, self.phase, self.detail = code, phase, detail
+
+
+def source_error(detail: str) -> tuple[str, str]:
+    """Classify extractor output without returning signed URLs or credentials."""
+    detail = re.sub(r"https?://[^\s\"'<>]+", "[url]", detail.lower())
+    detail = re.sub(r"\b(?:authorization|cookie|sessionid)\b[\"']?\s*[:=]\s*[^\r\n]+", "[redacted]", detail)
+    if "filesize" in detail or "max-filesize" in detail:
+        return "TELEGRAM_FILE_TOO_LARGE", "❌ حجم این ویدیو از سقف ارسال ۲ گیگابایت تلگرام بیشتر است."
+    if "429" in detail or "too many requests" in detail:
+        return "SOURCE_RATE_LIMITED", "❌ Pornhub درخواست‌های این سرور را موقتاً محدود کرده؛ کمی بعد امتحان کن."
+    if any(word in detail for word in ("requested format is not available", "no video formats", "only images")):
+        return "SOURCE_FORMAT_UNAVAILABLE", "❌ فرمت قابل دانلود این ویدیوی Pornhub دریافت نشد."
+    if any(word in detail for word in ("private", "removed", "video unavailable", "404", "not available")):
+        return "SOURCE_UNAVAILABLE", "❌ این ویدیوی Pornhub خصوصی، حذف‌شده یا در دسترس نیست."
+    if "403" in detail or "410" in detail:
+        return "SOURCE_LINK_REJECTED", "❌ Pornhub دسترسی این سرور به فایل ویدیو را نپذیرفت."
+    if any(word in detail for word in ("login", "sign in", "age verification", "confirm your age")):
+        return "SOURCE_AUTH_REQUIRED", "❌ Pornhub برای این ویدیو ورود یا تأیید دسترسی می‌خواهد."
+    if "certificate_verify_failed" in detail or "certificate verify failed" in detail:
+        return "SOURCE_TLS_ERROR", "❌ برقراری ارتباط امن با Pornhub انجام نشد."
+    return "SOURCE_DOWNLOAD_FAILED", "❌ دریافت ویدیو از Pornhub کامل نشد؛ دوباره امتحان کن."
+
+
+def run_source(command: list[str], timeout: int, phase: str) -> subprocess.CompletedProcess[str]:
+    try:
+        # Shared runner bounds the entire process group, including FFmpeg children.
+        return pipeline._run(command, timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise DownloadError("SOURCE_TIMEOUT", phase, "❌ دریافت ویدیو از Pornhub بیش از حد طول کشید؛ دوباره امتحان کن.") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = str(exc.stderr or "")
+        code, message = source_error(stderr)
+        # Keep one extractor error line for diagnosis, never its command or a
+        # provider response dump. The job boundary redacts secrets and URLs.
+        errors = [line.strip() for line in stderr.splitlines() if line.lstrip().startswith("ERROR:")]
+        raise DownloadError(code, phase, message, errors[-1] if errors else "") from exc
 
 
 def video_url(value: str) -> str:
@@ -29,42 +73,58 @@ def video_url(value: str) -> str:
 def download(url: str, workdir: Path) -> tuple[Path, str]:
     url = video_url(url)
     args = [app.REAL_YTDLP, "--ignore-config", "--no-playlist", "--use-extractors", "PornHub",
+            "--compat-options", "no-certifi",
             "--force-ipv4", "--socket-timeout", "15", "--retries", "2", "--fragment-retries", "2"]
-    try:
-        info = subprocess.run([*args, "--skip-download", "--dump-single-json", "--", url],
-                              capture_output=True, text=True, check=True, timeout=app.METADATA_TIMEOUT_SECONDS)
-        metadata = json.loads(info.stdout)
+    info_path = workdir / "source.info.json"
+    for attempt in range(2):
+        info = run_source([*args, "--skip-download", "--dump-single-json", "--", url],
+                          app.METADATA_TIMEOUT_SECONDS, "metadata")
+        try:
+            metadata = json.loads(info.stdout)
+            if not isinstance(metadata, dict):
+                raise ValueError("metadata must be an object")
+        except ValueError as exc:
+            raise DownloadError("SOURCE_INVALID_METADATA", "metadata", "❌ اطلاعات ویدیوی Pornhub کامل دریافت نشد.") from exc
         app.validate_video_metadata(metadata)
+        # Keep the exact catalog/headers just extracted; do not hit the webpage twice.
+        info_path.write_text(json.dumps(metadata), encoding="utf-8")
+        try:
+            result = run_source([
+                *args, "--abort-on-unavailable-fragments", "--max-filesize", str(app.DIRECT_TELEGRAM_LIMIT),
+                "--concurrent-fragments", "8", "--format", "bv*+ba/b",
+                "--format-sort", "res,+codec:avc:m4a,ext:mp4:m4a",
+                "--merge-output-format", "mp4", "--remux-video", "mp4", "--no-simulate", "--quiet",
+                "--output", str(workdir / "Pornhub.%(ext)s"), "--print", "after_move:%(filepath)s",
+                "--load-info-json", str(info_path),
+            ], app.DOWNLOAD_TIMEOUT_SECONDS, "download")
+            break
+        except DownloadError as exc:
+            # Refresh rejected/expired CDN links once, before any Telegram publish.
+            if attempt or exc.error_code != "SOURCE_LINK_REJECTED":
+                raise
+            for path in workdir.iterdir():
+                if path.is_file():
+                    path.unlink()
+
+    path = app.result_path(result, workdir)
+    if path is None or path.suffix.lower() != ".mp4":
+        code, message = source_error(str(result.stderr or ""))
+        if code != "TELEGRAM_FILE_TOO_LARGE":
+            code, message = "SOURCE_MISSING_FILE", "❌ فایل ویدیوی Pornhub پس از دانلود پیدا نشد."
+        raise DownloadError(code, "validation", message)
+    size = path.stat().st_size
+    if not 0 < size <= app.DIRECT_TELEGRAM_LIMIT:
+        raise DownloadError("TELEGRAM_FILE_TOO_LARGE" if size else "SOURCE_EMPTY_FILE", "validation",
+                            "❌ فایل ویدیو خالی است یا از سقف ارسال ۲ گیگابایت تلگرام بیشتر است.")
+    try:
         expected = float(metadata.get("duration") or 0)
-        if not math.isfinite(expected) or expected <= 0:
-            raise app.UserVisibleError("❌ مدت ویدیوی Pornhub مشخص نیست؛ دانلود کامل قابل بررسی نیست.")
-        result = subprocess.run([
-            *args, "--abort-on-unavailable-fragments", "--max-filesize", str(app.DIRECT_TELEGRAM_LIMIT),
-            "--concurrent-fragments", "8", "--format", "bv*[height<=1080]+ba/b[height<=1080]", "--format-sort", "res:1080,+codec:avc:m4a,ext:mp4:m4a",
-            "--merge-output-format", "mp4", "--remux-video", "mp4", "--no-simulate", "--quiet",
-            "--output", str(workdir / "Pornhub.%(ext)s"), "--print", "after_move:%(filepath)s", "--", url,
-        ], capture_output=True, text=True, check=True, timeout=app.DOWNLOAD_TIMEOUT_SECONDS)
-        path = app.result_path(result, workdir)
-        if path is None or path.suffix.lower() != ".mp4":
-            raise app.UserVisibleError("❌ فایل ویدیوی Pornhub دریافت نشد؛ ممکن است حجم آن بیش از سقف ۲ گیگابایت باشد.")
-        app.validate_file_size(path)
-        from youtube_pipeline import _probe_geometry
-        duration = app.probe_duration(path)
-        if not _probe_geometry(path) or not math.isfinite(duration) or duration <= 0 or duration < expected - 2:
-            raise app.UserVisibleError("❌ ویدیوی Pornhub کامل دریافت نشد؛ فایل ناقص ارسال نشد.")
-        return path, str(metadata.get("title") or "Pornhub video").strip()
-    except subprocess.TimeoutExpired as exc:
-        raise app.UserVisibleError("❌ دریافت ویدیو از Pornhub بیش از حد طول کشید؛ دوباره امتحان کن.") from exc
-    except subprocess.CalledProcessError as exc:
-        # Do not expose extractor output, signed URLs or authentication details.
-        detail = str(exc.stderr or "").lower()
-        if "filesize" in detail or "max-filesize" in detail:
-            message = "❌ حجم این ویدیو از سقف ارسال ۲ گیگابایت بیشتر است."
-        elif any(word in detail for word in ("private", "removed", "not available", "404")):
-            message = "❌ این ویدیوی Pornhub خصوصی، حذف‌شده یا در دسترس نیست."
-        else:
-            message = "❌ دریافت ویدیو از Pornhub ممکن نشد؛ ممکن است سایت ورود یا تأیید دسترسی بخواهد."
-        raise app.UserVisibleError(message) from exc
+    except (TypeError, ValueError):
+        expected = 0
+    duration = app.probe_duration(path)
+    if (not pipeline._probe_geometry(path) or not math.isfinite(duration) or duration <= 0
+            or (math.isfinite(expected) and expected > 0 and duration < expected - 2)):
+        raise DownloadError("SOURCE_INCOMPLETE_FILE", "validation", "❌ ویدیوی Pornhub کامل دریافت نشد؛ فایل ناقص ارسال نشد.")
+    return path, str(metadata.get("title") or "Pornhub video").strip()
 
 
 def process_job(payload: dict) -> dict:
@@ -73,20 +133,43 @@ def process_job(payload: dict) -> dict:
     message_id = int(payload["requestMessageId"])
     status_id = payload.get("statusMessageId")
     workdir = Path(tempfile.mkdtemp(prefix="pornhub-download-"))
+    deadline = time.monotonic() + app.YOUTUBE_JOB_SECONDS
+    inherited_deadline = app.JOB_DEADLINE.get()
+    deadline_token = app.JOB_DEADLINE.set(min(deadline, inherited_deadline) if inherited_deadline is not None else deadline)
+    phase = "download"
+
+    def status(message: str) -> None:
+        try:
+            app.edit_status(token, chat_id, status_id, message)
+        except Exception as exc:
+            print(json.dumps({"message": "pornhub status update failed", "jobId": payload.get("id"),
+                              "phase": phase, **app.upload_error_diagnostic(exc, token)}, ensure_ascii=False), flush=True)
+
     try:
         if not token:
             raise ValueError("Missing bot token")
         path, title = download(str(payload.get("url") or ""), workdir)
-        app.edit_status(token, chat_id, status_id, "📤 ویدیوی Pornhub آماده شد؛ دارم می‌فرستم…")
+        status("📤 ویدیوی Pornhub آماده شد؛ دارم می‌فرستم…")
+        app.job_timeout(1800)  # Expired downloads must never start publishing.
+        phase = "upload"
         app.send_media_file(token, chat_id, message_id, path, title, reply=True)
         app.delete_status(token, chat_id, status_id)
         return {"ok": True, "parts": 1, "title": title}
     except Exception as exc:
-        message = str(exc) if isinstance(exc, app.UserVisibleError) else "❌ دانلود یا ارسال ویدیوی Pornhub کامل نشد؛ دوباره لینک را بفرست."
-        try:
-            app.edit_status(token, chat_id, status_id, message)
-        except Exception:
-            pass
-        return {"ok": False, "message": message}
+        app.JOB_DEADLINE.set(None)  # Use the Workflow's reserved error-reporting time.
+        phase = getattr(exc, "phase", phase)
+        diagnostic = app.upload_error_diagnostic(exc, token)
+        if isinstance(exc, DownloadError):
+            diagnostic["errorCode"] = exc.error_code
+            if exc.detail:
+                diagnostic["diagnostic"] = app.upload_error_diagnostic(RuntimeError(exc.detail), token)["diagnostic"]
+        print(json.dumps({"message": "pornhub job failed", "jobId": payload.get("id"),
+                          "phase": phase, **diagnostic}, ensure_ascii=False), flush=True)
+        message = (str(exc) if isinstance(exc, app.UserVisibleError) else app.telegram_flood_message(diagnostic)
+                   or ("❌ ارسال فایل در تلگرام تأیید نشد؛ اگر فایلی دریافت کرده‌ای، پیش از درخواست دوباره بررسی کن."
+                       if phase == "upload" else "❌ دریافت ویدیوی Pornhub کامل نشد؛ دوباره امتحان کن."))
+        status(message)
+        return {"ok": False, "message": message, "phase": phase, **diagnostic}
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+        app.JOB_DEADLINE.reset(deadline_token)

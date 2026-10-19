@@ -410,6 +410,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
   }
 
   private async runYoutube(job: YoutubeDownloadJob, step: WorkflowStep): Promise<void> {
+    const source = job.source === "pornhub" ? "pornhub" : "youtube";
     let statusMessageId = job.statusMessageId;
     let phase = "startup";
     let lease: PoolLease | undefined;
@@ -572,7 +573,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           return true;
         });
       } else {
-        console.error("youtube download rejected", { jobId: job.id, phase: result.phase || "transfer",
+        console.error(`${source} download rejected`, { source, jobId: job.id, phase: result.phase || "transfer",
           code: result.errorCode || "SOURCE_REJECTED",
           type: result.errorType, rpcMethod: result.rpcMethod, rpcCode: result.rpcCode, retryAfterSeconds: result.retryAfterSeconds,
           detail: redactDiagnostic(result.diagnostic || result.message || "download failed", this.env) });
@@ -580,7 +581,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       }
     } catch (error) {
       const detail = redactDiagnostic(error instanceof Error ? error.message : String(error), this.env);
-      console.error("youtube workflow failed", { jobId: job.id, phase, detail });
+      console.error(`${source} workflow failed`, { source, jobId: job.id, phase, detail });
       const failureMessage = workflowFailureMessage(detail, phase);
       await step.do("track youtube failure", () => trackJob(this.env, job, "failed", { detail: failureMessage }));
 

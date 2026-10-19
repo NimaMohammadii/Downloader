@@ -1,8 +1,13 @@
 import json
+import os
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -13,6 +18,66 @@ import pornhub
 
 
 class PornhubTests(unittest.TestCase):
+    def payload(self):
+        return {'id': 'ytdl-42-7-42', 'source': 'pornhub', 'url': 'https://pornhub.com/embed/ph123',
+                'botToken': 'fictional', 'chatId': 42, 'requestMessageId': 7, 'statusMessageId': 10}
+
+    def test_status_failure_must_not_discard_a_ready_video(self):
+        with patch.object(pornhub, 'download', return_value=(Path('/fixture.mp4'), 'Example')), \
+             patch.object(app, 'edit_status', side_effect=RuntimeError('message to edit not found')), \
+             patch.object(app, 'send_media_file') as send, patch.object(app, 'delete_status'):
+            result = app.process_job(self.payload())
+        self.assertTrue(result['ok'])
+        send.assert_called_once()
+
+    def test_upload_failure_retains_exact_cause_and_is_never_replayed(self):
+        from telethon import functions
+        from telethon.errors import FloodWaitError
+        request = functions.auth.ImportBotAuthorizationRequest(flags=0, api_id=123,
+                   api_hash='api-secret', bot_auth_token='fictional')
+        failure = FloodWaitError(request, capture=137)
+        with patch.object(pornhub, 'download', return_value=(Path('/fixture.mp4'), 'Example')), \
+             patch.object(app, 'send_media_file', side_effect=failure) as send, \
+             patch.object(app, 'edit_status'), patch.dict(os.environ, {'API_HASH': 'api-secret'}):
+            result = app.process_job(self.payload())
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['phase'], 'upload')
+        self.assertEqual(result['errorCode'], 'FLOOD_WAIT')
+        self.assertEqual(result['rpcMethod'], 'ImportBotAuthorizationRequest')
+        self.assertEqual(result['retryAfterSeconds'], 137)
+        self.assertIn('137', result['message'])
+        self.assertNotIn('api-secret', json.dumps(result))
+        self.assertNotIn('fictional', json.dumps(result))
+        send.assert_called_once()
+
+    def test_unexpected_download_failure_is_diagnostic_and_redacted(self):
+        with patch.object(pornhub, 'download', side_effect=RuntimeError('fictional https://cdn.test/v?secret=value')), \
+             patch.object(app, 'send_media_file') as send, patch.object(app, 'edit_status'):
+            result = app.process_job(self.payload())
+        self.assertEqual(result['phase'], 'download')
+        self.assertEqual(result['errorCode'], 'RuntimeError')
+        self.assertNotIn('fictional', result['diagnostic'])
+        self.assertNotIn('cdn.test', result['diagnostic'])
+        send.assert_not_called()
+
+    def test_download_and_upload_share_a_deadline_and_restore_context(self):
+        inherited = app.JOB_DEADLINE.set(time.monotonic() + 5000)
+        try:
+            deadlines = []
+            def expire(*args):
+                deadlines.append(app.JOB_DEADLINE.get())
+                app.JOB_DEADLINE.set(time.monotonic() - 1)
+                return Path('/fixture.mp4'), 'Example'
+            with patch.object(pornhub, 'download', side_effect=expire), \
+                 patch.object(app, 'edit_status'), patch.object(app, 'send_media_file') as send:
+                result = app.process_job(self.payload())
+            self.assertFalse(result['ok'])
+            self.assertLessEqual(deadlines[0], time.monotonic() + app.YOUTUBE_JOB_SECONDS)
+            send.assert_not_called()
+            self.assertGreater(app.JOB_DEADLINE.get(), time.monotonic() + 4000)
+        finally:
+            app.JOB_DEADLINE.reset(inherited)
+
     def test_video_urls_and_untrusted_hosts(self):
         self.assertEqual(pornhub.video_url('http://fr.pornhub.org/embed/ph123'),
                          'https://fr.pornhub.org/view_video.php?viewkey=ph123')
@@ -30,7 +95,7 @@ class PornhubTests(unittest.TestCase):
         path.write_bytes(b'fictional-video')
         results = [subprocess.CompletedProcess([], 0, json.dumps(metadata or {'title': 'Example', 'duration': 60})),
                    subprocess.CompletedProcess([], 0, str(path))]
-        with patch.object(pornhub.subprocess, 'run', side_effect=results) as run, \
+        with patch.object(pipeline, '_run', side_effect=results) as run, \
              patch.object(app, 'probe_duration', return_value=duration), \
              patch.object(pipeline, '_probe_geometry', return_value=(1280, 720, 16/9)):
             value = pornhub.download('https://pornhub.com/view_video.php?viewkey=ph123', Path(directory))
@@ -45,9 +110,150 @@ class PornhubTests(unittest.TestCase):
                 command = call.args[0]
                 self.assertEqual(command[command.index('--use-extractors') + 1], 'PornHub')
                 self.assertNotIn('--extractor-args', command)
-                self.assertEqual(command[-2], '--')
+                self.assertEqual(command[command.index('--compat-options') + 1], 'no-certifi')
+            self.assertEqual(calls[0].args[0][-2], '--')
+            self.assertIn('--load-info-json', calls[1].args[0])
+            self.assertNotIn('https://pornhub.com/view_video.php?viewkey=ph123', calls[1].args[0])
             self.assertIn('--abort-on-unavailable-fragments', calls[1].args[0])
             self.assertIn(str(app.DIRECT_TELEGRAM_LIMIT), calls[1].args[0])
+
+    def test_selector_accepts_best_quality_above_1080_and_unknown_dimensions(self):
+        from yt_dlp import YoutubeDL
+        with tempfile.TemporaryDirectory() as directory:
+            _, calls = self.download(directory)
+        command = calls[1].args[0]
+        selector = command[command.index('--format') + 1]
+        sort = command[command.index('--format-sort') + 1].split(',')
+        with YoutubeDL({'quiet': True, 'format': selector, 'format_sort': sort}) as ydl:
+            for height in (2160, None):
+                formats = [{'format_id': 'high', 'url': 'https://fixture.invalid/video.mp4',
+                            'ext': 'mp4', 'vcodec': 'avc1', 'acodec': 'mp4a', 'height': height}]
+                if height:
+                    formats.insert(0, {**formats[0], 'format_id': 'low', 'height': 1080})
+                result = ydl.process_ie_result({'id': 'fixture', 'title': 'Example', 'formats': formats}, download=False)
+                self.assertEqual(result['format_id'], 'high')
+
+    def test_missing_source_duration_does_not_reject_a_readable_complete_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (path, _), _ = self.download(directory, metadata={'title': 'Example'})
+            self.assertTrue(path.exists())
+
+    def test_extractor_failures_report_the_stage_without_guessing_login_or_replaying(self):
+        cases = [('HTTP Error 429: Too Many Requests', 'SOURCE_RATE_LIMITED'),
+                 ('Requested format is not available', 'SOURCE_FORMAT_UNAVAILABLE'),
+                 ('This video is private', 'SOURCE_UNAVAILABLE'),
+                 ('Login required', 'SOURCE_AUTH_REQUIRED'),
+                 ('CERTIFICATE_VERIFY_FAILED', 'SOURCE_TLS_ERROR')]
+        for detail, code in cases:
+            with self.subTest(code=code), \
+                 patch.object(pipeline, '_run', side_effect=subprocess.CalledProcessError(1, 'yt-dlp',
+                              stderr=detail + ' fictional https://secret.test/file?token=hidden')) as run, \
+                 patch.object(app, 'edit_status'), patch.object(app, 'send_media_file') as send:
+                result = app.process_job(self.payload())
+            self.assertEqual(result['phase'], 'metadata')
+            self.assertEqual(result['errorCode'], code)
+            self.assertNotIn('secret.test', json.dumps(result))
+            self.assertNotIn('fictional', json.dumps(result))
+            run.assert_called_once()
+            send.assert_not_called()
+
+    def test_invalid_metadata_is_a_metadata_failure(self):
+        for value in ['not json', '[]', 'null']:
+            with self.subTest(value=value), \
+                 patch.object(pipeline, '_run', return_value=subprocess.CompletedProcess([], 0, value)), \
+                 patch.object(app, 'edit_status'), patch.object(app, 'send_media_file') as send:
+                result = app.process_job(self.payload())
+            self.assertEqual(result['phase'], 'metadata')
+            self.assertEqual(result['errorCode'], 'SOURCE_INVALID_METADATA')
+            send.assert_not_called()
+
+    def test_unknown_extractor_error_keeps_a_redacted_error_line_for_diagnosis(self):
+        detail = ('provider response must not be logged\n'
+                  'ERROR: extractor parse failed fictional api-secret https://cdn.test/v?signature=hidden Cookie: private')
+        with patch.object(pipeline, '_run', side_effect=subprocess.CalledProcessError(1, 'yt-dlp', stderr=detail)), \
+             patch.object(app, 'edit_status'), patch.dict(os.environ, {'API_HASH': 'api-secret'}):
+            result = app.process_job(self.payload())
+        self.assertEqual(result['phase'], 'metadata')
+        self.assertEqual(result['errorCode'], 'SOURCE_DOWNLOAD_FAILED')
+        self.assertIn('extractor parse failed', result['diagnostic'])
+        for secret in ['provider response', 'fictional', 'api-secret', 'cdn.test', 'signature=hidden', 'private']:
+            self.assertNotIn(secret, result['diagnostic'])
+
+    def test_rejected_download_link_refreshes_catalog_once_and_discards_partial_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            calls = []
+            def run(command, timeout):
+                calls.append(command)
+                if '--dump-single-json' in command:
+                    if len(calls) == 3:
+                        self.assertFalse((folder / 'Pornhub.mp4.part').exists())
+                    return subprocess.CompletedProcess(command, 0, json.dumps({'duration': 60, 'title': 'Example'}))
+                if len(calls) == 2:
+                    (folder / 'Pornhub.mp4.part').write_bytes(b'incomplete')
+                    raise subprocess.CalledProcessError(1, command, stderr='HTTP Error 403: Forbidden')
+                path = folder / 'Pornhub.mp4'
+                path.write_bytes(b'complete fixture')
+                return subprocess.CompletedProcess(command, 0, str(path))
+            with patch.object(pipeline, '_run', side_effect=run), \
+                 patch.object(app, 'probe_duration', return_value=60), \
+                 patch.object(pipeline, '_probe_geometry', return_value=(1280, 720, 16/9)):
+                pornhub.download(self.payload()['url'], folder)
+            self.assertEqual(len(calls), 4)
+
+    def test_repeated_rejected_download_links_stop_after_one_refresh(self):
+        info = subprocess.CompletedProcess([], 0, json.dumps({'duration': 60}))
+        error = subprocess.CalledProcessError(1, 'yt-dlp', stderr='HTTP Error 410: Gone')
+        with patch.object(pipeline, '_run', side_effect=[info, error, info, error]) as run, \
+             patch.object(app, 'edit_status'), patch.object(app, 'send_media_file') as send:
+            result = app.process_job(self.payload())
+        self.assertEqual(run.call_count, 4)
+        self.assertEqual(result['phase'], 'download')
+        self.assertEqual(result['errorCode'], 'SOURCE_LINK_REJECTED')
+        send.assert_not_called()
+
+    def test_real_ytdlp_and_ffprobe_deliver_complete_bytes_despite_a_missing_status_message(self):
+        class Handler(SimpleHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            video = Path(directory) / 'fixture.mp4'
+            subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'color=s=32x32:r=10',
+                            '-t', '3', '-c:v', 'mpeg4', str(video)], check=True, capture_output=True, timeout=15)
+            server = ThreadingHTTPServer(('127.0.0.1', 0), partial(Handler, directory=directory))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            metadata = {'id': 'fixture', 'title': 'Example', 'duration': 3, 'extractor': 'PornHub',
+                        'extractor_key': 'PornHub', 'webpage_url': self.payload()['url'],
+                        'formats': [{'format_id': 'mp4', 'ext': 'mp4', 'vcodec': 'mp4v', 'acodec': 'none',
+                                     'url': f'http://127.0.0.1:{server.server_port}/fixture.mp4'}]}
+            original_run = pornhub.run_source
+            sent = []
+            def run(command, timeout, phase):
+                if phase == 'metadata':
+                    return subprocess.CompletedProcess(command, 0, json.dumps(metadata))
+                return original_run(command, timeout, phase)
+            def telegram(token, method, **kwargs):
+                self.assertEqual(method, 'sendVideo')
+                sent.append(kwargs['files']['video'][1].read())
+                self.assertEqual(kwargs['data']['width'], '32')
+                self.assertEqual(kwargs['data']['duration'], '3')
+                return {'message_id': 123}
+            try:
+                with patch.object(pornhub, 'run_source', side_effect=run), \
+                     patch.object(app, 'REAL_YTDLP', str(Path(sys.executable).with_name('yt-dlp'))), \
+                     patch.object(app, 'send_media_file', wraps=pipeline.send_media_file), \
+                     patch.object(app, 'telegram_call', side_effect=telegram), \
+                     patch.object(app, 'edit_status', side_effect=RuntimeError('message to edit not found')), \
+                     patch.object(app, 'delete_status'):
+                    result = app.process_job(self.payload())
+                self.assertTrue(result['ok'], result)
+                self.assertEqual(sent, [video.read_bytes()])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
     def test_short_or_unreadable_file_is_rejected(self):
         for duration in [0, 40, float('nan')]:
@@ -59,7 +265,7 @@ class PornhubTests(unittest.TestCase):
                   subprocess.TimeoutExpired('yt-dlp', 90)]
         for error in errors:
             with tempfile.TemporaryDirectory() as directory, \
-                 patch.object(pornhub.subprocess, 'run', side_effect=error), \
+                 patch.object(pipeline, '_run', side_effect=error), \
                  self.assertRaisesRegex(app.UserVisibleError, 'Pornhub') as caught:
                 pornhub.download('https://pornhub.com/embed/ph123', Path(directory))
             self.assertNotIn('secret-url', str(caught.exception))
