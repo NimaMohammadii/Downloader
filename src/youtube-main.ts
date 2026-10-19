@@ -122,6 +122,7 @@ type ContainerResult = {
   rpcMethod?: string;
   rpcCode?: number;
   retryAfterSeconds?: number;
+  retrySafe?: boolean;
 };
 
 type YoutubeFileSize = { bytes: number; estimated: boolean };
@@ -200,20 +201,39 @@ export class YoutubeDownloaderContainer extends Container<Env> {
   defaultPort = 8080;
   sleepAfter: string | number = "5m";
   enableInternet = true;
-  envVars = { API_ID: this.env.API_ID || "", API_HASH: this.env.API_HASH || "" };
+  envVars: Record<string, string> = { API_ID: this.env.API_ID || "", API_HASH: this.env.API_HASH || "" };
   private starting?: Promise<void>;
   private idleShutdownRequested = false;
 
   override onStart(): void { this.idleShutdownRequested = false; }
 
-  async startShared(): Promise<void> {
+  async startShared(index: number): Promise<void> {
+    if (!Number.isInteger(index) || index < 0 || index >= POOL_INSTANCES) throw new Error("DOWNLOAD_POOL_ASSIGNMENT");
     if (!this.starting) {
-      this.starting = this.startAndWaitForPorts({
-        ports: [8080],
-        cancellationOptions: { instanceGetTimeoutMS: 45_000, portReadyTimeoutMS: 60_000 },
-      }).then(() => {}).finally(() => { this.starting = undefined; });
+      this.starting = (async () => {
+        const tag = await this.sessionTag();
+        const saved = await this.ctx.storage.get<{ tag: string; session: string }>("telegramSession");
+        this.envVars = { ...this.envVars,
+          TELEGRAM_BOT_SESSION: saved?.tag === tag ? saved.session : "",
+          TELEGRAM_SESSION_URL: `https://downloader.vexaagent.workers.dev/telegram-session/${index}`,
+          TELEGRAM_SESSION_TOKEN: await instagramSignature(this.env.BOT_TOKEN, `telegram-session:${index}:${this.env.API_ID}:${this.env.API_HASH}`),
+        };
+        await this.startAndWaitForPorts({
+          ports: [8080],
+          cancellationOptions: { instanceGetTimeoutMS: 45_000, portReadyTimeoutMS: 60_000 },
+        });
+      })().finally(() => { this.starting = undefined; });
     }
     await this.starting;
+  }
+
+  private sessionTag(): Promise<string> {
+    return instagramSignature(this.env.BOT_TOKEN, `telegram-session-config:${this.env.API_ID}:${this.env.API_HASH}`);
+  }
+
+  async saveTelegramSession(session: string): Promise<void> {
+    if (!/^1[A-Za-z0-9_=-]{300,500}$/.test(session)) throw new Error("Invalid Telegram session");
+    await this.ctx.storage.put("telegramSession", { tag: await this.sessionTag(), session });
   }
 
   async instagramRequest(action: string, payload: Record<string, unknown>): Promise<ContainerResult> {
@@ -414,19 +434,19 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
     let statusMessageId = job.statusMessageId;
     let phase = "startup";
     let lease: PoolLease | undefined;
-    const startContainer = async () => {
-      const assignment = await step.do("reserve download capacity", { retries: { limit: 0, delay: "1 second" } }, () => downloadPool(this.env).acquire(job.id));
+    const startContainer = async (suffix = "") => {
+      const assignment = await step.do(`reserve download capacity${suffix}`, { retries: { limit: 0, delay: "1 second" } }, () => downloadPool(this.env).acquire(job.id));
       if (!assignment) throw new Error("DOWNLOAD_POOL_FULL");
       lease = assignment;
       job.containerIndex = assignment.instance;
       return step.do(
-        "start youtube container",
+        `start youtube container${suffix}`,
         {
           retries: { limit: 2, delay: "5 seconds", backoff: "linear" },
           timeout: "2 minutes",
         },
         async () => {
-          await pooledContainer(this.env, job).startShared();
+          await pooledContainer(this.env, job).startShared(job.containerIndex!);
           return true;
         },
       );
@@ -549,22 +569,45 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       }
       await startContainer();
       phase = "transfer";
-      const result = await step.do(
-        job.audioMode ? "download and send youtube audio" : "download and send youtube video",
-        {
-          retries: { limit: 0, delay: "1 second", backoff: "constant" },
-          timeout: "30 minutes",
-        },
-        async () => {
-          return containerResult<ContainerResult>(this.env, job,
-            new Request("http://container/download", {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ ...job, statusMessageId, botToken: this.env.BOT_TOKEN, ...await mediaCacheContext(this.env, job) }),
-            }),
-          );
-        },
-      );
+      let result: ContainerResult;
+      let wait = 0;
+      while (true) {
+        const suffix = wait ? ` after telegram wait ${wait}` : "";
+        result = await step.do(
+          `${job.audioMode ? "download and send youtube audio" : "download and send youtube video"}${suffix}`,
+          {
+            retries: { limit: 0, delay: "1 second", backoff: "constant" },
+            timeout: "30 minutes",
+          },
+          async () => {
+            return containerResult<ContainerResult>(this.env, job,
+              new Request("http://container/download", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ ...job, statusMessageId, botToken: this.env.BOT_TOKEN, ...await mediaCacheContext(this.env, job) }),
+              }),
+            );
+          },
+        );
+        if (result.ok || !result.retrySafe || result.phase !== "upload" || result.rpcCode !== 420
+            || !["FLOOD_WAIT", "SLOWMODE_WAIT"].includes(result.errorCode || "")
+            || !Number.isSafeInteger(result.retryAfterSeconds) || result.retryAfterSeconds! < 0) break;
+        wait++;
+        const waitSuffix = ` for telegram wait ${wait}`;
+        console.info("youtube delivery waiting for telegram", { jobId: job.id, rpcMethod: result.rpcMethod,
+          retryAfterSeconds: result.retryAfterSeconds });
+        await step.do(`track telegram wait${waitSuffix}`, () => trackJob(this.env, job, "processing", { detail: result.message }));
+        // A definitive rejection is safe to resume. Release the host while the
+        // Workflow timer waits; never replay an ambiguous HTTP/send failure.
+        await step.do(`release download capacity${waitSuffix}`, { retries: { limit: 3, delay: "1 second" }, timeout: "1 minute" },
+          () => downloadPool(this.env).release(job.id, lease!.token));
+        lease = undefined;
+        phase = "telegram_wait";
+        await step.sleep(`wait for telegram ${wait}`, `${Math.max(1, result.retryAfterSeconds!)} seconds`);
+        phase = "startup";
+        await startContainer(` after telegram wait ${wait}`);
+        phase = "transfer";
+      }
 
       if (result.ok) {
         await step.do("record youtube delivery", async () => {
@@ -669,7 +712,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       lease = assignment;
       job.containerIndex = assignment.instance;
       await step.do("start instagram container", { retries: { limit: 2, delay: "5 seconds", backoff: "linear" }, timeout: "2 minutes" }, async () => {
-        await pooledContainer(this.env, job).startShared();
+        await pooledContainer(this.env, job).startShared(job.containerIndex!);
         return true;
       });
       started = true;
@@ -1239,6 +1282,24 @@ async function socialAudioCallback(env: Env, update: TelegramUpdate, callback: T
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const requestUrl = new URL(request.url);
+
+    // Only the assigned Container receives this capability. Sessions never go
+    // into Workflow results, the media cache, logs, or a public read endpoint.
+    const sessionRequest = /^\/telegram-session\/(\d+)$/.exec(requestUrl.pathname);
+    if (request.method === "POST" && sessionRequest) {
+      const index = Number(sessionRequest[1]);
+      if (index < 0 || index >= POOL_INSTANCES) return new Response("Invalid container", { status: 400 });
+      const expected = await instagramSignature(env.BOT_TOKEN, `telegram-session:${index}:${env.API_ID}:${env.API_HASH}`);
+      if (!equalSignature(request.headers.get("x-telegram-session-token") || "", expected)) return new Response("Forbidden", { status: 403 });
+      const text = await request.text();
+      if (text.length > 1024) return new Response("Too large", { status: 413 });
+      try {
+        const body = JSON.parse(text) as { session: string };
+        if (typeof body.session !== "string" || !/^1[A-Za-z0-9_=-]{300,500}$/.test(body.session)) return new Response("Invalid session", { status: 400 });
+        await pooledContainer(env, { containerIndex: index }).saveTelegramSession(body.session);
+        return Response.json({ ok: true }, { headers: { "cache-control": "no-store" } });
+      } catch { return new Response("Session storage unavailable", { status: 503 }); }
+    }
 
     const cacheRequest = /^\/media-cache\/((?:igdl|ytdl)--?\d+-\d+-\d+(?:-(?:audio|song|music-[A-Za-z0-9_-]{11}))?)$/.exec(requestUrl.pathname);
     if (request.method === "POST" && cacheRequest) {

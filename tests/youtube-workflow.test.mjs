@@ -2,6 +2,7 @@ import { build } from 'esbuild';
 import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { createHmac } from 'node:crypto';
 
 const source = await readFile(new URL('../src/youtube-main.ts', import.meta.url), 'utf8');
 const { outputFiles } = await build({
@@ -83,18 +84,71 @@ test('100 simultaneous admissions use exactly 20 hosts and five slots per host',
 });
 
 test('five simultaneous cold starts share one startup and a failed startup can be retried', async () => {
-  const container = new YoutubeDownloaderContainer({}, {});
+  const container = new YoutubeDownloaderContainer({ storage: memoryStorage() }, { BOT_TOKEN: "fake" });
   let finish, starts = 0;
-  container.startAndWaitForPorts = async () => { starts++; await new Promise(resolve => { finish = resolve; }); };
-  const requests = Array.from({ length: 5 }, () => container.startShared());
+  let boot;
+  const booted = new Promise(resolve => { boot = resolve; });
+  container.startAndWaitForPorts = async () => { starts++; await new Promise(resolve => { finish = resolve; boot(); }); };
+  const requests = Array.from({ length: 5 }, () => container.startShared(0));
+  await booted;
   assert.equal(starts, 1);
   finish();
   await Promise.all(requests);
   container.startAndWaitForPorts = async () => { starts++; throw Error('startup failed'); };
-  await assert.rejects(container.startShared(), /startup failed/);
+  await assert.rejects(container.startShared(0), /startup failed/);
   container.startAndWaitForPorts = async () => { starts++; };
-  await container.startShared();
+  await container.startShared(0);
   assert.equal(starts, 3);
+});
+
+test('authorized sessions survive cold starts only on their own Container and matching credentials', async () => {
+  const storage = memoryStorage();
+  const env = { BOT_TOKEN: 'bot-token', API_ID: '123', API_HASH: 'api-hash' };
+  const session = '1' + 'a'.repeat(352);
+  const first = new YoutubeDownloaderContainer({ storage }, env);
+  await first.saveTelegramSession(session);
+  const revived = new YoutubeDownloaderContainer({ storage }, env);
+  revived.startAndWaitForPorts = async () => {};
+  await revived.startShared(4);
+  assert.equal(revived.envVars.TELEGRAM_BOT_SESSION, session);
+  assert.equal(revived.envVars.TELEGRAM_SESSION_URL, 'https://downloader.vexaagent.workers.dev/telegram-session/4');
+  assert.equal(revived.envVars.TELEGRAM_SESSION_TOKEN,
+    createHmac('sha256', env.BOT_TOKEN).update('telegram-session:4:123:api-hash').digest('hex'));
+  const other = new YoutubeDownloaderContainer({ storage: memoryStorage() }, env);
+  other.startAndWaitForPorts = async () => {};
+  await other.startShared(5);
+  assert.equal(other.envVars.TELEGRAM_BOT_SESSION, '');
+  assert.notEqual(other.envVars.TELEGRAM_SESSION_TOKEN, revived.envVars.TELEGRAM_SESSION_TOKEN);
+  for (const changed of [{ BOT_TOKEN:'new-token' }, { API_ID:'456' }, { API_HASH:'new-hash' }]) {
+    const rotated = new YoutubeDownloaderContainer({ storage }, { ...env, ...changed });
+    rotated.startAndWaitForPorts = async () => {};
+    await rotated.startShared(4);
+    assert.equal(rotated.envVars.TELEGRAM_BOT_SESSION, '');
+  }
+  await assert.rejects(first.saveTelegramSession('invalid'), /Invalid Telegram session/);
+  await assert.rejects(first.startShared(20), /DOWNLOAD_POOL_ASSIGNMENT/);
+});
+
+test('session storage requires the host-specific capability and never returns a session', async () => {
+  const writes = [];
+  globalThis.container = { async saveTelegramSession(session) { writes.push(session); } };
+  const env = { BOT_TOKEN:'bot-token', API_ID:'123', API_HASH:'api-hash' };
+  const session = '1' + 'a'.repeat(352);
+  const capability = index => createHmac('sha256', env.BOT_TOKEN).update(`telegram-session:${index}:123:api-hash`).digest('hex');
+  const request = (index, signature, body) => new Request(`https://worker/telegram-session/${index}`, {
+    method:'POST', headers:{'x-telegram-session-token':signature}, body,
+  });
+  assert.equal((await worker.fetch(request(0, 'wrong', JSON.stringify({session})), env, {})).status, 403);
+  assert.equal((await worker.fetch(request(1, capability(0), JSON.stringify({session})), env, {})).status, 403);
+  assert.equal((await worker.fetch(request(20, capability(20), JSON.stringify({session})), env, {})).status, 400);
+  assert.equal((await worker.fetch(request(0, capability(0), 'a'.repeat(1025)), env, {})).status, 413);
+  assert.equal((await worker.fetch(request(0, capability(0), JSON.stringify({session:'invalid'})), env, {})).status, 400);
+  assert.deepEqual(writes, []);
+  const response = await worker.fetch(request(0, capability(0), JSON.stringify({session})), env, {});
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await response.json(), {ok:true});
+  assert.deepEqual(writes, [session]);
 });
 
 test('expired reservations are reclaimed on demand and stale releases cannot delete a new lease', async () => {
@@ -334,7 +388,7 @@ test('text and caption Pornhub links queue a deterministic direct-download job',
   assert.equal(jobs[0].params.quality, undefined);
 });
 
-async function run({ inspect = false, startupError, httpError, result, sizes, credentials = true, pornhub = false, pool = poolBinding() } = {}) {
+async function run({ inspect = false, startupError, httpError, result, sizes, credentials = true, pornhub = false, pool = poolBinding(), results, onSleep, checkpoints = new Map() } = {}) {
   const messages = [];
   const calls = [];
   const steps = [];
@@ -352,6 +406,7 @@ async function run({ inspect = false, startupError, httpError, result, sizes, cr
     async fetch(request) {
       calls.push([new URL(request.url).pathname]);
       if (httpError) return new Response(httpError.body, { status: httpError.status });
+      if (results?.length && new URL(request.url).pathname === "/download") return Response.json(results.shift());
       if (result) return Response.json(result);
       return Response.json(inspect ? { ok: true, videoId: 'dQw4w9WgXcQ', qualities: [360, 480, 720, 1080], audioAvailable: true, sizes } : { ok: true });
     },
@@ -360,7 +415,16 @@ async function run({ inspect = false, startupError, httpError, result, sizes, cr
     if (typeof config === 'function') { callback = config; config = {}; }
     steps.push([name, config]);
     if (config.timeout?.endsWith('minutes') && parseInt(config.timeout) > 30) throw Error('Workflow step timeout exceeds 30 minutes');
-    return callback();
+    if (checkpoints.has(name)) return structuredClone(checkpoints.get(name));
+    const value = await callback();
+    checkpoints.set(name, structuredClone(value));
+    return value;
+  }, async sleep(name, duration) {
+    steps.push([name, { sleep: duration }]);
+    if (!checkpoints.has(name)) {
+      if (onSleep) await onSleep(name, duration);
+      checkpoints.set(name, true);
+    }
   } };
   const job = { id: 'test-job', chatId: 42, userId: 42, requestMessageId: 7,
     url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
@@ -482,4 +546,42 @@ test('Telegram flood preserves the RPC method and server wait without replaying 
     assert.equal(result.calls.filter(x=>x[0]==='/download').length,1);assert.equal(result.delivered,0);
     assert.equal(globalThis.downloadHistory.at(-1).status,'failed');
   }finally{console.error=previous;}
+});
+
+
+test('1158-second and longer confirmed Telegram waits release capacity and automatically resume without a retry cap', async () => {
+  const pool = poolBinding();
+  const unrelated = await pool.getByName().acquire('unrelated');
+  const checkpoints = new Map();
+  const results = [1158, 7200, 1158].map(seconds => ({ok:false, retrySafe:true, phase:'upload',
+    errorCode:'FLOOD_WAIT', rpcCode:420, rpcMethod:'SendMediaRequest', retryAfterSeconds:seconds,
+    message:'Telegram waiting; automatic continuation'}));
+  results.push({ok:true});
+  const waits = [];
+  const result = await run({pool, results, checkpoints, async onSleep(_name, duration) {
+    waits.push(duration);
+    assert.equal(await pool.getByName().lookup('test-job'), null);
+    assert.deepEqual(await pool.getByName().lookup('unrelated'), unrelated);
+  }});
+  assert.deepEqual(waits, ['1158 seconds', '7200 seconds', '1158 seconds']);
+  assert.equal(result.calls.filter(call => call[0] === '/download').length, 4);
+  assert.equal(result.delivered, 1);
+  assert.equal(globalThis.downloadHistory.at(-1).status, 'success');
+  assert.ok(!globalThis.downloadHistory.some(record => record.status === 'failed'));
+  assert.equal(new Set(result.steps.map(([name]) => name)).size, result.steps.length, 'every checkpoint must have a distinct name');
+  assert.equal(await pool.getByName().lookup('test-job'), null);
+  const replay = await run({pool, checkpoints});
+  assert.deepEqual(replay.calls, [], 'Workflow replay must not repeat a transfer or boot');
+  assert.equal(replay.delivered, 0, 'the delivery accounting step is checkpointed too');
+});
+
+test('unknown, invalid and ambiguous results never take the Telegram continuation path', async () => {
+  for (const changed of [{retrySafe:false}, {rpcCode:500}, {retryAfterSeconds:-1},
+    {retryAfterSeconds:1.5}, {retryAfterSeconds:undefined}, {errorCode:'TimeoutError'}, {phase:'download'}]) {
+    const result = await run({result:{ok:false,retrySafe:true,phase:'upload',rpcCode:420,errorCode:'FLOOD_WAIT',
+      retryAfterSeconds:1158,...changed}, onSleep() { throw Error('unexpected continuation'); }});
+    assert.equal(result.calls.filter(call => call[0] === '/download').length, 1);
+    assert.ok(!result.steps.some(([,config]) => config.sleep));
+    assert.equal(result.delivered, 0);
+  }
 });

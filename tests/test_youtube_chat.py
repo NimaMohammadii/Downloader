@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import contextmanager
 import hashlib
 import os
 from pathlib import Path
@@ -13,16 +14,37 @@ import youtube_pipeline as pipeline
 from telethon import types
 
 
+@contextmanager
+def isolated_uploader():
+    uploader = app.TelegramUploader()
+    with patch.object(app, 'TELEGRAM_UPLOADER', uploader):
+        try:
+            yield uploader
+        finally:
+            if uploader.loop is not None:
+                if uploader.client is not None:
+                    asyncio.run_coroutine_threadsafe(uploader.client.disconnect(), uploader.loop).result(timeout=3)
+                uploader.loop.call_soon_threadsafe(uploader.loop.stop)
+                uploader.thread.join(3)
+                uploader.loop.close()
+
+
 class FakeClient:
     instances = []
 
     def __init__(self, *args, **kwargs):
+        self.session = args[0]
+        self.options = kwargs
         self.parts = {}
         self.sent = None
         self.active = self.peak = 0
         self.__class__.instances.append(self)
 
+    def is_connected(self):
+        return not getattr(self, "disconnected", False)
+
     async def start(self, **kwargs):
+        self.disconnected = False
         return self
 
     async def __aenter__(self):
@@ -54,7 +76,7 @@ class ChatTests(unittest.TestCase):
             content = (bytes(range(256)) * ((size + 255) // 256))[:size]
             path.write_bytes(content)
             with patch.dict(os.environ, {'API_ID': '123', 'API_HASH': 'test'}), \
-                 patch('telethon.TelegramClient', client_type), path.open('rb') as handle:
+                 patch('telethon.TelegramClient', client_type), isolated_uploader(), path.open('rb') as handle:
                 result = app.telegram_call('token', 'sendVideo', data={
                     'chat_id': '42', 'caption': 'literal *title*', 'width': '1280',
                     'height': '720', 'duration': '31',
@@ -161,7 +183,7 @@ class ChatTests(unittest.TestCase):
         self.upload(600_001,AuthClient)
         client=AuthClient.instances[-1]
         self.assertEqual(client.starts,1);self.assertTrue(client.disconnected)
-        AuthClient.failure=FloodWaitError(functions.auth.ImportBotAuthorizationRequest(flags=0,api_id=123,api_hash='hash',bot_auth_token='token'),capture=137)
+        AuthClient.failure=FloodWaitError(functions.auth.ImportBotAuthorizationRequest(flags=0,api_id=123,api_hash='hash',bot_auth_token='token'),capture=3600)
         with self.assertRaises(FloodWaitError):self.upload(600_001,AuthClient)
         client=AuthClient.instances[-1]
         self.assertEqual(client.starts,1);self.assertTrue(client.disconnected)
@@ -180,13 +202,169 @@ class ChatTests(unittest.TestCase):
         self.assertTrue(all(count==1 for count in client.attempts.values()))
         self.assertIsNone(client.sent);self.assertTrue(client.disconnected)
 
+    def test_wrapped_flood_identifies_the_inner_method_without_serializing_secrets(self):
+        from telethon import functions
+        from telethon.errors import FloodWaitError
+        request = functions.InvokeWithoutUpdatesRequest(functions.InvokeWithLayerRequest(227,
+            functions.auth.ImportBotAuthorizationRequest(0, 123, 'private-hash', 'private-token')))
+        diagnostic = app.upload_error_diagnostic(FloodWaitError(request, capture=1158), 'private-token')
+        self.assertEqual(diagnostic['rpcMethod'], 'ImportBotAuthorizationRequest')
+        self.assertEqual(diagnostic['retryAfterSeconds'], 1158)
+        self.assertNotIn('private', str(diagnostic))
+
+    def test_connection_setup_handles_short_wait_without_recreating_the_session_or_replaying_media(self):
+        from telethon import functions
+        from telethon.errors import FloodWaitError
+        class StartupFloodClient(FakeClient):
+            async def start(self, **kwargs):
+                self.starts = getattr(self, 'starts', 0) + 1
+                if self.starts == 1:
+                    raise FloodWaitError(functions.InvokeWithoutUpdatesRequest(functions.help.GetConfigRequest()), capture=30)
+                return await super().start(**kwargs)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'fixture.mp4'; path.write_bytes(b'complete media')
+            with patch.dict(os.environ, {'API_ID':'123','API_HASH':'test'}), \
+                    patch('telethon.TelegramClient', StartupFloodClient), isolated_uploader() as uploader:
+                waits = []
+                async def sleep(seconds):
+                    if seconds:
+                        waits.append(seconds)
+                        uploader.startup_not_before = 0
+                with patch.object(app.asyncio, 'sleep', side_effect=sleep), path.open('rb') as handle:
+                    result = asyncio.run(app.upload_complete_file('token', 'sendVideo', {'chat_id':'42'}, (path.name,handle,'video/mp4')))
+                client = StartupFloodClient.instances[-1]
+                self.assertEqual(client.starts, 2)
+                self.assertEqual(result['message_id'], 123)
+                self.assertEqual(len(client.parts), 1)
+                self.assertEqual(len(waits), 1)
+                self.assertAlmostEqual(waits[0], 30, delta=1)
+                self.assertFalse(client.disconnected, 'the healthy shared connection stays open')
+
+    def test_real_telethon_short_flood_retries_the_same_publish_rpc_and_long_flood_is_returned(self):
+        from telethon import TelegramClient, functions
+        from telethon.sessions import StringSession
+        from telethon.errors import FloodWaitError
+        async def exercise():
+            client = TelegramClient(StringSession(), 123, 'hash', receive_updates=False,
+                flood_sleep_threshold=60, raise_last_call_error=True)
+            calls = []
+            class Sender:
+                def send(self, request, ordered=False):
+                    calls.append(request)
+                    future = asyncio.get_running_loop().create_future()
+                    if len(calls) == 1:
+                        future.set_exception(FloodWaitError(request, capture=30))
+                    else:
+                        future.set_result(True)
+                    return future
+            request = functions.messages.SendMediaRequest(types.InputPeerUser(42, 99),
+                types.InputMediaUploadedDocument(types.InputFile(17,1,'fixture','checksum'), 'video/mp4', []),
+                'caption', random_id=987654321)
+            with patch.object(app.asyncio, 'sleep', new_callable=AsyncMock) as sleep:
+                result = await client._call(Sender(), request)
+            self.assertTrue(result)
+            sleep.assert_awaited_once_with(30)
+            self.assertEqual(len(calls), 2)
+            self.assertIs(calls[0], calls[1])
+            self.assertIs(calls[0].query, request)
+            self.assertEqual(calls[1].query.random_id, 987654321)
+            calls.clear()
+            class LongWaitSender:
+                def send(self, request, ordered=False):
+                    calls.append(request)
+                    future = asyncio.get_running_loop().create_future()
+                    future.set_exception(FloodWaitError(request, capture=1158))
+                    return future
+            with patch.object(app.asyncio, 'sleep', new_callable=AsyncMock) as sleep:
+                with self.assertRaises(FloodWaitError) as rejected:
+                    await client._call(LongWaitSender(), request)
+            self.assertEqual(rejected.exception.seconds, 1158)
+            self.assertEqual(len(calls), 1)
+            sleep.assert_not_awaited()
+        asyncio.run(exercise())
+
+    def test_timeout_cancels_shared_loop_workers_before_returning_and_next_upload_still_works(self):
+        class WaitingClient(FakeClient):
+            async def __call__(self, request):
+                if not hasattr(self, 'cancelled_parts'):
+                    self.cancelled_parts = 0
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    self.cancelled_parts += 1
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'fixture.mp4'; path.write_bytes(b'a' * 600001)
+            with patch.dict(os.environ, {'API_ID':'123','API_HASH':'test'}), \
+                    patch('telethon.TelegramClient', WaitingClient), isolated_uploader():
+                with path.open('rb') as handle, self.assertRaises(TimeoutError):
+                    app.telegram_call('token', 'sendVideo', data={'chat_id':'42'},
+                        files={'video':(path.name,handle,'video/mp4')}, timeout=.05)
+                client = WaitingClient.instances[-1]
+                self.assertEqual(client.cancelled_parts, 2)
+                self.assertIsNone(client.sent)
+                self.assertFalse(client.disconnected)
+                with patch.object(WaitingClient, '__call__', FakeClient.__call__), path.open('rb') as handle:
+                    self.assertEqual(app.telegram_call('token', 'sendVideo', data={'chat_id':'43'},
+                        files={'video':(path.name,handle,'video/mp4')})['message_id'], 123)
+                self.assertEqual(client.sent[0][0], 43)
+
+    def test_authorized_session_is_saved_and_restored_without_repeated_bot_authorization(self):
+        from telethon.crypto import AuthKey
+        class AuthorizedClient(FakeClient):
+            authorizations = 0
+            async def start(self, **kwargs):
+                if not self.session.auth_key:
+                    type(self).authorizations += 1
+                    self.session.set_dc(2, '149.154.167.51', 443)
+                    self.session.auth_key = AuthKey(bytes(range(256)))
+                return await super().start(**kwargs)
+        saved = []
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'fixture.mp4'; path.write_bytes(b'complete media')
+            env = {'API_ID':'123','API_HASH':'test','TELEGRAM_BOT_SESSION':'',
+                'TELEGRAM_SESSION_URL':'https://downloader.vexaagent.workers.dev/telegram-session/0', 'TELEGRAM_SESSION_TOKEN':'private-capability'}
+            with patch.dict(os.environ, env), patch('telethon.TelegramClient', AuthorizedClient), \
+                    patch.object(app.TelegramUploader, 'save_session', side_effect=saved.append), isolated_uploader():
+                for _ in range(2):
+                    with path.open('rb') as handle:
+                        asyncio.run(app.upload_complete_file('token','sendVideo',{'chat_id':'42'},(path.name,handle,'video/mp4')))
+                self.assertEqual(len(saved), 1)
+                self.assertEqual(AuthorizedClient.authorizations, 1)
+                self.assertEqual(AuthorizedClient.instances[-1].options['flood_sleep_threshold'], 60)
+            with patch.dict(os.environ, {**env,'TELEGRAM_BOT_SESSION':saved[0]}), \
+                    patch('telethon.TelegramClient', AuthorizedClient), isolated_uploader(), path.open('rb') as handle:
+                asyncio.run(app.upload_complete_file('token','sendVideo',{'chat_id':'43'},(path.name,handle,'video/mp4')))
+            self.assertEqual(AuthorizedClient.authorizations, 1)
+            self.assertEqual(AuthorizedClient.instances[-1].session.auth_key.key, bytes(range(256)))
+
+    def test_session_store_outage_keeps_the_healthy_connection_and_retries_only_on_real_upload(self):
+        from telethon.crypto import AuthKey
+        class AuthorizedClient(FakeClient):
+            async def start(self, **kwargs):
+                self.starts = getattr(self, 'starts', 0) + 1
+                self.session.set_dc(2, '149.154.167.51', 443)
+                self.session.auth_key = AuthKey(bytes(range(256)))
+                return await super().start(**kwargs)
+        env = {'API_ID':'123','API_HASH':'test','TELEGRAM_BOT_SESSION':'',
+            'TELEGRAM_SESSION_URL':'https://downloader.vexaagent.workers.dev/telegram-session/0'}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'fixture.mp4'; path.write_bytes(b'complete media')
+            with patch.dict(os.environ,env),patch('telethon.TelegramClient',AuthorizedClient), \
+                    patch.object(app.TelegramUploader,'save_session',side_effect=[RuntimeError('private'),None]) as save, \
+                    isolated_uploader():
+                for _ in range(3):
+                    with path.open('rb') as handle:
+                        self.assertEqual(asyncio.run(app.upload_complete_file('token','sendVideo',{'chat_id':'42'},(path.name,handle,'video/mp4')))['message_id'],123)
+                self.assertEqual(save.call_count, 2)
+                self.assertEqual(AuthorizedClient.instances[-1].starts, 1)
+
     def test_file_caption_and_button_use_native_custom_emoji_without_changing_media(self):
         import json
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'song.mp3';path.write_bytes(b'complete media fixture')
             caption='🎵 Song\n👤 Artist'
             markup={'inline_keyboard':[[{'text':'🎧 فقط صدا','callback_data':'signed|unchanged'}]]}
-            with patch.dict(os.environ,{'API_ID':'123','API_HASH':'test'}),patch('telethon.TelegramClient',FakeClient),path.open('rb') as handle:
+            with patch.dict(os.environ,{'API_ID':'123','API_HASH':'test'}),patch('telethon.TelegramClient',FakeClient),isolated_uploader(),path.open('rb') as handle:
                 asyncio.run(app.upload_complete_file('token','sendDocument',{'chat_id':'42','caption':caption,'reply_markup':json.dumps(markup)},(path.name,handle,'audio/mpeg')))
             client=FakeClient.instances[-1];options=client.sent[1]
             self.assertEqual(options['caption'],caption)
@@ -201,7 +379,7 @@ class ChatTests(unittest.TestCase):
         content=b'GIF89a-complete-animation-fixture'
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'Animation.gif';path.write_bytes(content)
-            with patch.dict(os.environ,{'API_ID':'123','API_HASH':'test'}),patch('telethon.TelegramClient',FakeClient),path.open('rb') as handle:
+            with patch.dict(os.environ,{'API_ID':'123','API_HASH':'test'}),patch('telethon.TelegramClient',FakeClient),isolated_uploader(),path.open('rb') as handle:
                 asyncio.run(app.upload_complete_file('token','sendAnimation',{'chat_id':'42'},(path.name,handle,'image/gif')))
         client=FakeClient.instances[-1]
         self.assertEqual(b''.join(client.parts[i] for i in sorted(client.parts)),content)
@@ -273,7 +451,7 @@ class ChatTests(unittest.TestCase):
                 return SimpleNamespace(id=123,document=document)
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'video.mp4';path.write_bytes(b'complete fixture')
-            with patch.dict(os.environ,{'API_ID':'123','API_HASH':'test'}),patch('telethon.TelegramClient',DocumentClient),path.open('rb') as handle:
+            with patch.dict(os.environ,{'API_ID':'123','API_HASH':'test'}),patch('telethon.TelegramClient',DocumentClient),isolated_uploader(),path.open('rb') as handle:
                 result=asyncio.run(app.upload_complete_file('token','sendVideo',{'chat_id':'42'},(path.name,handle,'video/mp4')))
         self.assertEqual(utils.resolve_bot_file_id(result['file_id']).id,12345)
 
@@ -359,10 +537,11 @@ class YouTubeJobTests(unittest.TestCase):
         result=self.run_job(send_error=ExceptionGroup('upload parts',[error]))
         self.assertEqual(result['errorCode'],'FLOOD_WAIT')
         self.assertEqual(result['retryAfterSeconds'],137)
-        self.assertIn('137',result['message']);self.assertIn('تلگرام',result['message'])
+        self.assertTrue(result['retrySafe']);self.assertIn('خودکار',result['message']);self.assertIn('تلگرام',result['message'])
         self.assertNotIn('تأیید نشد',result['message']);self.send.assert_called_once()
         result=self.run_job(send_error=RPCError(None,'FLOOD',420))
         self.assertNotIn('retryAfterSeconds',result)
+        self.assertNotIn('retrySafe',result)
         self.assertIn('محدود',result['message']);self.send.assert_called_once()
 
 

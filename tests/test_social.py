@@ -719,12 +719,12 @@ class SocialLifecycleTests(unittest.TestCase):
             finally:job.cleanup()
 
     def test_mtproto_sender_attaches_actual_inline_button_markup(self):
-        from test_youtube_chat import FakeClient
+        from test_youtube_chat import FakeClient, isolated_uploader
         from telethon import types
         with tempfile.TemporaryDirectory() as d:
             path=Path(d)/'Video.mp4';path.write_bytes(b'fixture')
             markup={'inline_keyboard':[[{'text':'🎵 فقط صدا','callback_data':'soa|0|42|0123456789abcdef'}]]}
-            with patch.dict(os.environ,{'API_ID':'123','API_HASH':'test'}),patch('telethon.TelegramClient',FakeClient),path.open('rb') as handle:
+            with patch.dict(os.environ,{'API_ID':'123','API_HASH':'test'}),patch('telethon.TelegramClient',FakeClient),isolated_uploader(),path.open('rb') as handle:
                 asyncio.run(app.upload_complete_file('fake','sendVideo',{'chat_id':'42','reply_markup':json.dumps(markup)},(path.name,handle,'video/mp4')))
             button=FakeClient.instances[-1].sent[1]['buttons'][0][0]
             self.assertIsInstance(button,types.KeyboardInlineButton)
