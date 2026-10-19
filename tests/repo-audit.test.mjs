@@ -19,7 +19,7 @@ test('health identifies the deployed download fix without starting a container',
   const response=await worker.fetch(new Request('https://worker/health'),{BOT_TOKEN:'fictional'},{});
   assert.equal(response.status,200);
   const body=await response.json();
-  assert.equal(body.downloadFixVersion,'idle-exit-v2');
+  assert.equal(body.downloadFixVersion,'pool-five-v1');
   assert.equal(body.botConfigured,true);
 });
 const request=(text,value)=>new Request('https://worker/telegram/webhook',{method:'POST',

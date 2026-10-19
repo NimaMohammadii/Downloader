@@ -749,7 +749,7 @@ export default {
         service: "telegram-instagram-downloader",
         mode: "cloudflare-only",
         resolver: "instagram-v13-instagrapi-exact-public-session",
-        downloadFixVersion: "idle-exit-v2",
+        downloadFixVersion: "pool-five-v1",
         botConfigured: Boolean(env.BOT_TOKEN),
         webhookSecretConfigured: Boolean(env.WEBHOOK_SECRET),
         instagramSessionConfigured: Boolean(env.INSTAGRAM_SESSIONID?.trim()),

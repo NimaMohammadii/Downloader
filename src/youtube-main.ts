@@ -1,5 +1,6 @@
 import { Container, getContainer } from "@cloudflare/containers";
 import {
+  DurableObject,
   WorkflowEntrypoint,
   type WorkflowEvent,
   type WorkflowStep,
@@ -28,6 +29,7 @@ const RECOGNITION_FILE_LIMIT = 20_000_000;
 
 type YoutubeDownloadJob = {
   id: string;
+  containerIndex?: number;
   chatId: number;
   requestMessageId: number;
   userId: number;
@@ -49,6 +51,7 @@ type Env = AdminStatsEnv & {
   API_HASH?: string;
   YOUTUBE_DOWNLOAD_WORKFLOW: Workflow<YoutubeDownloadJob>;
   YOUTUBE_DOWNLOADER_CONTAINER: DurableObjectNamespace<YoutubeDownloaderContainer>;
+  DOWNLOAD_POOL: DurableObjectNamespace<DownloadPool>;
   INSTAGRAM_SESSIONID?: string;
   INSTAGRAM_CSRFTOKEN?: string;
   INSTAGRAM_DS_USER_ID?: string;
@@ -129,18 +132,83 @@ type ParsedQualityCallback = {
 
 const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
 
+const POOL_INSTANCES = 20;
+const JOBS_PER_CONTAINER = 5;
+type PoolLease = { instance: number; token: string; until: number };
+
+// Admission only: no waiting list, alarms, polling, or additional Container.
+// Persist assignments so Workflow replays and stop callbacks find the same host.
+export class DownloadPool extends DurableObject<Env> {
+  async acquire(id: string): Promise<PoolLease | null> {
+    return this.ctx.storage.transaction(async storage => {
+      const jobs = await storage.get<Record<string, PoolLease>>("jobs") || {};
+      const now = Date.now();
+      for (const [key, lease] of Object.entries(jobs)) if (lease.until <= now) delete jobs[key];
+      if (jobs[id]) return jobs[id];
+      const counts = Array<number>(POOL_INSTANCES).fill(0);
+      for (const lease of Object.values(jobs)) counts[lease.instance]++;
+      // Pack live work first, avoiding twenty cold boots for a small burst.
+      let instance = counts.findIndex(count => count > 0 && count < JOBS_PER_CONTAINER);
+      if (instance < 0) instance = counts.indexOf(0);
+      if (instance < 0) return null;
+      const lease = { instance, token: crypto.randomUUID(), until: now + 4 * 60 * 60 * 1000 };
+      jobs[id] = lease;
+      await storage.put("jobs", jobs);
+      return lease;
+    });
+  }
+
+  async lookup(id: string): Promise<PoolLease | null> {
+    const jobs = await this.ctx.storage.get<Record<string, PoolLease>>("jobs") || {};
+    return jobs[id]?.until > Date.now() ? jobs[id] : null;
+  }
+
+  async release(id: string, token: string): Promise<void> {
+    await this.ctx.storage.transaction(async storage => {
+      const jobs = await storage.get<Record<string, PoolLease>>("jobs") || {};
+      if (jobs[id]?.token !== token) return;
+      delete jobs[id];
+      await storage.put("jobs", jobs);
+    });
+  }
+}
+
+function downloadPool(env: Env) {
+  return env.DOWNLOAD_POOL.getByName("downloads-v1");
+}
+
+function pooledContainer(env: Env, job: Pick<YoutubeDownloadJob, "containerIndex">) {
+  if (!Number.isInteger(job.containerIndex) || job.containerIndex! < 0 || job.containerIndex! >= POOL_INSTANCES) throw new Error("DOWNLOAD_POOL_ASSIGNMENT");
+  return getContainer(env.YOUTUBE_DOWNLOADER_CONTAINER, `download-pool-v1-${job.containerIndex}`);
+}
+
 export class YoutubeDownloaderContainer extends Container<Env> {
   defaultPort = 8080;
   sleepAfter: string | number = "10s";
   enableInternet = true;
   envVars = { API_ID: this.env.API_ID || "", API_HASH: this.env.API_HASH || "" };
+  private starting?: Promise<void>;
+
+  async startShared(): Promise<void> {
+    if (!this.starting) {
+      this.starting = this.startAndWaitForPorts({
+        ports: [8080],
+        cancellationOptions: { instanceGetTimeoutMS: 45_000, portReadyTimeoutMS: 60_000 },
+      }).then(() => {}).finally(() => { this.starting = undefined; });
+    }
+    await this.starting;
+  }
 
   async instagramRequest(action: string, payload: Record<string, unknown>): Promise<ContainerResult> {
     if (!["start", "stop", "send", "cleanup"].includes(action)) throw new Error("IG_ACTION");
     // Cleanup must not start a fresh instance after a crash or rollout.
     if (action === "cleanup" && !this.ctx.container?.running) return { ok: true };
     if (action === "start") {
-      await this.ctx.storage.put("instagramJob", { id: String(payload.id), until: Date.now() + 3 * 60 * 60 * 1000 });
+      await this.ctx.storage.transaction(async storage => {
+        const jobs = await storage.get<Record<string, number>>("instagramJobs") || {};
+        jobs[String(payload.id)] = Date.now() + 3 * 60 * 60 * 1000;
+        await storage.put("instagramJobs", jobs);
+      });
     }
     const response = await this.containerFetch(`http://container/instagram/${action}`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload),
@@ -149,16 +217,21 @@ export class YoutubeDownloaderContainer extends Container<Env> {
     return response.json() as Promise<ContainerResult>;
   }
 
-  async releaseInstagram(): Promise<void> {
-    await this.ctx.storage.delete("instagramJob");
+  async releaseInstagram(id: string): Promise<void> {
+    await this.ctx.storage.transaction(async storage => {
+      const jobs = await storage.get<Record<string, number>>("instagramJobs") || {};
+      delete jobs[id];
+      await storage.put("instagramJobs", jobs);
+    });
     this.sleepAfter = "10s";
     this.renewActivityTimeout();
   }
 
   override async onActivityExpired(): Promise<void> {
-    const job = await this.ctx.storage.get<{ until: number }>("instagramJob");
-    if (job && job.until > Date.now()) {
-      this.sleepAfter = Math.ceil((job.until - Date.now()) / 1000);
+    const jobs = await this.ctx.storage.get<Record<string, number>>("instagramJobs") || {};
+    const until = Math.max(0, ...Object.values(jobs));
+    if (until > Date.now()) {
+      this.sleepAfter = Math.ceil((until - Date.now()) / 1000);
       this.renewActivityTimeout();
       return;
     }
@@ -170,25 +243,19 @@ export class YoutubeDownloaderContainer extends Container<Env> {
   }
 
   private async instagramInterrupted(): Promise<boolean> {
-    const job = await this.ctx.storage.get<{ id: string }>("instagramJob");
-    if (!job) return false;
-    const instance = await this.env.YOUTUBE_DOWNLOAD_WORKFLOW.get(job.id);
-    await instance.sendEvent({ type: "instagram-ready", payload: { ok: false, message: "❌ سرور هنگام دریافت فایل ری‌استارت شد؛ درخواست کامل نشد. دوباره درخواست را بفرست." } });
-    return true;
+    const jobs = await this.ctx.storage.get<Record<string, number>>("instagramJobs") || {};
+    const active = Object.entries(jobs).filter(([, until]) => until > Date.now());
+    await Promise.allSettled(active.map(async ([id]) => {
+      const instance = await this.env.YOUTUBE_DOWNLOAD_WORKFLOW.get(id);
+      await instance.sendEvent({ type: "instagram-ready", payload: { ok: false, message: "❌ سرور هنگام دریافت فایل ری‌استارت شد؛ درخواست کامل نشد. دوباره درخواست را بفرست." } });
+    }));
+    return active.length > 0;
   }
 
   override async onStop(): Promise<void> { await this.instagramInterrupted(); }
   override async onError(error: unknown): Promise<void> {
     if (!await this.instagramInterrupted()) super.onError(error);
   }
-}
-
-function containerSessionId(job: Pick<YoutubeDownloadJob, "chatId" | "requestMessageId" | "userId">): string {
-  return `yt-session-${job.chatId}-${job.requestMessageId}-${job.userId}`;
-}
-
-function instagramContainer(env: Env, job: Pick<YoutubeDownloadJob, "id">) {
-  return getContainer(env.YOUTUBE_DOWNLOADER_CONTAINER, `instagram-${job.id}`);
 }
 
 async function instagramSignature(token: string, value: string): Promise<string> {
@@ -259,7 +326,7 @@ function workflowFailureMessage(detail: string, phase: string): string {
   if (detail.includes("YT_CONFIG")) {
     return "❌ تنظیمات ارسال فایل آماده نیست؛ API_ID و API_HASH باید در Secretهای همین Worker تنظیم شوند.";
   }
-  if (/YT_HTTP_(503|429)|no container instance|max.*instance|provision/i.test(detail)) {
+  if (/DOWNLOAD_POOL_FULL|YT_HTTP_(503|429)|no container instance|max.*instance|provision/i.test(detail)) {
     return "❌ سرور دانلود هنوز آماده نیست یا ظرفیتش پر شده؛ کمی بعد دوباره لینک رو بفرست.";
   }
   if (phase === "startup" || /YT_HTTP_500|not listening|port.*ready/i.test(detail)) {
@@ -272,7 +339,7 @@ function workflowFailureMessage(detail: string, phase: string): string {
 }
 
 async function containerResult<T>(env: Env, job: YoutubeDownloadJob, request: Request): Promise<T> {
-  const container = getContainer(env.YOUTUBE_DOWNLOADER_CONTAINER, containerSessionId(job));
+  const container = pooledContainer(env, job);
   const response = await container.fetch(request);
   if (!response.ok) {
     const detail = redactDiagnostic(await response.text(), env);
@@ -288,25 +355,28 @@ async function containerResult<T>(env: Env, job: YoutubeDownloadJob, request: Re
 
 export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDownloadJob> {
   async run(event: WorkflowEvent<YoutubeDownloadJob>, step: WorkflowStep) {
-    const job = event.payload;
+    const job: YoutubeDownloadJob = { ...event.payload };
     if (job.instagram || job.recognition || job.playlist || job.social) return this.runInstagram(job, step);
     let statusMessageId = job.statusMessageId;
     let phase = "startup";
-    const startContainer = () => step.do(
-      "start youtube container",
-      {
-        retries: { limit: 2, delay: "5 seconds", backoff: "linear" },
-        timeout: "2 minutes",
-      },
-      async () => {
-        const container = getContainer(this.env.YOUTUBE_DOWNLOADER_CONTAINER, containerSessionId(job));
-        await container.startAndWaitForPorts({
-          ports: [8080],
-          cancellationOptions: { instanceGetTimeoutMS: 45_000, portReadyTimeoutMS: 60_000 },
-        });
-        return true;
-      },
-    );
+    let lease: PoolLease | undefined;
+    const startContainer = async () => {
+      const assignment = await step.do("reserve download capacity", { retries: { limit: 0, delay: "1 second" } }, () => downloadPool(this.env).acquire(job.id));
+      if (!assignment) throw new Error("DOWNLOAD_POOL_FULL");
+      lease = assignment;
+      job.containerIndex = assignment.instance;
+      return step.do(
+        "start youtube container",
+        {
+          retries: { limit: 2, delay: "5 seconds", backoff: "linear" },
+          timeout: "2 minutes",
+        },
+        async () => {
+          await pooledContainer(this.env, job).startShared();
+          return true;
+        },
+      );
+    };
 
     try {
       if (!job.quality && !job.audioMode && job.source !== "pornhub") {
@@ -470,12 +540,15 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           return true;
         },
       );
+    } finally {
+      if (lease) await step.do("release download capacity", { retries: { limit: 3, delay: "1 second" }, timeout: "1 minute" }, () => downloadPool(this.env).release(job.id, lease!.token));
     }
   }
 
   private async runInstagram(job: YoutubeDownloadJob, step: WorkflowStep): Promise<void> {
     let statusId: number | undefined;
     let started = false;
+    let lease: PoolLease | undefined;
     try {
       statusId = await step.do("show instagram video status", async () => {
         const message = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
@@ -513,14 +586,18 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         return;
       }
       if (!/^\d+$/.test(this.env.API_ID || "") || !this.env.API_HASH?.trim()) throw new Error("YT_CONFIG");
+      const assignment = await step.do("reserve download capacity", { retries: { limit: 0, delay: "1 second" } }, () => downloadPool(this.env).acquire(job.id));
+      if (!assignment) throw new Error("DOWNLOAD_POOL_FULL");
+      lease = assignment;
+      job.containerIndex = assignment.instance;
       await step.do("start instagram container", { retries: { limit: 2, delay: "5 seconds", backoff: "linear" }, timeout: "2 minutes" }, async () => {
-        await instagramContainer(this.env, job).startAndWaitForPorts({ ports: [8080], cancellationOptions: { instanceGetTimeoutMS: 45_000, portReadyTimeoutMS: 60_000 } });
+        await pooledContainer(this.env, job).startShared();
         return true;
       });
       started = true;
       await step.do("begin instagram capture", { retries: { limit: 2, delay: "3 seconds" }, timeout: "1 minute" }, async () => {
         const signature = (await instagramSignature(this.env.BOT_TOKEN, `stop:${job.chatId}:${job.requestMessageId}:${job.userId}`)).slice(0, 16);
-        const result = await instagramContainer(this.env, job).instagramRequest("start", {
+        const result = await pooledContainer(this.env, job).instagramRequest("start", {
           id: job.id, source, botToken: this.env.BOT_TOKEN, chatId: job.chatId, requestMessageId: job.requestMessageId, userId: job.userId,
           statusMessageId: statusId,
           stopData: `igs|${job.requestMessageId}|${job.userId}|${signature}`,
@@ -540,7 +617,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         return;
       }
       const result = await step.do("send complete instagram recording", { retries: { limit: 0, delay: "1 second" }, timeout: "30 minutes" }, () =>
-        instagramContainer(this.env, job).instagramRequest("send", { id: job.id }),
+        pooledContainer(this.env, job).instagramRequest("send", { id: job.id }),
       );
       if (result.ok) await step.do("record instagram video delivery", async () => {
         for (let i = 0; i < Math.min(20, result.parts || 1); i++) await recordSuccessfulDelivery(this.env, `instagram:${job.id}${i ? `:${i}` : ""}`);
@@ -556,8 +633,8 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
     } catch (error) {
       console.error("instagram video workflow failed", { jobId: job.id, type: error instanceof Error ? error.name : "error" });
       await step.do("notify instagram video failure", async () => {
-        const text = error instanceof Error && error.message.includes("YT_CONFIG")
-          ? workflowFailureMessage("YT_CONFIG", "startup")
+        const text = error instanceof Error && /YT_CONFIG|DOWNLOAD_POOL_FULL|max.*instance|provision/i.test(error.message)
+          ? workflowFailureMessage(error.message, "startup")
           : job.social ? `❌ دریافت یا ارسال فایل ${socialName(job.social.platform)} کامل نشد؛ اگر فایلی دریافت کرده‌ای، پیش از درخواست دوباره بررسی کن.` : job.recognition || job.playlist || job.instagram?.kind === "music" || job.instagram?.kind === "audio" ? "❌ دریافت یا ارسال فایل صوتی کامل نشد؛ درخواست را دوباره بفرست." : "❌ ضبط یا ارسال لایو کامل نشد؛ لینک را دوباره بفرست. ممکن است سرور ری‌استارت شده باشد.";
         await safeTelegramCall(this.env.BOT_TOKEN, statusId ? "editMessageText" : "sendMessage", {
           chat_id: job.chatId, message_id: statusId, text, reply_markup: { inline_keyboard: [] },
@@ -565,12 +642,16 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         return true;
       });
     } finally {
-      if (started) await step.do("release instagram recording", { retries: { limit: 1, delay: "2 seconds" }, timeout: "1 minute" }, async () => {
-        const container = instagramContainer(this.env, job);
-        try { await container.instagramRequest("cleanup", { id: job.id }); }
-        finally { await container.releaseInstagram(); }
-        return true;
-      });
+      try {
+        if (started) await step.do("release instagram recording", { retries: { limit: 1, delay: "2 seconds" }, timeout: "1 minute" }, async () => {
+          const container = pooledContainer(this.env, job);
+          try { await container.instagramRequest("cleanup", { id: job.id }); }
+          finally { await container.releaseInstagram(job.id); }
+          return true;
+        });
+      } finally {
+        if (lease) await step.do("release download capacity", { retries: { limit: 3, delay: "1 second" }, timeout: "1 minute" }, () => downloadPool(this.env).release(job.id, lease!.token));
+      }
     }
   }
 }
@@ -967,7 +1048,11 @@ async function stopInstagramRecording(env: Env, callback: TelegramCallbackQuery)
       // Acknowledge immediately; the capture process finalizes its file separately.
       await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "درخواست توقف ارسال شد…" });
       try {
-        const result = await instagramContainer(env, { id: `igdl-${chatId}-${match[1]}-${match[2]}` }).instagramRequest("stop", { id: `igdl-${chatId}-${match[1]}-${match[2]}` });
+        const id = `igdl-${chatId}-${match[1]}-${match[2]}`;
+        const lease = await downloadPool(env).lookup(id);
+        const result = lease
+          ? await pooledContainer(env, { containerIndex: lease.instance }).instagramRequest("stop", { id })
+          : { ok: false, message: "ضبط قبلاً تمام شده یا در حال ارسال است." };
         if (!result.ok) await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: result.message || "ضبط قبلاً تمام شده یا در حال ارسال است." });
       } catch {
         await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "❌ ارتباط با ضبط‌کننده برقرار نشد؛ ممکن است ضبط پایان یافته یا سرور ری‌استارت شده باشد." });

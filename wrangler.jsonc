@@ -15,6 +15,10 @@
         "class_name": "AdminStatsStore"
       },
       {
+        "name": "DOWNLOAD_POOL",
+        "class_name": "DownloadPool"
+      },
+      {
         "name": "YOUTUBE_DOWNLOADER_CONTAINER",
         "class_name": "YoutubeDownloaderContainer"
       }
@@ -44,6 +48,10 @@
     {
       "tag": "v6",
       "new_sqlite_classes": ["YoutubeDownloaderContainer"]
+    },
+    {
+      "tag": "v7",
+      "new_sqlite_classes": ["DownloadPool"]
     }
   ],
   "containers": [
@@ -52,7 +60,7 @@
       "class_name": "YoutubeDownloaderContainer",
       "image": "./Dockerfile",
       "max_instances": 20,
-      "instance_type": "standard-1",
+      "instance_type": "standard-2",
       "rollout_step_percentage": [100]
     }
   ],

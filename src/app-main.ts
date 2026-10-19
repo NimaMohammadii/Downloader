@@ -1,5 +1,5 @@
 import youtubeWorker from "./youtube-main";
-export { AdminStatsStore, YoutubeDownloaderContainer, YoutubeDownloadWorkflow } from "./youtube-main";
+export { AdminStatsStore, DownloadPool, YoutubeDownloaderContainer, YoutubeDownloadWorkflow } from "./youtube-main";
 import { MINI_APP_HTML } from "./mini-app-ui";
 import { WEB_APP_HTML } from "./web-ui";
 import { applyWebBackground } from "./web-mesh-background";

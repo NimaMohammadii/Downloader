@@ -26,6 +26,11 @@ ASPECT_TOLERANCE = 0.06
 QUALITY_TOLERANCE = 18
 
 
+def session_state_path() -> Path:
+    directory = app.REQUEST_CACHE.get()
+    return directory / "session.json" if directory is not None else SESSION_STATE_PATH
+
+
 class ClientAttemptError(Exception):
     def __init__(self, client: str, category: str, message: str, detail: str = "") -> None:
         super().__init__(message)
@@ -160,16 +165,17 @@ def _save_session(metadata: dict[str, Any], client: str) -> None:
         "videoId": str(metadata.get("id") or ""),
     }
     try:
-        temp = SESSION_STATE_PATH.with_suffix(".tmp")
+        path = session_state_path()
+        temp = path.with_suffix(".tmp")
         temp.write_text(json.dumps(state), encoding="utf-8")
-        temp.replace(SESSION_STATE_PATH)
+        temp.replace(path)
     except Exception as exc:
         print(f"youtube session state write failed: {type(exc).__name__}: {exc}", flush=True)
 
 
 def _load_session_client(metadata: dict[str, Any] | None = None) -> str | None:
     try:
-        state = json.loads(SESSION_STATE_PATH.read_text(encoding="utf-8"))
+        state = json.loads(session_state_path().read_text(encoding="utf-8"))
         if not isinstance(state, dict):
             return None
         client = str(state.get("client") or "")

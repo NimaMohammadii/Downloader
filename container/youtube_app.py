@@ -24,7 +24,68 @@ from urllib.parse import parse_qs, urlparse, urljoin
 
 import requests
 
-JOB_LOCK = threading.Lock()
+class JobCapacity:
+    """Nonblocking admission shared by metadata, downloads and background jobs."""
+
+    def __init__(self, limit: int = 5) -> None:
+        self.limit = limit
+        self.lock = threading.Lock()
+        self.jobs: set[str] = set()
+
+    def acquire(self, key: str) -> bool:
+        with self.lock:
+            if key in self.jobs or len(self.jobs) >= self.limit:
+                return False
+            self.jobs.add(key)
+            return True
+
+    def release(self, key: str) -> None:
+        with self.lock:
+            self.jobs.discard(key)
+
+
+JOB_CAPACITY = JobCapacity()
+REQUEST_CACHE: ContextVar[Path | None] = ContextVar("request_cache", default=None)
+CATALOG_CACHE: dict[str, tuple[float, str, str]] = {}
+CATALOG_LOCK = threading.Lock()
+
+
+@contextmanager
+def request_cache(url: str = ""):
+    # Every extraction owns its metadata and selected-client files. Concurrent
+    # requests must never load another video's --load-info-json input.
+    with tempfile.TemporaryDirectory(prefix="youtube-request-") as directory:
+        folder = Path(directory)
+        with CATALOG_LOCK:
+            now = time.monotonic()
+            for key, cached in list(CATALOG_CACHE.items()):
+                if cached[0] <= now:
+                    del CATALOG_CACHE[key]
+            cached = CATALOG_CACHE.get(url) if url else None
+        if cached:
+            (folder / "info.json").write_text(cached[1], encoding="utf-8")
+            (folder / "session.json").write_text(cached[2], encoding="utf-8")
+        token = REQUEST_CACHE.set(folder)
+        try:
+            yield
+        finally:
+            REQUEST_CACHE.reset(token)
+            try:
+                info = (folder / "info.json").read_text(encoding="utf-8")
+                session = (folder / "session.json").read_text(encoding="utf-8")
+                if url and len(info.encode("utf-8")) + len(session.encode("utf-8")) <= 2_000_000:
+                    with CATALOG_LOCK:
+                        if url not in CATALOG_CACHE and len(CATALOG_CACHE) >= 20:
+                            del CATALOG_CACHE[next(iter(CATALOG_CACHE))]
+                        # Reuse cannot extend signed source URLs indefinitely.
+                        CATALOG_CACHE[url] = (cached[0] if cached else time.monotonic() + 300, info, session)
+            except (OSError, UnicodeError):
+                pass
+
+
+def metadata_cache_path() -> Path:
+    directory = REQUEST_CACHE.get()
+    return directory / "info.json" if directory is not None else METADATA_CACHE_PATH
 
 
 class IdleExit:
@@ -264,9 +325,10 @@ def fetch_metadata(url: str) -> dict[str, Any]:
 
 def save_metadata_cache(metadata: dict[str, Any]) -> None:
     try:
-        temp_path = METADATA_CACHE_PATH.with_suffix(".tmp")
+        path = metadata_cache_path()
+        temp_path = path.with_suffix(".tmp")
         temp_path.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
-        temp_path.replace(METADATA_CACHE_PATH)
+        temp_path.replace(path)
     except Exception as exc:
         print(f"metadata cache write failed: {type(exc).__name__}: {exc}", flush=True)
 
@@ -290,10 +352,11 @@ def youtube_video_id(url: str) -> str | None:
 
 
 def load_metadata_cache(url: str) -> dict[str, Any] | None:
-    if not METADATA_CACHE_PATH.exists():
+    path = metadata_cache_path()
+    if not path.exists():
         return None
     try:
-        metadata = json.loads(METADATA_CACHE_PATH.read_text(encoding="utf-8"))
+        metadata = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(metadata, dict):
             return None
         expected = youtube_video_id(url)
@@ -440,12 +503,12 @@ def download_video(url: str, workdir: Path, quality: int, metadata: dict[str, An
         f"b[{dimension}<={quality}][ext=mp4]/b[{dimension}<={quality}]/b"
     )
 
-    if METADATA_CACHE_PATH.exists():
+    if metadata_cache_path().exists():
         cached = run_cached_command(
             [
                 REAL_YTDLP,
                 "--load-info-json",
-                str(METADATA_CACHE_PATH),
+                str(metadata_cache_path()),
                 "--no-simulate",
                 "--retries",
                 "1",
@@ -513,12 +576,12 @@ def download_audio(url: str, workdir: Path, audio_mode: str) -> Path:
     source_template = str(workdir / "audio-source.%(ext)s")
     result: subprocess.CompletedProcess[str] | None = None
 
-    if METADATA_CACHE_PATH.exists():
+    if metadata_cache_path().exists():
         result = run_cached_command(
             [
                 REAL_YTDLP,
                 "--load-info-json",
-                str(METADATA_CACHE_PATH),
+                str(metadata_cache_path()),
                 "--no-simulate",
                 "--retries",
                 "1",
@@ -632,6 +695,7 @@ def validate_file_size(path: Path) -> None:
 async def upload_complete_file(token: str, method: str, data: dict[str, Any], file: tuple) -> Any:
     from telethon import Button, TelegramClient, functions, types, utils
     from telethon.errors import FloodWaitError
+    from telethon.sessions import MemorySession
 
     filename, handle, mime = file
     path = Path(handle.name)
@@ -643,7 +707,7 @@ async def upload_complete_file(token: str, method: str, data: dict[str, Any], fi
 
     # This MTProto bot session leaves the existing Bot API webhook intact.
     async with await TelegramClient(
-        "/tmp/youtube-uploader", int(api_id), api_hash,
+        MemorySession(), int(api_id), api_hash,
         receive_updates=False, flood_sleep_threshold=60,
     ).start(bot_token=token) as client:
         size = path.stat().st_size
@@ -1189,7 +1253,7 @@ class InstagramCapture:
         self.safe_status("❌ اعلام نتیجهٔ پلی‌لیست به ربات کامل نشد؛ پیش از درخواست دوباره، فایل‌های ارسال‌شده را بررسی کن." if self.source.get("playlist") else "❌ فایل دریافت شد ولی اعلام نتیجه به ربات کامل نشد؛ لینک را دوباره بفرست.")
 
     def run_active(self) -> None:
-        with server_activity():
+        with server_activity(), request_cache():
             self.run()
 
     def run(self) -> None:
@@ -1360,6 +1424,9 @@ class InstagramCapture:
             self.notify()
             if self.cleanup_requested:
                 shutil.rmtree(self.workdir, ignore_errors=True)
+                JOB_CAPACITY.release(self.id)
+                with INSTAGRAM_LOCK:
+                    INSTAGRAM_JOBS.pop(self.id, None)
 
     def run_playlist(self) -> None:
         from youtube_pipeline import playlist_entries, prepare_music_url
@@ -1544,6 +1611,7 @@ class InstagramCapture:
             self.thread.join(timeout=20)
         if not self.thread.is_alive():
             shutil.rmtree(self.workdir, ignore_errors=True)
+            JOB_CAPACITY.release(self.id)
         self.expiry.cancel()
         if SERVER_IDLE is not None:
             SERVER_IDLE.refresh()
@@ -1557,12 +1625,20 @@ def instagram_action(action: str, payload: dict[str, Any]) -> dict[str, Any]:
             if job:
                 # Workflow start retries reuse the same process and file.
                 return {"ok": True}
-            if INSTAGRAM_JOBS:
-                return {"ok": False, "message": "ضبط دیگری در حال انجام است."}
-            job = InstagramCapture(payload)
-            INSTAGRAM_JOBS[job_id] = job
-            job.expiry.start()
-            job.thread.start()
+            if not JOB_CAPACITY.acquire(job_id):
+                return {"ok": False, "message": "ظرفیت هم‌زمان این سرور پر است."}
+            try:
+                job = InstagramCapture(payload)
+                INSTAGRAM_JOBS[job_id] = job
+                job.expiry.start()
+                job.thread.start()
+            except Exception:
+                INSTAGRAM_JOBS.pop(job_id, None)
+                JOB_CAPACITY.release(job_id)
+                if job:
+                    job.expiry.cancel()
+                    shutil.rmtree(job.workdir, ignore_errors=True)
+                raise
             return {"ok": True}
     if not job:
         return {"ok": action == "cleanup", "message": "ضبط قبلاً تمام شده یا سرور ری‌استارت شده است."}
@@ -1573,7 +1649,8 @@ def instagram_action(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     if action == "cleanup":
         job.cleanup()
         with INSTAGRAM_LOCK:
-            INSTAGRAM_JOBS.pop(job_id, None)
+            if not job.thread.is_alive():
+                INSTAGRAM_JOBS.pop(job_id, None)
         return {"ok": True}
     raise ValueError("Invalid Instagram action")
 
@@ -1615,15 +1692,23 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
             if self.path.startswith("/instagram/"):
                 result = instagram_action(self.path.rsplit("/", 1)[-1], payload)
-            elif self.path == "/metadata":
-                url = str(payload.get("url") or "")
-                if not url:
-                    self._send_json(400, {"ok": False, "message": "❌ لینک YouTube نامعتبره."})
-                    return
-                result = inspect_video(url)
             else:
-                with JOB_LOCK:
-                    result = process_job(payload)
+                key = str(payload.get("id") or secrets.token_hex(16))
+                if not JOB_CAPACITY.acquire(key):
+                    self._send_json(429, {"ok": False, "message": "ظرفیت هم‌زمان این سرور پر است."})
+                    return
+                try:
+                    with request_cache(str(payload.get("url") or "")):
+                        if self.path == "/metadata":
+                            url = str(payload.get("url") or "")
+                            if not url:
+                                self._send_json(400, {"ok": False, "message": "❌ لینک YouTube نامعتبره."})
+                                return
+                            result = inspect_video(url)
+                        else:
+                            result = process_job(payload)
+                finally:
+                    JOB_CAPACITY.release(key)
             self._send_json(200, result)
         except Exception as exc:
             print(f"youtube container request failed: {type(exc).__name__}", flush=True)
@@ -1642,7 +1727,7 @@ def serve() -> None:
                        for job in INSTAGRAM_JOBS.values())
     SERVER_IDLE = IdleExit(10, pending_media)
     SERVER_IDLE.refresh()
-    print(f"youtube downloader listening on :{server.server_port} (idle-exit-v2)", flush=True)
+    print(f"youtube downloader listening on :{server.server_port} (pool-five-v1)", flush=True)
     server.serve_forever()
 
 

@@ -21,7 +21,7 @@ const { outputFiles } = await build({
           onError(error){throw error;}
         }
         export const getContainer=(_env,id)=>{globalThis.containerIds.push(id);return globalThis.container;};` };
-      if (a.path === 'cloudflare:workers') return { contents: 'export class WorkflowEntrypoint {constructor(ctx,env){this.env=env;}}' };
+      if (a.path === 'cloudflare:workers') return { contents: 'export class DurableObject {constructor(ctx,env){this.ctx=ctx;this.env=env;}} export class WorkflowEntrypoint {constructor(ctx,env){this.env=env;}}' };
       if (a.path === './admin') return { contents: `
         export const telegramFileCache=async(...args)=>globalThis.testFileCache ? globalThis.testFileCache(...args) : null; export class AdminStatsStore{} export const ADMIN_USER_ID=1;
         export const recordUserActivity=async()=>{};
@@ -31,7 +31,8 @@ const { outputFiles } = await build({
   } }],
 });
 const mod = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
-const env = { BOT_TOKEN: 'fictional-bot-token', API_ID: '123', API_HASH: 'fictional-api-hash', INSTAGRAM_SESSIONID: '42%3Afictional-session' };
+const env = { BOT_TOKEN: 'fictional-bot-token', API_ID: '123', API_HASH: 'fictional-api-hash', INSTAGRAM_SESSIONID: '42%3Afictional-session',
+  DOWNLOAD_POOL: {getByName(){return {async acquire(){return {instance:0,token:'test-lease'};},async release(){},async lookup(){return {instance:0};}};}} };
 const liveUrl = 'https://scontent.cdninstagram.com/live.mpd';
 const job = { id: 'igdl-42-7-42', chatId: 42, requestMessageId: 7, userId: 42, url: '', instagram: {kind:'live',broadcastId:'17900000000000001'} };
 function api(routes) {
@@ -107,7 +108,7 @@ async function workflow(ready = {ok:true}) {
   const calls=[],steps=[],messages=[];
   globalThis.delivered=0; globalThis.containerIds=[];
   globalThis.container={
-    async startAndWaitForPorts(){calls.push('start');},
+    async startShared(){calls.push('start');},
     async instagramRequest(action,payload){calls.push(action);if(action==='start') globalThis.startedPayload=payload;return {ok:true};},
     async releaseInstagram(){calls.push('release');},
   };
@@ -166,18 +167,18 @@ test('completion endpoint rejects forged events and delivers authenticated event
 });
 
 test('only leased Instagram containers stay awake and release clears the lease',async()=>{
-  const map=new Map([['instagramJob',{id:job.id,until:Date.now()+7_200_000}]]);
-  const storage={get:async key=>map.get(key),delete:async key=>map.delete(key)};
+  const map=new Map([['instagramJobs',{[job.id]:Date.now()+7_200_000}]]);
+  const storage={get:async key=>map.get(key),put:async(key,value)=>map.set(key,value),transaction:async fn=>fn(storage)};
   globalThis.renewed=0;globalThis.expired=0;
   const container=new mod.YoutubeDownloaderContainer({storage},env);
   await container.onActivityExpired();assert.equal(globalThis.expired,0);assert.ok(globalThis.renewed);
-  await container.releaseInstagram();assert.equal(container.sleepAfter,'10s');
+  await container.releaseInstagram(job.id);assert.equal(container.sleepAfter,'10s');
   await container.onActivityExpired();assert.equal(globalThis.expired,1);
 });
 
 test('container restart wakes the recording workflow with an explicit failure',async()=>{
   const events=[];
-  const storage={get:async()=>({id:job.id,until:Date.now()+1000})};
+  const storage={get:async()=>({[job.id]:Date.now()+1000})};
   const interruptedEnv={...env,YOUTUBE_DOWNLOAD_WORKFLOW:{async get(id){assert.equal(id,job.id);return {async sendEvent(event){events.push(event);}};}}};
   const container=new mod.YoutubeDownloaderContainer({storage},interruptedEnv);
   await container.onStop();
@@ -335,7 +336,7 @@ test('recognition uses the same completion event and upload path without requiri
   const calls=[];const steps=[];
   globalThis.containerIds=[];globalThis.delivered=0;
   globalThis.container={
-    async startAndWaitForPorts(){calls.push('boot');},
+    async startShared(){calls.push('boot');},
     async instagramRequest(action,payload){calls.push(action);if(action==='start')globalThis.recognitionPayload=payload;return {ok:true};},
     async releaseInstagram(){calls.push('release');},
   };
@@ -523,7 +524,7 @@ test('social webhook dispatches all providers into existing media job without mu
 test('social workflow sends signed source, waits for event and uploads batch without publish retries',async()=>{
   const calls=[],messages=[],steps=[];globalThis.delivered=0;globalThis.containerIds=[];
   const social={platform:'pinterest',url:'https://www.pinterest.com/pin/123/'};
-  globalThis.container={async startAndWaitForPorts(){calls.push('boot');},
+  globalThis.container={async startShared(){calls.push('boot');},
     async instagramRequest(action,payload){calls.push(action);if(action==='start')globalThis.startedPayload=payload;return {ok:true,parts:3};},
     async releaseInstagram(){calls.push('release');}};
   globalThis.fetch=async(url,init)=>{messages.push(JSON.parse(init.body));return Response.json({ok:true,result:{message_id:10}});};
@@ -541,7 +542,7 @@ test('social workflow sends signed source, waits for event and uploads batch wit
 
 test('social batch failure preserves confirmed count and warns against duplicate sends',async()=>{
   const messages=[];globalThis.delivered=0;globalThis.containerIds=[];
-  globalThis.container={async startAndWaitForPorts(){},async instagramRequest(action){return action==='send'?{ok:false,parts:1,message:'1 file confirmed; check chat before repeating'}:{ok:true};},async releaseInstagram(){}};
+  globalThis.container={async startShared(){},async instagramRequest(action){return action==='send'?{ok:false,parts:1,message:'1 file confirmed; check chat before repeating'}:{ok:true};},async releaseInstagram(){}};
   globalThis.fetch=async(url,init)=>{messages.push(JSON.parse(init.body));return Response.json({ok:true,result:{message_id:10}});};
   const step={async do(name,options,fn){return (typeof options==='function'?options:fn)();},async waitForEvent(){return {payload:{ok:true}};}};
   await new mod.YoutubeDownloadWorkflow({},env).run({payload:{...job,instagram:undefined,social:{platform:'x',url:'https://x.com/i/status/123'}}},step);

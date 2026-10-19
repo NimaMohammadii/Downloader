@@ -20,6 +20,7 @@ const { outputFiles } = await build({
         export const getContainer = () => globalThis.container;
       ` };
       if (args.path === 'cloudflare:workers') return { contents: `
+        export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }
         export class WorkflowEntrypoint { constructor(ctx, env) { this.env = env; } }
       ` };
       if (args.path === './story-main') return { contents: 'export default { fetch() {} }; export const parseInstagramVideoTarget = () => null; export const parseInstagramAudioTarget = () => null; export const resolveInstagramVideo = () => {}; export const instagramVideoErrorText = () => "error";' };
@@ -33,7 +34,116 @@ const { outputFiles } = await build({
     });
   } }],
 });
-const { YoutubeDownloaderContainer, YoutubeDownloadWorkflow, extractPornhubUrl, default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
+const { DownloadPool, YoutubeDownloaderContainer, YoutubeDownloadWorkflow, extractPornhubUrl, default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
+
+function memoryStorage() {
+  const values = new Map();
+  let serial = Promise.resolve();
+  const storage = {
+    async get(key) { return structuredClone(values.get(key)); },
+    async put(key, value) { values.set(key, structuredClone(value)); },
+    async delete(key) { values.delete(key); },
+    transaction(fn) { const result = serial.then(() => fn(storage)); serial = result.catch(() => {}); return result; },
+  };
+  return storage;
+}
+
+function poolBinding() {
+  const storage = memoryStorage();
+  const pool = new DownloadPool({ storage }, {});
+  return { getByName() { return pool; } };
+}
+
+test('100 simultaneous admissions use exactly 20 hosts and five slots per host', async () => {
+  const storage = memoryStorage();
+  const pool = new DownloadPool({ storage }, {});
+  const leases = await Promise.all(Array.from({ length: 100 }, (_, i) => pool.acquire(`job-${i}`)));
+  const counts = new Map();
+  for (const lease of leases) {
+    assert.ok(lease);
+    counts.set(lease.instance, (counts.get(lease.instance) || 0) + 1);
+  }
+  assert.equal(counts.size, 20);
+  assert.ok([...counts.values()].every(count => count === 5));
+  assert.equal(await pool.acquire('overflow'), null);
+  const revived = new DownloadPool({ storage }, {});
+  assert.deepEqual(await revived.acquire('job-0'), leases[0], 'replay must not consume another slot');
+  await revived.release('job-0', 'wrong-token');
+  assert.equal(await revived.acquire('overflow'), null);
+  await revived.release('job-0', leases[0].token);
+  const replacement = await revived.acquire('overflow');
+  assert.equal(replacement.instance, leases[0].instance);
+  assert.equal(await revived.lookup('job-0'), null);
+  assert.equal((await revived.lookup('job-1')).token, leases[1].token);
+});
+
+test('five simultaneous cold starts share one startup and a failed startup can be retried', async () => {
+  const container = new YoutubeDownloaderContainer({}, {});
+  let finish, starts = 0;
+  container.startAndWaitForPorts = async () => { starts++; await new Promise(resolve => { finish = resolve; }); };
+  const requests = Array.from({ length: 5 }, () => container.startShared());
+  assert.equal(starts, 1);
+  finish();
+  await Promise.all(requests);
+  container.startAndWaitForPorts = async () => { starts++; throw Error('startup failed'); };
+  await assert.rejects(container.startShared(), /startup failed/);
+  container.startAndWaitForPorts = async () => { starts++; };
+  await container.startShared();
+  assert.equal(starts, 3);
+});
+
+test('expired reservations are reclaimed on demand and stale releases cannot delete a new lease', async () => {
+  const storage = memoryStorage();
+  const pool = new DownloadPool({ storage }, {});
+  const old = await pool.acquire('job');
+  const jobs = await storage.get('jobs');
+  jobs.job.until = Date.now() - 1;
+  await storage.put('jobs', jobs);
+  assert.equal(await pool.lookup('job'), null);
+  const current = await pool.acquire('job');
+  assert.notEqual(current.token, old.token);
+  await pool.release('job', old.token);
+  assert.deepEqual(await pool.lookup('job'), current);
+});
+
+test('finishing one background job does not expire other jobs and crash notification reaches all of them', async () => {
+  const storage = memoryStorage();
+  const events = [];
+  const container = new YoutubeDownloaderContainer({ storage }, {
+    YOUTUBE_DOWNLOAD_WORKFLOW: { async get(id) { return { async sendEvent(event) { events.push([id, event]); } }; } },
+  });
+  container.containerFetch = async () => Response.json({ ok: true });
+  await Promise.all(['a', 'b', 'c', 'd', 'e'].map(id => container.instagramRequest('start', { id })));
+  await container.releaseInstagram('a');
+  await container.onActivityExpired();
+  assert.equal(container.destroyed, undefined);
+  await container.onStop();
+  assert.deepEqual(events.map(([id]) => id).sort(), ['b', 'c', 'd', 'e']);
+  for (const id of ['b', 'c', 'd', 'e']) await container.releaseInstagram(id);
+  await container.onActivityExpired();
+  assert.equal(container.destroyed, true);
+});
+
+test('full pool rejects immediately without starting or retrying a transfer', async () => {
+  let admitted = 0;
+  const pool = { getByName() { return { async acquire() { admitted++; return null; } }; } };
+  const result = await run({ pool });
+  assert.equal(admitted, 1);
+  assert.deepEqual(result.calls, []);
+  assert.match(result.messages.at(-1).text, /ظرفیت/);
+  assert.equal(result.steps.find(([name]) => name === 'reserve download capacity')[1].retries.limit, 0);
+});
+
+test('startup failures, metadata completion and ambiguous transfers all release only their own reservation', async () => {
+  for (const options of [{ startupError: 'failed' }, { inspect: true }, { httpError: { status: 502, body: 'uncertain' } }]) {
+    const binding = poolBinding();
+    const pool = binding.getByName();
+    const unrelated = await pool.acquire('unrelated');
+    await run({ ...options, pool: binding });
+    assert.equal(await pool.lookup('test-job'), null);
+    assert.deepEqual(await pool.lookup('unrelated'), unrelated);
+  }
+});
 
 const sdkBuild = await build({
   stdin: { contents: 'export { Container } from "@cloudflare/containers";', loader: 'js', resolveDir: process.cwd() },
@@ -71,16 +181,11 @@ test('real SDK does not expire an active HTTP transfer', () => {
 });
 
 test('idle containers stop after ten seconds and completed background jobs restore that timeout', async () => {
-  const values = new Map();
-  const ctx = { storage: {
-    async get(key) { return values.get(key); },
-    async put(key, value) { values.set(key, value); },
-    async delete(key) { values.delete(key); },
-  } };
+  const ctx = { storage: memoryStorage() };
   const container = new YoutubeDownloaderContainer(ctx, {});
   assert.equal(container.sleepAfter, '10s');
   container.containerFetch = async () => {
-    assert.ok(values.get('instagramJob').until > Date.now());
+    assert.ok((await ctx.storage.get('instagramJobs'))['active-job'] > Date.now());
     return Response.json({ ok: true });
   };
   await container.instagramRequest('start', { id: 'active-job' });
@@ -88,8 +193,8 @@ test('idle containers stop after ten seconds and completed background jobs resto
   assert.equal(container.stopped, undefined, 'background preparation/live capture must stay running');
   assert.equal(container.destroyed, undefined, 'an active background lease must never be destroyed');
   assert.ok(container.sleepAfter > 0);
-  await container.releaseInstagram();
-  assert.equal(values.has('instagramJob'), false);
+  await container.releaseInstagram('active-job');
+  assert.deepEqual(await ctx.storage.get('instagramJobs'), {});
   assert.equal(container.sleepAfter, '10s');
   assert.equal(container.renewed, 2);
   await container.onActivityExpired();
@@ -99,7 +204,7 @@ test('idle containers stop after ten seconds and completed background jobs resto
 
 test('an expired background lease no longer prevents idle shutdown', async () => {
   const container = new YoutubeDownloaderContainer({ storage: {
-    async get() { return { id: 'expired-job', until: Date.now() - 1 }; },
+    async get() { return { 'expired-job': Date.now() - 1 }; },
   } }, {});
   await container.onActivityExpired();
   assert.equal(container.stopped, true);
@@ -161,7 +266,7 @@ test('text and caption Pornhub links queue a deterministic direct-download job',
   assert.equal(jobs[0].params.quality, undefined);
 });
 
-async function run({ inspect = false, startupError, httpError, sizes, credentials = true, pornhub = false } = {}) {
+async function run({ inspect = false, startupError, httpError, sizes, credentials = true, pornhub = false, pool = poolBinding() } = {}) {
   const messages = [];
   const calls = [];
   const steps = [];
@@ -171,7 +276,7 @@ async function run({ inspect = false, startupError, httpError, sizes, credential
     return Response.json({ ok: true, result: { message_id: 10 } });
   };
   globalThis.container = {
-    async startAndWaitForPorts(options) {
+    async startShared(options) {
       calls.push(['start', options]);
       if (startupError) throw Error(startupError);
     },
@@ -191,7 +296,7 @@ async function run({ inspect = false, startupError, httpError, sizes, credential
     url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
     ...(pornhub ? { source: 'pornhub', url: 'https://www.pornhub.com/view_video.php?viewkey=ph123' } : inspect ? {} : { quality: 720, statusMessageId: 10 }),
   };
-  await new YoutubeDownloadWorkflow({}, { BOT_TOKEN: 'secret-token', ...(credentials ? { API_ID: '123', API_HASH: 'secret-hash' } : {}) }).run({ payload: job }, step);
+  await new YoutubeDownloadWorkflow({}, { BOT_TOKEN: 'secret-token', DOWNLOAD_POOL: pool, ...(credentials ? { API_ID: '123', API_HASH: 'secret-hash' } : {}) }).run({ payload: job }, step);
   return { calls, messages, steps, delivered: globalThis.delivered };
 }
 

@@ -80,7 +80,7 @@ class ServerExitTests(unittest.TestCase):
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(self.stop_server, child)
         line = child.stdout.readline()
-        self.assertIn("idle-exit-v2", line)
+        self.assertIn("pool-five-v1", line)
         port = int(line.split("listening on :")[1].split()[0])
         return child, port
 
@@ -117,7 +117,7 @@ app.Handler.handle_get = slow_get
 
     def test_real_server_keeps_ready_media_until_cleanup(self):
         child, _ = self.start_server('''from types import SimpleNamespace
-job = SimpleNamespace(state="ready", cleanup_requested=False)
+job = SimpleNamespace(state="ready", cleanup_requested=False, thread=SimpleNamespace(is_alive=lambda: False))
 def cleanup():
     job.cleanup_requested = True
     app.SERVER_IDLE.refresh()
