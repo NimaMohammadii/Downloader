@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import hashlib
 import hmac
 import json
@@ -171,7 +172,8 @@ def upload_error_diagnostic(exc: BaseException, token: str) -> dict[str, Any]:
     detail = str(getattr(exc, "message", None) or str(exc))
     if isinstance(exc, subprocess.SubprocessError):
         detail = "subprocess failed"  # Commands can contain signed URLs and account headers.
-    for secret in (token, os.environ.get("API_HASH", ""), os.environ.get("INSTAGRAM_SESSIONID", "")):
+    for secret in (token, os.environ.get("API_HASH", ""), os.environ.get("INSTAGRAM_SESSIONID", ""),
+                   os.environ.get("TELEGRAM_BOT_SESSION", ""), os.environ.get("TELEGRAM_SESSION_TOKEN", "")):
         if secret:
             detail = detail.replace(secret, "[redacted]")
     detail = re.sub(r"https?://[^\s\"'<>]+", "[url]", detail)
@@ -181,6 +183,15 @@ def upload_error_diagnostic(exc: BaseException, token: str) -> dict[str, Any]:
     diagnostic: dict[str, Any] = {"errorCode": code, "diagnostic": detail[:1200], "errorType": type(exc).__name__}
     # Never serialize the request itself: auth requests contain the bot token.
     request = getattr(exc, "request", None)
+    # receive_updates=False wraps every RPC, not just connection setup. Expose
+    # the actual method, never the request arguments or authorization string.
+    for _ in range(8):
+        if type(request).__name__ not in {"InvokeWithoutUpdatesRequest", "InvokeWithLayerRequest", "InitConnectionRequest"}:
+            break
+        nested = getattr(request, "query", None)
+        if nested is None:
+            break
+        request = nested
     if request is not None:
         diagnostic["rpcMethod"] = type(request).__name__
     if getattr(exc, "code", None) == 420:
@@ -859,104 +870,233 @@ def validate_file_size(path: Path) -> None:
         raise UserVisibleError("❌ حجم فایل از سقف ۲ گیگابایت بیشتره؛ کیفیت پایین‌تر رو انتخاب کن.")
 
 
+class TelegramUploader:
+    """One event loop and authorized bot connection per Container process."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.loop = None
+        self.thread = None
+        self.client = None
+        self.session = None
+        self.credentials = None
+        self.start_lock = None
+        self.startup_not_before = 0.0
+        self.startup_flood = None
+        self.persisted_session = os.environ.get("TELEGRAM_BOT_SESSION", "")
+
+    def event_loop(self):
+        with self.lock:
+            if self.loop is None:
+                self.loop = asyncio.new_event_loop()
+                self.thread = threading.Thread(target=self.loop.run_forever, daemon=True, name="telegram-upload")
+                self.thread.start()
+            return self.loop
+
+    async def get_client(self, token: str):
+        from telethon import TelegramClient
+        from telethon.errors import FloodWaitError, FloodPremiumWaitError, SlowModeWaitError
+        from telethon.sessions import StringSession
+
+        api_id, api_hash = os.environ.get("API_ID", ""), os.environ.get("API_HASH", "")
+        if not api_id.isdecimal() or not api_hash:
+            raise UserVisibleError("❌ تنظیمات API_ID و API_HASH برای ارسال فایل آماده نیست.")
+        if self.start_lock is None:
+            self.start_lock = asyncio.Lock()
+        async with self.start_lock:
+            credentials = (token, api_id, api_hash)
+            if self.credentials is not None and self.credentials != credentials:
+                raise RuntimeError("Telegram uploader credentials changed; restart the Container")
+            self.credentials = credentials
+            if self.client is not None and self.client.is_connected():
+                await self.persist_session()
+                return self.client
+            if self.session is None:
+                self.session = StringSession(os.environ.get("TELEGRAM_BOT_SESSION", ""))
+            client = self.client or TelegramClient(self.session, int(api_id), api_hash,
+                receive_updates=False, flood_sleep_threshold=60, raise_last_call_error=True)
+            try:
+                while True:
+                    delay = self.startup_not_before - time.monotonic()
+                    if delay > 60 and self.startup_flood is not None:
+                        raise type(self.startup_flood)(self.startup_flood.request, capture=int(delay) + 1)
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    try:
+                        await client.start(bot_token=token)
+                        break
+                    except (FloodWaitError, FloodPremiumWaitError, SlowModeWaitError) as exc:
+                        # connect() sends its initialization RPC directly, outside
+                        # Telethon's normal flood handling. No file can be sent yet.
+                        await client.disconnect()
+                        delay = max(1, exc.seconds)
+                        self.startup_not_before = time.monotonic() + delay
+                        self.startup_flood = exc
+                        if delay > 60 or job_timeout(YOUTUBE_JOB_SECONDS) <= delay:
+                            raise
+                await self.persist_session()
+                self.client = client
+                return client
+            except BaseException:
+                await client.disconnect()
+                raise
+
+    async def persist_session(self) -> None:
+        session = self.session.save()
+        if not session or session == self.persisted_session or not os.environ.get("TELEGRAM_SESSION_URL"):
+            return
+        try:
+            await asyncio.to_thread(self.save_session, session)
+            self.persisted_session = session
+        except Exception:
+            # Keep the healthy connection; retry persistence on the next real
+            # upload, without a timer or logging authorization material.
+            print("telegram session persistence deferred", flush=True)
+
+    @staticmethod
+    def save_session(session: str) -> None:
+        url = os.environ["TELEGRAM_SESSION_URL"]
+        if not re.fullmatch(r"https://downloader\.vexaagent\.workers\.dev/telegram-session/\d{1,2}", url):
+            raise RuntimeError("Invalid Telegram session store")
+        try:
+            response = requests.post(url,
+                headers={"x-telegram-session-token": os.environ["TELEGRAM_SESSION_TOKEN"]},
+                json={"session": session}, timeout=(5, 10), allow_redirects=False)
+            if response.status_code != 200:
+                raise RuntimeError("Telegram session storage unavailable")
+        except requests.RequestException:
+            raise RuntimeError("Telegram session storage unavailable") from None
+
+    async def upload(self, token: str, method: str, data: dict[str, Any], file: tuple):
+        done = threading.Event()
+        loop = self.event_loop()
+        future = concurrent.futures.Future()
+
+        def begin():
+            task = loop.create_task(_upload_complete_file(self, token, method, data, file))
+
+            def finished(task):
+                try:
+                    if task.cancelled():
+                        future.cancel()
+                    elif task.exception() is not None:
+                        future.set_exception(task.exception())
+                    else:
+                        future.set_result(task.result())
+                except concurrent.futures.InvalidStateError:
+                    pass  # The caller cancelled while the task was completing.
+                finally:
+                    done.set()
+
+            task.add_done_callback(finished)
+            future.add_done_callback(lambda result: loop.call_soon_threadsafe(task.cancel) if result.cancelled() else None)
+
+        loop.call_soon_threadsafe(begin)
+        try:
+            return await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            future.cancel()
+            # Wait for the task's done callback even if cancellation happened
+            # before its first instruction, then permit source-file cleanup.
+            await asyncio.to_thread(done.wait)
+            raise
+
+
+TELEGRAM_UPLOADER = TelegramUploader()
+
+
 async def upload_complete_file(token: str, method: str, data: dict[str, Any], file: tuple) -> Any:
-    from telethon import Button, TelegramClient, functions, types, utils
+    return await TELEGRAM_UPLOADER.upload(token, method, data, file)
+
+
+async def _upload_complete_file(uploader: TelegramUploader, token: str, method: str, data: dict[str, Any], file: tuple) -> Any:
+    from telethon import Button, functions, types, utils
     from telethon.errors import RPCError
-    from telethon.sessions import MemorySession
 
     filename, handle, mime = file
     path = Path(handle.name)
     validate_file_size(path)
-    api_id = os.environ.get("API_ID", "")
-    api_hash = os.environ.get("API_HASH", "")
-    if not api_id.isdecimal() or not api_hash:
-        raise UserVisibleError("❌ تنظیمات API_ID و API_HASH برای ارسال فایل آماده نیست.")
+    client = await uploader.get_client(token)
+    # Keep the existing complete-file sender and its per-file state. Only the
+    # connection is shared; destinations, parts and checksums remain isolated.
+    size = path.stat().st_size
+    part_size = 512 * 1024
+    count = (size + part_size - 1) // part_size
+    file_id = secrets.randbits(63)
+    digest = hashlib.md5()
+    big = size > 10 * 1024 * 1024
 
-    # This MTProto bot session leaves the existing Bot API webhook intact.
-    client = TelegramClient(
-        MemorySession(), int(api_id), api_hash,
-        receive_updates=False, flood_sleep_threshold=60, raise_last_call_error=True,
-    )
+    async def save_part(index: int, chunk: bytes) -> None:
+        job_timeout(YOUTUBE_JOB_SECONDS)
+        # Short waits stay inside Telethon's RPC retry mechanism. Long waits
+        # are returned to the Workflow for durable sleep with no active host.
+        request = (functions.upload.SaveBigFilePartRequest(file_id, index, count, chunk)
+                   if big else functions.upload.SaveFilePartRequest(file_id, index, chunk))
+        if not await client(request):
+            raise RuntimeError("Telegram rejected an upload part")
+
+    # Keep eight parts in flight without a batch barrier: a slow part must
+    # not leave completed slots idle. Read/hash in file order before await,
+    # and finish every worker before publishing the complete media file.
+    with path.open("rb") as source:
+        indices = iter(range(count))
+
+        async def upload_worker() -> None:
+            for index in indices:
+                chunk = source.read(part_size)
+                if not big:
+                    digest.update(chunk)
+                await save_part(index, chunk)
+
+        async with asyncio.TaskGroup() as group:
+            for _ in range(min(8, count)):
+                group.create_task(upload_worker())
+    uploaded = (types.InputFileBig(file_id, count, filename) if big
+                else types.InputFile(file_id, count, filename, digest.hexdigest()))
+    attributes = [types.DocumentAttributeFilename(filename)]
+    if method == "sendVideo":
+        attributes.append(types.DocumentAttributeVideo(
+            duration=float(data.get("duration", 0)),
+            w=int(data.get("width", 0)), h=int(data.get("height", 0)),
+            supports_streaming=True,
+        ))
+    elif method == "sendAudio":
+        attributes.append(types.DocumentAttributeAudio(
+            duration=int(probe_duration(path)), title=str(data.get("title") or path.stem),
+            performer=str(data.get("performer") or "") or None,
+        ))
+    elif method == "sendAnimation":
+        attributes.append(types.DocumentAttributeAnimated())
+    reply = json.loads(data.get("reply_parameters", "{}"))
+    decorated = telegram_custom_emoji(method, data)
+    markup = decorated.get("reply_markup")
+    if isinstance(markup, str):
+        markup = json.loads(markup)
+    buttons = [[Button.inline(button["text"], data=button["callback_data"].encode(),
+                              icon=int(button["icon_custom_emoji_id"]) if button.get("icon_custom_emoji_id") else None) for button in row]
+               for row in markup["inline_keyboard"]] if markup else None
+    caption_entities = decorated.get("caption_entities", [])
+    if isinstance(caption_entities, str):
+        caption_entities = json.loads(caption_entities)
+    formatting_entities = [types.MessageEntityCustomEmoji(e["offset"], e["length"], int(e["custom_emoji_id"]))
+                           for e in caption_entities if e.get("type") == "custom_emoji"]
+    options = dict(caption=data.get("caption", ""), parse_mode=None,
+                   formatting_entities=formatting_entities or None,
+                   mime_type=mime, attributes=attributes,
+                   supports_streaming=method == "sendVideo",
+                   force_document=method == "sendDocument",
+                   reply_to=reply.get("message_id"), buttons=buttons)
     try:
-        await client.start(bot_token=token)
-        size = path.stat().st_size
-        part_size = 512 * 1024
-        count = (size + part_size - 1) // part_size
-        file_id = secrets.randbits(63)
-        digest = hashlib.md5()
-        big = size > 10 * 1024 * 1024
-
-        async def save_part(index: int, chunk: bytes) -> None:
-            # Telethon already handles short FloodWait responses. Do not add a
-            # second retry loop that repeats a request after its retry budget.
-            request = (functions.upload.SaveBigFilePartRequest(file_id, index, count, chunk)
-                       if big else functions.upload.SaveFilePartRequest(file_id, index, chunk))
-            if not await client(request):
-                raise RuntimeError("Telegram rejected an upload part")
-
-        # Keep eight parts in flight without a batch barrier: a slow part must
-        # not leave completed slots idle. Read/hash in file order before await,
-        # and finish every worker before publishing the complete media file.
-        with path.open("rb") as source:
-            indices = iter(range(count))
-
-            async def upload_worker() -> None:
-                for index in indices:
-                    chunk = source.read(part_size)
-                    if not big:
-                        digest.update(chunk)
-                    await save_part(index, chunk)
-
-            async with asyncio.TaskGroup() as group:
-                for _ in range(min(8, count)):
-                    group.create_task(upload_worker())
-        uploaded = (types.InputFileBig(file_id, count, filename) if big
-                    else types.InputFile(file_id, count, filename, digest.hexdigest()))
-        attributes = [types.DocumentAttributeFilename(filename)]
-        if method == "sendVideo":
-            attributes.append(types.DocumentAttributeVideo(
-                duration=float(data.get("duration", 0)),
-                w=int(data.get("width", 0)), h=int(data.get("height", 0)),
-                supports_streaming=True,
-            ))
-        elif method == "sendAudio":
-            attributes.append(types.DocumentAttributeAudio(
-                duration=int(probe_duration(path)), title=str(data.get("title") or path.stem),
-                performer=str(data.get("performer") or "") or None,
-            ))
-        elif method == "sendAnimation":
-            attributes.append(types.DocumentAttributeAnimated())
-        reply = json.loads(data.get("reply_parameters", "{}"))
-        decorated = telegram_custom_emoji(method, data)
-        markup = decorated.get("reply_markup")
-        if isinstance(markup, str):
-            markup = json.loads(markup)
-        buttons = [[Button.inline(button["text"], data=button["callback_data"].encode(),
-                                  icon=int(button["icon_custom_emoji_id"]) if button.get("icon_custom_emoji_id") else None) for button in row]
-                   for row in markup["inline_keyboard"]] if markup else None
-        caption_entities = decorated.get("caption_entities", [])
-        if isinstance(caption_entities, str):
-            caption_entities = json.loads(caption_entities)
-        formatting_entities = [types.MessageEntityCustomEmoji(e["offset"], e["length"], int(e["custom_emoji_id"]))
-                               for e in caption_entities if e.get("type") == "custom_emoji"]
-        options = dict(caption=data.get("caption", ""), parse_mode=None,
-                       formatting_entities=formatting_entities or None,
-                       mime_type=mime, attributes=attributes,
-                       supports_streaming=method == "sendVideo",
-                       force_document=method == "sendDocument",
-                       reply_to=reply.get("message_id"), buttons=buttons)
-        try:
-            message = await client.send_file(int(data["chat_id"]), uploaded, **options)
-        except RPCError as exc:
-            # A definitive reply rejection has not published a message. Reuse the uploaded file once.
-            if (not options["reply_to"] or not reply.get("allow_sending_without_reply", True) or reply.get("chat_id") or
-                    exc.code != 400 or exc.message != "REPLY_MESSAGE_ID_INVALID"):
-                raise
-            options["reply_to"] = None
-            message = await client.send_file(int(data["chat_id"]), uploaded, **options)
-        return {"message_id": message.id, "file_id": utils.pack_bot_file_id(getattr(message, "document", None))}
-    finally:
-        await client.disconnect()
+        job_timeout(YOUTUBE_JOB_SECONDS)
+        message = await client.send_file(int(data["chat_id"]), uploaded, **options)
+    except RPCError as exc:
+        # A definitive reply rejection has not published a message. Reuse the uploaded file once.
+        if (not options["reply_to"] or not reply.get("allow_sending_without_reply", True) or reply.get("chat_id") or
+                exc.code != 400 or exc.message != "REPLY_MESSAGE_ID_INVALID"):
+            raise
+        options["reply_to"] = None
+        message = await client.send_file(int(data["chat_id"]), uploaded, **options)
+    return {"message_id": message.id, "file_id": utils.pack_bot_file_id(getattr(message, "document", None))}
 
 
 def send_media_file(
@@ -1096,6 +1236,16 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         JOB_DEADLINE.set(None)
         diagnostic = upload_error_diagnostic(exc, token)
+        retry_safe = (phase == "upload" and diagnostic.get("rpcCode") == 420
+                      and diagnostic.get("errorCode") in {"FLOOD_WAIT", "SLOWMODE_WAIT"}
+                      and type(diagnostic.get("retryAfterSeconds")) is int)
+        if retry_safe:
+            # Single-file sends raise this definitive server rejection before
+            # delivery; all part workers have already stopped. Ambiguous
+            # network failures never enter this resumable path.
+            message = "⏳ تلگرام موقتاً ارسال را متوقف کرده؛ درخواست محفوظ است و خودکار ادامه پیدا می‌کند. نیازی به درخواست دوباره نیست."
+            status(message)
+            return {"ok": False, "message": message, "phase": phase, "retrySafe": True, **diagnostic}
         print(json.dumps({"message": "youtube job failed", "jobId": payload.get("id"),
                           "phase": phase, **diagnostic}, ensure_ascii=False), flush=True)
         message = telegram_flood_message(diagnostic) or ("❌ ارسال فایل در تلگرام تأیید نشد؛ اگر فایلی دریافت کرده‌ای، پیش از درخواست دوباره بررسی کن."

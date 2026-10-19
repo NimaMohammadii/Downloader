@@ -13,7 +13,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "container"))
 import youtube_app as app
 import youtube_pipeline as pipeline
-from telethon.sessions import MemorySession
+from telethon.sessions import StringSession
+from test_youtube_chat import isolated_uploader
 
 
 class ConcurrentJobsTests(unittest.TestCase):
@@ -121,55 +122,60 @@ class ConcurrentJobsTests(unittest.TestCase):
                 for key in list(app.INSTAGRAM_JOBS):
                     app.instagram_action("cleanup", {"id": key})
 
-    def test_five_uploads_have_independent_sessions_bytes_and_destinations(self):
+    def test_five_uploads_share_one_connection_with_independent_bytes_and_destinations(self):
         clients = []
-        barrier = threading.Barrier(5)
 
         class Client:
             def __init__(self, session, *args, **kwargs):
-                self.session, self.parts = session, {}
+                self.session, self.parts, self.sends = session, {}, []
+                self.starts = 0
+                self.all_sending = asyncio.Event()
                 clients.append(self)
 
+            def is_connected(self):
+                return True
+
             async def start(self, **kwargs):
+                self.starts += 1
+                await asyncio.sleep(0)
                 return self
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
 
             async def disconnect(self):
                 self.disconnected = True
 
             async def __call__(self, request):
-                self.parts[request.file_part] = request.bytes
+                self.parts.setdefault(request.file_id, {})[request.file_part] = request.bytes
                 await asyncio.sleep(0)
                 return True
 
-            async def send_file(self, destination, *args, **kwargs):
-                self.destination = destination
-                barrier.wait(timeout=4)
+            async def send_file(self, destination, file, **kwargs):
+                self.sends.append((destination, file.id))
+                if len(self.sends) == 5:
+                    self.all_sending.set()
+                await asyncio.wait_for(self.all_sending.wait(), 3)
                 return SimpleNamespace(id=destination)
 
         def upload(index, directory):
             path = Path(directory) / f"video-{index}.mp4"
-            content = bytes([index]) * 600_001
-            path.write_bytes(content)
+            path.write_bytes(bytes([index]) * 600_001)
             with path.open("rb") as handle:
                 result = asyncio.run(app.upload_complete_file("test-token", "sendVideo", {"chat_id": str(index)}, (path.name, handle, "video/mp4")))
             self.assertEqual(result["message_id"], index)
 
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"API_ID": "123", "API_HASH": "test"}), \
-                patch("telethon.TelegramClient", Client), concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+                patch("telethon.TelegramClient", Client), isolated_uploader(), concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
             futures = [pool.submit(upload, i, directory) for i in range(5)]
             for future in futures:
                 future.result(timeout=6)
-        self.assertEqual(len({id(client.session) for client in clients}), 5)
-        for client in clients:
-            self.assertIsInstance(client.session, MemorySession)
-            self.assertTrue(client.disconnected)
-            self.assertEqual(b"".join(client.parts[i] for i in sorted(client.parts)), bytes([client.destination]) * 600_001)
+        self.assertEqual(len(clients), 1)
+        client = clients[0]
+        self.assertIsInstance(client.session, StringSession)
+        self.assertEqual(client.starts, 1)
+        self.assertTrue(client.disconnected)
+        self.assertEqual(len(client.parts), 5)
+        for destination, file_id in client.sends:
+            parts = client.parts[file_id]
+            self.assertEqual(b"".join(parts[i] for i in sorted(parts)), bytes([destination]) * 600_001)
 
 
 if __name__ == "__main__":
