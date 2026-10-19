@@ -11,6 +11,10 @@ import {
   ADMIN_USER_ID,
   recordSuccessfulDelivery,
   recordUserActivity,
+  recordDownload,
+  isInstagramDownloadLink,
+  type DownloadRecord,
+  type DownloadStatus,
   telegramFileCache,
   type CachedTelegramFile,
   type AdminStatsEnv,
@@ -104,6 +108,7 @@ type TelegramApiResponse<T> = {
 
 type ContainerResult = {
   ok: boolean;
+  partial?: boolean;
   message?: string;
   title?: string;
   parts?: number;
@@ -352,10 +357,33 @@ async function containerResult<T>(env: Env, job: YoutubeDownloadJob, request: Re
   }
 }
 
+function jobHistory(job: YoutubeDownloadJob): Omit<DownloadRecord, "status"> {
+  const ig = job.instagram;
+  const source = job.social ? socialName(job.social.platform) : job.playlist ? "YouTube Playlist"
+    : job.recognition ? "تشخیص آهنگ" : ig ? ig.kind === "music" ? "جست‌وجو و دانلود آهنگ" : `Instagram ${ig.kind}`
+    : job.source === "pornhub" ? "Pornhub" : "YouTube";
+  const request = job.url || job.social?.url || (job.playlist ? `${job.playlist.url} • ${job.playlist.start}-${job.playlist.end}` : "")
+    || (job.recognition ? "فایل ارسالی برای تشخیص آهنگ" : ig?.musicVideoId ? `https://www.youtube.com/watch?v=${ig.musicVideoId}`
+      : ig?.query || (ig?.shortcode ? `https://www.instagram.com/p/${ig.shortcode}/` : ig?.mediaId ? `Instagram Story ${ig.mediaId}`
+        : ig?.username ? `Instagram @${ig.username}` : ig?.broadcastId ? `Instagram Live ${ig.broadcastId}` : source));
+  return { key: ig || job.social || job.recognition || job.playlist ? job.id : `youtube:${job.chatId}:${job.requestMessageId}:${job.userId}`,
+    userId: job.userId, source, request };
+}
+
+async function trackJob(env: Env, job: YoutubeDownloadJob, status: DownloadStatus, extra: Partial<DownloadRecord> = {}): Promise<void> {
+  await recordDownload(env, { ...jobHistory(job), ...extra, status });
+}
+
 export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDownloadJob> {
   async run(event: WorkflowEvent<YoutubeDownloadJob>, step: WorkflowStep) {
     const job: YoutubeDownloadJob = { ...event.payload };
+    const inspect = !job.instagram && !job.recognition && !job.playlist && !job.social && !job.quality && !job.audioMode && job.source !== "pornhub";
+    await step.do("track download request", () => trackJob(this.env, job, inspect ? "pending" : "processing"));
     if (job.instagram || job.recognition || job.playlist || job.social) return this.runInstagram(job, step);
+    return this.runYoutube(job, step);
+  }
+
+  private async runYoutube(job: YoutubeDownloadJob, step: WorkflowStep): Promise<void> {
     let statusMessageId = job.statusMessageId;
     let phase = "startup";
     let lease: PoolLease | undefined;
@@ -415,6 +443,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         );
 
         if (!metadata.ok || !metadata.videoId) {
+          await step.do("track metadata failure", () => trackJob(this.env, job, "failed", { detail: metadata.message || "دریافت اطلاعات ویدیو ناموفق بود." }));
           await step.do("show youtube metadata error", async () => {
             await safeTelegramCall(this.env.BOT_TOKEN, "editMessageText", {
               chat_id: job.chatId,
@@ -428,6 +457,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
 
         const qualities = normalizeQualities(metadata.qualities);
         if (qualities.length === 0 && !metadata.audioAvailable) {
+          await step.do("track unavailable qualities", () => trackJob(this.env, job, "failed", { title: metadata.title, detail: "کیفیت قابل دانلود پیدا نشد." }));
           await step.do("show no youtube qualities", async () => {
             await safeTelegramCall(this.env.BOT_TOKEN, "editMessageText", {
               chat_id: job.chatId,
@@ -439,6 +469,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           return;
         }
 
+        await step.do("track quality selection", () => trackJob(this.env, job, "awaiting_selection", { title: metadata.title }));
         await step.do("show youtube quality buttons", async () => {
           await telegramCall(this.env.BOT_TOKEN, "editMessageText", {
             chat_id: job.chatId,
@@ -483,7 +514,10 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         throw new Error("YT_CONFIG");
       }
       if (await step.do("reuse telegram youtube file", { retries: { limit: 0, delay: "1 second" }, timeout: "1 minute" }, () => sendCachedMedia(this.env, job, statusMessageId))) {
-        await step.do("record cached youtube delivery", () => recordSuccessfulDelivery(this.env, `youtube:${job.id}`));
+        await step.do("record cached youtube delivery", async () => {
+          await recordSuccessfulDelivery(this.env, `youtube:${job.id}`);
+          await trackJob(this.env, job, "success", { delivered: 1, detail: formatSelection(job) });
+        });
         return;
       }
       await startContainer();
@@ -508,13 +542,17 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       if (result.ok) {
         await step.do("record youtube delivery", async () => {
           await recordSuccessfulDelivery(this.env, `youtube:${job.id}`);
+          await trackJob(this.env, job, "success", { delivered: 1, title: result.title, detail: formatSelection(job) });
           return true;
         });
+      } else {
+        await step.do("track youtube rejection", () => trackJob(this.env, job, "failed", { title: result.title, detail: result.message || "دریافت یا ارسال فایل ناموفق بود." }));
       }
     } catch (error) {
       const detail = redactDiagnostic(error instanceof Error ? error.message : String(error), this.env);
       console.error("youtube workflow failed", { jobId: job.id, phase, detail });
       const failureMessage = workflowFailureMessage(detail, phase);
+      await step.do("track youtube failure", () => trackJob(this.env, job, "failed", { detail: failureMessage }));
 
       await step.do(
         "notify youtube workflow failure",
@@ -560,7 +598,10 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       // Public song-query cache hits can be delivered without source resolution.
       const needsAccessCheck = Boolean(job.instagram && job.instagram.kind !== "music");
       if (!needsAccessCheck && await step.do("reuse telegram media file", { retries: { limit: 0, delay: "1 second" }, timeout: "1 minute" }, () => sendCachedMedia(this.env, job, statusId))) {
-        await step.do("record cached media delivery", () => recordSuccessfulDelivery(this.env, `instagram:${job.id}`));
+        await step.do("record cached media delivery", async () => {
+          await recordSuccessfulDelivery(this.env, `instagram:${job.id}`);
+          await trackJob(this.env, job, "success", { delivered: 1 });
+        });
         return;
       }
       // Return friendly failures durably, without retrying rejected Instagram sessions.
@@ -574,6 +615,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         catch (error) { return { message: instagramVideoErrorText(error) }; }
       });
       if (!resolution.source) {
+        await step.do("track source failure", () => trackJob(this.env, job, "failed", { detail: resolution.message }));
         await step.do("show instagram resolution error", () => telegramCall<boolean>(this.env.BOT_TOKEN, "editMessageText", {
           chat_id: job.chatId, message_id: statusId, text: resolution.message,
         }));
@@ -581,7 +623,10 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       }
       const source = resolution.source;
       if (needsAccessCheck && await step.do("reuse accessible instagram file", { retries: { limit: 0, delay: "1 second" }, timeout: "1 minute" }, () => sendCachedMedia(this.env, job, statusId))) {
-        await step.do("record cached media delivery", () => recordSuccessfulDelivery(this.env, `instagram:${job.id}`));
+        await step.do("record cached media delivery", async () => {
+          await recordSuccessfulDelivery(this.env, `instagram:${job.id}`);
+          await trackJob(this.env, job, "success", { delivered: 1 });
+        });
         return;
       }
       if (!/^\d+$/.test(this.env.API_ID || "") || !this.env.API_HASH?.trim()) throw new Error("YT_CONFIG");
@@ -610,6 +655,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       // A completion event may arrive before this call; Workflows buffers it.
       const ready = await step.waitForEvent<ContainerResult>("await instagram recording", { type: "instagram-ready", timeout: "150 minutes" });
       if (!ready.payload.ok) {
+        await step.do("track capture failure", () => trackJob(this.env, job, "failed", { title: source.title, detail: ready.payload.message || "دریافت محتوا کامل نشد." }));
         await step.do("show instagram capture failure", () => telegramCall<boolean>(this.env.BOT_TOKEN, "editMessageText", {
           chat_id: job.chatId, message_id: statusId, text: ready.payload.message || "❌ دریافت لایو کامل نشد؛ دوباره لینک را بفرست.", reply_markup: { inline_keyboard: [] },
         }));
@@ -619,11 +665,19 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         pooledContainer(this.env, job).instagramRequest("send", { id: job.id }),
       );
       if (result.ok) {
+        const searchOnly = job.instagram?.kind === "music" && !job.instagram.musicVideoId;
+        await step.do("track media result", () => trackJob(this.env, job, searchOnly ? "results" : result.partial ? "partial" : "success", {
+          title: result.title || source.title, delivered: searchOnly ? 0 : Math.min(20, result.parts || 1),
+          detail: result.partial ? result.message : undefined,
+        }));
         // Search results are messages, not downloaded files.
         if (!(job.instagram?.kind === "music" && !job.instagram.musicVideoId)) await step.do("record instagram video delivery", async () => {
           for (let i = 0; i < Math.min(20, result.parts || 1); i++) await recordSuccessfulDelivery(this.env, `instagram:${job.id}${i ? `:${i}` : ""}`);
         });
       } else if (job.social && result.message) {
+        await step.do("track partial media result", () => trackJob(this.env, job, result.parts ? "partial" : "failed", {
+          title: result.title || source.title, delivered: result.parts || 0, detail: result.message,
+        }));
         if (result.parts) await step.do("record partial social delivery", async () => {
           for (let i = 0; i < Math.min(20, result.parts || 0); i++) await recordSuccessfulDelivery(this.env, `instagram:${job.id}${i ? `:${i}` : ""}`);
         });
@@ -633,6 +687,9 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       } else throw new Error("IG_SEND_FAILED");
     } catch (error) {
       console.error("instagram video workflow failed", { jobId: job.id, type: error instanceof Error ? error.name : "error" });
+      await step.do("track media failure", () => trackJob(this.env, job, "failed", {
+        detail: "دریافت یا ارسال کامل نشد؛ تحویل فایل تأیید نشده است.",
+      }));
       await step.do("notify instagram video failure", async () => {
         const text = error instanceof Error && /YT_CONFIG|DOWNLOAD_POOL_FULL|max.*instance|provision/i.test(error.message)
           ? workflowFailureMessage(error.message, "startup")
@@ -918,10 +975,6 @@ async function createYoutubeInspectWorkflow(
 ): Promise<Response> {
   const message = update.message!;
   const user = trackedUser(message);
-  if (user && user.id !== ADMIN_USER_ID) {
-    await recordUserActivity(env, user, true);
-  }
-
   const userId = user?.id ?? message.chat.id;
   const job: YoutubeDownloadJob = {
     id: source === "pornhub" ? `ytdl-${message.chat.id}-${message.message_id}-${userId}` : `ytq-${update.update_id}`,
@@ -932,11 +985,13 @@ async function createYoutubeInspectWorkflow(
     ...(source ? { source } : {}),
   };
 
+  await trackJob(env, job, "pending");
   try {
     await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id: job.id, params: job });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     if (!/already|exists|duplicate|conflict/i.test(detail)) {
+      await trackJob(env, job, "failed", { detail: "ایجاد درخواست دانلود ناموفق بود." });
       console.error("youtube inspect workflow create failed", { jobId: job.id, detail });
       await safeTelegramCall(env.BOT_TOKEN, "sendMessage", {
         chat_id: message.chat.id,
@@ -985,6 +1040,7 @@ async function handleQualityCallback(
   };
   const selectionText = formatSelection(job);
 
+  await trackJob(env, job, "pending");
   try {
     await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id: job.id, params: job });
     await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", {
@@ -1006,6 +1062,7 @@ async function handleQualityCallback(
         show_alert: false,
       });
     } else {
+      await trackJob(env, job, "failed", { detail: "شروع دانلود ناموفق بود." });
       console.error("youtube download workflow create failed", { jobId: job.id, detail });
       await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", {
         callback_query_id: callback.id,
@@ -1029,11 +1086,12 @@ async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target?
     ...(playlist ? { playlist } : {}),
     ...(social ? { social } : {}),
   };
+  await trackJob(env, job, "pending");
   try {
     await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id: job.id, params: job });
-    if (user && user.id !== ADMIN_USER_ID) await recordUserActivity(env, user, true);
   } catch (error) {
     if (!/already|exists|duplicate|conflict/i.test(error instanceof Error ? error.message : String(error))) {
+      await trackJob(env, job, "failed", { detail: "شروع دریافت فایل ناموفق بود." });
       await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id, text: "❌ شروع دریافت فایل ناموفق بود؛ درخواست را دوباره بفرست." });
     }
   }
@@ -1183,6 +1241,17 @@ export default {
         // Let the existing worker keep its current malformed-update behavior.
       }
 
+      // Count every authenticated interaction once, including routes delegated to older handlers.
+      const actor = update?.callback_query?.from || update?.message?.from;
+      const activityText = (update?.message?.text || update?.message?.caption || "").trim();
+      if (actor && actor.id !== ADMIN_USER_ID && !update?.callback_query?.data?.startsWith("admin:")
+          && !/^\/admin(?:@[A-Za-z0-9_]+)?$/i.test(activityText)) {
+        const linkSent = Boolean(isInstagramDownloadLink(activityText) || extractYouTubeUrl(activityText)
+          || extractPornhubUrl(activityText) || parseSocialUrl(activityText) || parsePlaylist(activityText));
+        await recordUserActivity(env, { id: actor.id, username: actor.username, firstName: actor.first_name, lastName: actor.last_name },
+          linkSent, update?.update_id, isStartCommand(activityText));
+      }
+
       if (update?.callback_query?.data?.startsWith("ytq|")) {
         return handleQualityCallback(env, update, update.callback_query);
       }
@@ -1224,10 +1293,6 @@ export default {
         }
 
         if (isStartCommand(text)) {
-          const user = trackedUser(message);
-          if (user && user.id !== ADMIN_USER_ID) {
-            await recordUserActivity(env, user, false);
-          }
           await telegramCall(env.BOT_TOKEN, "sendMessage", {
             chat_id: message.chat.id,
             text: "لینک YouTube، Pornhub یا اینستاگرام رو بفرست؛ فایلش رو همین‌جا می‌فرستم ⚡️\n\n⬇️ X، Pinterest، TikTok، SoundCloud و Aparat: لینک پست یا آهنگ را بفرست\n\n🎵 برای آهنگ، اسم آهنگ و خواننده را بنویس یا /music نام آهنگ\n🔎 تشخیص آهنگ: ویس، صدا یا ویدیو بفرست؛ در گروه روی فایل ریپلای کن و /shazam بنویس\n🔎 آهنگ اینستاگرام: دکمهٔ «پیداکردن آهنگ» یا /findmusic و لینک\n🎼 پلی‌لیست YouTube: لینک پلی‌لیست یا /playlist لینک 1-20\n🎧 صدای اینستاگرام: دکمهٔ «فقط صدا» یا /audio و لینک ویدیو\nضبط لایو: /live username\nبازپخش: /replay و لینک بازپخش منتشرشده\nتوقف ضبط با دکمهٔ زیر پیام ضبط انجام می‌شود.",

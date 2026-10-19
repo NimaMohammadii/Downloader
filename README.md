@@ -125,6 +125,16 @@ Ordinary Instagram media does not show a download-link button. The Worker resolv
 
 For this Worker media-proxy path, Telegram's Bot API remote-URL limits apply: currently 20 MB for videos/other content and 5 MB for photos. The Worker tries lower Instagram renditions when a larger rendition exceeds that limit.
 
+## Telegram admin panel
+
+The configured admin can open `/admin` → «لیست کاربران». Users appear as paginated buttons; selecting one opens their profile, usage counts and paginated request history, with refresh and back buttons. Dates use Tehran time. Admin commands and callbacks remain restricted to `ADMIN_USER_ID`.
+
+A visit begins with the first recorded interaction or an interaction after at least 30 minutes of inactivity. Returns are visits minus the first visit. Messages and callbacks count as interactions; `/start` is also counted separately. Authenticated Telegram `update_id` values deduplicate activity across delegated handlers and redeliveries for seven days. Link counts count messages containing supported links, separately from download requests and search queries.
+
+History records the source, URL/query, available title, time, outcome, confirmed file count and failure explanation. YouTube inspection and its quality selection share one history entry. Successful delivery requires a successful Telegram send response; fetching the `/media` proxy alone no longer counts as delivery. Partial batches, song search results, pending requests and failures have separate labels. Requests without a final outcome after four hours show an unknown result rather than a guessed success or failure. A partially delivered playlist includes its confirmed file count and requested range.
+
+The existing users, link totals and global success counter are preserved. New tables are created automatically in the existing SQLite Durable Object; no new binding or class migration is required. Visits and per-user download history start when this version runs and cannot reconstruct previously unrecorded activity. History is retained without automatic deletion; activity deduplication and the existing media cache keep their own expiry policies. Recording outages do not block downloads; missing final records remain visibly unresolved.
+
 ## Required Cloudflare secret
 
 `BOT_TOKEN`

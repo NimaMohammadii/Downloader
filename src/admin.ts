@@ -41,6 +41,29 @@ export async function telegramTextMotion(token: string, method: string, payload:
 
 export const ADMIN_USER_ID = 7138547731;
 export const ADMIN_USERS_PAGE_SIZE = 8;
+export const ADMIN_DOWNLOADS_PAGE_SIZE = 5;
+export const VISIT_IDLE_MS = 30 * 60_000;
+
+export type DownloadStatus = "pending" | "awaiting_selection" | "processing" | "success" | "failed" | "partial" | "results";
+export type DownloadRecord = {
+  key: string;
+  userId: number;
+  source: string;
+  request: string;
+  status: DownloadStatus;
+  title?: string;
+  detail?: string;
+  delivered?: number;
+};
+export type AdminDownload = DownloadRecord & { createdAt: number; updatedAt: number; stale: boolean };
+export type AdminUserDetail = {
+  user: AdminUserRow;
+  activity: { visits: number; interactions: number; starts: number; trackingSince: number } | null;
+  counts: { total: number; success: number; failed: number; partial: number; active: number; stale: number; results: number; delivered: number };
+  downloads: AdminDownload[];
+  page: number;
+  totalPages: number;
+};
 
 type StoreEnv = Record<string, never>;
 
@@ -82,6 +105,8 @@ export type AdminUsersPage = {
 type RecordPayload = {
   user: TrackedUser;
   linkSent: boolean;
+  eventId?: number;
+  start?: boolean;
 };
 
 export type CachedTelegramFile = {
@@ -168,6 +193,26 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       );
       CREATE INDEX IF NOT EXISTS idx_delivered_media_at ON delivered_media(delivered_at);
 
+      CREATE TABLE IF NOT EXISTS user_activity (
+        user_id TEXT PRIMARY KEY,
+        visits INTEGER NOT NULL DEFAULT 0,
+        interactions INTEGER NOT NULL DEFAULT 0,
+        starts INTEGER NOT NULL DEFAULT 0,
+        tracking_since INTEGER NOT NULL,
+        last_activity INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS activity_events (
+        event_id TEXT PRIMARY KEY, recorded_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_activity_events_at ON activity_events(recorded_at);
+      CREATE TABLE IF NOT EXISTS download_history (
+        key TEXT PRIMARY KEY, user_id TEXT NOT NULL, source TEXT NOT NULL,
+        request TEXT NOT NULL, status TEXT NOT NULL, title TEXT, detail TEXT,
+        delivered INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_download_history_user ON download_history(user_id, created_at DESC, key);
+
       CREATE TABLE IF NOT EXISTS telegram_file_cache (
         key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at INTEGER NOT NULL
       );
@@ -207,31 +252,96 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
 
       const now = Date.now();
       const id = String(user.id);
-      this.ctx.storage.sql.exec(
-        `INSERT INTO users(id, username, first_name, last_name, links_sent, first_seen, last_seen)
-         VALUES (?, ?, ?, ?, 0, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
-           username = excluded.username,
-           first_name = excluded.first_name,
-           last_name = excluded.last_name,
-           last_seen = excluded.last_seen`,
-        id,
-        cleanText(user.username),
-        cleanText(user.firstName),
-        cleanText(user.lastName),
-        now,
-        now,
-      );
-
-      if (payload.linkSent) {
-        this.ctx.storage.sql.exec(
-          "UPDATE users SET links_sent = links_sent + 1, last_seen = ? WHERE id = ?",
-          now,
-          id,
+      this.ctx.storage.transactionSync(() => {
+        const sql = this.ctx.storage.sql;
+        if (Number.isSafeInteger(payload.eventId)) {
+          const inserted = sql.exec("INSERT OR IGNORE INTO activity_events(event_id, recorded_at) VALUES (?, ?)", String(payload.eventId), now);
+          if (!inserted.rowsWritten) return;
+        }
+        sql.exec(
+          `INSERT INTO users(id, username, first_name, last_name, links_sent, first_seen, last_seen)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET username = excluded.username,
+             first_name = excluded.first_name, last_name = excluded.last_name,
+             links_sent = users.links_sent + excluded.links_sent, last_seen = excluded.last_seen`,
+          id, cleanText(user.username), cleanText(user.firstName), cleanText(user.lastName),
+          payload.linkSent ? 1 : 0, now, now,
         );
-      }
+        sql.exec(
+          `INSERT INTO user_activity(user_id, visits, interactions, starts, tracking_since, last_activity)
+           VALUES (?, 1, 1, ?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+             visits = visits + CASE WHEN excluded.last_activity - last_activity >= ? THEN 1 ELSE 0 END,
+             interactions = interactions + 1, starts = starts + excluded.starts,
+             last_activity = excluded.last_activity`,
+          id, payload.start ? 1 : 0, now, now, VISIT_IDLE_MS,
+        );
+        sql.exec("DELETE FROM activity_events WHERE recorded_at < ?", now - 7 * 86400_000);
+      });
 
       return Response.json({ ok: true });
+    }
+
+    if (request.method === "POST" && url.pathname === "/download") {
+      const payload = await request.json() as DownloadRecord;
+      const statuses: DownloadStatus[] = ["pending", "awaiting_selection", "processing", "success", "failed", "partial", "results"];
+      if (!/^[A-Za-z0-9:_-]{1,180}$/.test(payload.key || "") || !Number.isSafeInteger(payload.userId)
+          || payload.userId <= 0 || !statuses.includes(payload.status)) return new Response("Invalid download", { status: 400 });
+      const now = Date.now();
+      const terminal = ["success", "failed", "partial", "results"].includes(payload.status);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO download_history(key,user_id,source,request,status,title,detail,delivered,created_at,updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET
+           status = excluded.status, title = COALESCE(excluded.title, download_history.title),
+           detail = excluded.detail, delivered = MAX(download_history.delivered, excluded.delivered),
+           updated_at = excluded.updated_at
+         WHERE download_history.user_id = excluded.user_id
+           AND download_history.status NOT IN ('success','results')
+           AND (download_history.status NOT IN ('failed','partial') OR excluded.status = 'success')
+           AND (excluded.status NOT IN ('pending','awaiting_selection') OR download_history.status = 'pending')`,
+        payload.key, String(payload.userId), cleanText(payload.source) || "نامشخص",
+        displayText(payload.request, 500) || "بدون لینک", payload.status, displayText(payload.title, 180),
+        terminal ? displayText(payload.detail, 240) : null,
+        Math.max(0, Math.min(100, Math.floor(Number(payload.delivered) || 0))), now, now,
+      );
+      return Response.json({ ok: true });
+    }
+
+    if (request.method === "GET" && url.pathname === "/user") {
+      const id = url.searchParams.get("id") || "";
+      if (!/^[1-9]\d{0,15}$/.test(id)) return new Response("Invalid user", { status: 400 });
+      const sql = this.ctx.storage.sql;
+      const rows = sql.exec("SELECT * FROM users WHERE id = ?", id).toArray();
+      if (!rows.length) return new Response("User not found", { status: 404 });
+      const rawUser = rows[0] as unknown as UserSqlRow;
+      const activityRows = sql.exec("SELECT * FROM user_activity WHERE user_id = ?", id).toArray();
+      const activity = activityRows[0];
+      const staleBefore = Date.now() - 4 * 3600_000;
+      const counts = sql.exec(`SELECT COUNT(*) AS total,
+        COALESCE(SUM(status = 'success'),0) AS success, COALESCE(SUM(status = 'failed'),0) AS failed,
+        COALESCE(SUM(status = 'partial'),0) AS partial, COALESCE(SUM(status = 'results'),0) AS results,
+        COALESCE(SUM(status = 'awaiting_selection' OR (status IN ('pending','processing') AND updated_at >= ?)),0) AS active,
+        COALESCE(SUM(status IN ('pending','processing') AND updated_at < ?),0) AS stale,
+        COALESCE(SUM(delivered),0) AS delivered FROM download_history WHERE user_id = ?`, staleBefore, staleBefore, id).one();
+      const totalPages = Math.max(1, Math.ceil(asNumber(counts.total) / ADMIN_DOWNLOADS_PAGE_SIZE));
+      const rawPage = Number(url.searchParams.get("page") || 0);
+      const page = Math.min(Number.isSafeInteger(rawPage) && rawPage >= 0 ? rawPage : 0, totalPages - 1);
+      const downloads = sql.exec("SELECT * FROM download_history WHERE user_id = ? ORDER BY created_at DESC, key DESC LIMIT ? OFFSET ?",
+        id, ADMIN_DOWNLOADS_PAGE_SIZE, page * ADMIN_DOWNLOADS_PAGE_SIZE).toArray().map(row => ({
+          key: String(row.key), userId: Number(id), source: String(row.source), request: String(row.request),
+          status: row.status as DownloadStatus, title: row.title ? String(row.title) : undefined,
+          detail: row.detail ? String(row.detail) : undefined, delivered: asNumber(row.delivered),
+          createdAt: asNumber(row.created_at), updatedAt: asNumber(row.updated_at),
+          stale: ["pending", "processing"].includes(String(row.status)) && asNumber(row.updated_at) < staleBefore,
+        }));
+      return Response.json({
+        user: { id, username: rawUser.username, firstName: rawUser.first_name, lastName: rawUser.last_name,
+          linksSent: asNumber(rawUser.links_sent), firstSeen: asNumber(rawUser.first_seen), lastSeen: asNumber(rawUser.last_seen) },
+        activity: activity ? { visits: asNumber(activity.visits), interactions: asNumber(activity.interactions),
+          starts: asNumber(activity.starts), trackingSince: asNumber(activity.tracking_since) } : null,
+        counts: Object.fromEntries(Object.entries(counts).map(([key, value]) => [key, asNumber(value)])),
+        downloads, page, totalPages,
+      });
     }
 
     if (request.method === "POST" && url.pathname === "/delivery") {
@@ -288,7 +398,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       const rows = this.ctx.storage.sql.exec(
         `SELECT id, username, first_name, last_name, links_sent, first_seen, last_seen
          FROM users
-         ORDER BY last_seen DESC
+         ORDER BY last_seen DESC, id ASC
          LIMIT ? OFFSET ?`,
         ADMIN_USERS_PAGE_SIZE,
         offset,
@@ -339,12 +449,15 @@ export async function recordUserActivity(
   env: AdminStatsEnv,
   user: TrackedUser,
   linkSent: boolean,
+  eventId?: number,
+  start = false,
 ): Promise<void> {
+  if (!env.ADMIN_STATS) return;
   try {
     const response = await statsStub(env).fetch("https://admin-stats/record", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ user, linkSent } satisfies RecordPayload),
+      body: JSON.stringify({ user, linkSent, eventId, start } satisfies RecordPayload),
     });
     if (!response.ok) {
       console.warn("admin stats record rejected", { status: response.status });
@@ -431,33 +544,91 @@ export function adminDashboardKeyboard(): Record<string, unknown> {
 }
 
 export function formatAdminUsers(page: AdminUsersPage): string {
-  const lines = [
-    `👥 لیست کاربران (${page.totalUsers})`,
-    `صفحه ${page.page + 1}/${page.totalPages}`,
-    "",
-  ];
-
-  if (!page.users.length) {
-    lines.push("هنوز کاربری ثبت نشده.");
-    return lines.join("\n");
-  }
-
-  page.users.forEach((user, index) => {
-    const number = page.page * page.pageSize + index + 1;
-    const username = user.username ? ` • @${user.username}` : "";
-    lines.push(`${number}. ${userDisplayName(user)}${username}`);
-    lines.push(`ID: ${user.id} • 🔗 ${user.linksSent}`);
-    if (index !== page.users.length - 1) lines.push("");
-  });
-
-  return lines.join("\n");
+  return [`👥 لیست کاربران (${page.totalUsers})`, `صفحه ${page.page + 1}/${page.totalPages}`, "",
+    page.users.length ? "برای مشاهده آمار و سابقه دانلود، کاربر را انتخاب کنید:" : "هنوز کاربری ثبت نشده."].join("\n");
 }
 
 export function adminUsersKeyboard(page: AdminUsersPage): Record<string, unknown> {
-  const nav: Array<Record<string, string>> = [];
+  const rows = page.users.map(user => [{
+    text: `${displayText(userDisplayName(user), 35)} • ${user.id}`,
+    callback_data: `admin:user:${user.id}:${page.page}:0`,
+  }]);
+  const nav: Array<{ text: string; callback_data: string }> = [];
   if (page.page > 0) nav.push({ text: "‹ قبلی", callback_data: `admin:users:${page.page - 1}` });
   nav.push({ text: "🏠 آمار", callback_data: "admin:stats" });
   if (page.page + 1 < page.totalPages) nav.push({ text: "بعدی ›", callback_data: `admin:users:${page.page + 1}` });
+  return { inline_keyboard: [...rows, nav] };
+}
 
-  return { inline_keyboard: [nav] };
+function displayText(value: unknown, limit: number): string | null {
+  if (typeof value !== "string") return null;
+  const text = value.replace(/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g, " ").trim();
+  return text ? text.slice(0, limit) : null;
+}
+
+export async function recordDownload(env: Partial<AdminStatsEnv>, record: DownloadRecord): Promise<void> {
+  if (!env.ADMIN_STATS || record.userId === ADMIN_USER_ID) return;
+  try {
+    const response = await statsStub(env as AdminStatsEnv).fetch("https://admin-stats/download", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(record),
+    });
+    if (!response.ok) console.warn("download history rejected", { status: response.status });
+  } catch { console.warn("download history unavailable"); }
+}
+
+export async function getAdminUserDetail(env: AdminStatsEnv, id: string, page: number): Promise<AdminUserDetail | null> {
+  const url = new URL("https://admin-stats/user");
+  url.searchParams.set("id", id);
+  url.searchParams.set("page", String(page));
+  const response = await statsStub(env).fetch(url.toString());
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`ADMIN_USER_${response.status}`);
+  return await response.json() as AdminUserDetail;
+}
+
+const STATUS_LABELS: Record<DownloadStatus, string> = {
+  pending: "⏳ در صف یا بررسی درخواست", awaiting_selection: "🎛 منتظر انتخاب کاربر", processing: "⏳ در حال دریافت یا ارسال",
+  success: "✅ موفق؛ فایل تحویل تلگرام شد", failed: "❌ ناموفق", partial: "⚠️ بخشی ارسال شد", results: "🔎 نتایج جست‌وجو؛ بدون دانلود فایل",
+};
+function dateLabel(value: number): string {
+  return new Intl.DateTimeFormat("fa-IR", { dateStyle: "short", timeStyle: "short", timeZone: "Asia/Tehran" }).format(value);
+}
+
+export function formatAdminUserDetail(detail: AdminUserDetail): string {
+  const { user, activity, counts } = detail;
+  const lines = [`👤 ${displayText(userDisplayName(user), 80)}`, `شناسه: ${user.id}`,
+    ...(user.username ? [`نام کاربری: @${displayText(user.username, 40)}`] : []),
+    `اولین مشاهده: ${dateLabel(user.firstSeen)}`, `آخرین استفاده: ${dateLabel(user.lastSeen)}`, "",
+    ...(activity ? [`🚪 مراجعه‌ها: ${activity.visits} • برگشت‌ها: ${Math.max(0, activity.visits - 1)}`,
+      `💬 تعامل‌ها (پیام و دکمه): ${activity.interactions} • /start: ${activity.starts}`,
+      `شروع ثبت آمار مراجعه: ${dateLabel(activity.trackingSince)}`] : ["آمار مراجعه: هنوز از زمان فعال‌شدن ثبت جدید استفاده نکرده است."]),
+    "هر مراجعه: استفاده پس از حداقل ۳۰ دقیقه بی‌فعالیتی. ساعت‌ها: تهران.",
+    `🔗 لینک‌های ارسالی: ${user.linksSent}`, `📥 درخواست‌های ثبت‌شده: ${counts.total} • فایل‌های تحویل‌شده: ${counts.delivered}`,
+    `✅ موفق: ${counts.success} • ❌ ناموفق: ${counts.failed} • ⚠️ ناقص: ${counts.partial}`,
+    `⏳ باز: ${counts.active} • ❔ نتیجه نامشخص: ${counts.stale} • 🔎 جست‌وجو: ${counts.results}`, "",
+    `📋 سابقه • صفحه ${detail.page + 1}/${detail.totalPages}`,
+    "سابقه و تعداد برگشت‌های پیش از فعال‌شدن ثبت جدید در دسترس نیست.",
+  ];
+  if (!detail.downloads.length) lines.push("هنوز درخواست جدیدی ثبت نشده.");
+  detail.downloads.forEach((item, index) => {
+    lines.push("", `${detail.page * ADMIN_DOWNLOADS_PAGE_SIZE + index + 1}. ${displayText(item.source, 32)} • ${dateLabel(item.createdAt)}`,
+      item.stale ? "❔ نتیجه نهایی ثبت نشده (بیش از ۴ ساعت)" : STATUS_LABELS[item.status],
+      ...(item.title ? [`عنوان: ${displayText(item.title, 90)}`] : []),
+      `درخواست: ${displayText(item.request, 180)}`,
+      ...(item.delivered ? [`فایل تحویل‌شده: ${item.delivered}`] : []),
+      ...(item.detail ? [`توضیح: ${displayText(item.detail, 100)}`] : []));
+  });
+  return lines.join("\n");
+}
+
+export function adminUserDetailKeyboard(detail: AdminUserDetail, usersPage: number): Record<string, unknown> {
+  const callback = (page: number) => `admin:user:${detail.user.id}:${usersPage}:${page}`;
+  const nav: Array<{ text: string; callback_data: string }> = [];
+  if (detail.page > 0) nav.push({ text: "‹ جدیدتر", callback_data: callback(detail.page - 1) });
+  if (detail.page + 1 < detail.totalPages) nav.push({ text: "قدیمی‌تر ›", callback_data: callback(detail.page + 1) });
+  return { inline_keyboard: [
+    ...(nav.length ? [nav] : []),
+    [{ text: "🔄 بروزرسانی", callback_data: callback(detail.page) }],
+    [{ text: "👥 بازگشت به کاربران", callback_data: `admin:users:${usersPage}` }, { text: "🏠 آمار", callback_data: "admin:stats" }],
+  ] };
 }

@@ -1,11 +1,10 @@
 import appWorker from "./main";
 import {
   telegramTextMotion,
-  ADMIN_USER_ID,
-  recordUserActivity,
+  recordDownload,
+  recordSuccessfulDelivery,
   telegramFileCache,
   type AdminStatsEnv,
-  type TrackedUser,
 } from "./admin";
 
 export { AdminStatsStore } from "./admin";
@@ -108,16 +107,6 @@ function parseStoryTarget(text: string): StoryTarget | null {
   return null;
 }
 
-function trackedUser(message: TelegramMessage): TrackedUser | null {
-  const id = message.from?.id ?? (message.chat.id > 0 ? message.chat.id : 0);
-  if (!Number.isSafeInteger(id) || id <= 0) return null;
-  return {
-    id,
-    username: message.from?.username,
-    firstName: message.from?.first_name,
-    lastName: message.from?.last_name,
-  };
-}
 
 function createJar(env: Env): CookieJar {
   const jar: CookieJar = new Map();
@@ -686,6 +675,9 @@ async function proxyUrl(token: string, source: string): Promise<string> {
 
 async function sendResolvedStory(env: Env, target: StoryTarget, update: TelegramUpdate, media: MediaCandidate[]): Promise<Response> {
   const message = update.message!;
+  const history = { key: `ig:${message.chat.id}:${message.message_id}:${message.from?.id || message.chat.id}`,
+    userId: message.from?.id || message.chat.id, source: `Instagram ${target.kind}`, request: target.url };
+  let delivered = 0;
   let statusMessageId: number | undefined;
   try {
     const status = await telegramCall<TelegramMessage>(env.BOT_TOKEN, "sendMessage", {
@@ -732,11 +724,15 @@ async function sendResolvedStory(env: Env, target: StoryTarget, update: Telegram
           method: "sendVideo", fileId: sent.video.file_id, data: { caption, supports_streaming: true },
         });
       }
+      delivered++;
+      await recordSuccessfulDelivery(env, `${history.key}:${i}`);
     }
+    await recordDownload(env, { ...history, status: "success", delivered });
     if (statusMessageId) {
       await safeTelegramCall(env.BOT_TOKEN, "deleteMessage", { chat_id: message.chat.id, message_id: statusMessageId });
     }
   } catch (error) {
+    await recordDownload(env, { ...history, status: delivered ? "partial" : "failed", delivered, detail: "ارسال کامل استوری تأیید نشد." });
     const detail = error instanceof Error ? error.message : String(error);
     console.error("instagram private story send failed", { target: target.kind, detail });
     if (statusMessageId) {
@@ -768,14 +764,17 @@ export default {
       const text = (message?.text || message?.caption || "").trim();
       const target = parseStoryTarget(text);
       if (update && message && target) {
+        const history = { key: `ig:${message.chat.id}:${message.message_id}:${message.from?.id || message.chat.id}`,
+          userId: message.from?.id || message.chat.id, source: `Instagram ${target.kind}`, request: target.url };
+        await recordDownload(env, { ...history, status: "processing" });
         try {
           const media = await privateResolve(target, env);
           if (media?.length) {
-            const user = trackedUser(message);
-            if (user && user.id !== ADMIN_USER_ID) await recordUserActivity(env, user, true);
             return sendResolvedStory(env, target, update, media);
           }
+          throw new Error("INSTAGRAM_NO_MEDIA");
         } catch (error) {
+          await recordDownload(env, { ...history, status: "failed", detail: "دریافت محتوای استوری ناموفق بود." });
           console.warn("instagram story resolution failed", {
             target: target.kind, code: error instanceof StoryError ? error.code : "network",
           });

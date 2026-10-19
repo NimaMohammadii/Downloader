@@ -25,6 +25,8 @@ const { outputFiles } = await build({
       ` };
       if (args.path === './story-main') return { contents: 'export default { fetch() {} }; export const parseInstagramVideoTarget = () => null; export const parseInstagramAudioTarget = () => null; export const resolveInstagramVideo = () => {}; export const instagramVideoErrorText = () => "error";' };
       if (args.path === './admin') return { contents: `
+        export const recordDownload = async(_env,record)=>{(globalThis.downloadHistory ||= []).push(record);};
+        export const isInstagramDownloadLink = text=>/instagram.com\\//.test(text);
         export const telegramTextMotion=async()=>{};
         export const telegramFileCache=async(...args)=>globalThis.testFileCache ? globalThis.testFileCache(...args) : null; export class AdminStatsStore {}
         export const ADMIN_USER_ID = 1;
@@ -272,6 +274,7 @@ async function run({ inspect = false, startupError, httpError, sizes, credential
   const calls = [];
   const steps = [];
   globalThis.delivered = 0;
+  globalThis.downloadHistory = [];
   globalThis.fetch = async (_url, init) => {
     messages.push(JSON.parse(init.body));
     return Response.json({ ok: true, result: { message_id: 10 } });
@@ -366,4 +369,21 @@ test('older metadata without a size still offers working quality buttons', async
   const buttons = result.messages.find(m => m.reply_markup)?.reply_markup.inline_keyboard.flat();
   assert.ok(buttons.some(b => b.text === '360p Low Size unknown'));
   assert.ok(buttons.every(b => b.callback_data.startsWith('ytq|')));
+});
+
+
+test('download history associates quality inspection and final delivery with one user request', async () => {
+  await run({ inspect: true });
+  const waiting = globalThis.downloadHistory.at(-1);
+  assert.equal(waiting.status, 'awaiting_selection');
+  assert.equal(waiting.delivered, undefined);
+  await run();
+  const delivered = globalThis.downloadHistory.at(-1);
+  assert.equal(delivered.key, waiting.key);
+  assert.equal(delivered.userId, 42);
+  assert.equal(delivered.status, 'success');
+  assert.equal(delivered.delivered, 1);
+  await run({ httpError: { status: 502, body: 'uncertain' } });
+  assert.equal(globalThis.downloadHistory.at(-1).status, 'failed');
+  assert.ok(!globalThis.downloadHistory.some(item => item.status === 'success'));
 });
