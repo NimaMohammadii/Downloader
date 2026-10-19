@@ -52,7 +52,7 @@
       "class_name": "YoutubeDownloaderContainer",
       "image": "./Dockerfile",
       "max_instances": 20,
-      "instance_type": "standard-1",
+      "instance_type": "standard-4",
       "rollout_step_percentage": [100]
     }
   ],

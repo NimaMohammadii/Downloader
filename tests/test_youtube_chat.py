@@ -77,6 +77,56 @@ class ChatTests(unittest.TestCase):
         self.assertIsInstance(uploaded, types.InputFile)
         self.assertEqual(uploaded.md5_checksum, hashlib.md5(content).hexdigest())
 
+    def test_slow_part_does_not_block_refilling_upload_slots(self):
+        original_call = FakeClient.__call__
+        original_send = FakeClient.send_file
+
+        async def delayed_call(client, request):
+            if not hasattr(client, 'later_part_started'):
+                client.later_part_started = asyncio.Event()
+                client.first_part_done = False
+            if request.file_part == 0:
+                # Part 8 must start while part 0 is still pending. A batch
+                # barrier deadlocks here instead of keeping free slots busy.
+                await asyncio.wait_for(client.later_part_started.wait(), timeout=1)
+            elif request.file_part == 8:
+                client.later_part_started.set()
+            result = await original_call(client, request)
+            if request.file_part == 0:
+                client.first_part_done = True
+            return result
+
+        async def checked_send(client, *args, **kwargs):
+            self.assertTrue(client.first_part_done, 'publish must await the slow part too')
+            self.assertEqual(len(client.parts), 11)
+            return await original_send(client, *args, **kwargs)
+
+        with patch.object(FakeClient, '__call__', delayed_call), \
+             patch.object(FakeClient, 'send_file', checked_send):
+            uploaded, content = self.upload(10 * 512 * 1024 + 123)
+        self.assertEqual(uploaded.md5_checksum, hashlib.md5(content).hexdigest())
+
+    def test_failure_after_refill_cancels_pending_parts_without_publishing(self):
+        original_call = FakeClient.__call__
+
+        async def failing_call(client, request):
+            if request.file_part == 0:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    client.pending_part_cancelled = True
+                    raise
+            if request.file_part == 8:
+                raise RuntimeError('part rejected after upload slot refill')
+            return await original_call(client, request)
+
+        with patch.object(FakeClient, '__call__', failing_call), \
+             self.assertRaises(ExceptionGroup):
+            self.upload(10 * 512 * 1024 + 123)
+        client = FakeClient.instances[-1]
+        self.assertTrue(client.pending_part_cancelled)
+        self.assertIsNone(client.sent)
+
     def test_uploaded_document_returns_reusable_bot_file_id(self):
         from datetime import datetime, timezone
         from telethon import utils

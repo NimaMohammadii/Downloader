@@ -606,18 +606,22 @@ async def upload_complete_file(token: str, method: str, data: dict[str, Any], fi
                         raise
                     await asyncio.sleep(exc.seconds)
 
-        # Bound memory to eight chunks, await every part before publishing media.
+        # Keep eight parts in flight without a batch barrier: a slow part must
+        # not leave completed slots idle. Read/hash in file order before await,
+        # and finish every worker before publishing the complete media file.
         with path.open("rb") as source:
-            for first in range(0, count, 8):
-                batch = []
-                for index in range(first, min(first + 8, count)):
+            indices = iter(range(count))
+
+            async def upload_worker() -> None:
+                for index in indices:
                     chunk = source.read(part_size)
                     if not big:
                         digest.update(chunk)
-                    batch.append(save_part(index, chunk))
-                async with asyncio.TaskGroup() as group:
-                    for task in batch:
-                        group.create_task(task)
+                    await save_part(index, chunk)
+
+            async with asyncio.TaskGroup() as group:
+                for _ in range(min(8, count)):
+                    group.create_task(upload_worker())
         uploaded = (types.InputFileBig(file_id, count, filename) if big
                     else types.InputFile(file_id, count, filename, digest.hexdigest()))
         attributes = [types.DocumentAttributeFilename(filename)]
