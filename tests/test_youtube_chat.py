@@ -77,6 +77,19 @@ class ChatTests(unittest.TestCase):
         self.assertIsInstance(uploaded, types.InputFile)
         self.assertEqual(uploaded.md5_checksum, hashlib.md5(content).hexdigest())
 
+    def test_animation_upload_sets_native_animated_attribute_and_preserves_complete_bytes(self):
+        content=b'GIF89a-complete-animation-fixture'
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'Animation.gif';path.write_bytes(content)
+            with patch.dict(os.environ,{'API_ID':'123','API_HASH':'test'}),patch('telethon.TelegramClient',FakeClient),path.open('rb') as handle:
+                asyncio.run(app.upload_complete_file('token','sendAnimation',{'chat_id':'42'},(path.name,handle,'image/gif')))
+        client=FakeClient.instances[-1]
+        self.assertEqual(b''.join(client.parts[i] for i in sorted(client.parts)),content)
+        options=client.sent[1]
+        self.assertTrue(any(isinstance(a,types.DocumentAttributeAnimated) for a in options['attributes']))
+        self.assertEqual(options['mime_type'],'image/gif')
+        self.assertFalse(options['force_document'])
+
     def test_slow_part_does_not_block_refilling_upload_slots(self):
         original_call = FakeClient.__call__
         original_send = FakeClient.send_file

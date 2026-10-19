@@ -1096,7 +1096,8 @@ def social_gallery_entries(url: str, platform: str) -> list[dict[str, Any]]:
             continue
         media_url, info = str(row[1]).removeprefix("ytdl:"), row[2]
         ext = str(info.get("extension") or "").lower()
-        if ext not in {"jpg", "jpeg", "png", "webp", "avif", "mp4", "m3u8", "webm", "mov"}:
+        animation = platform == "pinterest" and ext == "gif"
+        if not animation and ext not in {"jpg", "jpeg", "png", "webp", "avif", "mp4", "m3u8", "webm", "mov"}:
             continue
         if info.get("category") != platform:
             raise social_error(platform, "invalid extractor")
@@ -1110,7 +1111,7 @@ def social_gallery_entries(url: str, platform: str) -> list[dict[str, Any]]:
             if direct:
                 media_url, fallbacks, manifest = direct, [], False
         entries.append({"url": media_url, "fallbacks": fallbacks, "ext": "m3u8" if manifest else ext,
-                        "image": ext in {"jpg", "jpeg", "png", "webp", "avif"},
+                        "image": animation or ext in {"jpg", "jpeg", "png", "webp", "avif"}, "animation": animation,
                         "title": str(info.get("title") or info.get("description") or SOCIAL_NAMES[platform])[:180],
                         "id": str(info.get("id") or ""), "duration": info.get("duration", 0) if platform == "tiktok" else 0})
     if not entries:
@@ -1152,7 +1153,7 @@ def social_prepare_entry(entry: dict[str, Any], platform: str, workdir: Path, bu
     audio_request = audio_only or platform == "soundcloud"
     if audio_request and entry.get("image"):
         raise app.UserVisibleError("❌ این آیتم عکس است و صدای ویدیو ندارد.")
-    target = workdir / ("Image.jpg" if entry.get("image") else "Music.mp3" if audio_request else "Video.mp4")
+    target = workdir / ("Animation.gif" if entry.get("animation") else "Image.jpg" if entry.get("image") else "Music.mp3" if audio_request else "Video.mp4")
     source = workdir / ("source." + (entry.get("ext", "bin") if entry.get("image") else "bin"))
     remaining = lambda: max(1, min(1200, int(deadline - time.monotonic())))
     try:
@@ -1196,7 +1197,16 @@ def social_prepare_entry(entry: dict[str, Any], platform: str, workdir: Path, bu
             raise app.UserVisibleError("❌ فایل خالی یا بیش از حد بزرگ بود؛ ارسال نشد.")
         title = str(entry.get("track") or entry.get("title") or SOCIAL_NAMES[platform])[:180]
         artist = str(entry.get("artist") or entry.get("uploader") or "")[:120]
-        if entry.get("image"):
+        if entry.get("animation"):
+            probe = json.loads(_run(["ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-f", "gif",
+                                    "-count_frames", "-show_streams", "-of", "json", str(source)], min(45, remaining())).stdout)
+            stream = next((s for s in probe.get("streams", []) if s.get("codec_name") == "gif"), {})
+            if int(stream.get("nb_read_frames") or 0) < 1 or int(stream.get("width") or 0) <= 0 or int(stream.get("height") or 0) <= 0:
+                raise app.UserVisibleError("❌ فایل GIF سالم برای ارسال پیدا نشد.")
+            source.replace(target)  # Keep all frames and the original bytes.
+            method = "sendAnimation" if target.stat().st_size <= 50_000_000 else "sendDocument"
+            details = {}
+        elif entry.get("image"):
             _run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin", "-protocol_whitelist", "file,pipe",
                   "-format_whitelist", "image2,jpeg_pipe,png_pipe,webp_pipe,avif,mov",
                   "-i", str(source), "-frames:v", "1", "-vf", "scale=w='min(2560,iw)':h='min(2560,ih)':force_original_aspect_ratio=decrease", "-q:v", "2", str(target)], remaining())

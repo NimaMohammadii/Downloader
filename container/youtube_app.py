@@ -760,6 +760,8 @@ async def upload_complete_file(token: str, method: str, data: dict[str, Any], fi
                 duration=int(probe_duration(path)), title=str(data.get("title") or path.stem),
                 performer=str(data.get("performer") or "") or None,
             ))
+        elif method == "sendAnimation":
+            attributes.append(types.DocumentAttributeAnimated())
         reply = json.loads(data.get("reply_parameters", "{}"))
         markup = data.get("reply_markup")
         if isinstance(markup, str):
@@ -1580,7 +1582,7 @@ class InstagramCapture:
                         item["fileSize"] = item["path"].stat().st_size
                         method = item["method"]
                         data, markup = self.social_delivery_options(item)
-                    mime = {"sendPhoto": "image/jpeg", "sendDocument": "image/jpeg", "sendAudio": "audio/mpeg", "sendVideo": "video/mp4"}[method]
+                    mime = "image/gif" if item["path"].suffix.lower() == ".gif" else {"sendPhoto": "image/jpeg", "sendDocument": "image/jpeg", "sendAnimation": "image/gif", "sendAudio": "audio/mpeg", "sendVideo": "video/mp4"}[method]
                     self.safe_status(f"📤 در حال ارسال فایل {self.social_sent + 1}/{len(self.social_items)}…")
                     with item["path"].open("rb") as handle:
                         sent = asyncio.run(asyncio.wait_for(upload_complete_file(self.payload["botToken"], method, data,

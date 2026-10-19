@@ -164,6 +164,20 @@ class SocialBoundaryTests(unittest.TestCase):
 
 
 class SocialExtractorTests(unittest.TestCase):
+    def test_pinterest_gif_from_reported_pin_is_kept_as_animation(self):
+        rows=[[3,'https://i.pinimg.com/originals/94/3c/9f/943c9f351186f1b98e3ed3bfb855c8e0.gif',
+               {'category':'pinterest','extension':'gif','id':'794674296784100176'}]]
+        with patch.object(p,'social_json',return_value=rows):
+            entry=p.social_gallery_entries('https://www.pinterest.com/pin/794674296784100176/','pinterest')[0]
+        self.assertEqual(entry['ext'],'gif')
+        self.assertTrue(entry['animation'])
+        self.assertTrue(entry['image'],'GIF must not be offered as an audio source')
+        with tempfile.TemporaryDirectory() as directory,patch.object(p,'social_gallery_entries',return_value=[entry]), \
+                patch.object(p,'social_prepare_entry') as prepare:
+            with self.assertRaisesRegex(app.UserVisibleError,'صدا'):
+                p.prepare_social_media({'platform':'pinterest','url':'https://www.pinterest.com/pin/794674296784100176/','audioOnly':True},Path(directory))
+            prepare.assert_not_called()
+
     def test_x_multi_video_and_explicit_order_are_kept(self):
         entries=[metadata(),metadata()];entries[1]['id']='124'
         with patch.object(p,'social_json',return_value={'_type':'playlist','extractor_key':'Twitter','entries':entries}) as run:
@@ -320,6 +334,7 @@ class SocialFileTests(unittest.TestCase):
         subprocess.run(['ffmpeg','-y','-v','error','-f','lavfi','-i','color=blue:s=64x48:r=25','-f','lavfi','-i','sine=frequency=440:sample_rate=44100','-t','1','-c:v','libx264','-c:a','aac',str(cls.root/'fixture.mp4')],check=True)
         subprocess.run(['ffmpeg','-y','-v','error','-i',str(cls.root/'fixture.mp4'),'-frames:v','1',str(cls.root/'fixture.jpg')],check=True)
         subprocess.run(['ffmpeg','-y','-v','error','-i',str(cls.root/'fixture.mp4'),'-an','-c:v','copy',str(cls.root/'silent.mp4')],check=True)
+        subprocess.run(['ffmpeg','-y','-v','error','-i',str(cls.root/'fixture.mp4'),'-vf','fps=5',str(cls.root/'fixture.gif')],check=True)
     @classmethod
     def tearDownClass(cls):cls.directory.cleanup()
 
@@ -346,6 +361,25 @@ class SocialFileTests(unittest.TestCase):
     def test_photo_is_readable_jpeg_for_telegram_photo_message(self):
         item,probe=self.prepare({'url':'https://i.pinimg.com/a.jpg','ext':'jpg','image':True,'title':'Fixture'},'pinterest','fixture.jpg')
         self.assertEqual(item['method'],'sendPhoto');self.assertEqual(probe['streams'][0]['codec_name'],'mjpeg')
+
+    def test_gif_keeps_every_original_byte_and_frame_instead_of_becoming_a_still_photo(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original=(self.root/'fixture.gif').read_bytes()
+            entry={'url':'https://i.pinimg.com/fixture.gif','ext':'gif','image':True,'animation':True,'title':'GIF fixture'}
+            def download(url,target,*args):target.write_bytes(original)
+            with patch.object(p,'social_download_http',side_effect=download):
+                item=p.social_prepare_entry(entry,'pinterest',Path(directory),1_000_000,time.monotonic()+60)
+            self.assertEqual(item['method'],'sendAnimation')
+            self.assertEqual(item['path'].suffix,'.gif')
+            self.assertEqual(item['path'].read_bytes(),original)
+            probe=json.loads(subprocess.run(['ffprobe','-v','error','-count_frames','-show_streams','-of','json',str(item['path'])],capture_output=True,text=True,check=True).stdout)
+            self.assertGreater(int(probe['streams'][0]['nb_read_frames']),1)
+            self.assertFalse(item['hasAudio'])
+
+    def test_non_gif_bytes_are_never_published_as_animation(self):
+        entry={'url':'https://i.pinimg.com/fixture.gif','ext':'gif','image':True,'animation':True}
+        with self.assertRaises(app.UserVisibleError):
+            self.prepare(entry,'pinterest','fixture.jpg')
 
     def test_short_video_is_rejected_instead_of_sending_partial(self):
         with self.assertRaisesRegex(app.UserVisibleError,'ناقص'):
@@ -604,6 +638,24 @@ class SocialEarlyCacheTests(unittest.TestCase):
 
 
 class SocialLifecycleTests(unittest.TestCase):
+    def test_gif_is_sent_through_existing_social_upload_with_correct_mime_and_without_audio_button(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'Animation.gif';path.write_bytes(b'GIF89a-complete-fixture')
+            job=app.InstagramCapture(payload('pinterest'))
+            job.state='ready';job.social_sent=0;job.social_url='https://www.pinterest.com/pin/794674296784100176/'
+            job.social_items=[{'method':'sendAnimation','path':path,'data':{},'caption':'GIF','index':0,'hasAudio':False}]
+            async def upload(token,method,data,file):
+                self.assertEqual(method,'sendAnimation');self.assertEqual(file[2],'image/gif')
+                self.assertEqual(file[1].read(),b'GIF89a-complete-fixture')
+                self.assertNotIn('reply_markup',data)
+                return {'message_id':1}
+            try:
+                with patch.object(app,'upload_complete_file',side_effect=upload),patch.object(job,'safe_status'),patch.object(app,'delete_status'):
+                    self.assertTrue(job.send()['ok'])
+                self.assertEqual(job.social_sent,1);self.assertEqual(job.state,'sent')
+                self.assertFalse(path.exists())
+            finally:job.cleanup()
+
     def test_social_prepare_uses_existing_completion_event_and_no_instagram_session(self):
         job=app.InstagramCapture(payload())
         try:
