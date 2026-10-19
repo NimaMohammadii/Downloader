@@ -1,5 +1,6 @@
 import downloaderWorker from "./entry";
 import {
+  telegramTextMotion,
   ADMIN_USER_ID,
   AdminStatsStore,
   adminDashboardKeyboard,
@@ -68,6 +69,7 @@ async function telegramCall<T = unknown>(
   method: string,
   payload: Record<string, unknown>,
 ): Promise<T> {
+  await telegramTextMotion(token, method, payload);
   const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },

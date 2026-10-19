@@ -1,5 +1,6 @@
 import appWorker from "./main";
 import {
+  telegramTextMotion,
   ADMIN_USER_ID,
   recordUserActivity,
   telegramFileCache,
@@ -60,6 +61,7 @@ const PRIVATE_SUPPORTED_CAPABILITIES = [
 ];
 
 async function telegramCall<T = unknown>(token: string, method: string, payload: Record<string, unknown>): Promise<T> {
+  await telegramTextMotion(token, method, payload);
   const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -512,6 +514,7 @@ export type InstagramVideoTarget = {
   mediaId?: string;
   videoIndex?: number;
   query?: string;
+  musicVideoId?: string;
   recognizeMusic?: boolean;
 };
 export type InstagramVideoSource = {
@@ -522,6 +525,8 @@ export type InstagramVideoSource = {
   duration?: number;
   audioOnly?: boolean;
   musicQuery?: string;
+  musicSearch?: boolean;
+  musicVideoId?: string;
   recognizeMusic?: boolean;
 };
 
@@ -606,8 +611,9 @@ function replayMediaSource(item: any): InstagramVideoSource | null {
 }
 
 export async function resolveInstagramVideo(target: InstagramVideoTarget, env: Env): Promise<InstagramVideoSource> {
-  if (target.kind === "music" && target.query) {
-    return { mode: "replay", title: target.query, audioOnly: true, musicQuery: target.query };
+  if (target.kind === "music" && (target.query || target.musicVideoId)) {
+    return { mode: "replay", title: target.query || "Music", audioOnly: true,
+      ...(target.musicVideoId ? { musicVideoId: target.musicVideoId } : { musicQuery: target.query, musicSearch: true }) };
   }
   const jar = createJar(env);
   if (!authParts(jar)) throw new StoryError("session_missing");

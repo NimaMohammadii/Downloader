@@ -1,4 +1,4 @@
-import { telegramFileCache, type AdminStatsEnv } from "./admin";
+import { telegramTextMotion, telegramFileCache, type AdminStatsEnv } from "./admin";
 
 type Env = Partial<AdminStatsEnv> & {
   BOT_TOKEN: string;
@@ -96,6 +96,7 @@ async function telegramCall<T = unknown>(
   method: string,
   payload: Record<string, unknown>,
 ): Promise<T> {
+  await telegramTextMotion(token, method, payload);
   const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },

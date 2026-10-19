@@ -173,6 +173,46 @@ def job_timeout(seconds: float) -> float:
     return min(seconds, remaining)
 
 
+TEXT_MOTION_CHATS: dict[tuple[str, int], float] = {}
+TEXT_MOTION_LOCK = threading.Lock()
+
+
+def telegram_text_motion(token: str, method: str, payload: dict[str, Any]) -> None:
+    text = payload.get("text")
+    if method not in {"sendMessage", "editMessageText"} or not isinstance(text, str) or len(text) < 24:
+        return
+    if payload.get("inline_message_id") or payload.get("business_connection_id"):
+        return
+    try:
+        chat = int(payload["chat_id"])
+        key, now = (token.split(":")[0], chat), time.monotonic()
+        with TEXT_MOTION_LOCK:
+            if now < TEXT_MOTION_CHATS.get(key, -10):
+                return
+            if len(TEXT_MOTION_CHATS) >= 512:
+                TEXT_MOTION_CHATS.pop(next(iter(TEXT_MOTION_CHATS)))
+            TEXT_MOTION_CHATS[key] = now + 3
+        if method == "sendMessage" and chat > 0:
+            action = "sendMessageDraft"
+            body = {k: payload[k] for k in ("chat_id", "message_thread_id", "text", "parse_mode", "entities") if k in payload}
+            body["draft_id"] = secrets.randbelow(2147483646) + 1
+        elif method == "editMessageText" and payload.get("message_id") and not payload.get("parse_mode") and not payload.get("entities"):
+            action = method
+            body = {"chat_id": chat, "message_id": payload["message_id"], "text": text[:max(12, (len(text) * 55 + 99) // 100)] + "…"}
+        else:
+            return
+        response = requests.post(f"https://api.telegram.org/bot{token}/{action}", json=body, timeout=(0.4, 0.4))
+        result = response.json()
+        if response.status_code == 429:
+            retry = max(3, min(3600, float(result.get("parameters", {}).get("retry_after") or 30)))
+            with TEXT_MOTION_LOCK:
+                TEXT_MOTION_CHATS[key] = time.monotonic() + retry
+        if response.ok and result.get("ok"):
+            time.sleep(min(0.18, job_timeout(0.18)))
+    except Exception:
+        pass  # Optional effect must never prevent the complete message.
+
+
 def telegram_call(
     token: str,
     method: str,
@@ -186,6 +226,7 @@ def telegram_call(
         upload_timeout = job_timeout(timeout)
         return asyncio.run(asyncio.wait_for(
             upload_complete_file(token, method, data or {}, next(iter(files.values()))), timeout=upload_timeout))
+    telegram_text_motion(token, method, json_payload or data or {})
     response = requests.post(
         f"https://api.telegram.org/bot{token}/{method}",
         json=json_payload,
@@ -1183,7 +1224,7 @@ class InstagramCapture:
     def __init__(self, payload: dict[str, Any]):
         self.payload = payload
         self.id = str(payload.get("id") or "")
-        if not re.fullmatch(r"igdl--?\d+-\d+-\d+(?:-(?:audio|song))?", self.id):
+        if not re.fullmatch(r"igdl--?\d+-\d+-\d+(?:-(?:audio|song|music-[A-Za-z0-9_-]{11}))?", self.id):
             raise ValueError("Invalid Instagram job ID")
         self.source = payload.get("source") or {}
         self.live = self.source.get("mode") == "live"
@@ -1261,6 +1302,16 @@ class InstagramCapture:
     def run(self) -> None:
         watchdog = wall_timer = None
         try:
+            if self.source.get("musicSearch"):
+                from youtube_pipeline import music_candidates
+                results = music_candidates(str(self.source.get("musicQuery") or ""))[:5]
+                if not results:
+                    raise UserVisibleError("❌ آهنگی با این نام پیدا نشد؛ نام خواننده را هم بنویس.")
+                self.source["musicResults"] = results
+                self.result = {"ok": True}
+                with self.lock:
+                    self.state = "ready"
+                return
             if self.source.get("playlist"):
                 self.run_playlist()
                 return
@@ -1286,17 +1337,20 @@ class InstagramCapture:
                 self.source.update({"recognizedTitle": match["title"], "recognizedArtist": match["artist"],
                                     "musicQuery": f"{match['artist']} {match['title']}"})
                 self.safe_status(f"✅ آهنگ شناسایی شد\n🎵 {match['title']}\n👤 {match['artist']}\n⬇️ دارم فایل کاملش را پیدا می‌کنم…")
-            if self.source.get("musicQuery"):
-                from youtube_pipeline import prepare_music
-                if reuse_cached_file(self.payload, music_query_key(self.source["musicQuery"])):
+            if self.source.get("musicQuery") or self.source.get("musicVideoId"):
+                from youtube_pipeline import prepare_music, prepare_music_url
+                selected_id = self.source.get("musicVideoId")
+                cache_key = f"yt:{selected_id}:mp3" if selected_id else music_query_key(self.source["musicQuery"])
+                if reuse_cached_file(self.payload, cache_key):
                     self.cached = True
                     self.result = {"ok": True}
                     with self.lock:
                         self.state = "ready"
                     return
                 if not self.source.get("recognition") and not self.source.get("recognizeMusic"):
-                    self.safe_status("🔎 دارم نتیجهٔ مناسب آهنگ را از YouTube پیدا و دانلود می‌کنم…")
-                self.path, title, artist, url = prepare_music(self.source["musicQuery"], self.workdir)
+                    self.safe_status("⬇️ دارم آهنگ انتخاب‌شده را دانلود می‌کنم…")
+                self.path, title, artist, url = (prepare_music_url(f"https://www.youtube.com/watch?v={selected_id}", self.workdir)
+                    if selected_id else prepare_music(self.source["musicQuery"], self.workdir))
                 self.source.update({"title": title, "performer": artist, "musicUrl": url})
                 video_id = parse_qs(urlparse(url).query).get("v", [""])[0]
                 self.source["musicFileKey"] = f"yt:{video_id}:mp3"
@@ -1513,13 +1567,34 @@ class InstagramCapture:
                 return {"ok": True}
             self.state = "sending"
         try:
+            if self.source.get("musicSearch"):
+                expiry = int(time.time()) + 86400
+                owner = int(self.payload["userId"])
+                lines, buttons = ["🎵 نتیجه‌های جست‌وجو\nآهنگ موردنظرت را انتخاب کن:\n"], []
+                for index, item in enumerate(self.source["musicResults"], 1):
+                    title = " ".join(str(item.get("title") or "Music").split())[:110]
+                    artist = " ".join(str(item.get("channel") or item.get("uploader") or "").split())[:70]
+                    duration = int(float(item.get("duration") or 0))
+                    length = f"{duration // 60}:{duration % 60:02d}" if duration > 0 else ""
+                    lines.append(f"{index}. {title}\n" + " | ".join(part for part in [artist, length] if part))
+                    video_id = item["id"]
+                    signature = hmac.new(self.payload["botToken"].encode(),
+                        f"music-select:{self.payload['chatId']}:{owner}:{video_id}:{expiry}".encode(), hashlib.sha256).hexdigest()[:16]
+                    buttons.append([{"text": f"{index}. {title}"[:64], "callback_data": f"msc|{video_id}|{owner}|{expiry}|{signature}"}])
+                telegram_call(self.payload["botToken"], "editMessageText", json_payload={
+                    "chat_id": self.payload["chatId"], "message_id": self.payload["statusMessageId"],
+                    "text": "\n\n".join(lines), "reply_markup": {"inline_keyboard": buttons},
+                    "link_preview_options": {"is_disabled": True}}, timeout=30)
+                with self.lock:
+                    self.state = "sent"
+                return {"ok": True, "parts": 0}
             if self.source.get("social"):
                 return self.send_social()
             notes = {"user": "ضبط با درخواست شما متوقف شد.", "time_limit": "ضبط به سقف زمانی رسید.", "size_limit": "ضبط به سقف حجم رسید.", "interrupted": "ارتباط پخش قطع شد؛ بخش دریافت‌شده ارسال شد."}
             caption = str(self.source.get("title") or "Instagram Live")[:180]
             if self.source.get("recognizedTitle"):
                 caption = f"🎵 {self.source['recognizedTitle']}\n👤 {self.source['recognizedArtist']}"
-            caption += "\n" + ("Music" if self.source.get("musicQuery") else "Instagram Audio" if self.audio_only else "Live Recording" if self.live else "Live Replay")
+            caption += "\n" + ("Music" if self.source.get("musicQuery") or self.source.get("musicVideoId") else "Instagram Audio" if self.audio_only else "Live Recording" if self.live else "Live Replay")
             if self.source.get("musicUrl"):
                 caption += "\n" + self.source["musicUrl"]
             if self.live and self.reason in notes:

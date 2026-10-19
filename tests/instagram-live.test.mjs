@@ -23,6 +23,7 @@ const { outputFiles } = await build({
         export const getContainer=(_env,id)=>{globalThis.containerIds.push(id);return globalThis.container;};` };
       if (a.path === 'cloudflare:workers') return { contents: 'export class DurableObject {constructor(ctx,env){this.ctx=ctx;this.env=env;}} export class WorkflowEntrypoint {constructor(ctx,env){this.env=env;}}' };
       if (a.path === './admin') return { contents: `
+        export const telegramTextMotion=async()=>{};
         export const telegramFileCache=async(...args)=>globalThis.testFileCache ? globalThis.testFileCache(...args) : null; export class AdminStatsStore{} export const ADMIN_USER_ID=1;
         export const recordUserActivity=async()=>{};
         export const recordSuccessfulDelivery=async()=>{globalThis.delivered++;};` };
@@ -117,7 +118,7 @@ test('untrusted stream URLs never reach the recorder', async () => {
   await assert.rejects(()=>mod.resolveInstagramVideo({kind:'live',broadcastId:'123'},env), /در دسترس/);
 });
 
-async function workflow(ready = {ok:true}) {
+async function workflow(ready = {ok:true}, input = job) {
   const calls=[],steps=[],messages=[];
   globalThis.delivered=0; globalThis.containerIds=[];
   globalThis.container={
@@ -131,7 +132,7 @@ async function workflow(ready = {ok:true}) {
   };
   const step={async do(name,options,fn){if(typeof options==='function'){fn=options;options={};}steps.push({name,options});return fn();},
     async waitForEvent(name,options){steps.push({name,options});return {payload:ready};}};
-  await new mod.YoutubeDownloadWorkflow({},env).run({payload:job},step);
+  await new mod.YoutubeDownloadWorkflow({},env).run({payload:input},step);
   return {calls,steps,messages};
 }
 
@@ -143,6 +144,61 @@ test('recording waits for a completion event and sends one whole file', async()=
   assert.ok(r.steps.every(s=>!s.options.timeout?.endsWith('minutes')||s.options.type||parseInt(s.options.timeout)<=30));
   assert.ok(!JSON.stringify(globalThis.startedPayload).includes(env.INSTAGRAM_SESSIONID));
   assert.ok(Buffer.byteLength(globalThis.startedPayload.stopData)<=64);
+});
+
+test('music search releases its container after listing results and never records a file delivery',async()=>{
+  const result=await workflow({ok:true},{...job,instagram:{kind:'music',query:'Artist Title'}});
+  assert.ok(result.calls.includes('cleanup'));assert.ok(result.calls.includes('release'));
+  assert.equal(globalThis.startedPayload.source.musicSearch,true);
+  assert.equal(globalThis.startedPayload.source.musicQuery,'Artist Title');
+  assert.equal(globalThis.delivered,0);
+  assert.deepEqual(globalThis.startedPayload.source,{mode:'replay',title:'Artist Title',audioOnly:true,musicQuery:'Artist Title',musicSearch:true});
+});
+
+test('music buttons bind chat, owner, exact video and expiry before creating an idempotent download',async()=>{
+  const jobs=[],messages=[];
+  const workerEnv={...env,WEBHOOK_SECRET:'fictional-secret',YOUTUBE_DOWNLOAD_WORKFLOW:{async create(value){jobs.push(value);}}};
+  globalThis.fetch=async(url,init)=>{messages.push(JSON.parse(init.body));return Response.json({ok:true,result:true});};
+  const expiry=String(Math.floor(Date.now()/1000)+3600),video='abcdefghijk',owner='42';
+  const sign=async(chat,id,user,until)=>{
+    const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(env.BOT_TOKEN),{name:'HMAC',hash:'SHA-256'},false,['sign']);
+    const bytes=await crypto.subtle.sign('HMAC',key,new TextEncoder().encode(`music-select:${chat}:${user}:${id}:${until}`));
+    return [...new Uint8Array(bytes)].map(b=>b.toString(16).padStart(2,'0')).join('').slice(0,16);
+  };
+  const data=`msc|${video}|${owner}|${expiry}|${await sign(42,video,owner,expiry)}`;
+  const click=(value,user=42,chat=42)=>mod.default.fetch(new Request('https://worker/telegram/webhook',{method:'POST',
+    headers:{'x-telegram-bot-api-secret-token':'fictional-secret'},body:JSON.stringify({update_id:99,
+      callback_query:{id:'callback',from:{id:user},data:value,message:{message_id:10,chat:{id:chat}}}})}),workerEnv,{});
+  await click(data,99);await click(data,42,43);await click(data.replace(video,'bbbbbbbbbbb'));
+  const old=String(Math.floor(Date.now()/1000)-10);
+  await click(`msc|${video}|${owner}|${old}|${await sign(42,video,owner,old)}`);
+  assert.equal(jobs.length,0);
+  await click(data);await click(data);
+  assert.equal(jobs.length,2);assert.equal(jobs[0].id,jobs[1].id);
+  assert.equal(jobs[0].id,'igdl-42-10-42-music-abcdefghijk');
+  assert.deepEqual(jobs[0].params.instagram,{kind:'music',musicVideoId:video});
+  const source=await mod.resolveInstagramVideo(jobs[0].params.instagram,env);
+  assert.equal(source.musicSearch,undefined);assert.equal(source.musicVideoId,video);assert.equal(source.audioOnly,true);
+});
+
+test('native text motion is bounded, preserves formatting and final delivery survives preview failures',async()=>{
+  const text=await readFile(new URL('../src/admin.ts',import.meta.url),'utf8');
+  const result=await build({stdin:{contents:text,loader:'ts'},bundle:true,format:'esm',write:false,
+    plugins:[{name:'motion-runtime',setup(b){b.onResolve({filter:/^cloudflare:workers$/},a=>({path:a.path,namespace:'runtime'}));
+      b.onLoad({filter:/.*/,namespace:'runtime'},()=>({contents:'export class DurableObject {}'}));}}]});
+  const {telegramTextMotion}=await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString('base64')}`);
+  const calls=[];globalThis.fetch=async(url,init)=>{calls.push({method:String(url).split('/').at(-1),body:JSON.parse(init.body)});return Response.json({ok:true,result:true});};
+  const body={chat_id:444,text:'متن کامل آهنگ و خواننده برای نمایش نرم 🎵',parse_mode:'HTML',reply_markup:{inline_keyboard:[]}};
+  await telegramTextMotion('fictional','sendMessage',body);
+  assert.equal(calls.length,1);assert.equal(calls[0].method,'sendMessageDraft');
+  assert.equal(calls[0].body.text,body.text);assert.equal(calls[0].body.parse_mode,'HTML');assert.ok(calls[0].body.draft_id>0);
+  await telegramTextMotion('fictional','sendMessage',body);assert.equal(calls.length,1);
+  await telegramTextMotion('fictional','editMessageText',{...body,chat_id:445,message_id:7});assert.equal(calls.length,1);
+  await telegramTextMotion('fictional','sendAudio',{chat_id:446,text:body.text});assert.equal(calls.length,1);
+  await telegramTextMotion('fictional','editMessageText',{chat_id:447,message_id:7,text:body.text});
+  assert.equal(calls.length,2);assert.equal(calls[1].method,'editMessageText');assert.notEqual(calls[1].body.text,body.text);
+  globalThis.fetch=async()=>{throw Error('draft unavailable');};
+  await assert.doesNotReject(()=>telegramTextMotion('fictional','sendMessage',{...body,chat_id:448}));
 });
 
 test('a restart event does not upload a missing or partial replay',async()=>{
@@ -402,12 +458,14 @@ test('playlist webhook uses the event-driven MP3 queue, not the individual quali
   assert.equal(jobs[0].params.instagram,undefined);
 });
 
-test('cache keys separate quality, bot-facing music query and private Instagram owners',async()=>{
+test('cache keys separate exact music choices, quality and private Instagram owners; searches never reuse a song',async()=>{
   assert.notEqual(await mod.mediaCacheKey({...job,instagram:undefined,url:'https://www.youtube.com/watch?v=abcdefghijk',quality:720}),await mod.mediaCacheKey({...job,instagram:undefined,url:'https://www.youtube.com/watch?v=abcdefghijk',quality:1080}));
   const a=await mod.mediaCacheKey({...job,instagram:{kind:'music',query:'  ADELE   Hello '}});
   const b=await mod.mediaCacheKey({...job,instagram:{kind:'music',query:'Adele Hello'}});
   assert.equal(a,b);
-  assert.equal(a,'mq:d1a0fb389cfe7ce8610222f4fa46b0ea5260d847374dcc8f446b4cde23e0eb43');
+  assert.equal(a,undefined);
+  assert.equal(await mod.mediaCacheKey({...job,instagram:{kind:'music',musicVideoId:'abcdefghijk'}}),'yt:abcdefghijk:mp3');
+  assert.equal(await mod.mediaCacheKey({...job,instagram:{kind:'music',musicVideoId:'bbbbbbbbbbb'}}),'yt:bbbbbbbbbbb:mp3');
   assert.notEqual(await mod.mediaCacheKey({...job,instagram:{kind:'audio',mediaId:'123'}}),await mod.mediaCacheKey({...job,userId:99,instagram:{kind:'audio',mediaId:'123'}}));
 });
 
@@ -417,7 +475,7 @@ test('a cache hit sends the Telegram file without booting the container',async()
   globalThis.testFileCache=async(_env,op)=>op==='get'?{method:'sendAudio',fileId:'stored_id',data:{caption:'Hello'}}:null;
   const step={async do(name,options,fn){return (typeof options==='function'?options:fn)();}};
   try {
-    await new mod.YoutubeDownloadWorkflow({},env).run({payload:{...job,instagram:{kind:'music',query:'Adele Hello'}}},step);
+    await new mod.YoutubeDownloadWorkflow({},env).run({payload:{...job,instagram:{kind:'music',musicVideoId:'abcdefghijk'}}},step);
     assert.equal(globalThis.containerIds.length,0);assert.equal(globalThis.delivered,1);
     assert.equal(messages.find(m=>m.url.endsWith('/sendAudio')).body.audio,'stored_id');
   } finally {delete globalThis.testFileCache;}

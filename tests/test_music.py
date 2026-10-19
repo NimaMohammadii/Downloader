@@ -125,6 +125,112 @@ class MusicFileTests(unittest.TestCase):
                 job.cleanup()
 
 
+class MusicSelectionTests(unittest.TestCase):
+    def job(self, source, suffix=''):
+        job_id = 'igdl-42-7-42' + suffix
+        return app.InstagramCapture({'id':job_id,'source':{'mode':'replay','audioOnly':True,**source},
+            'botToken':'fictional','chatId':42,'userId':42,'requestMessageId':7,'statusMessageId':10,
+            'completionUrl':'https://downloader.vexaagent.workers.dev/instagram/events/'+job_id,'completionToken':'0'*64})
+
+    def test_search_only_lists_five_choices_without_metadata_download_upload_or_cache_shortcut(self):
+        import hashlib,hmac,time
+        entries=[{'id':str(i)*11,'title':f'Track {i}','channel':'Artist','duration':125} for i in range(6)]
+        job=self.job({'musicQuery':'Artist Track','musicSearch':True})
+        try:
+            with patch.object(pipeline,'music_candidates',return_value=entries),patch.object(pipeline,'prepare_music') as download, \
+                 patch.object(app,'reuse_cached_file',return_value=True) as cache,patch.object(job,'notify'),patch.object(app,'upload_complete_file') as upload:
+                job.run()
+                self.assertEqual(job.state,'ready')
+                with patch.object(app,'telegram_call') as send:
+                    self.assertEqual(job.send(),{'ok':True,'parts':0})
+                    job.send()
+                download.assert_not_called();cache.assert_not_called();upload.assert_not_called()
+                send.assert_called_once()
+                body=send.call_args.kwargs['json_payload']
+                self.assertIn('2:05',body['text']);self.assertIn('Artist',body['text'])
+                buttons=body['reply_markup']['inline_keyboard'];self.assertEqual(len(buttons),5)
+                for i,row in enumerate(buttons):
+                    action,video,owner,expiry,signature=row[0]['callback_data'].split('|')
+                    self.assertEqual((action,video,owner),('msc',entries[i]['id'],'42'))
+                    expected=hmac.new(b'fictional',f'music-select:42:42:{video}:{expiry}'.encode(),hashlib.sha256).hexdigest()[:16]
+                    self.assertEqual(signature,expected);self.assertGreater(int(expiry),time.time())
+                    self.assertLessEqual(len(row[0]['callback_data'].encode()),64)
+        finally:job.cleanup()
+
+    def test_selected_song_uses_exact_video_and_mp3_cache_key_without_running_search(self):
+        job=self.job({'musicVideoId':'abcdefghijk'},'-music-abcdefghijk')
+        try:
+            path=job.workdir/'Music.mp3';path.write_bytes(b'full fixture')
+            with patch.object(app,'reuse_cached_file',return_value=False) as cache,patch.object(pipeline,'prepare_music') as search, \
+                 patch.object(pipeline,'prepare_music_url',return_value=(path,'Chosen','Artist','https://www.youtube.com/watch?v=abcdefghijk')) as exact, \
+                 patch.object(job,'safe_status'),patch.object(job,'notify'):
+                job.run()
+            search.assert_not_called();exact.assert_called_once_with('https://www.youtube.com/watch?v=abcdefghijk',job.workdir)
+            self.assertIn('yt:abcdefghijk:mp3',[c.args[1] for c in cache.call_args_list])
+            self.assertEqual(job.source['title'],'Chosen');self.assertEqual(job.state,'ready')
+        finally:job.cleanup()
+
+    def test_failed_selection_never_substitutes_another_search_result(self):
+        job=self.job({'musicVideoId':'abcdefghijk'},'-music-abcdefghijk')
+        try:
+            with patch.object(pipeline,'prepare_music_url',side_effect=app.UserVisibleError('unavailable')), \
+                 patch.object(pipeline,'prepare_music') as search,patch.object(job,'notify'),patch.object(job,'safe_status'):
+                job.run()
+            search.assert_not_called();self.assertEqual(job.state,'failed')
+        finally:job.cleanup()
+
+    def test_empty_search_is_friendly_and_never_becomes_ready(self):
+        job=self.job({'musicQuery':'Missing Track','musicSearch':True})
+        try:
+            with patch.object(pipeline,'music_candidates',return_value=[]),patch.object(job,'notify'),patch.object(job,'safe_status'):
+                job.run()
+            self.assertEqual(job.state,'failed');self.assertIn('پیدا نشد',job.result['message'])
+        finally:job.cleanup()
+
+
+class TextMotionTests(unittest.TestCase):
+    def setUp(self):app.TEXT_MOTION_CHATS.clear()
+
+    def test_native_private_draft_is_followed_by_complete_message_with_original_buttons(self):
+        from unittest.mock import MagicMock
+        reply=MagicMock();reply.ok=True;reply.json.return_value={'ok':True,'result':{'message_id':8}}
+        body={'chat_id':42,'text':'متن کامل تست برای نمایش نرم و درست پیام 🎵','reply_markup':{'inline_keyboard':[[{'text':'Download','callback_data':'test'}]]}}
+        with patch.object(app.requests,'post',return_value=reply) as post,patch.object(app.time,'sleep'):
+            result=app.telegram_call('fictional','sendMessage',json_payload=body)
+        self.assertEqual(result,{'message_id':8});self.assertEqual(len(post.call_args_list),2)
+        self.assertTrue(post.call_args_list[0].args[0].endswith('/sendMessageDraft'))
+        self.assertEqual(post.call_args_list[0].kwargs['json']['text'],body['text'])
+        self.assertEqual(post.call_args_list[-1].kwargs['json'],body)
+
+    def test_failed_motion_still_sends_final_and_back_to_back_messages_skip_effect(self):
+        from unittest.mock import MagicMock
+        reply=MagicMock();reply.ok=True;reply.json.return_value={'ok':True,'result':True}
+        body={'chat_id':42,'message_id':8,'text':'Complete text for the edited message, unchanged.'}
+        with patch.object(app.requests,'post',side_effect=[app.requests.Timeout(),reply,reply]) as post:
+            app.telegram_call('fictional','editMessageText',json_payload=body)
+            app.telegram_call('fictional','editMessageText',json_payload=body)
+        self.assertEqual(len(post.call_args_list),3)
+        self.assertEqual(post.call_args_list[1].kwargs['json'],body)
+        self.assertEqual(post.call_args_list[2].kwargs['json'],body)
+
+    def test_formatted_edits_callbacks_and_group_sends_are_not_rewritten(self):
+        with patch.object(app.requests,'post') as post:
+            app.telegram_text_motion('a','answerCallbackQuery',{'text':'Very long callback notification text','chat_id':42})
+            app.telegram_text_motion('a','editMessageText',{'chat_id':42,'message_id':3,'text':'<b>A complete formatted message for editing</b>','parse_mode':'HTML'})
+            app.telegram_text_motion('b','sendMessage',{'chat_id':-42,'text':'Group message with a complete original body.'})
+        post.assert_not_called()
+
+    def test_preview_rate_limit_disables_optional_effect_until_retry_after(self):
+        from unittest.mock import MagicMock
+        reply=MagicMock();reply.ok=False;reply.status_code=429
+        reply.json.return_value={'ok':False,'parameters':{'retry_after':30}}
+        body={'chat_id':42,'text':'A complete message for optional preview rate limiting.'}
+        with patch.object(app.requests,'post',return_value=reply) as post:
+            with patch.object(app.time,'monotonic',return_value=100):app.telegram_text_motion('fictional','sendMessage',body)
+            with patch.object(app.time,'monotonic',return_value=104):app.telegram_text_motion('fictional','sendMessage',body)
+        post.assert_called_once()
+
+
 class RecognitionDownloadTests(unittest.TestCase):
     def response(self, chunks, headers=None, status=200):
         from unittest.mock import MagicMock

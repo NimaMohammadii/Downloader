@@ -83,11 +83,13 @@ Public Reel/Post downloads are attempted without an Instagram session first. A v
 
 ## Music search and Instagram audio
 
-Send a song name and artist as plain text, or use `/music Adele Hello` (also `/song`). The bot searches up to five YouTube results, prefers a matching official audio/Topic result over unrequested covers/remixes, checks availability, downloads the audio through the existing client fallback, and sends one MP3 with title/artist metadata. The selected source URL appears in the caption. Specify the artist/version when a name is ambiguous; availability is not guaranteed.
+Send a song name and artist as plain text, or use `/music Adele Hello` (also `/song`). The bot lists up to five YouTube results with titles, channels/artists and available durations, ranked to prefer matching official audio/Topic results over unrequested covers/remixes. Choose a result to download that exact video as MP3 with title/artist metadata and its source URL in the caption. An unavailable selection fails explicitly instead of substituting another song. Buttons are signed, requester/chat-bound and expire after 24 hours. Search results are never replaced by a cached song; the container is released after listing results and is not held while waiting for a choice. Recognition from clips keeps its existing automatic full-song delivery.
 
 Ordinary Instagram video posts/Reels and individual video Stories now offer a **🎵 فقط صدا** button. Use `/audio https://www.instagram.com/reel/SHORTCODE/` directly for a Reel/video post/TV, or a single video Story link. Carousel buttons select their own media item; the direct command accepts `?img_index=2` to select an item, otherwise it uses the first video. Photos and videos explicitly marked silent are rejected.
 
-Instagram audio is delivered as M4A, music search as MP3. Both reuse the event-driven download job, FFmpeg validation and complete-file MTProto sender. No new secrets or bindings are needed. Ordinary Instagram URLs and YouTube quality selection retain their routes; non-command text without a URL is treated as a song search.
+Instagram audio is delivered as M4A, selected music as MP3. Both reuse the event-driven download job, FFmpeg validation and complete-file MTProto sender. No new secrets or bindings are needed. Ordinary Instagram URLs and YouTube quality selection retain their routes; non-command text without a URL is treated as a song search.
+
+Text replies across the Worker and container use a bounded presentation effect: private-chat sends preview the complete text with Telegram's native `sendMessageDraft`, then persist the original message and buttons. Unformatted edits use one short partial-text transition before the complete edit. Native rendering depends on the Telegram client; formatted edits, media captions, short messages and rapid updates keep normal delivery. Optional effects are limited to one per chat every three seconds within each process, respect preview `retry_after` responses and time out quickly; preview failure still proceeds to the original complete send/edit. There is no recurring animation or polling loop.
 
 ## Recognize music from an uploaded clip
 

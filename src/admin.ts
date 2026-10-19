@@ -1,5 +1,44 @@
 import { DurableObject } from "cloudflare:workers";
 
+const textMotionChats = new Map<string, number>();
+
+// One bounded transition per chat, never a polling loop or character-by-character edits.
+export async function telegramTextMotion(token: string, method: string, payload: Record<string, unknown>): Promise<void> {
+  if (!["sendMessage", "editMessageText"].includes(method) || typeof payload.text !== "string" ||
+      payload.text.length < 24 || payload.inline_message_id || payload.business_connection_id) return;
+  const chat = Number(payload.chat_id);
+  if (!Number.isSafeInteger(chat) || !chat) return;
+  const key = `${token.split(":")[0]}:${chat}`;
+  const now = Date.now();
+  if (now < (textMotionChats.get(key) || 0)) return;
+  if (textMotionChats.size >= 512) textMotionChats.delete(textMotionChats.keys().next().value!);
+  textMotionChats.set(key, now + 3000);
+  const post = async (action: string, body: Record<string, unknown>) => {
+    const response = await fetch(`https://api.telegram.org/bot${token}/${action}`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+      signal: AbortSignal.timeout(800),
+    });
+    const result = await response.json() as { ok?: boolean; parameters?: { retry_after?: number } };
+    if (response.status === 429) textMotionChats.set(key, Date.now() + Math.max(3000, Math.min(3600, Number(result.parameters?.retry_after) || 30) * 1000));
+    if (!response.ok || !result.ok) throw new Error("TEXT_MOTION_UNAVAILABLE");
+  };
+  try {
+    if (method === "sendMessage" && chat > 0) {
+      // Native drafts fade in on supported Telegram clients. Persist with sendMessage.
+      const draft_id = crypto.getRandomValues(new Uint32Array(1))[0] % 2147483646 + 1;
+      await post("sendMessageDraft", { chat_id: chat, message_thread_id: payload.message_thread_id, draft_id,
+        text: payload.text, parse_mode: payload.parse_mode, entities: payload.entities });
+      await new Promise(resolve => setTimeout(resolve, 180));
+    } else if (method === "editMessageText" && payload.message_id && !payload.parse_mode && !payload.entities) {
+      // Existing messages have no native animation API. Use one short transition.
+      const chars = Array.from(payload.text);
+      const text = chars.slice(0, Math.max(12, Math.ceil(chars.length * 0.55))).join("") + "…";
+      await post("editMessageText", { chat_id: chat, message_id: payload.message_id, text });
+      await new Promise(resolve => setTimeout(resolve, 180));
+    }
+  } catch { /* Motion is optional; the complete original send/edit must always run. */ }
+}
+
 export const ADMIN_USER_ID = 7138547731;
 export const ADMIN_USERS_PAGE_SIZE = 8;
 

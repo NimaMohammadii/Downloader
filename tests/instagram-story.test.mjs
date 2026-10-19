@@ -9,7 +9,7 @@ const { outputFiles } = await build({
     build.onResolve({ filter: /.*/ }, a => ({ path: a.path, namespace: 'test' }));
     build.onLoad({ filter: /.*/, namespace: 'test' }, a => ({ contents: a.path === './main'
       ? 'export default { fetch() { globalThis.legacy++; return Response.json({delegated: true}); } };'
-      : 'export const telegramFileCache=async(...args)=>globalThis.storyFileCache ? globalThis.storyFileCache(...args) : null; export class AdminStatsStore {} export const ADMIN_USER_ID = 1; export async function recordUserActivity() {}' }));
+      : 'export const telegramTextMotion=async()=>{}; export const telegramFileCache=async(...args)=>globalThis.storyFileCache ? globalThis.storyFileCache(...args) : null; export class AdminStatsStore {} export const ADMIN_USER_ID = 1; export async function recordUserActivity() {}' }));
   } }],
 });
 const { default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
