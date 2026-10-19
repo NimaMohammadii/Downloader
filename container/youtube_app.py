@@ -1006,13 +1006,21 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
 
     workdir = Path(tempfile.mkdtemp(prefix="youtube-download-"))
     deadline_token = JOB_DEADLINE.set(time.monotonic() + YOUTUBE_JOB_SECONDS)
+    phase = "cache"
+    def status(text: str) -> None:
+        try:
+            edit_status(token, chat_id, status_message_id, text)
+        except Exception as exc:
+            print(json.dumps({"message": "youtube status update failed", "jobId": payload.get("id"),
+                              "phase": phase, **upload_error_diagnostic(exc, token)}, ensure_ascii=False), flush=True)
     try:
         if reuse_cached_file(payload, payload.get("mediaCacheKey")):
             delete_status(token, chat_id, status_message_id)
             return {"ok": True, "parts": 1, "cached": True}
+        phase = "metadata"
         metadata = load_metadata_cache(url)
         if metadata is None:
-            edit_status(token, chat_id, status_message_id, "🔎 دارم اطلاعات ویدیو رو تازه می‌کنم…")
+            status("🔎 دارم اطلاعات ویدیو رو تازه می‌کنم…")
             metadata = fetch_metadata(url)
             save_metadata_cache(metadata)
         validate_video_metadata(metadata)
@@ -1023,14 +1031,11 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
                 raise UserVisibleError("❌ این ویدیو فایل صوتی قابل دانلود نداره.")
 
             mode_label = "کم‌حجم" if audio_mode == "low" else "HQ"
-            edit_status(
-                token,
-                chat_id,
-                status_message_id,
-                f"⬇️ دارم صدای ویدیو رو با حالت {mode_label} دانلود می‌کنم…",
-            )
+            phase = "download"
+            status(f"⬇️ دارم صدای ویدیو رو با حالت {mode_label} دانلود می‌کنم…")
             audio_path = download_audio(url, workdir, audio_mode)
-            edit_status(token, chat_id, status_message_id, "📤 فایل صوتی آماده شد؛ دارم می‌فرستم…")
+            phase = "upload"
+            status("📤 فایل صوتی آماده شد؛ دارم می‌فرستم…")
             sent = send_audio_file(
                 token,
                 chat_id,
@@ -1046,10 +1051,12 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
         if quality not in available_qualities(metadata):
             raise UserVisibleError(f"❌ کیفیت {quality}p برای این ویدیو موجود نیست. دوباره لینک رو بفرست.")
 
-        edit_status(token, chat_id, status_message_id, f"⬇️ دارم ویدیو رو با کیفیت {quality}p دانلود می‌کنم…")
+        phase = "download"
+        status(f"⬇️ دارم ویدیو رو با کیفیت {quality}p دانلود می‌کنم…")
         video_path = download_video(url, workdir, quality, metadata)
         validate_file_size(video_path)
-        edit_status(token, chat_id, status_message_id, "📤 ویدیو کامل آماده شد؛ دارم می‌فرستم…")
+        phase = "upload"
+        status("📤 ویدیو کامل آماده شد؛ دارم می‌فرستم…")
         sent = send_media_file(
             token, chat_id, request_message_id, video_path,
             f"{title}\n{quality}p", reply=True,
@@ -1067,17 +1074,14 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "message": str(exc)}
     except Exception as exc:
         JOB_DEADLINE.set(None)
-        print(f"youtube job failed: {type(exc).__name__}", flush=True)
-        try:
-            edit_status(
-                token,
-                chat_id,
-                status_message_id,
-                "❌ یه خطای موقت پیش اومد. دوباره لینک رو بفرست.",
-            )
-        except Exception:
-            pass
-        return {"ok": False, "message": "unexpected error"}
+        diagnostic = upload_error_diagnostic(exc, token)
+        print(json.dumps({"message": "youtube job failed", "jobId": payload.get("id"),
+                          "phase": phase, **diagnostic}, ensure_ascii=False), flush=True)
+        message = ("❌ ارسال فایل در تلگرام تأیید نشد؛ اگر فایلی دریافت کرده‌ای، پیش از درخواست دوباره بررسی کن."
+                   if phase in {"upload", "cache"} else "❌ دریافت اطلاعات ویدیو کامل نشد؛ دوباره امتحان کن."
+                   if phase == "metadata" else "❌ دریافت فایل از منبع کامل نشد؛ دوباره امتحان کن.")
+        status(message)
+        return {"ok": False, "message": message, "phase": phase, **diagnostic}
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
         JOB_DEADLINE.reset(deadline_token)

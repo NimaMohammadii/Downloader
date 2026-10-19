@@ -117,6 +117,7 @@ type ContainerResult = {
   audioMode?: YoutubeAudioMode;
   errorCode?: string;
   diagnostic?: string;
+  phase?: string;
 };
 
 type YoutubeFileSize = { bytes: number; estimated: boolean };
@@ -550,6 +551,9 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           return true;
         });
       } else {
+        console.error("youtube download rejected", { jobId: job.id, phase: result.phase || "transfer",
+          code: result.errorCode || "SOURCE_REJECTED",
+          detail: redactDiagnostic(result.diagnostic || result.message || "download failed", this.env) });
         await step.do("track youtube rejection", () => trackJob(this.env, job, "failed", { title: result.title, detail: result.message || "دریافت یا ارسال فایل ناموفق بود." }));
       }
     } catch (error) {

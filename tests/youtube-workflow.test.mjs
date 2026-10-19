@@ -270,7 +270,7 @@ test('text and caption Pornhub links queue a deterministic direct-download job',
   assert.equal(jobs[0].params.quality, undefined);
 });
 
-async function run({ inspect = false, startupError, httpError, sizes, credentials = true, pornhub = false, pool = poolBinding() } = {}) {
+async function run({ inspect = false, startupError, httpError, result, sizes, credentials = true, pornhub = false, pool = poolBinding() } = {}) {
   const messages = [];
   const calls = [];
   const steps = [];
@@ -288,6 +288,7 @@ async function run({ inspect = false, startupError, httpError, sizes, credential
     async fetch(request) {
       calls.push([new URL(request.url).pathname]);
       if (httpError) return new Response(httpError.body, { status: httpError.status });
+      if (result) return Response.json(result);
       return Response.json(inspect ? { ok: true, videoId: 'dQw4w9WgXcQ', qualities: [360, 480, 720, 1080], audioAvailable: true, sizes } : { ok: true });
     },
   };
@@ -387,4 +388,18 @@ test('download history associates quality inspection and final delivery with one
   await run({ httpError: { status: 502, body: 'uncertain' } });
   assert.equal(globalThis.downloadHistory.at(-1).status, 'failed');
   assert.ok(!globalThis.downloadHistory.some(item => item.status === 'success'));
+});
+
+test('a rejected YouTube job reports the exact stage and safe cause without replaying the download',async()=>{
+  const logs=[],previous=console.error;
+  try{
+    console.error=(message,detail)=>logs.push({message,detail});
+    const result=await run({result:{ok:false,phase:'upload',errorCode:'TimeoutError',
+      diagnostic:'delivery unknown secret-token secret-hash https://signed.example/file?token=private',message:'ارسال تأیید نشد'}});
+    const failure=logs.find(x=>x.message==='youtube download rejected');
+    assert.equal(failure.detail.phase,'upload');assert.equal(failure.detail.code,'TimeoutError');
+    for(const secret of ['secret-token','secret-hash','signed.example','token=private'])assert.ok(!JSON.stringify(failure).includes(secret));
+    assert.equal(result.calls.filter(x=>x[0]==='/download').length,1);assert.equal(result.delivered,0);
+    assert.equal(globalThis.downloadHistory.at(-1).status,'failed');
+  }finally{console.error=previous;}
 });

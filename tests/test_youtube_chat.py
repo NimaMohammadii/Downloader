@@ -263,5 +263,45 @@ class ChatTests(unittest.TestCase):
             fetch.assert_not_called()
 
 
+class YouTubeJobTests(unittest.TestCase):
+    def run_job(self, mode='video', status_error=None, download_error=None, send_error=None):
+        from contextlib import ExitStack
+        self.addCleanup(app.JOB_DEADLINE.set,None)
+        body={'id':'yt-test-42','botToken':'bot-secret','url':'https://youtube.com/watch?v=abcdefghijk',
+              'chatId':42,'requestMessageId':7,'statusMessageId':8,
+              **({'quality':360} if mode=='video' else {'audioMode':'hq'})}
+        metadata={'id':'abcdefghijk','title':'Fixture','duration':1}
+        def prepare(url,directory,*args):
+            if download_error:raise download_error
+            path=directory/('Video.mp4' if mode=='video' else 'Audio.m4a');path.write_bytes(b'complete file');return path
+        with ExitStack() as stack:
+            for name,value in [('reuse_cached_file',False),('load_metadata_cache',metadata),('available_qualities',[360]),('audio_formats',[{}])]:
+                stack.enter_context(patch.object(app,name,return_value=value))
+            self.download=stack.enter_context(patch.object(app,'download_video' if mode=='video' else 'download_audio',side_effect=prepare))
+            self.send=stack.enter_context(patch.object(app,'send_media_file' if mode=='video' else 'send_audio_file',
+                                                     side_effect=send_error,return_value={'message_id':10}))
+            self.status=stack.enter_context(patch.object(app,'edit_status',side_effect=status_error))
+            stack.enter_context(patch.object(app,'store_uploaded_file'))
+            stack.enter_context(patch.object(app,'delete_status'))
+            stack.enter_context(patch('builtins.print'))
+            return app.process_job(body)
+
+    def test_failed_optional_status_edit_does_not_abort_video_or_audio_delivery(self):
+        for mode in ['video','audio']:
+            for reason in ['Bad Request: message to edit not found','Bad Request: message is not modified','Too Many Requests: retry after 30']:
+                with self.subTest(mode=mode,reason=reason):
+                    result=self.run_job(mode,status_error=RuntimeError(reason))
+                    self.assertTrue(result['ok']);self.download.assert_called_once();self.send.assert_called_once()
+
+    def test_download_and_upload_failures_have_distinct_phases_and_never_replay_delivery(self):
+        result=self.run_job(download_error=RuntimeError('decoder failed bot-secret https://signed.example/private?token=secret'))
+        self.assertFalse(result['ok']);self.assertEqual(result['phase'],'download');self.send.assert_not_called()
+        self.assertNotIn('bot-secret',str(result));self.assertNotIn('signed.example',str(result))
+        self.assertIn('دریافت',result['message']);self.assertNotIn('یه خطای موقت',result['message'])
+        result=self.run_job(send_error=TimeoutError('delivery unknown'))
+        self.assertEqual(result['phase'],'upload');self.send.assert_called_once();self.download.assert_called_once()
+        self.assertIn('تأیید',result['message'])
+
+
 if __name__ == '__main__':
     unittest.main()
