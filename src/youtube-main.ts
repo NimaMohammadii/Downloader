@@ -741,9 +741,27 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         return;
       }
       phase = "upload";
-      const result = await step.do("send complete instagram recording", { retries: { limit: 0, delay: "1 second" }, timeout: "30 minutes" }, () =>
-        pooledContainer(this.env, job).instagramRequest("send", { id: job.id }),
-      );
+      let result: ContainerResult;
+      let telegramWait = 0;
+      while (true) {
+        const suffix = telegramWait ? ` after telegram wait ${telegramWait}` : "";
+        result = await step.do(`send complete instagram recording${suffix}`, { retries: { limit: 0, delay: "1 second" }, timeout: "30 minutes" }, () =>
+          pooledContainer(this.env, job).instagramRequest("send", { id: job.id }),
+        );
+        if (result.ok || !result.retrySafe || result.phase !== "upload" || result.rpcCode !== 420
+            || !["FLOOD_WAIT", "SLOWMODE_WAIT"].includes(result.errorCode || "")
+            || !Number.isSafeInteger(result.retryAfterSeconds) || result.retryAfterSeconds! < 0) break;
+        telegramWait++;
+        console.info("instagram delivery waiting for telegram", { jobId: job.id, rpcMethod: result.rpcMethod,
+          retryAfterSeconds: result.retryAfterSeconds });
+        await step.do(`track instagram telegram wait ${telegramWait}`, () =>
+          trackJob(this.env, job, "processing", { detail: result.message }));
+        // Unlike YouTube, the prepared Instagram file lives in this assigned Container.
+        // Keep its lease and job while the Workflow sleeps; never replay an ambiguous send.
+        phase = "telegram_wait";
+        await step.sleep(`wait for instagram telegram ${telegramWait}`, `${Math.max(1, result.retryAfterSeconds!)} seconds`);
+        phase = "upload";
+      }
       if (result.ok) {
         const searchOnly = job.instagram?.kind === "music" && !job.instagram.musicVideoId;
         await step.do("track media result", () => trackJob(this.env, job, searchOnly ? "results" : result.partial ? "partial" : "success", {

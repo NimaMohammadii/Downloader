@@ -746,3 +746,88 @@ test('partly delivered playlist is retained as partial history with its requeste
   assert.match(globalThis.downloadHistory.at(-1).request,/1-3/);
   assert.equal(globalThis.delivered,2);
 });
+
+async function runInstagramFloodCase(results, checkpoints = new Map(), onSleep = async () => {}) {
+  const calls = [], waits = [];
+  globalThis.delivered = 0; globalThis.containerIds = []; globalThis.downloadHistory = [];
+  globalThis.container = {
+    async startShared() { calls.push('start container'); },
+    async instagramRequest(action) {
+      calls.push(action);
+      if (action === 'send') return results.shift();
+      return { ok: true };
+    },
+    async releaseInstagram() { calls.push('release instagram'); },
+  };
+  const localEnv = { ...env, DOWNLOAD_POOL: { getByName() { return {
+    async acquire() { calls.push('reserve capacity'); return { instance: 0, token: 'test-lease' }; },
+    async release() { calls.push('release capacity'); },
+  }; } } };
+  globalThis.fetch = async (url, init) => String(url).includes('api.telegram.org')
+    ? Response.json({ ok: true, result: { message_id: 10 } })
+    : Response.json({ broadcast_status: 'active', dash_playback_url: liveUrl });
+  const step = {
+    async do(name, config, callback) {
+      if (typeof config === 'function') callback = config;
+      if (checkpoints.has(name)) return structuredClone(checkpoints.get(name));
+      const value = await callback();
+      checkpoints.set(name, structuredClone(value));
+      return value;
+    },
+    async waitForEvent() { return { payload: { ok: true } }; },
+    async sleep(name, duration) {
+      if (checkpoints.has(name)) return;
+      waits.push(duration);
+      await onSleep(name, duration, calls);
+      checkpoints.set(name, true);
+    },
+  };
+  await new mod.YoutubeDownloadWorkflow({}, localEnv).run({ payload: { ...job } }, step);
+  return { calls, waits, delivered: globalThis.delivered };
+}
+
+test('Instagram confirmed FLOOD_WAIT resumes the same prepared recording after durable waits', async () => {
+  const wait = seconds => ({ ok: false, retrySafe: true, phase: 'upload', errorCode: 'FLOOD_WAIT',
+    rpcCode: 420, retryAfterSeconds: seconds, message: 'Telegram delivery deferred' });
+  const checkpoints = new Map();
+  const first = await runInstagramFloodCase([wait(231), wait(1158), { ok: true, parts: 1 }],
+    checkpoints, async (_name, _duration, calls) => {
+      assert.equal(calls.filter(x => x === 'reserve capacity').length, 1);
+      assert.ok(!calls.includes('cleanup'));
+      assert.ok(!calls.includes('release capacity'), 'prepared recording must remain on its original host');
+    });
+  assert.deepEqual(first.waits, ['231 seconds', '1158 seconds']);
+  assert.equal(first.calls.filter(x => x === 'send').length, 3);
+  assert.equal(first.calls.filter(x => x === 'start').length, 1);
+  assert.equal(first.calls.filter(x => x === 'cleanup').length, 1);
+  assert.equal(first.calls.filter(x => x === 'release capacity').length, 1);
+  assert.ok(globalThis.containerIds.every(id => id === 'download-pool-v1-0'));
+  assert.equal(first.delivered, 1);
+  assert.equal(globalThis.downloadHistory.at(-1).status, 'success');
+  assert.ok(!globalThis.downloadHistory.some(record => record.status === 'failed'));
+
+  const replay = await runInstagramFloodCase([], checkpoints);
+  assert.equal(replay.calls.length, 0, 'Workflow replay must not repeat a send');
+  assert.equal(replay.delivered, 0, 'delivery accounting must also be checkpointed');
+});
+
+test('Instagram rejects ambiguous and unconfirmed floods without any automatic re-upload', async () => {
+  const previous = console.error;
+  try {
+    console.error = () => {};
+    for (const changed of [{ retrySafe: false }, { phase: 'download' }, { rpcCode: 500 },
+      { errorCode: 'TimeoutError' }, { retryAfterSeconds: -1 }, { retryAfterSeconds: 1.5 },
+      { retryAfterSeconds: undefined }]) {
+      const result = await runInstagramFloodCase([{ ok: false, retrySafe: true, phase: 'upload',
+        errorCode: 'FLOOD_WAIT', rpcCode: 420, retryAfterSeconds: 231, ...changed }], new Map(),
+      async () => { throw Error('Unexpected unsafe Instagram upload replay'); });
+      assert.equal(result.calls.filter(x => x === 'send').length, 1);
+      assert.equal(result.waits.length, 0);
+      assert.equal(result.delivered, 0);
+      assert.equal(globalThis.downloadHistory.at(-1).status, 'failed');
+      assert.ok(result.calls.includes('cleanup'));
+    }
+  } finally {
+    console.error = previous;
+  }
+});

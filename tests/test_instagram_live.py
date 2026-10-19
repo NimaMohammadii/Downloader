@@ -96,6 +96,72 @@ class LifecycleTests(unittest.TestCase):
             job.cleanup()
 
 
+    def test_confirmed_telegram_flood_reuses_prepared_file_and_never_duplicates_delivery(self):
+        class Flood(Exception):
+            code = 420
+            seconds = 231
+
+        job = app.InstagramCapture(payload('replay'))
+        job.path.write_bytes(b'prepared recording fixture')
+        job.state = 'ready'
+        calls = []
+
+        async def upload(token, method, data, file):
+            calls.append(file[1].read())
+            if len(calls) == 1:
+                raise Flood('wait 231 seconds')
+            return {'message_id': 42, 'file_id': 'cached-id'}
+
+        try:
+            with patch.object(app, 'upload_complete_file', side_effect=upload), \
+                 patch.object(job, 'safe_status'), patch.object(app, 'store_uploaded_file'), \
+                 patch.object(app, 'delete_status'):
+                rejected = job.send()
+                self.assertFalse(rejected['ok'])
+                self.assertTrue(rejected['retrySafe'])
+                self.assertEqual(rejected['phase'], 'upload')
+                self.assertEqual(rejected['errorCode'], 'FLOOD_WAIT')
+                self.assertEqual(rejected['retryAfterSeconds'], 231)
+                self.assertEqual(job.state, 'ready')
+                self.assertTrue(job.path.exists())
+                self.assertTrue(job.send()['ok'])
+                self.assertTrue(job.send()['ok'])
+            self.assertEqual(calls, [b'prepared recording fixture'] * 2)
+            self.assertEqual(job.state, 'sent')
+        finally:
+            job.cleanup()
+
+    def test_ambiguous_upload_and_post_delivery_flood_are_never_replayed(self):
+        class Flood(Exception):
+            code = 420
+            seconds = 231
+
+        for fail_after_delivery in (False, True):
+            job = app.InstagramCapture(payload('replay'))
+            job.path.write_bytes(b'prepared recording fixture')
+            job.state = 'ready'
+            calls = []
+
+            async def upload(token, method, data, file):
+                calls.append(method)
+                if not fail_after_delivery:
+                    raise TimeoutError('ambiguous telegram send')
+                return {'message_id': 42, 'file_id': 'cached-id'}
+
+            try:
+                with patch.object(app, 'upload_complete_file', side_effect=upload), \
+                     patch.object(job, 'safe_status'), patch.object(app, 'delete_status'), \
+                     patch.object(app, 'store_uploaded_file', side_effect=Flood('post delivery')) if fail_after_delivery else patch.object(app, 'store_uploaded_file'):
+                    failed = job.send()
+                    self.assertFalse(failed['ok'])
+                    self.assertNotIn('retrySafe', failed)
+                    self.assertEqual(job.state, 'failed')
+                    self.assertFalse(job.send()['ok'])
+                    self.assertEqual(calls, ['sendVideo'])
+            finally:
+                job.cleanup()
+
+
 @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'FFmpeg required')
 class FFmpegTests(unittest.TestCase):
     @classmethod

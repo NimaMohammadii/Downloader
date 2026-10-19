@@ -1858,6 +1858,7 @@ class InstagramCapture:
                 delete_status(self.payload["botToken"], self.payload["chatId"], self.payload["statusMessageId"])
                 return {"ok": True}
             self.state = "sending"
+        uploading = False
         try:
             if self.source.get("musicSearch"):
                 expiry = int(time.time()) + 86400
@@ -1897,7 +1898,9 @@ class InstagramCapture:
             with self.path.open("rb") as handle:
                 method = "sendAudio" if self.audio_only else "sendVideo"
                 mime = "audio/mpeg" if self.path.suffix == ".mp3" else "audio/mp4" if self.audio_only else "video/mp4"
+                uploading = True
                 sent = asyncio.run(asyncio.wait_for(upload_complete_file(self.payload["botToken"], method, data, (self.path.name, handle, mime)), timeout=25 * 60))
+                uploading = False
             store_uploaded_file(self.payload, [self.payload.get("mediaCacheKey"), self.source.get("musicFileKey"),
                 music_query_key(self.source["musicQuery"]) if self.source.get("musicQuery") else None], method, data, sent)
             with self.lock:
@@ -1906,6 +1909,18 @@ class InstagramCapture:
             return {"ok": True, "title": self.source.get("recognizedTitle") or self.source.get("title")}
         except Exception as exc:
             diagnostic = upload_error_diagnostic(exc, self.payload["botToken"])
+            retry_safe = (uploading and diagnostic.get("rpcCode") == 420
+                          and diagnostic.get("errorCode") in {"FLOOD_WAIT", "SLOWMODE_WAIT"}
+                          and type(diagnostic.get("retryAfterSeconds")) is int
+                          and not self.cleanup_requested and self.path.is_file())
+            if retry_safe:
+                # The upload was definitively rejected, not ambiguously delivered.
+                # Keep the prepared file and job for the same Workflow to resume.
+                with self.lock:
+                    self.state = "ready"
+                message = "⏳ تلگرام موقتاً ارسال را متوقف کرده؛ فایل آماده محفوظ است و ارسال خودکار ادامه پیدا می‌کند. نیازی به درخواست دوباره نیست."
+                self.safe_status(message)
+                return {"ok": False, "phase": "upload", "retrySafe": True, "message": message, **diagnostic}
             print(json.dumps({"message": "instagram upload failed", "jobId": self.id, **diagnostic}, ensure_ascii=False), flush=True)
             with self.lock:
                 self.state = "failed"
