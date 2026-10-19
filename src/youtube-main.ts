@@ -198,10 +198,13 @@ function pooledContainer(env: Env, job: Pick<YoutubeDownloadJob, "containerIndex
 
 export class YoutubeDownloaderContainer extends Container<Env> {
   defaultPort = 8080;
-  sleepAfter: string | number = "10s";
+  sleepAfter: string | number = "5m";
   enableInternet = true;
   envVars = { API_ID: this.env.API_ID || "", API_HASH: this.env.API_HASH || "" };
   private starting?: Promise<void>;
+  private idleShutdownRequested = false;
+
+  override onStart(): void { this.idleShutdownRequested = false; }
 
   async startShared(): Promise<void> {
     if (!this.starting) {
@@ -237,7 +240,7 @@ export class YoutubeDownloaderContainer extends Container<Env> {
       delete jobs[id];
       await storage.put("instagramJobs", jobs);
     });
-    this.sleepAfter = "10s";
+    this.sleepAfter = "5m";
     this.renewActivityTimeout();
   }
 
@@ -253,7 +256,13 @@ export class YoutubeDownloaderContainer extends Container<Env> {
     // default stop() only signals it and can leave idle instances occupying
     // capacity. The SDK excludes in-flight HTTP requests before this hook;
     // the lease above separately protects background capture/preparation.
-    await this.destroy();
+    this.idleShutdownRequested = true;
+    try {
+      await this.destroy();
+    } catch (error) {
+      this.idleShutdownRequested = false;
+      throw error;
+    }
   }
 
   private async instagramInterrupted(): Promise<boolean> {
@@ -268,7 +277,15 @@ export class YoutubeDownloaderContainer extends Container<Env> {
 
   override async onStop(): Promise<void> { await this.instagramInterrupted(); }
   override async onError(error: unknown): Promise<void> {
-    if (!await this.instagramInterrupted()) super.onError(error);
+    const idleShutdownRequested = this.idleShutdownRequested;
+    this.idleShutdownRequested = false;
+    if (await this.instagramInterrupted()) return;
+    const message = error instanceof Error ? error.message : String(error);
+    if (idleShutdownRequested && message === "The RPC call destroy() was called") {
+      console.info("container stopped after idle timeout", { sleepAfter: this.sleepAfter });
+      return;
+    }
+    super.onError(error);
   }
 }
 

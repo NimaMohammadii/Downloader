@@ -70,10 +70,14 @@ class IdleExitTests(unittest.TestCase):
 
 
 class ServerExitTests(unittest.TestCase):
-    def start_server(self, extra="", *, accelerated=True):
+    def start_server(self, extra=""):
         script = "import youtube_app as app\nimport time, threading\napp.PORT = 0\n"
-        if accelerated:
-            script += "OriginalIdleExit = app.IdleExit\napp.IdleExit = lambda seconds, busy: OriginalIdleExit(0.35, busy)\n"
+        script += '''OriginalIdleExit = app.IdleExit
+def configured_idle(seconds, busy):
+    assert seconds == 300, f"Unexpected production idle timeout: {seconds}"
+    return OriginalIdleExit(0.35, busy)
+app.IdleExit = configured_idle
+'''
         script += extra + "\napp.serve()\n"
         child = subprocess.Popen([sys.executable, "-u", "-c", script],
             env={**os.environ, "PYTHONPATH": str(Path(app.__file__).parent)},
@@ -90,12 +94,12 @@ class ServerExitTests(unittest.TestCase):
             child.kill()
         child.communicate(timeout=3)
 
-    def test_real_server_exits_after_ten_seconds_without_sdk_activity(self):
-        child, _ = self.start_server(accelerated=False)
+    def test_real_server_uses_five_minute_idle_setting_with_accelerated_timer(self):
+        child, _ = self.start_server()
         started = time.monotonic()
-        child.communicate(timeout=13)
+        child.communicate(timeout=3)
         self.assertEqual(child.returncode, 0)
-        self.assertGreaterEqual(time.monotonic() - started, 9)
+        self.assertGreaterEqual(time.monotonic() - started, 0.25)
 
     def test_real_slow_http_request_outlives_idle_timeout(self):
         child, port = self.start_server('''original_get = app.Handler.handle_get

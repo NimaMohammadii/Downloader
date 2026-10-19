@@ -1945,7 +1945,7 @@ def serve() -> None:
         with INSTAGRAM_LOCK:
             return any(not job.cleanup_requested and job.state not in {"sent", "failed"}
                        for job in INSTAGRAM_JOBS.values())
-    SERVER_IDLE = IdleExit(10, pending_media)
+    SERVER_IDLE = IdleExit(300, pending_media)
     SERVER_IDLE.refresh()
     print(f"youtube downloader listening on :{server.server_port} (pool-five-v1)", flush=True)
     server.serve_forever()

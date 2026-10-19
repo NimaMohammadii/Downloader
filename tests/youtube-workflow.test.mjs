@@ -16,6 +16,7 @@ const { outputFiles } = await build({
           renewActivityTimeout() { this.renewed = (this.renewed || 0) + 1; }
           async onActivityExpired() { this.stopped = true; }
           async destroy() { this.stopped = true; this.destroyed = true; }
+          onError(error) { throw error; }
         }
         export const getContainer = () => globalThis.container;
       ` };
@@ -174,7 +175,7 @@ test('real SDK signals cannot retain an idle instance whose PID 1 ignores SIGTER
 
 test('real SDK does not expire an active HTTP transfer', () => {
   const sdk = Object.create(SDKContainer.prototype);
-  sdk.sleepAfter = '10s';
+  sdk.sleepAfter = '5m';
   sdk.sleepAfterMs = 0;
   sdk.inflightRequests = 1;
   assert.equal(sdk.isActivityExpired(), false);
@@ -184,10 +185,10 @@ test('real SDK does not expire an active HTTP transfer', () => {
   assert.equal(sdk.isActivityExpired(), true);
 });
 
-test('idle containers stop after ten seconds and completed background jobs restore that timeout', async () => {
+test('idle containers stop after five minutes and completed background jobs restore that timeout', async () => {
   const ctx = { storage: memoryStorage() };
   const container = new YoutubeDownloaderContainer(ctx, {});
-  assert.equal(container.sleepAfter, '10s');
+  assert.equal(container.sleepAfter, '5m');
   container.containerFetch = async () => {
     assert.ok((await ctx.storage.get('instagramJobs'))['active-job'] > Date.now());
     return Response.json({ ok: true });
@@ -199,7 +200,7 @@ test('idle containers stop after ten seconds and completed background jobs resto
   assert.ok(container.sleepAfter > 0);
   await container.releaseInstagram('active-job');
   assert.deepEqual(await ctx.storage.get('instagramJobs'), {});
-  assert.equal(container.sleepAfter, '10s');
+  assert.equal(container.sleepAfter, '5m');
   assert.equal(container.renewed, 2);
   await container.onActivityExpired();
   assert.equal(container.stopped, true);
@@ -213,6 +214,41 @@ test('an expired background lease no longer prevents idle shutdown', async () =>
   await container.onActivityExpired();
   assert.equal(container.stopped, true);
   assert.equal(container.destroyed, true);
+});
+
+test('real SDK monitor treats our idle destroy notification as an expected stop', async () => {
+  const logs=[],previous=console.info;
+  try {
+    console.info=(...args)=>logs.push(args);
+    const container=new YoutubeDownloaderContainer({
+      storage:memoryStorage(),async blockConcurrencyWhile(fn){return fn();},
+    },{});
+    let rejectMonitor;
+    container.monitor=new Promise((_resolve,reject)=>{rejectMonitor=reject;});
+    let stopped=0;
+    container.state={async setStopped(){stopped++;}};
+    container.destroy=async()=>rejectMonitor(new Error('The RPC call destroy() was called'));
+    SDKContainer.prototype.setupMonitorCallbacks.call(container);
+    await container.onActivityExpired();
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(stopped,1);assert.equal(container.monitor,undefined);
+    assert.ok(logs.some(([message])=>message==='container stopped after idle timeout'));
+  } finally {console.info=previous;}
+});
+
+test('unexpected destroy, crashes and failed shutdowns are never hidden as idle stops', async () => {
+  const container=new YoutubeDownloaderContainer({storage:memoryStorage()},{});
+  const destroyError=new Error('The RPC call destroy() was called');
+  await assert.rejects(container.onError(destroyError),error=>error===destroyError);
+  await container.onActivityExpired();
+  const crash=new Error('container crashed with exit code 137');
+  await assert.rejects(container.onError(crash),error=>error===crash);
+  await container.onActivityExpired();
+  container.onStart();
+  await assert.rejects(container.onError(destroyError),error=>error===destroyError);
+  container.destroy=async()=>{throw new Error('destroy failed');};
+  await assert.rejects(container.onActivityExpired(),/destroy failed/);
+  await assert.rejects(container.onError(destroyError),error=>error===destroyError);
 });
 
 test('cleanup of a stopped container does not allocate a new instance', async () => {
