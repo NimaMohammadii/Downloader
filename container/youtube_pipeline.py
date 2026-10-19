@@ -1305,10 +1305,4 @@ def install() -> None:
 
 if __name__ == "__main__":
     install()
-    server = app.ThreadingHTTPServer(("0.0.0.0", app.PORT), app.Handler)
-    print(
-        f"youtube downloader listening on :{app.PORT} "
-        "(fresh single-client extraction/download pipeline)",
-        flush=True,
-    )
-    server.serve_forever()
+    app.serve()

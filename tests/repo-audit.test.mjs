@@ -14,6 +14,14 @@ const result=await build({entryPoints:['src/app-main.ts'],bundle:true,format:'es
 const {default:worker}=await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString('base64')}`);
 const secret='fictional-private-webhook-secret-32';
 const legacy='dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1';
+
+test('health identifies the deployed download fix without starting a container',async()=>{
+  const response=await worker.fetch(new Request('https://worker/health'),{BOT_TOKEN:'fictional'},{});
+  assert.equal(response.status,200);
+  const body=await response.json();
+  assert.equal(body.downloadFixVersion,'idle-exit-v2');
+  assert.equal(body.botConfigured,true);
+});
 const request=(text,value)=>new Request('https://worker/telegram/webhook',{method:'POST',
   headers:{'x-telegram-bot-api-secret-token':value,'content-type':'application/json'},
   body:JSON.stringify({update_id:1,message:{message_id:7,from:{id:42},chat:{id:42},text}})});

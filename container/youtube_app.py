@@ -15,6 +15,7 @@ import wave
 import unicodedata
 from array import array
 from contextvars import ContextVar
+from contextlib import contextmanager
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +25,65 @@ from urllib.parse import parse_qs, urlparse, urljoin
 import requests
 
 JOB_LOCK = threading.Lock()
+
+
+class IdleExit:
+    """One-shot inactivity timer independent of the Container SDK's counters."""
+
+    def __init__(self, seconds: float, busy, exit_process=os._exit) -> None:
+        self.seconds, self.busy, self.exit_process = seconds, busy, exit_process
+        self.lock = threading.RLock()
+        self.active = 0
+        self.generation = 0
+        self.timer = None
+
+    def begin(self) -> None:
+        with self.lock:
+            self.active += 1
+            self._cancel()
+
+    def end(self) -> None:
+        with self.lock:
+            self.active -= 1
+            if self.active == 0:
+                self.refresh()
+
+    def _cancel(self) -> None:
+        self.generation += 1
+        if self.timer is not None:
+            self.timer.cancel()
+            self.timer = None
+
+    def refresh(self) -> None:
+        with self.lock:
+            self._cancel()
+            if self.active:
+                return
+            self.timer = threading.Timer(self.seconds, self._expire, args=(self.generation,))
+            self.timer.daemon = True
+            self.timer.start()
+
+    def _expire(self, generation: int) -> None:
+        with self.lock:
+            if generation != self.generation or self.active or self.busy():
+                return
+            print("youtube downloader idle: exiting to release container capacity", flush=True)
+            self.exit_process(0)
+
+
+SERVER_IDLE: IdleExit | None = None
+
+
+@contextmanager
+def server_activity():
+    guard = SERVER_IDLE
+    if guard is not None:
+        guard.begin()
+    try:
+        yield
+    finally:
+        if guard is not None:
+            guard.end()
 
 PORT = int(os.environ.get("PORT", "8080"))
 DIRECT_TELEGRAM_LIMIT = 2_000_000_000
@@ -1078,7 +1138,7 @@ class InstagramCapture:
         self.cached = False
         self.state = "starting"
         self.result: dict[str, Any] = {"ok": False}
-        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread = threading.Thread(target=self.run_active, daemon=True)
         self.expiry = threading.Timer(3 * 60 * 60, self.cleanup)
         self.expiry.daemon = True
 
@@ -1127,6 +1187,10 @@ class InstagramCapture:
             if attempt < 2:
                 self.stop_event.wait(2 ** (attempt + 1))
         self.safe_status("❌ اعلام نتیجهٔ پلی‌لیست به ربات کامل نشد؛ پیش از درخواست دوباره، فایل‌های ارسال‌شده را بررسی کن." if self.source.get("playlist") else "❌ فایل دریافت شد ولی اعلام نتیجه به ربات کامل نشد؛ لینک را دوباره بفرست.")
+
+    def run_active(self) -> None:
+        with server_activity():
+            self.run()
 
     def run(self) -> None:
         watchdog = wall_timer = None
@@ -1481,6 +1545,8 @@ class InstagramCapture:
         if not self.thread.is_alive():
             shutil.rmtree(self.workdir, ignore_errors=True)
         self.expiry.cancel()
+        if SERVER_IDLE is not None:
+            SERVER_IDLE.refresh()
 
 
 def instagram_action(action: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1524,12 +1590,20 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
+        with server_activity():
+            self.handle_get()
+
+    def handle_get(self) -> None:
         if self.path in {"/", "/health", "/ping"}:
             self._send_json(200, {"ok": True, "service": "youtube-yt-dlp-container"})
             return
         self._send_json(404, {"ok": False, "error": "not found"})
 
     def do_POST(self) -> None:
+        with server_activity():
+            self.handle_post()
+
+    def handle_post(self) -> None:
         if self.path not in {"/metadata", "/download", "/instagram/start", "/instagram/stop", "/instagram/send", "/instagram/cleanup"}:
             self._send_json(404, {"ok": False, "error": "not found"})
             return
@@ -1559,7 +1633,18 @@ class Handler(BaseHTTPRequestHandler):
         print(f"youtube-container: {fmt % args}", flush=True)
 
 
-if __name__ == "__main__":
+def serve() -> None:
+    global SERVER_IDLE
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"youtube downloader listening on :{PORT}", flush=True)
+    def pending_media() -> bool:
+        with INSTAGRAM_LOCK:
+            return any(not job.cleanup_requested and job.state not in {"sent", "failed"}
+                       for job in INSTAGRAM_JOBS.values())
+    SERVER_IDLE = IdleExit(10, pending_media)
+    SERVER_IDLE.refresh()
+    print(f"youtube downloader listening on :{server.server_port} (idle-exit-v2)", flush=True)
     server.serve_forever()
+
+
+if __name__ == "__main__":
+    serve()
