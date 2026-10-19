@@ -817,7 +817,7 @@ function parseSocialUrl(text: string): SocialInput | null {
         return { platform: "x", url: `https://x.com/i/status/${m[1]}${m[2] ? `/video/${m[2]}` : ""}`, ...audio };
       }
       if (/^(?:(?:www|[a-z]{2})\.)?pinterest\.(?:com|fr|de|ch|jp|cl|ca|it|co\.uk|nz|ru|com\.au|at|pt|co\.kr|es|com\.mx|dk|ph|th|com\.uy|co|nl|info|kr|ie|vn|com\.vn|ec|mx|in|pe|co\.at|hu|co\.in|co\.nz|id|com\.ec|com\.py|tw|be|uk|com\.bo|com\.pe)$/.test(host)
-          && (m = /^\/pin\/(?:[\w-]+--)?(\d{1,25})\/?$/.exec(path))) {
+          && (m = /^\/pin\/(?:[\w-]+--)?(\d{1,25})(?:\/sent)?\/?$/.exec(path))) {
         return { platform: "pinterest", url: `https://www.pinterest.com/pin/${m[1]}/`, ...audio };
       }
       if (["pin.it", "vm.tiktok.com", "vt.tiktok.com", "on.soundcloud.com"].includes(host) && /^\/[A-Za-z0-9_-]{3,128}\/?$/.test(path)) {

@@ -893,7 +893,7 @@ def social_url(value: str, platform: str) -> str:
         if m:
             return f"https://x.com/i/status/{m[1]}" + (f"/video/{m[2]}" if m[2] else "")
     if platform == "pinterest" and any(host in {f"pinterest.{d}", f"www.pinterest.{d}"} or re.fullmatch(r"[a-z]{2}\.pinterest\." + re.escape(d), host) for d in PINTEREST_DOMAINS):
-        m = re.fullmatch(r"/pin/(?:[\w-]+--)?(\d{1,25})/?", path)
+        m = re.fullmatch(r"/pin/(?:[\w-]+--)?(\d{1,25})(?:/sent)?/?", path)
         if m:
             return f"https://www.pinterest.com/pin/{m[1]}/"
     short_hosts = {"pinterest": {"pin.it"}, "tiktok": {"vm.tiktok.com", "vt.tiktok.com"}, "soundcloud": {"on.soundcloud.com"}}
@@ -923,19 +923,43 @@ def social_error(platform: str, detail: str) -> app.UserVisibleError:
     return app.UserVisibleError(f"❌ دریافت فایل {name} کامل نشد؛ لینک عمومی پست یا آهنگ را دوباره بفرست.")
 
 
+def pinterest_redirect_url(value: str) -> str:
+    """Allow Pinterest's exact shortener endpoint only within redirect resolution."""
+    p = urlparse(value)
+    if (p.scheme == "https" and p.hostname == "api.pinterest.com"
+            and not p.username and not p.password and not p.port
+            and re.fullmatch(r"/url_shortener/[A-Za-z0-9_-]{3,128}/redirect/?", p.path)):
+        return f"https://api.pinterest.com{p.path}"
+    result = social_url(value, "pinterest")
+    p = urlparse(result)
+    if p.hostname == "pin.it":
+        # Match the pinned gallery-dl PinterestPinitExtractor. The share website
+        # can return an app landing page instead of a usable HTTP redirect.
+        return f"https://api.pinterest.com/url_shortener/{p.path.strip('/')}/redirect/"
+    return result
+
+
 def resolve_social_url(value: str, platform: str) -> str:
     current = social_url(value, platform)
     p = urlparse(current)
     if p.hostname not in {"pin.it", "vm.tiktok.com", "vt.tiktok.com", "on.soundcloud.com"} and not p.path.startswith("/t/"):
         return current
+    if platform == "pinterest":
+        current = pinterest_redirect_url(current)
     try:
         for _ in range(6):
             # Validate every hop before requesting it; requests must not follow redirects.
-            with requests.get(current, stream=True, allow_redirects=False, timeout=(10, 15),
+            request = requests.head if platform == "pinterest" else requests.get
+            with request(current, stream=True, allow_redirects=False, timeout=(10, 15),
                               headers={"User-Agent": "Mozilla/5.0"}) as response:
                 if response.is_redirect:
-                    current = social_url(urljoin(current, response.headers.get("Location", "")), platform)
+                    destination = urljoin(current, response.headers.get("Location", ""))
+                    current = pinterest_redirect_url(destination) if platform == "pinterest" else social_url(destination, platform)
+                    if platform == "pinterest" and urlparse(current).hostname == "www.pinterest.com":
+                        return current  # Already an exact Pin; do not fetch the share/login HTML.
                 elif response.ok:
+                    if platform == "pinterest":
+                        raise app.UserVisibleError("❌ لینک کوتاه پینترست باز نشد؛ لینک کامل همان پست را بفرست.")
                     result = social_url(current, platform)
                     if urlparse(result).hostname in {"pin.it", "vm.tiktok.com", "vt.tiktok.com", "on.soundcloud.com"} or urlparse(result).path.startswith("/t/"):
                         raise app.UserVisibleError("❌ لینک کوتاه باز نشد؛ لینک کامل پست را بفرست.")

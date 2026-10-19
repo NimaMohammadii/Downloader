@@ -35,6 +35,19 @@ const env = { BOT_TOKEN: 'fictional-bot-token', API_ID: '123', API_HASH: 'fictio
   DOWNLOAD_POOL: {getByName(){return {async acquire(){return {instance:0,token:'test-lease'};},async release(){},async lookup(){return {instance:0};}};}} };
 const liveUrl = 'https://scontent.cdninstagram.com/live.mpd';
 const job = { id: 'igdl-42-7-42', chatId: 42, requestMessageId: 7, userId: 42, url: '', instagram: {kind:'live',broadcastId:'17900000000000001'} };
+
+test('Pinterest shared Pin links normalize before creating jobs while boards and internal API URLs stay rejected',()=>{
+  for(const url of ['https://www.pinterest.com/pin/266556871689003952/sent/?sender=42',
+                   'https://de.pinterest.com/pin/title--266556871689003952/sent/']) {
+    assert.deepEqual(mod.parseSocialUrl(url),{platform:'pinterest',url:'https://www.pinterest.com/pin/266556871689003952/'});
+    assert.deepEqual(mod.parseSocialUrl('/audio '+url),{platform:'pinterest',url:'https://www.pinterest.com/pin/266556871689003952/',audioOnly:true});
+  }
+  for(const url of ['https://pinterest.com/name/board/','https://pinterest.com/name/',
+                   'https://pinterest.com/pin/123/sent/extra/','https://pinterest.com.evil/pin/123/sent/',
+                   'https://api.pinterest.com/url_shortener/Example123/redirect/']) {
+    assert.equal(mod.parseSocialUrl(url),null);
+  }
+});
 function api(routes) {
   globalThis.fetch = async (url, init) => {
     const parsed = new URL(url);

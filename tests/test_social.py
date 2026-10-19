@@ -47,6 +47,7 @@ class SocialBoundaryTests(unittest.TestCase):
     def test_canonical_individual_urls_and_large_ids(self):
         cases=[('x','https://mobile.twitter.com/name/status/1234567890123456789/video/2?s=20','https://x.com/i/status/1234567890123456789/video/2'),
                ('pinterest','https://de.pinterest.com/pin/title--123456789/','https://www.pinterest.com/pin/123456789/'),
+               ('pinterest','https://www.pinterest.com/pin/266556871689003952/sent/?invite_code=example&sender=42','https://www.pinterest.com/pin/266556871689003952/'),
                ('tiktok','https://m.tiktok.com/@creator/photo/123?tracking=1','https://www.tiktok.com/@creator/photo/123'),
                ('soundcloud','https://m.soundcloud.com/artist/track?tracking=1','https://soundcloud.com/artist/track')]
         for platform,url,expected in cases:self.assertEqual(p.social_url(url,platform),expected)
@@ -65,9 +66,73 @@ class SocialBoundaryTests(unittest.TestCase):
             self.assertEqual(p.resolve_social_url('https://vm.tiktok.com/ABC123','tiktok'),'https://www.tiktok.com/@name/video/123')
             self.assertEqual(get.call_count,2)
             self.assertTrue(all(c.kwargs['allow_redirects'] is False for c in get.call_args_list))
-        with patch.object(p.requests,'get',return_value=response(location='https://127.0.0.1/private')) as get:
+        with patch.object(p.requests,'head',return_value=response(location='https://127.0.0.1/private')) as get:
             with self.assertRaises(app.UserVisibleError):p.resolve_social_url('https://pin.it/ABC123','pinterest')
             self.assertEqual(get.call_count,1)
+
+    def test_pinterest_shortener_uses_official_head_endpoint_and_canonicalizes_sent_pin(self):
+        destination='https://de.pinterest.com/pin/266556871689003952/sent/?invite_code=example&sender=42'
+        with patch.object(p.requests,'head',return_value=response(location=destination)) as head, \
+                patch.object(p.requests,'get',side_effect=AssertionError('no share-page GET')):
+            self.assertEqual(p.resolve_social_url('https://pin.it/Example123?tracking=1','pinterest'),
+                             'https://www.pinterest.com/pin/266556871689003952/')
+            self.assertEqual(head.call_count,1)
+            self.assertEqual(head.call_args.args[0],'https://api.pinterest.com/url_shortener/Example123/redirect/')
+            self.assertFalse(head.call_args.kwargs['allow_redirects'])
+
+    def test_pinterest_allows_only_exact_official_intermediate_redirect_paths(self):
+        endpoint='https://api.pinterest.com/url_shortener/Example456/redirect/'
+        destination='https://www.pinterest.com/pin/123/sent/?sender=example'
+        with patch.object(p.requests,'head',side_effect=[response(location=endpoint),response(location=destination)]) as head:
+            self.assertEqual(p.resolve_social_url('https://pin.it/Example123','pinterest'),'https://www.pinterest.com/pin/123/')
+            self.assertEqual([c.args[0] for c in head.call_args_list],
+                             ['https://api.pinterest.com/url_shortener/Example123/redirect/',endpoint])
+        for target in ['https://api.pinterest.com.evil/url_shortener/Example456/redirect/',
+                       'https://api.pinterest.com/other/path',
+                       'https://api.pinterest.com/url_shortener/../redirect/',
+                       'https://user:pass@api.pinterest.com/url_shortener/Example456/redirect/',
+                       'https://api.pinterest.com:443/url_shortener/Example456/redirect/',
+                       'http://api.pinterest.com/url_shortener/Example456/redirect/',
+                       'https://www.pinterest.com/name/board/',
+                       'https://www.pinterest.com/name/',
+                       'https://www.pinterest.com/pin/123/sent/extra/']:
+            with self.subTest(target=target), patch.object(p.requests,'head',return_value=response(location=target)) as head:
+                with self.assertRaises((app.UserVisibleError,ValueError)):
+                    p.resolve_social_url('https://pin.it/Example123','pinterest')
+                self.assertEqual(head.call_count,1,'invalid redirect must never be fetched')
+        with self.assertRaises(app.UserVisibleError):
+            p.social_url(endpoint,'pinterest')  # Internal API URLs are not public Pin inputs.
+
+    def test_pinterest_shortener_loop_missing_redirect_and_http_errors_are_bounded(self):
+        with patch.object(p.requests,'head',return_value=response(location='https://pin.it/Example123')) as head:
+            with self.assertRaisesRegex(app.UserVisibleError,'بیش از حد'):
+                p.resolve_social_url('https://pin.it/Example123','pinterest')
+            self.assertEqual(head.call_count,6)
+        for status, pattern in [(200,'لینک کوتاه'),(404,'دسترس'),(403,'نپذیرفت')]:
+            with self.subTest(status=status),patch.object(p.requests,'head',return_value=response(status=status)) as head:
+                with self.assertRaisesRegex(app.UserVisibleError,pattern):
+                    p.resolve_social_url('https://pin.it/Example123','pinterest')
+                self.assertEqual(head.call_count,1)
+
+    def test_shared_pinterest_photo_and_video_reach_existing_preparation_with_exact_pin(self):
+        canonical='https://www.pinterest.com/pin/266556871689003952/'
+        for image in (True,False):
+            entry={'id':'266556871689003952','url':'https://i.pinimg.com/fixture.jpg' if image else 'https://v.pinimg.com/fixture.mp4',
+                   'title':'Pin fixture','ext':'jpg' if image else 'mp4','image':image}
+            def prepare(item,platform,directory,budget,deadline,*,audio_only):
+                path=directory/'fixture';path.write_bytes(b'complete fixture')
+                return {'path':path,'method':'sendPhoto' if image else 'sendVideo','data':{},'title':'Pin fixture'}
+            with self.subTest(image=image),tempfile.TemporaryDirectory() as directory, \
+                    patch.object(p.requests,'head',return_value=response(location=canonical+'sent/?sender=42')), \
+                    patch.object(p,'social_gallery_entries',return_value=[entry]) as gallery, \
+                    patch.object(p,'social_prepare_entry',side_effect=prepare):
+                url,items=p.prepare_social_media({'platform':'pinterest','url':'https://pin.it/Example123'},Path(directory))
+                gallery.assert_called_once_with(canonical,'pinterest')
+                self.assertEqual(url,canonical)
+                self.assertEqual(items[0]['method'],'sendPhoto' if image else 'sendVideo')
+                self.assertEqual(items[0]['path'].read_bytes(),b'complete fixture')
+                self.assertIn(canonical,items[0]['caption'])
+                self.assertNotIn('sender=',items[0]['caption'])
 
     def test_cdn_redirect_to_another_service_never_fetched(self):
         with tempfile.TemporaryDirectory() as d,patch.object(p.requests,'get',return_value=response(location='https://evil.example/video')) as get:
