@@ -208,7 +208,7 @@ def telegram_text_motion(token: str, method: str, payload: dict[str, Any]) -> No
             with TEXT_MOTION_LOCK:
                 TEXT_MOTION_CHATS[key] = time.monotonic() + retry
         if response.ok and result.get("ok"):
-            time.sleep(min(0.18, job_timeout(0.18)))
+            time.sleep(min(0.4, job_timeout(0.4)))
     except Exception:
         pass  # Optional effect must never prevent the complete message.
 

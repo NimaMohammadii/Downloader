@@ -28,13 +28,13 @@ export async function telegramTextMotion(token: string, method: string, payload:
       const draft_id = crypto.getRandomValues(new Uint32Array(1))[0] % 2147483646 + 1;
       await post("sendMessageDraft", { chat_id: chat, message_thread_id: payload.message_thread_id, draft_id,
         text: payload.text, parse_mode: payload.parse_mode, entities: payload.entities });
-      await new Promise(resolve => setTimeout(resolve, 180));
+      await new Promise(resolve => setTimeout(resolve, 400));
     } else if (method === "editMessageText" && payload.message_id && !payload.parse_mode && !payload.entities) {
       // Existing messages have no native animation API. Use one short transition.
       const chars = Array.from(payload.text);
       const text = chars.slice(0, Math.max(12, Math.ceil(chars.length * 0.55))).join("") + "…";
       await post("editMessageText", { chat_id: chat, message_id: payload.message_id, text });
-      await new Promise(resolve => setTimeout(resolve, 180));
+      await new Promise(resolve => setTimeout(resolve, 400));
     }
   } catch { /* Motion is optional; the complete original send/edit must always run. */ }
 }
