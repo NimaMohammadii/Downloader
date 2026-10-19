@@ -176,6 +176,69 @@ def job_timeout(seconds: float) -> float:
 TEXT_MOTION_CHATS: dict[tuple[str, int], float] = {}
 TEXT_MOTION_LOCK = threading.Lock()
 
+TELEGRAM_EMOJI_IDS = {
+    "❌": "5210952531676504517", "✅": "5352871660024246779", "⚠": "5447644880824181073",
+    "🔎": "5231012545799666522", "⬇": "5271604874419647061", "📤": "5445355530111437729",
+    "⏳": "5386367538735104399", "🎵": "5463107823946717464", "🎧": "5424818078833715060",
+    "🎼": "5253997827788385948", "🎬": "5427168083074628963", "⭐": "5438496463044752972",
+    "🔴": "5264919878082509254", "⏹": "5260293700088511294", "👤": "5397866377367268054",
+    "⚡": "5210956306952758910", "👇": "5231102735817918643",
+}
+TELEGRAM_EMOJI_PATTERN = re.compile("(?:" + "|".join(map(re.escape, TELEGRAM_EMOJI_IDS)) + ")\\ufe0f?")
+
+
+def telegram_custom_emoji(method: str, payload: dict[str, Any], *, form: bool = False) -> dict[str, Any]:
+    if method not in {"sendMessage", "sendMessageDraft", "editMessageText", "editMessageCaption", "editMessageReplyMarkup",
+                      "sendVideo", "sendAudio", "sendDocument", "sendPhoto", "sendAnimation", "sendMediaGroup"}:
+        return payload
+
+    def decorate(body: dict[str, Any]) -> dict[str, Any]:
+        result = dict(body)
+        for field, entity_field in (("text", "entities"), ("caption", "caption_entities")):
+            text = body.get(field)
+            if not isinstance(text, str) or body.get("parse_mode"):
+                continue
+            original = body.get(entity_field, [])
+            entities = list(json.loads(original) if isinstance(original, str) else original)
+            for match in TELEGRAM_EMOJI_PATTERN.finditer(text):
+                offset = len(text[:match.start()].encode("utf-16-le")) // 2
+                length = len(match[0].encode("utf-16-le")) // 2
+                if any(e.get("type") in {"code", "pre", "url", "custom_emoji"} and
+                       e["offset"] < offset + length and e["offset"] + e["length"] > offset for e in entities):
+                    continue
+                entities.append({"type": "custom_emoji", "offset": offset, "length": length,
+                                 "custom_emoji_id": TELEGRAM_EMOJI_IDS[match[0].replace("\ufe0f", "")]})
+            if entities:
+                entities.sort(key=lambda e: e["offset"])
+                result[entity_field] = json.dumps(entities) if form or isinstance(original, str) else entities
+        return result
+
+    result = decorate(payload)
+    if isinstance(payload.get("media"), list):
+        result["media"] = [decorate(item) for item in payload["media"]]
+    markup = payload.get("reply_markup")
+    if isinstance(markup, str):
+        markup = json.loads(markup)
+    if isinstance(markup, dict):
+        converted = dict(markup)
+        for field in ("inline_keyboard", "keyboard"):
+            if not isinstance(markup.get(field), list):
+                continue
+            rows = []
+            for row in markup[field]:
+                buttons = []
+                for button in row:
+                    text = button.get("text") if isinstance(button, dict) else None
+                    match = TELEGRAM_EMOJI_PATTERN.match(text) if isinstance(text, str) else None
+                    if match and not button.get("icon_custom_emoji_id") and text[match.end():].lstrip():
+                        button = {**button, "text": text[match.end():].lstrip(),
+                                  "icon_custom_emoji_id": TELEGRAM_EMOJI_IDS[match[0].replace("\ufe0f", "")]}
+                    buttons.append(button)
+                rows.append(buttons)
+            converted[field] = rows
+        result["reply_markup"] = json.dumps(converted, ensure_ascii=False) if form or isinstance(payload.get("reply_markup"), str) else converted
+    return result
+
 
 def telegram_text_motion(token: str, method: str, payload: dict[str, Any]) -> None:
     text = payload.get("text")
@@ -201,7 +264,7 @@ def telegram_text_motion(token: str, method: str, payload: dict[str, Any]) -> No
             body = {"chat_id": chat, "message_id": payload["message_id"], "text": text[:max(12, (len(text) * 55 + 99) // 100)] + "…"}
         else:
             return
-        response = requests.post(f"https://api.telegram.org/bot{token}/{action}", json=body, timeout=(0.4, 0.4))
+        response = requests.post(f"https://api.telegram.org/bot{token}/{action}", json=telegram_custom_emoji(action, body), timeout=(0.4, 0.4))
         result = response.json()
         if response.status_code == 429:
             retry = max(3, min(3600, float(result.get("parameters", {}).get("retry_after") or 30)))
@@ -229,8 +292,8 @@ def telegram_call(
     telegram_text_motion(token, method, json_payload or data or {})
     response = requests.post(
         f"https://api.telegram.org/bot{token}/{method}",
-        json=json_payload,
-        data=data,
+        json=telegram_custom_emoji(method, json_payload) if json_payload is not None else None,
+        data=telegram_custom_emoji(method, data, form=True) if data is not None else None,
         files=files,
         timeout=(min(20, job_timeout(timeout)), job_timeout(timeout)),
     )
@@ -787,14 +850,22 @@ async def upload_complete_file(token: str, method: str, data: dict[str, Any], fi
         elif method == "sendAnimation":
             attributes.append(types.DocumentAttributeAnimated())
         reply = json.loads(data.get("reply_parameters", "{}"))
-        markup = data.get("reply_markup")
+        decorated = telegram_custom_emoji(method, data)
+        markup = decorated.get("reply_markup")
         if isinstance(markup, str):
             markup = json.loads(markup)
-        buttons = [[Button.inline(button["text"], data=button["callback_data"].encode()) for button in row]
+        buttons = [[Button.inline(button["text"], data=button["callback_data"].encode(),
+                                  icon=int(button["icon_custom_emoji_id"]) if button.get("icon_custom_emoji_id") else None) for button in row]
                    for row in markup["inline_keyboard"]] if markup else None
+        caption_entities = decorated.get("caption_entities", [])
+        if isinstance(caption_entities, str):
+            caption_entities = json.loads(caption_entities)
+        formatting_entities = [types.MessageEntityCustomEmoji(e["offset"], e["length"], int(e["custom_emoji_id"]))
+                               for e in caption_entities if e.get("type") == "custom_emoji"]
         message = await client.send_file(
             int(data["chat_id"]), uploaded,
             caption=data.get("caption", ""), parse_mode=None,
+            formatting_entities=formatting_entities or None,
             mime_type=mime, attributes=attributes,
             supports_streaming=method == "sendVideo",
             force_document=method == "sendDocument",

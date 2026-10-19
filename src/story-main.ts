@@ -1,6 +1,7 @@
 import appWorker from "./main";
 import {
   telegramTextMotion,
+  telegramCustomEmoji,
   recordDownload,
   recordSuccessfulDelivery,
   telegramFileCache,
@@ -64,7 +65,7 @@ async function telegramCall<T = unknown>(token: string, method: string, payload:
   const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(telegramCustomEmoji(method, payload)),
   });
   const data = (await response.json()) as TelegramApiResponse<T>;
   if (!response.ok || !data.ok) throw new Error(data.description || `Telegram ${method} failed`);

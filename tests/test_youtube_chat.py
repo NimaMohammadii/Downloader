@@ -77,6 +77,23 @@ class ChatTests(unittest.TestCase):
         self.assertIsInstance(uploaded, types.InputFile)
         self.assertEqual(uploaded.md5_checksum, hashlib.md5(content).hexdigest())
 
+    def test_file_caption_and_button_use_native_custom_emoji_without_changing_media(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'song.mp3';path.write_bytes(b'complete media fixture')
+            caption='🎵 Song\n👤 Artist'
+            markup={'inline_keyboard':[[{'text':'🎧 فقط صدا','callback_data':'signed|unchanged'}]]}
+            with patch.dict(os.environ,{'API_ID':'123','API_HASH':'test'}),patch('telethon.TelegramClient',FakeClient),path.open('rb') as handle:
+                asyncio.run(app.upload_complete_file('token','sendDocument',{'chat_id':'42','caption':caption,'reply_markup':json.dumps(markup)},(path.name,handle,'audio/mpeg')))
+            client=FakeClient.instances[-1];options=client.sent[1]
+            self.assertEqual(options['caption'],caption)
+            self.assertEqual(b''.join(client.parts[i] for i in sorted(client.parts)),b'complete media fixture')
+            self.assertTrue(all(isinstance(e,types.MessageEntityCustomEmoji) for e in options['formatting_entities']))
+            self.assertEqual([e.document_id for e in options['formatting_entities']],[5463107823946717464,5397866377367268054])
+            button=options['buttons'][0][0]
+            self.assertEqual(button.text,'فقط صدا');self.assertEqual(button.style.icon,5424818078833715060)
+            self.assertEqual(button.type.data,b'signed|unchanged')
+
     def test_animation_upload_sets_native_animated_attribute_and_preserves_complete_bytes(self):
         content=b'GIF89a-complete-animation-fixture'
         with tempfile.TemporaryDirectory() as directory:

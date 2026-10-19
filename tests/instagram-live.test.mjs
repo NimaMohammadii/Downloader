@@ -26,6 +26,7 @@ const { outputFiles } = await build({
         export const recordDownload = async(_env,record)=>{(globalThis.downloadHistory ||= []).push(record);};
         export const isInstagramDownloadLink = text=>/instagram.com\\//.test(text);
         export const telegramTextMotion=async()=>{};
+        export const telegramCustomEmoji=(_method,payload)=>payload;
         export const telegramFileCache=async(...args)=>globalThis.testFileCache ? globalThis.testFileCache(...args) : null; export class AdminStatsStore{} export const ADMIN_USER_ID=1;
         export const recordUserActivity=async()=>{};
         export const recordSuccessfulDelivery=async()=>{globalThis.delivered++;};` };
@@ -192,7 +193,24 @@ test('native text motion is bounded, preserves formatting and final delivery sur
   const result=await build({stdin:{contents:text,loader:'ts'},bundle:true,format:'esm',write:false,
     plugins:[{name:'motion-runtime',setup(b){b.onResolve({filter:/^cloudflare:workers$/},a=>({path:a.path,namespace:'runtime'}));
       b.onLoad({filter:/.*/,namespace:'runtime'},()=>({contents:'export class DurableObject {}'}));}}]});
-  const {telegramTextMotion}=await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString('base64')}`);
+  const {telegramTextMotion,telegramCustomEmoji}=await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString('base64')}`);
+  const icons='❌ ✅ ⚠️ 🔎 ⬇️ 📤 ⏳ 🎵 🎧 🎼 🎬 ⭐️ 🔴 ⏹️ 👤 ⚡️ 👇';
+  const ids=['5210952531676504517','5352871660024246779','5447644880824181073','5231012545799666522','5271604874419647061','5445355530111437729','5386367538735104399','5463107823946717464','5424818078833715060','5253997827788385948','5427168083074628963','5438496463044752972','5264919878082509254','5260293700088511294','5397866377367268054','5210956306952758910','5231102735817918643'];
+  const original={chat_id:42,text:`سلام 😀 ${icons}`,reply_markup:{inline_keyboard:[[{text:'⏹ توقف',callback_data:'signed|unchanged'},{text:'👑 ادمین',callback_data:'admin'}]]}};
+  const copy=structuredClone(original);const converted=telegramCustomEmoji('sendMessage',original);
+  assert.deepEqual(original,copy);assert.equal(converted.text,original.text);
+  assert.deepEqual(converted.entities.map(e=>e.custom_emoji_id),ids);
+  assert.deepEqual(converted.entities.map(e=>original.text.slice(e.offset,e.offset+e.length)),icons.split(' '));
+  assert.equal(converted.reply_markup.inline_keyboard[0][0].text,'توقف');
+  assert.equal(converted.reply_markup.inline_keyboard[0][0].icon_custom_emoji_id,ids[13]);
+  assert.equal(converted.reply_markup.inline_keyboard[0][0].callback_data,'signed|unchanged');
+  assert.deepEqual(converted.reply_markup.inline_keyboard[0][1],original.reply_markup.inline_keyboard[0][1]);
+  assert.deepEqual(telegramCustomEmoji('sendMessage',converted),converted);
+  assert.deepEqual(telegramCustomEmoji('answerCallbackQuery',original),original);
+  const formatted=telegramCustomEmoji('editMessageText',{text:'🎵 ✅',entities:[{type:'code',offset:0,length:2},{type:'bold',offset:3,length:1}]});
+  assert.equal(formatted.entities.length,3);assert.equal(formatted.entities.at(-1).custom_emoji_id,ids[1]);
+  const media=telegramCustomEmoji('sendMediaGroup',{media:[{type:'video',media:'file-id',caption:'🎬 title'}]});
+  assert.equal(media.media[0].caption_entities[0].custom_emoji_id,ids[10]);
   const calls=[];globalThis.fetch=async(url,init)=>{calls.push({method:String(url).split('/').at(-1),body:JSON.parse(init.body)});return Response.json({ok:true,result:true});};
   const body={chat_id:444,text:'متن کامل آهنگ و خواننده برای نمایش نرم 🎵',parse_mode:'HTML',reply_markup:{inline_keyboard:[]}};
   await telegramTextMotion('fictional','sendMessage',body);
@@ -203,6 +221,9 @@ test('native text motion is bounded, preserves formatting and final delivery sur
   await telegramTextMotion('fictional','sendAudio',{chat_id:446,text:body.text});assert.equal(calls.length,1);
   await telegramTextMotion('fictional','editMessageText',{chat_id:447,message_id:7,text:body.text});
   assert.equal(calls.length,2);assert.equal(calls[1].method,'editMessageText');assert.notEqual(calls[1].body.text,body.text);
+  const plain={chat_id:449,text:'🎵 یک متن کامل دیگر برای نمایش نرم و ایموجی سفارشی'};
+  await telegramTextMotion('fictional','sendMessage',plain);
+  assert.deepEqual(calls.at(-1).body.entities,telegramCustomEmoji('sendMessage',plain).entities);
   globalThis.fetch=async()=>{throw Error('draft unavailable');};
   await assert.doesNotReject(()=>telegramTextMotion('fictional','sendMessage',{...body,chat_id:448}));
 });

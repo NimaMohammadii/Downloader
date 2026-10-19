@@ -8,6 +8,7 @@ import {
 import storyWorker, { parseInstagramVideoTarget, parseInstagramAudioTarget, resolveInstagramVideo, instagramVideoErrorText, type InstagramVideoTarget, type InstagramVideoSource } from "./story-main";
 import {
   telegramTextMotion,
+  telegramCustomEmoji,
   ADMIN_USER_ID,
   recordSuccessfulDelivery,
   recordUserActivity,
@@ -723,7 +724,7 @@ async function telegramCall<T = unknown>(
   const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(telegramCustomEmoji(method, payload)),
   });
   const data = (await response.json()) as TelegramApiResponse<T>;
   if (!response.ok || !data.ok) {

@@ -200,7 +200,36 @@ class TextMotionTests(unittest.TestCase):
         self.assertEqual(result,{'message_id':8});self.assertEqual(len(post.call_args_list),2)
         self.assertTrue(post.call_args_list[0].args[0].endswith('/sendMessageDraft'))
         self.assertEqual(post.call_args_list[0].kwargs['json']['text'],body['text'])
-        self.assertEqual(post.call_args_list[-1].kwargs['json'],body)
+        sent=post.call_args_list[-1].kwargs['json']
+        self.assertEqual(sent['text'],body['text']);self.assertEqual(sent['reply_markup'],body['reply_markup'])
+        self.assertEqual(sent['entities'],[{'type':'custom_emoji','offset':len(body['text'][:-1].encode('utf-16-le'))//2,'length':2,'custom_emoji_id':'5463107823946717464'}])
+        self.assertEqual(post.call_args_list[0].kwargs['json']['entities'],sent['entities'])
+        self.assertNotIn('entities',body)
+
+    def test_custom_emoji_ids_utf16_offsets_variants_and_buttons_preserve_payload(self):
+        import copy
+        icons='❌ ✅ ⚠️ 🔎 ⬇️ 📤 ⏳ 🎵 🎧 🎼 🎬 ⭐️ 🔴 ⏹️ 👤 ⚡️ 👇'
+        ids=['5210952531676504517','5352871660024246779','5447644880824181073','5231012545799666522','5271604874419647061','5445355530111437729','5386367538735104399','5463107823946717464','5424818078833715060','5253997827788385948','5427168083074628963','5438496463044752972','5264919878082509254','5260293700088511294','5397866377367268054','5210956306952758910','5231102735817918643']
+        body={'chat_id':42,'text':'سلام 😀 '+icons,'reply_markup':{'inline_keyboard':[[{'text':'⏹ توقف','callback_data':'signed|unchanged'},{'text':'👑 ادمین','callback_data':'admin'}]]}}
+        original=copy.deepcopy(body);sent=app.telegram_custom_emoji('sendMessage',body)
+        self.assertEqual(body,original);self.assertEqual(sent['text'],body['text'])
+        self.assertEqual([e['custom_emoji_id'] for e in sent['entities']],ids)
+        encoded=body['text'].encode('utf-16-le')
+        self.assertEqual([encoded[e['offset']*2:(e['offset']+e['length'])*2].decode('utf-16-le') for e in sent['entities']],icons.split())
+        button=sent['reply_markup']['inline_keyboard'][0][0]
+        self.assertEqual(button,{'text':'توقف','callback_data':'signed|unchanged','icon_custom_emoji_id':ids[13]})
+        self.assertEqual(sent['reply_markup']['inline_keyboard'][0][1],body['reply_markup']['inline_keyboard'][0][1])
+        self.assertEqual(app.telegram_custom_emoji('sendMessage',sent),sent)
+        self.assertEqual(app.telegram_custom_emoji('answerCallbackQuery',body),body)
+
+    def test_custom_emoji_captions_forms_and_existing_entities(self):
+        sent=app.telegram_custom_emoji('editMessageText',{'text':'🎵 ✅','entities':[{'type':'code','offset':0,'length':2},{'type':'bold','offset':3,'length':1}]})
+        self.assertEqual(len(sent['entities']),3);self.assertEqual(sent['entities'][-1]['custom_emoji_id'],'5352871660024246779')
+        sent=app.telegram_custom_emoji('sendAudio',{'caption':'🎵 song','reply_markup':json.dumps({'inline_keyboard':[[{'text':'🎧 HQ','callback_data':'same'}]]})},form=True)
+        self.assertEqual(json.loads(sent['caption_entities'])[0]['custom_emoji_id'],'5463107823946717464')
+        self.assertEqual(json.loads(sent['reply_markup'])['inline_keyboard'][0][0]['icon_custom_emoji_id'],'5424818078833715060')
+        sent=app.telegram_custom_emoji('sendMediaGroup',{'media':[{'type':'video','media':'file-id','caption':'🎬 title'}]})
+        self.assertEqual(sent['media'][0]['caption_entities'][0]['custom_emoji_id'],'5427168083074628963')
 
     def test_failed_motion_still_sends_final_and_back_to_back_messages_skip_effect(self):
         from unittest.mock import MagicMock

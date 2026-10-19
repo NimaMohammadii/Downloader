@@ -1,6 +1,7 @@
 import downloaderWorker from "./entry";
 import {
   telegramTextMotion,
+  telegramCustomEmoji,
   ADMIN_USER_ID,
   AdminStatsStore,
   adminDashboardKeyboard,
@@ -75,7 +76,7 @@ async function telegramCall<T = unknown>(
   const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(telegramCustomEmoji(method, payload)),
   });
   const data = (await response.json()) as TelegramApiResponse<T>;
   if (!response.ok || !data.ok) throw new Error(data.description || `Telegram ${method} failed`);

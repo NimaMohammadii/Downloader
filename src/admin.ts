@@ -1,5 +1,54 @@
 import { DurableObject } from "cloudflare:workers";
 
+const telegramEmojiIds: Record<string, string> = {
+  "❌": "5210952531676504517", "✅": "5352871660024246779", "⚠": "5447644880824181073",
+  "🔎": "5231012545799666522", "⬇": "5271604874419647061", "📤": "5445355530111437729",
+  "⏳": "5386367538735104399", "🎵": "5463107823946717464", "🎧": "5424818078833715060",
+  "🎼": "5253997827788385948", "🎬": "5427168083074628963", "⭐": "5438496463044752972",
+  "🔴": "5264919878082509254", "⏹": "5260293700088511294", "👤": "5397866377367268054",
+  "⚡": "5210956306952758910", "👇": "5231102735817918643",
+};
+const telegramEmojiPattern = /(?:❌|✅|⚠|🔎|⬇|📤|⏳|🎵|🎧|🎼|🎬|⭐|🔴|⏹|👤|⚡|👇)\uFE0F?/gu;
+
+// Keep literal text and UTF-16 offsets intact; button icons use Telegram's own field.
+export function telegramCustomEmoji(method: string, payload: Record<string, unknown>): Record<string, unknown> {
+  if (!/^(sendMessage|sendMessageDraft|editMessageText|editMessageCaption|editMessageReplyMarkup|sendVideo|sendAudio|sendDocument|sendPhoto|sendAnimation|sendMediaGroup)$/.test(method)) return payload;
+  const decorate = (body: Record<string, unknown>): Record<string, unknown> => {
+    const result = { ...body };
+    for (const [field, entityField] of [["text", "entities"], ["caption", "caption_entities"]]) {
+      if (typeof body[field] !== "string" || body.parse_mode) continue;
+      const entities = Array.isArray(body[entityField]) ? [...body[entityField] as Record<string, unknown>[]] : [];
+      for (const match of (body[field] as string).matchAll(telegramEmojiPattern)) {
+        const offset = match.index!;
+        if (entities.some(e => ["code", "pre", "url", "custom_emoji"].includes(String(e.type)) &&
+            Number(e.offset) < offset + match[0].length && Number(e.offset) + Number(e.length) > offset)) continue;
+        entities.push({ type: "custom_emoji", offset, length: match[0].length,
+          custom_emoji_id: telegramEmojiIds[match[0].replace(/\uFE0F/g, "")] });
+      }
+      if (entities.length) result[entityField] = entities.sort((a, b) => Number(a.offset) - Number(b.offset));
+    }
+    return result;
+  };
+  const result = decorate(payload);
+  if (Array.isArray(payload.media)) result.media = payload.media.map(item => decorate(item as Record<string, unknown>));
+  const markup = payload.reply_markup as { inline_keyboard?: Record<string, unknown>[][]; keyboard?: Record<string, unknown>[][] } | undefined;
+  if (markup && typeof markup === "object") {
+    const converted = { ...markup };
+    for (const field of ["inline_keyboard", "keyboard"] as const) {
+      if (!Array.isArray(markup[field])) continue;
+      converted[field] = markup[field]!.map(row => row.map(button => {
+        if (typeof button.text !== "string" || button.icon_custom_emoji_id) return button;
+        const match = [...button.text.matchAll(telegramEmojiPattern)][0];
+        if (!match || match.index !== 0) return button;
+        const text = button.text.slice(match[0].length).trimStart();
+        return text ? { ...button, text, icon_custom_emoji_id: telegramEmojiIds[match[0].replace(/\uFE0F/g, "")] } : button;
+      }));
+    }
+    result.reply_markup = converted;
+  }
+  return result;
+}
+
 const textMotionChats = new Map<string, number>();
 
 // One bounded transition per chat, never a polling loop or character-by-character edits.
@@ -15,7 +64,7 @@ export async function telegramTextMotion(token: string, method: string, payload:
   textMotionChats.set(key, now + 3000);
   const post = async (action: string, body: Record<string, unknown>) => {
     const response = await fetch(`https://api.telegram.org/bot${token}/${action}`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(telegramCustomEmoji(action, body)),
       signal: AbortSignal.timeout(800),
     });
     const result = await response.json() as { ok?: boolean; parameters?: { retry_after?: number } };
