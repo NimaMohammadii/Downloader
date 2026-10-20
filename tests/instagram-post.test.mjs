@@ -143,6 +143,10 @@ test('a fresh HTML CSRF token replaces the stale configured value in both cookie
     }
   } });
   assert.equal(files(result).length, 1);
+  const webRequest = result.calls.find(call => call.hostname === 'www.instagram.com' && call.path === apiPath);
+  assert.equal(webRequest.headers.get('x-csrftoken'), 'html-csrf');
+  assert.match(webRequest.headers.get('cookie'), /csrftoken=html-csrf/);
+  assert.equal(result.calls.length, 4);
 });
 
 test('anonymous cookies never become part of the configured account session', async () => {
@@ -155,6 +159,9 @@ test('anonymous cookies never become part of the configured account session', as
     }
   } });
   assert.equal(files(result).length, 1);
+  const authenticated = result.calls.filter(call => call.headers.get('cookie')?.includes('sessionid='));
+  assert.ok(authenticated.length > 0);
+  assert.ok(authenticated.every(call => !call.headers.get('cookie').includes('anonymous-mid')));
 });
 
 test('confirmed session account redirects stop without retrying rejected account endpoints', async () => {
