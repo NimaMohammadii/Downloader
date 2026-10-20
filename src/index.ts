@@ -532,7 +532,8 @@ async function fetchPostResponse(url: string, headers: Headers, jar: CookieJar):
     if (/^\/(?:challenge|checkpoint)(?:\/|$)/.test(location.pathname)) throw new Error("INSTAGRAM_CHALLENGE_REQUIRED");
     if (/^\/accounts\/login(?:\/|$)/.test(location.pathname)) throw new Error("INSTAGRAM_LOGIN_REQUIRED");
     if (/^\/(?:accounts\/)?consent(?:\/|$)/.test(location.pathname)) throw new Error("INSTAGRAM_CONSENT_REQUIRED");
-    if (location.pathname === "/" || location.pathname.startsWith("/accounts/")) throw new Error("INSTAGRAM_ACCOUNT_ACTION_REQUIRED");
+    if (location.pathname === "/") throw new Error("INSTAGRAM_REDIRECT_HOME");
+    if (location.pathname.startsWith("/accounts/")) throw new Error("INSTAGRAM_REDIRECT_ACCOUNT");
     const destination = /^\/(?:p|reel|reels|tv)\/([A-Za-z0-9_-]+)\/?$/.exec(location.pathname)?.[1];
     if (!shortcode || destination !== shortcode || location.hostname === "i.instagram.com") throw new Error("INSTAGRAM_REDIRECT_UNSUPPORTED");
     if (visited.has(location.href)) throw new Error("INSTAGRAM_REDIRECT_LOOP");
@@ -717,7 +718,7 @@ async function resolvePost(
     }
     diagnostics.push(`${name}:${code}`);
     if (code === "INSTAGRAM_RATE_LIMIT_429") throw failure(code);
-    if (name.startsWith("session/") && ["INSTAGRAM_CHALLENGE_REQUIRED", "INSTAGRAM_CONSENT_REQUIRED", "INSTAGRAM_ACCOUNT_ACTION_REQUIRED"].includes(code)) {
+    if (name.startsWith("session/") && ["INSTAGRAM_CHALLENGE_REQUIRED", "INSTAGRAM_CONSENT_REQUIRED"].includes(code)) {
       throw failure(code.replace("INSTAGRAM_", "INSTAGRAM_SESSION_"));
     }
     // A page redirect/form demanding login is authoritative. An API-only 401
@@ -1127,8 +1128,8 @@ function friendlyError(detail: string): string {
   if (value.startsWith("instagram_session_challenge_required")) {
     return "❌ حساب اینستاگرام متصل نیاز به تأیید امنیتی دارد؛ ابتدا در خود اینستاگرام تأیید شود.";
   }
-  if (value.startsWith("instagram_session_consent_required") || value.startsWith("instagram_session_account_action_required")) {
-    return "❌ اینستاگرام حساب متصل را به صفحهٔ تأیید حساب یا پذیرش شرایط می‌فرستد؛ این مرحله باید داخل خود اینستاگرام کامل شود.";
+  if (value.startsWith("instagram_session_consent_required")) {
+    return "❌ اینستاگرام برای حساب متصل پذیرش شرایط می‌خواهد؛ این مرحله باید داخل خود اینستاگرام کامل شود.";
   }
   if (value.startsWith("instagram_session_login_required")) {
     return "❌ اینستاگرام نشست حساب متصل را برای دریافت این پست نپذیرفت؛ ورود حساب و دسترسی آن به پست باید بررسی شود.";
