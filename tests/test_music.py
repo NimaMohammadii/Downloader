@@ -195,12 +195,15 @@ class TextMotionTests(unittest.TestCase):
         from unittest.mock import MagicMock
         reply=MagicMock();reply.ok=True;reply.json.return_value={'ok':True,'result':{'message_id':8}}
         body={'chat_id':42,'text':'متن کامل تست برای نمایش نرم و درست پیام 🎵','reply_markup':{'inline_keyboard':[[{'text':'Download','callback_data':'test'}]]}}
-        with patch.object(app.requests,'post',return_value=reply) as post,patch.object(app.time,'sleep'):
+        with patch.object(app.requests,'post',return_value=reply) as post,patch.object(app.time,'sleep') as sleep:
             result=app.telegram_call('fictional','sendMessage',json_payload=body)
         self.assertEqual(result,{'message_id':8})
         drafts=[call.kwargs['json'] for call in post.call_args_list[:-1]]
         self.assertTrue(all(call.args[0].endswith('/sendMessageDraft') for call in post.call_args_list[:-1]))
-        self.assertGreater(len(drafts),1);self.assertLessEqual(len(drafts),6)
+        self.assertEqual(len(drafts),2)
+        self.assertAlmostEqual(sleep.call_args_list[0].args[0],0.12)
+        self.assertGreaterEqual(sleep.call_args_list[1].args[0],0.5)
+        self.assertLessEqual(sleep.call_args_list[1].args[0],1.0)
         self.assertEqual(drafts[0]['text'],body['text'][0]);self.assertEqual(drafts[-1]['text'],body['text'])
         self.assertEqual(len({d['draft_id'] for d in drafts}),1)
         self.assertEqual([len(d['text']) for d in drafts],sorted({len(d['text']) for d in drafts}))
@@ -281,11 +284,25 @@ class TextMotionTests(unittest.TestCase):
             self.assertTrue(all(e['offset']+e['length']<=length for e in draft['entities']))
             self.assertFalse(draft['text'].endswith(('\u200c','\u200d')))
         clock=[100.0];app.TEXT_MOTION_CHATS.clear()
-        def slow_post(*args,**kwargs):clock[0]+=1.7;return reply
-        def advance(seconds):clock[0]+=seconds
+        events=[]
+        def slow_post(*args,**kwargs):
+            clock[0]+=0.6
+            events.append('draft')
+            return reply
+        def advance(seconds):
+            events.append(seconds)
+            clock[0]+=seconds
         with patch.object(app.time,'monotonic',side_effect=lambda:clock[0]),patch.object(app.time,'sleep',side_effect=advance),patch.object(app.requests,'post',side_effect=slow_post) as post:
             app.telegram_text_motion('fictional','sendMessage',body)
-        self.assertLessEqual(post.call_count,3)
+        self.assertEqual(post.call_count,2)
+        self.assertEqual(events[0],'draft');self.assertAlmostEqual(events[1],0.12)
+        self.assertEqual(events[2],'draft');self.assertGreaterEqual(events[3],0.5)
+        # An exhausted preview budget must still stop optional animation work.
+        clock[0]=100.0;app.TEXT_MOTION_CHATS.clear()
+        def stalled_post(*args,**kwargs):clock[0]+=5;return reply
+        with patch.object(app.time,'monotonic',side_effect=lambda:clock[0]),patch.object(app.time,'sleep',side_effect=advance),patch.object(app.requests,'post',side_effect=stalled_post) as post:
+            app.telegram_text_motion('fictional','sendMessage',body)
+        self.assertEqual(post.call_count,1)
 
 
 class RecognitionDownloadTests(unittest.TestCase):

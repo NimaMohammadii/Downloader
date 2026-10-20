@@ -51,7 +51,8 @@ export function telegramCustomEmoji(method: string, payload: Record<string, unkn
 
 const textMotionChats = new Map<string, number>();
 
-// Telegram animates newly appended draft characters. Never truncate a delivered message.
+// Seed the draft, then let Telegram animate the complete append in one pass.
+// Repeated coarse updates restart the client animation and make it stutter.
 export async function telegramTextMotion(token: string, method: string, payload: Record<string, unknown>): Promise<void> {
   if (method !== "sendMessage" || typeof payload.text !== "string" || payload.parse_mode ||
       payload.text.length < 2 || payload.inline_message_id || payload.business_connection_id) return;
@@ -75,19 +76,20 @@ export async function telegramTextMotion(token: string, method: string, payload:
   try {
     const chars = Array.from(new Intl.Segmenter("fa", { granularity: "grapheme" }).segment(payload.text), part => part.segment);
     if (chars.length < 2) return;
-    const frames = Math.min(6, Math.max(2, Math.ceil(chars.length / 8)));
     const draft_id = crypto.getRandomValues(new Uint32Array(1))[0] % 2147483646 + 1;
-    for (let frame = 0; frame < frames; frame++) {
+    for (let frame = 0; frame < 2; frame++) {
       if (performance.now() >= deadline) break;
-      const end = frame === 0 ? 1 : Math.ceil(chars.length * frame / (frames - 1));
+      const end = frame === 0 ? 1 : chars.length;
       const text = chars.slice(0, end).join("");
       if (!text.trim()) continue;
       const entities = Array.isArray(payload.entities) ? (payload.entities as Record<string, unknown>[])
         .filter(e => Number(e.offset) < text.length && (e.type !== "custom_emoji" || Number(e.offset) + Number(e.length) <= text.length))
         .map(e => ({ ...e, length: Math.min(Number(e.length), text.length - Number(e.offset)) })) : undefined;
-      const sentAt = performance.now();
       await post("sendMessageDraft", { chat_id: chat, message_thread_id: payload.message_thread_id, draft_id, text, entities });
-      await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(400 - (performance.now() - sentAt), deadline - performance.now()))));
+      // Wait after acknowledgement: network time must not consume the reveal time.
+      // Persisting immediately would replace the draft before its animation finishes.
+      const pause = frame === 0 ? 120 : Math.min(1000, Math.max(500, chars.length * 12));
+      await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(pause, deadline - performance.now()))));
     }
   } catch { /* Motion is optional; the complete original send/edit must always run. */ }
 }

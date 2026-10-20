@@ -319,13 +319,13 @@ def telegram_text_motion(token: str, method: str, payload: dict[str, Any]) -> No
                 chars.append(char)
         if len(chars) < 2:
             return
-        frames = min(6, max(2, (len(chars) + 7) // 8))
         draft_id, deadline = secrets.randbelow(2147483646) + 1, now + 4.5
-        for frame in range(frames):
+        # Seed once, then let Telegram animate the full append without restarts.
+        for frame in range(2):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            end = 1 if frame == 0 else (len(chars) * frame + frames - 2) // (frames - 1)
+            end = 1 if frame == 0 else len(chars)
             prefix = "".join(chars[:end])
             if not prefix.strip():
                 continue
@@ -338,7 +338,6 @@ def telegram_text_motion(token: str, method: str, payload: dict[str, Any]) -> No
             body["entities"] = [{**e, "length": min(e["length"], length - e["offset"])} for e in entities
                                 if e["offset"] < length and (e.get("type") != "custom_emoji" or e["offset"] + e["length"] <= length)]
             request_timeout = min(0.4, remaining / 2, job_timeout(0.4))
-            sent_at = time.monotonic()
             response = requests.post(f"https://api.telegram.org/bot{token}/sendMessageDraft",
                                      json=telegram_custom_emoji("sendMessageDraft", body), timeout=(request_timeout, request_timeout))
             result = response.json()
@@ -348,7 +347,9 @@ def telegram_text_motion(token: str, method: str, payload: dict[str, Any]) -> No
                     TEXT_MOTION_CHATS[key] = time.monotonic() + retry
             if not response.ok or not result.get("ok"):
                 break
-            time.sleep(max(0, min(0.4 - (time.monotonic() - sent_at), deadline - time.monotonic(), job_timeout(0.4))))
+            # Give the client time after acknowledgement before final persistence.
+            pause = 0.12 if frame == 0 else min(1.0, max(0.5, len(chars) * 0.012))
+            time.sleep(max(0, min(pause, deadline - time.monotonic(), job_timeout(pause))))
     except Exception:
         pass  # Optional effect must never prevent the complete message.
 

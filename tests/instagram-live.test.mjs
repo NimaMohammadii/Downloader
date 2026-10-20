@@ -239,8 +239,13 @@ test('native text motion is bounded, preserves formatting and final delivery sur
   assert.equal(media.media[0].caption_entities[0].custom_emoji_id,ids[10]);
   const calls=[];globalThis.fetch=async(url,init)=>{calls.push({method:String(url).split('/').at(-1),body:JSON.parse(init.body)});return Response.json({ok:true,result:true});};
   const body={chat_id:444,text:'متن کامل آهنگ و خواننده برای نمایش نرم 🎵',reply_markup:{inline_keyboard:[]}};
-  await telegramTextMotion('fictional','sendMessage',body);
-  assert.ok(calls.length>1 && calls.length<=6);assert.ok(calls.every(c=>c.method==='sendMessageDraft'));
+  const pauses=[],originalTimeout=globalThis.setTimeout;
+  try {
+    globalThis.setTimeout=(callback,ms)=>{pauses.push(ms);return originalTimeout(callback,0);};
+    await telegramTextMotion('fictional','sendMessage',body);
+  } finally { globalThis.setTimeout=originalTimeout; }
+  assert.equal(calls.length,2);assert.ok(calls.every(c=>c.method==='sendMessageDraft'));
+  assert.equal(pauses[0],120);assert.ok(pauses[1]>=500 && pauses[1]<=1000);
   assert.equal(calls[0].body.text,'م');assert.equal(calls.at(-1).body.text,body.text);
   assert.equal(new Set(calls.map(c=>c.body.draft_id)).size,1);assert.ok(calls[0].body.draft_id>0);
   assert.ok(calls.every((c,i)=>body.text.startsWith(c.body.text) && (!i || c.body.text.length>calls[i-1].body.text.length)));
@@ -254,7 +259,7 @@ test('native text motion is bounded, preserves formatting and final delivery sur
   const limit=plain.text.length;plain.entities=[{type:'bold',offset:0,length:limit}];
   await telegramTextMotion('fictional','sendMessage',plain);
   const unicode=calls.slice(count);assert.equal(unicode[0].body.text,'👩‍💻');
-  assert.equal(unicode.at(-1).body.text,plain.text);assert.ok(unicode.length<=6);
+  assert.equal(unicode.at(-1).body.text,plain.text);assert.equal(unicode.length,2);
   for(const frame of unicode){
     assert.equal(frame.body.message_thread_id,5);assert.ok(!/[\u200c\u200d]$/u.test(frame.body.text));
     assert.ok(frame.body.entities.every(e=>e.offset+e.length<=frame.body.text.length));
