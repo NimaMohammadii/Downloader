@@ -18,223 +18,288 @@ const { outputFiles } = await build({
 const { default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
 
 const shortcode = 'DesNYugDyMp';
-const mediaId = [...shortcode].reduce((value, char) => value * 64n + BigInt('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'.indexOf(char)), 0n).toString();
+const mediaId = '4011640241882342185';
+const pagePath = `/p/${shortcode}/`;
+const apiPath = `/api/v1/media/${mediaId}/info/`;
 const video = { code: shortcode, video_versions: [{ url: 'https://scontent.cdninstagram.com/video.mp4', width: 1080, height: 1920 }] };
+const html = product => `<script data-sjs>${JSON.stringify(product)}</script>`;
+const redirect = (location, headers = {}) => new Response(null, { status: 302, headers: { location, ...headers } });
+const report = result => result.diagnostics.find(item => item.message === 'instagram download failed')?.info?.detail;
+const files = result => result.sent.filter(item => ['sendPhoto', 'sendVideo'].includes(item.method));
+const errorText = result => result.sent.findLast(item => item.method === 'editMessageText')?.payload.text;
 
-async function run({ session = '12345%3Afixture-session', mobileAllowsAuth = true, graphqlErrorCode = 4630001,
-  oembedStatus = 200, graphqlData, pageHtml = '<html></html>', homeRedirect, webInfo, mobileStatus = 401,
-  pageRedirect, graphqlRaw, graphqlFailure, mobilePayload } = {}) {
+async function run({ session = '12345%3Afixture-session', env = {}, respond } = {}) {
   const calls = [], sent = [], diagnostics = [];
   globalThis.history = [];
-  const originalError = console.error;
-  const originalWarn = console.warn;
-  console.error = (message, info) => diagnostics.push({ message, info });
-  console.warn = (message, info) => diagnostics.push({ message, info });
+  const previous = { error: console.error, warn: console.warn, log: console.log };
+  for (const level of Object.keys(previous)) console[level] = (message, info) => diagnostics.push({ message, info });
   try {
     globalThis.fetch = async (url, init = {}) => {
       const target = new URL(typeof url === 'string' ? url : url.url);
       const headers = new Headers(init.headers);
       if (target.hostname === 'api.telegram.org') {
         const method = target.pathname.split('/').at(-1);
-        const payload = JSON.parse(init.body);
-        sent.push({ method, payload });
+        sent.push({ method, payload: JSON.parse(init.body) });
         return Response.json({ ok: true, result: { message_id: 99,
           ...(method === 'sendVideo' ? { video: { file_id: 'video-file-id' } } : {}) } });
       }
-      calls.push({ path: target.pathname, hostname: target.hostname, headers });
-      if (target.hostname === 'scontent.cdninstagram.com') {
-        return new Response(null, { headers: { 'content-length': '1000000' } });
+      if (target.hostname === 'scontent.cdninstagram.com') return new Response(null, { headers: { 'content-length': '1000000' } });
+      const call = { path: target.pathname, url: target, hostname: target.hostname, headers, signal: init.signal };
+      calls.push(call);
+      const custom = respond?.(call);
+      if (custom) return custom;
+      if (target.pathname === apiPath) {
+        if (target.hostname === 'i.instagram.com' && headers.get('authorization')?.startsWith('Bearer IGT:2:')) {
+          return Response.json({ items: [video] });
+        }
+        return Response.json({}, { status: target.hostname === 'i.instagram.com' ? 403 : 401 });
       }
-      if (target.pathname === '/api/v1/oembed/') {
-        return Response.json({ media_id: `${mediaId}_12345` }, { status: oembedStatus });
-      }
-      if (target.pathname === `/api/v1/media/${mediaId}/info/`) {
-        if (target.hostname === 'www.instagram.com' && webInfo) return Response.json({ items: [webInfo] });
-        if (mobilePayload) return Response.json(mobilePayload, { status: mobileStatus });
-        const allowed = mobileAllowsAuth && headers.get('authorization')?.startsWith('Bearer IGT:2:')
-          && headers.get('x-ig-app-id') === '567067343352427'
-          && headers.get('cookie')?.includes('sessionid=');
-        return allowed
-          ? Response.json({ items: [video] })
-          : Response.json({ message: 'login_required' }, { status: mobileStatus });
-      }
-      if (target.pathname === '/graphql/query' || target.pathname === '/api/graphql') {
-        if (graphqlFailure) throw Error(graphqlFailure);
-        if (graphqlRaw) return new Response(graphqlRaw);
-        if (graphqlData) return Response.json(graphqlData);
-        return Response.json({ data: null, errors: [{ message: graphqlErrorCode === 1675004
-          ? 'Rate limit exceeded' : 'execution error', code: graphqlErrorCode }] });
-      }
-      if (target.pathname.startsWith('/api/v1/media/')) {
-        return Response.json({ items: [] }, { status: 404 });
-      }
-      if (target.pathname === '/' && homeRedirect) return new Response(null, { status: 302, headers: { location: homeRedirect } });
-      if (target.pathname === `/p/${shortcode}/` && pageRedirect) {
-        return new Response(null, { status: 302, headers: { location: pageRedirect } });
-      }
-      if (target.pathname === '/' || target.pathname.includes('/p/') || target.pathname.includes('/reel/') || target.pathname.includes('/embed/')) {
-        return new Response(target.pathname === `/p/${shortcode}/` ? pageHtml : '<html></html>', { headers: { 'content-type': 'text/html' } });
-      }
-      throw Error('Unmocked endpoint ' + target.pathname);
+      if (target.pathname === pagePath) return new Response('<html></html>');
+      throw Error('Unmocked endpoint');
     };
-    const request = new Request('https://worker/telegram/webhook', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-telegram-bot-api-secret-token': 'test-webhook' },
+    const response = await worker.fetch(new Request('https://worker/telegram/webhook', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-telegram-bot-api-secret-token': 'test-webhook' },
       body: JSON.stringify({ update_id: 9, message: { message_id: 8, from: { id: 42 }, chat: { id: 42 },
         text: `https://www.instagram.com/reel/${shortcode}/?mdxt=test` } }),
-    });
-    const response = await worker.fetch(request, {
-      BOT_TOKEN: 'test-telegram-token', WEBHOOK_SECRET: 'test-webhook',
-      INSTAGRAM_SESSIONID: session,
-    }, {});
+    }), { BOT_TOKEN: 'test-telegram-token', WEBHOOK_SECRET: 'test-webhook', INSTAGRAM_SESSIONID: session, ...env }, {});
     assert.equal(response.status, 200);
-  } finally { console.error = originalError; console.warn = originalWarn; }
+  } finally { Object.assign(console, previous); }
   return { calls, sent, diagnostics, history: globalThis.history };
 }
 
-test('existing mobile resolver authenticates the same reel after anonymous access is rejected', async () => {
+function noObsoleteRequests(result) {
+  assert.ok(!result.calls.some(call => /graphql|oembed|embed/.test(call.path) || call.path === '/'));
+  assert.ok(result.calls.length <= 5, 'at most two public and three session operations');
+}
+
+test('the existing native API remains a bounded fallback with no legacy GraphQL/embed requests', async () => {
   const result = await run();
-  const mobile = result.calls.filter(call => call.hostname === 'i.instagram.com' && call.path === `/api/v1/media/${mediaId}/info/`);
-  assert.equal(mobile.length, 2);
-  assert.equal(mobile[0].headers.get('authorization'), null, 'public fallback stays anonymous');
-  assert.match(mobile[1].headers.get('authorization'), /^Bearer IGT:2:/);
-  assert.equal(mobile[1].headers.get('x-ig-app-id'), '567067343352427');
-  assert.equal(result.sent.filter(call => call.method === 'sendVideo').length, 1);
+  assert.equal(files(result).length, 1);
   assert.equal(result.history.at(-1).status, 'success');
+  assert.deepEqual(result.calls.map(call => `${call.hostname}:${call.path}`), [
+    `i.instagram.com:${apiPath}`, `www.instagram.com:${pagePath}`, `www.instagram.com:${pagePath}`,
+    `www.instagram.com:${apiPath}`, `i.instagram.com:${apiPath}`,
+  ]);
+  assert.equal(result.calls[0].headers.get('authorization'), null);
+  assert.match(result.calls.at(-1).headers.get('authorization'), /^Bearer IGT:2:/);
+  noObsoleteRequests(result);
 });
 
-test('a forbidden oEmbed endpoint must not prevent fetching media info from the shortcode', async () => {
-  const result = await run({ oembedStatus: 403 });
-  assert.equal(result.sent.filter(call => call.method === 'sendVideo').length, 1);
-  assert.equal(result.history.at(-1).status, 'success');
-  assert.equal(result.calls.filter(call => call.path === '/api/v1/oembed/').length, 0);
+test('public mobile media sends without authentication or oEmbed', async () => {
+  const result = await run({ respond(call) {
+    if (call.hostname === 'i.instagram.com') return Response.json({ items: [video] });
+  } });
+  assert.equal(result.calls.length, 1);
+  assert.equal(result.calls[0].headers.get('cookie'), null);
+  assert.equal(files(result).length, 1);
 });
 
-test('GraphQL shortcode media responses are accepted without the mobile-only wrapper', async () => {
-  for (const data of [{ xdt_shortcode_media: video }, { shortcode_media: video },
-    { xdt_api__v1__media__shortcode__web_info: { items: [video] } }]) {
-    const result = await run({ mobileAllowsAuth: false, graphqlData: { data } });
-    assert.equal(result.sent.filter(call => call.method === 'sendVideo').length, 1);
+test('canonical redirects follow only the same requested reel', async () => {
+  const result = await run({ session: '', respond(call) {
+    if (call.path === pagePath) return redirect(`/reel/${shortcode}/`);
+    if (call.path === `/reel/${shortcode}/`) return new Response(html(video));
+  } });
+  assert.equal(files(result).length, 1);
+  assert.equal(result.calls.at(-1).path, `/reel/${shortcode}/`);
+  noObsoleteRequests(result);
+});
+
+test('a canonical redirect retains response cookies and updates the following request', async () => {
+  const result = await run({ session: '', respond(call) {
+    if (call.path === pagePath) return redirect(`https://instagram.com/reel/${shortcode}/`, { 'set-cookie': 'mid=fresh-mid; Path=/' });
+    if (call.path === `/reel/${shortcode}/`) {
+      assert.match(call.headers.get('cookie'), /mid=fresh-mid/);
+      return new Response(html(video));
+    }
+  } });
+  assert.equal(files(result).length, 1);
+});
+
+test('session CSRF from the page reaches the media request instead of being lost in a jar clone', async () => {
+  const result = await run({ respond(call) {
+    if (call.path === pagePath && call.headers.get('cookie')?.includes('sessionid=')) {
+      return new Response('<html></html>', { headers: { 'set-cookie': 'csrftoken=fresh-csrf; Path=/' } });
+    }
+    if (call.path === apiPath && call.hostname === 'www.instagram.com') {
+      assert.equal(call.headers.get('x-csrftoken'), 'fresh-csrf');
+      assert.match(call.headers.get('cookie'), /csrftoken=fresh-csrf/);
+      return Response.json({ items: [video] });
+    }
+  } });
+  assert.equal(files(result).length, 1);
+  assert.equal(result.calls.length, 4);
+});
+
+test('a fresh HTML CSRF token replaces the stale configured value in both cookie and header', async () => {
+  const result = await run({ env: { INSTAGRAM_CSRFTOKEN: 'stale-csrf' }, respond(call) {
+    if (call.path === pagePath && call.headers.get('cookie')?.includes('sessionid=')) {
+      return new Response('<script>{"csrf_token":"html-csrf"}</script>');
+    }
+    if (call.path === apiPath && call.hostname === 'www.instagram.com') {
+      assert.equal(call.headers.get('x-csrftoken'), 'html-csrf');
+      assert.match(call.headers.get('cookie'), /csrftoken=html-csrf/);
+      assert.ok(!call.headers.get('cookie').includes('stale-csrf'));
+      return Response.json({ items: [video] });
+    }
+  } });
+  assert.equal(files(result).length, 1);
+  const webRequest = result.calls.find(call => call.hostname === 'www.instagram.com' && call.path === apiPath);
+  assert.equal(webRequest.headers.get('x-csrftoken'), 'html-csrf');
+  assert.match(webRequest.headers.get('cookie'), /csrftoken=html-csrf/);
+  assert.equal(result.calls.length, 4);
+});
+
+test('anonymous cookies never become part of the configured account session', async () => {
+  const result = await run({ respond(call) {
+    if (call.path === pagePath && !call.headers.get('cookie')?.includes('sessionid=')) {
+      return new Response('<html></html>', { headers: { 'set-cookie': 'mid=anonymous-mid; Path=/' } });
+    }
+    if (call.path === pagePath && call.headers.get('cookie')?.includes('sessionid=')) {
+      assert.ok(!call.headers.get('cookie').includes('anonymous-mid'));
+    }
+  } });
+  assert.equal(files(result).length, 1);
+  const authenticated = result.calls.filter(call => call.headers.get('cookie')?.includes('sessionid='));
+  assert.ok(authenticated.length > 0);
+  assert.ok(authenticated.every(call => !call.headers.get('cookie').includes('anonymous-mid')));
+});
+
+test('confirmed session account redirects stop without retrying rejected account endpoints', async () => {
+  for (const [path, code, text] of [
+    ['/accounts/login/?private=redirect-secret', 'LOGIN_REQUIRED', /نشست/],
+    ['/challenge/?private=redirect-secret', 'CHALLENGE_REQUIRED', /تأیید امنیتی/],
+    ['/consent/?private=redirect-secret', 'CONSENT_REQUIRED', /پذیرش شرایط/],
+    ['/accounts/onetap/?private=redirect-secret', 'ACCOUNT_ACTION_REQUIRED', /تأیید حساب/],
+    ['/?private=redirect-secret', 'ACCOUNT_ACTION_REQUIRED', /تأیید حساب/],
+  ]) {
+    const result = await run({ respond(call) {
+      if (call.path === pagePath && call.headers.get('cookie')?.includes('sessionid=')) return redirect(path);
+    } });
+    assert.match(report(result), new RegExp(`^INSTAGRAM_SESSION_${code}`));
+    assert.equal(result.calls.length, 3);
+    assert.equal(files(result).length, 0);
+    assert.match(errorText(result), text);
+    assert.ok(!JSON.stringify(result.diagnostics).includes('redirect-secret'));
+    noObsoleteRequests(result);
   }
 });
 
-test('public post data is read even when homepage bootstrap redirects to login and LSD is absent', async () => {
-  const result = await run({ session: '', mobileAllowsAuth: false, homeRedirect: '/accounts/login/?private=secret',
-    pageHtml: `<html><script type="application/json" data-sjs>${JSON.stringify({ data: { item: video } })}</script></html>` });
-  assert.equal(result.sent.filter(call => call.method === 'sendVideo').length, 1);
-  assert.equal(result.history.at(-1).status, 'success');
+test('non-2xx API JSON preserves the specific security or login rejection', async () => {
+  for (const [payload, status, code] of [
+    [{ message: 'challenge_required', challenge: {} }, 400, 'SESSION_CHALLENGE_REQUIRED'],
+    [{ message: 'consent_required' }, 403, 'SESSION_CONSENT_REQUIRED'],
+    [{ message: 'session_expired' }, 403, 'SESSION_LOGIN_REQUIRED'],
+  ]) {
+    const result = await run({ respond(call) {
+      if (call.path === apiPath && call.headers.get('cookie')?.includes('sessionid=')) return Response.json(payload, { status });
+    } });
+    assert.match(report(result), new RegExp(`^INSTAGRAM_${code}`));
+    assert.equal(files(result).length, 0);
+    noObsoleteRequests(result);
+  }
 });
 
-test('all failed post resolvers report sanitized per-resolver failure causes in the final error', async () => {
-  const result = await run({ mobileAllowsAuth: false });
-  assert.equal(result.sent.filter(call => call.method === 'sendVideo').length, 0);
-  assert.equal(result.history.at(-1).status, 'failed');
-  const report = result.diagnostics.find(item => item.message === 'instagram download failed')?.info?.detail;
-  assert.match(report, /INSTAGRAM_ALL_RESOLVERS_FAILED/);
-  assert.match(report, /session\/mobile-api:INSTAGRAM_LOGIN_REQUIRED/);
-  assert.match(report, /graphql-web-info:INSTAGRAM_GRAPHQL_ERROR_4630001/);
-  assert.doesNotMatch(report, /fixture-session|test-telegram-token/);
+test('HTTP 200 login forms are classified without mistaking a normal login link for rejection', async () => {
+  const rejected = await run({ respond(call) {
+    if (call.path === pagePath) return new Response('<form id="loginForm" action="/accounts/login/"></form>');
+  } });
+  assert.match(report(rejected), /^INSTAGRAM_SESSION_LOGIN_REQUIRED/);
+  assert.equal(rejected.calls.length, 3);
+  const accessible = await run({ session: '', respond(call) {
+    if (call.path === pagePath) return new Response('<a href="/accounts/login/">Log in</a>' + html(video));
+  } });
+  assert.equal(files(accessible).length, 1);
 });
 
-test('web media info remains available when the native mobile API returns 403', async () => {
-  const result = await run({ mobileAllowsAuth: false, mobileStatus: 403, webInfo: video });
-  assert.equal(result.sent.filter(call => call.method === 'sendVideo').length, 1);
-  const web = result.calls.find(call => call.hostname === 'www.instagram.com' && call.path === `/api/v1/media/${mediaId}/info/`);
-  assert.match(web.headers.get('cookie'), /sessionid=/);
-  assert.equal(result.history.at(-1).status, 'success');
+test('public page data needs no homepage bootstrap, LSD or fixed GraphQL document', async () => {
+  const result = await run({ session: '', respond(call) {
+    if (call.path === pagePath) return new Response(html({ data: { item: video } }));
+  } });
+  assert.equal(files(result).length, 1);
+  assert.equal(result.calls.length, 2);
+  noObsoleteRequests(result);
 });
 
-test('post JSON selects the exact carousel and ignores recommendations', async () => {
+test('post JSON matches the exact carousel and never a recommendation', async () => {
   const other = { ...video, code: 'AnotherPost', video_versions: [{ url: 'https://scontent.cdninstagram.com/wrong.mp4' }] };
   const carousel = { code: shortcode, carousel_media: [video, { ...video, video_versions: [{ url: 'https://scontent.cdninstagram.com/second.mp4' }] }] };
-  const result = await run({ mobileAllowsAuth: false,
-    pageHtml: `<script data-sjs>${JSON.stringify({ recommendations: [other], post: carousel })}</script>` });
-  assert.equal(result.sent.filter(call => call.method === 'sendVideo').length, 2);
-  assert.equal(result.history.at(-1).delivered, 2);
-  assert.ok(!result.calls.some(call => call.path === '/wrong.mp4'));
-  const absent = await run({ session: '', mobileAllowsAuth: false,
-    pageHtml: `<script data-sjs>${JSON.stringify({ recommendations: [other] })}</script>` });
-  assert.equal(absent.sent.filter(call => call.method === 'sendVideo').length, 0);
-  assert.ok(!absent.calls.some(call => call.path === '/wrong.mp4'));
+  const result = await run({ session: '', respond(call) {
+    if (call.path === pagePath) return new Response(html({ recommendations: [other], post: carousel }));
+  } });
+  assert.equal(files(result).length, 2);
+  assert.deepEqual(files(result).map(item => new URL(item.payload.video).searchParams.get('src')), [
+    'https://scontent.cdninstagram.com/video.mp4', 'https://scontent.cdninstagram.com/second.mp4',
+  ]);
+  const absent = await run({ session: '', respond(call) {
+    if (call.path === pagePath) return new Response(html({ recommendations: [other] }));
+  } });
+  assert.equal(files(absent).length, 0);
 });
 
-test('post OpenGraph video works without JSON, CSRF or LSD tokens', async () => {
-  const result = await run({ session: '', mobileAllowsAuth: false,
-    pageHtml: '<meta content="https://scontent.cdninstagram.com/video.mp4?a=1&amp;b=2" property="og:video:secure_url">' });
-  assert.equal(result.sent.filter(call => call.method === 'sendVideo').length, 1);
-  assert.equal(result.history.at(-1).status, 'success');
+test('OpenGraph metadata and ordinary photo posts still resolve without the removed paths', async () => {
+  for (const [page, method] of [
+    ['<meta content="https://scontent.cdninstagram.com/video.mp4?a=1&amp;b=2" property="og:video:secure_url">', 'sendVideo'],
+    [html({ code: shortcode, media_type: 1, image_versions2: { candidates: [{ url: 'https://scontent.cdninstagram.com/photo.jpg' }] } }), 'sendPhoto'],
+  ]) {
+    const result = await run({ session: '', respond(call) { if (call.path === pagePath) return new Response(page); } });
+    assert.equal(files(result).length, 1);
+    assert.equal(files(result)[0].method, method);
+  }
 });
 
-test('a video cover without video bytes is not delivered as a successful photo download', async () => {
-  const cover = { code: shortcode, is_video: true, media_type: 2, image_versions2: { candidates: [{ url: 'https://scontent.cdninstagram.com/cover.jpg' }] } };
-  const result = await run({ session: '', mobileAllowsAuth: false, graphqlData: { data: { xdt_shortcode_media: cover } },
-    pageHtml: `<script data-sjs>${JSON.stringify(cover)}</script>` });
-  assert.equal(result.sent.filter(call => ['sendPhoto', 'sendVideo'].includes(call.method)).length, 0);
+test('a video cover is not substituted for missing video bytes', async () => {
+  const result = await run({ session: '', respond(call) {
+    if (call.path === pagePath) return new Response(html({ code: shortcode, media_type: 2, is_video: true,
+      image_versions2: { candidates: [{ url: 'https://scontent.cdninstagram.com/cover.jpg' }] } }));
+  } });
+  assert.equal(files(result).length, 0);
   assert.equal(result.history.at(-1).status, 'failed');
 });
 
-test('ordinary photo posts still deliver as photos', async () => {
-  const photo = { code: shortcode, is_video: false, media_type: 1,
-    image_versions2: { candidates: [{ url: 'https://scontent.cdninstagram.com/photo.jpg' }] } };
-  const result = await run({ session: '', mobileAllowsAuth: false, graphqlData: { data: { xdt_shortcode_media: photo } } });
-  assert.equal(result.sent.filter(call => call.method === 'sendPhoto').length, 1);
-  assert.equal(result.history.at(-1).status, 'success');
-});
-
-test('login and challenge redirects have explicit causes without logging redirect secrets', async () => {
-  for (const [path, code] of [['/accounts/login/?next=private-session', 'INSTAGRAM_LOGIN_REQUIRED'], ['/challenge/?secret=private-session', 'INSTAGRAM_CHALLENGE_REQUIRED']]) {
-    const result = await run({ mobileAllowsAuth: false, mobileStatus: 403, homeRedirect: path, pageRedirect: path });
-    const report = result.diagnostics.find(item => item.message === 'instagram download failed').info.detail;
-    assert.match(report, new RegExp(`session/webpage:${code}`));
-    assert.match(report, new RegExp(`graphql-web-info:${code}`));
-    assert.ok(!JSON.stringify(result.diagnostics).includes('private-session'));
-    const message = result.sent.findLast(call => call.method === 'editMessageText').payload.text;
-    assert.doesNotMatch(message, /resolver|لاگ/);
-    assert.match(message, code === 'INSTAGRAM_CHALLENGE_REQUIRED' ? /تأیید امنیتی/ : /نشست/);
+test('rate-limit responses stop immediately, including feedback errors with HTTP 400', async () => {
+  for (const [status, payload] of [[429, {}], [400, { message: 'feedback_required' }], [200, { message: 'Please wait a few minutes' }]]) {
+    const result = await run({ respond() { return Response.json(payload, { status }); } });
+    assert.match(report(result), /^INSTAGRAM_RATE_LIMIT_429/);
+    assert.equal(result.calls.length, 1);
+    assert.equal(files(result).length, 0);
   }
 });
 
-test('HTTP 200 access failures are not hidden as EMPTY', async () => {
-  for (const [data, code] of [[{ message: 'login_required' }, 'INSTAGRAM_LOGIN_REQUIRED'],
-    [{ message: 'challenge_required' }, 'INSTAGRAM_CHALLENGE_REQUIRED'],
-    [{ status: 'fail', message: 'feedback_required' }, 'INSTAGRAM_FEEDBACK_REQUIRED']]) {
-    const result = await run({ mobileAllowsAuth: false, mobileStatus: 200, mobilePayload: data });
-    const report = result.diagnostics.find(item => item.message === 'instagram download failed').info.detail;
-    assert.match(report, new RegExp(`session/mobile-api:${code}`));
-    assert.equal(result.sent.filter(call => call.method === 'sendVideo').length, 0);
+test('redirect loops are bounded and unsafe or unrelated destinations are never requested', async () => {
+  for (const [location, code] of [
+    [pagePath, 'LOOP'], ['https://attacker.test/private?secret=hidden', 'UNSAFE'],
+    [`http://www.instagram.com/reel/${shortcode}/`, 'UNSAFE'],
+    [`https://user:password@www.instagram.com/reel/${shortcode}/`, 'UNSAFE'],
+    [`https://www.instagram.com:444/reel/${shortcode}/`, 'UNSAFE'],
+    ['/reel/AnotherPost/', 'UNSUPPORTED'], ['/unknown/?secret=hidden', 'UNSUPPORTED'],
+  ]) {
+    const result = await run({ session: '', respond(call) { if (call.path === pagePath) return redirect(location); } });
+    assert.match(report(result), new RegExp(`INSTAGRAM_REDIRECT_${code}`));
+    assert.equal(result.calls.length, 2);
+    assert.equal(files(result).length, 0);
+    assert.ok(!JSON.stringify(result.diagnostics).includes('hidden'));
+    assert.ok(!JSON.stringify(result.diagnostics).includes('password'));
   }
 });
 
-test('non-JSON and network failures preserve safe causes rather than provider responses or secrets', async () => {
-  for (const [options, code] of [[{ graphqlRaw: '<html>private-session</html>' }, 'INSTAGRAM_NON_JSON_HTTP_200'],
-    [{ graphqlFailure: 'test-telegram-token fixture-session https://private.test/?token=private-session' }, 'INSTAGRAM_NETWORK_ERROR']]) {
-    const result = await run({ mobileAllowsAuth: false, ...options });
-    const report = result.diagnostics.find(item => item.message === 'instagram download failed').info.detail;
-    assert.match(report, new RegExp(`graphql-web-info:${code}`));
-    for (const secret of ['private-session', 'fixture-session', 'test-telegram-token', 'private.test']) {
-      assert.ok(!JSON.stringify(result.diagnostics).includes(secret));
-    }
+test('a chain of distinct canonical redirects is bounded by the existing request transport', async () => {
+  const result = await run({ session: '', respond(call) {
+    if (call.path === pagePath) return redirect(`/reel/${shortcode}/?step=1`);
+    if (call.path.startsWith('/reel/')) return redirect(`/reel/${shortcode}/?step=${Number(call.url.searchParams.get('step')) + 1}`);
+  } });
+  assert.match(report(result), /INSTAGRAM_REDIRECT_LIMIT/);
+  assert.equal(result.calls.length, 4);
+  assert.ok(result.calls.every(call => call.signal instanceof AbortSignal));
+});
+
+test('non-JSON and network diagnostics never contain response bodies, cookies or credential URLs', async () => {
+  for (const network of [false, true]) {
+    const result = await run({ session: '', respond(call) {
+      if (network) throw Error('test-telegram-token fixture-session https://private.test/?secret=hidden');
+      if (call.path === apiPath) return new Response('<html>fixture-session hidden</html>');
+    } });
+    assert.match(report(result), network ? /INSTAGRAM_NETWORK_ERROR/ : /INSTAGRAM_NON_JSON_HTTP_200/);
+    for (const value of ['fixture-session', 'test-telegram-token', 'private.test', 'hidden']) assert.ok(!JSON.stringify(result.diagnostics).includes(value));
+    noObsoleteRequests(result);
   }
-});
-
-test('a real 429 stops resolver retries instead of multiplying requests', async () => {
-  const result = await run({ session: '', mobileAllowsAuth: false, mobileStatus: 429 });
-  assert.equal(result.calls.length, 1);
-  assert.equal(result.sent.filter(call => call.method === 'sendVideo').length, 0);
-  assert.equal(result.diagnostics.find(item => item.message === 'instagram download failed').info.detail, 'INSTAGRAM_RATE_LIMIT_429');
-});
-
-test('a GraphQL rate limit in an API fail envelope is still treated as rate limiting', async () => {
-  const result = await run({ session: '', mobileAllowsAuth: false,
-    graphqlData: { status: 'fail', errors: [{ code: 1675004, message: 'Rate limit exceeded' }] } });
-  assert.equal(result.diagnostics.find(item => item.message === 'instagram download failed').info.detail, 'INSTAGRAM_RATE_LIMIT_429');
-  assert.equal(result.calls.filter(call => call.path === '/graphql/query').length, 1);
-});
-
-test('GraphQL rate-limit error carried with HTTP 200 is not disguised as an empty result', async () => {
-  const result = await run({ graphqlErrorCode: 1675004 });
-  const report = result.diagnostics.find(item => item.message === 'instagram download failed')?.info?.detail;
-  assert.equal(report, 'INSTAGRAM_RATE_LIMIT_429');
-  assert.equal(result.sent.filter(call => call.method === 'sendVideo').length, 0);
-  assert.equal(result.history.at(-1).status, 'failed');
 });
