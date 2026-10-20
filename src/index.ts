@@ -782,18 +782,23 @@ async function resolvePost(
   const anonymous: CookieJar = new Map();
   const session = secretCookies(env);
   const mediaId = shortcodeToMediaId(target.shortcode);
-  const attempts: Array<[string, () => Promise<MediaCandidate[][] | null>]> = [
-    ["public/mobile-api", () => resolveViaMobileMediaInfo(target, anonymous)],
-    ["public/webpage", () => resolveViaPostPage(target, anonymous)],
-  ];
+  const attempts: Array<[string, () => Promise<MediaCandidate[][] | null>]> = [];
+  // Use the connected account before public probes. Anonymous web throttling
+  // must not prevent a healthy authenticated media request from ever running.
   if (session.get("sessionid")) attempts.push(
+    ["session/mobile-api", () => resolveViaMobileMediaInfo(target, session)],
     ["session/webpage", () => resolveViaPostPage(target, session)],
     ["session/authenticated-media-info", () => resolveAuthenticatedMediaInfo(target, mediaId, session)],
-    ["session/mobile-api", () => resolveViaMobileMediaInfo(target, session)],
+  );
+  attempts.push(
+    ["public/mobile-api", () => resolveViaMobileMediaInfo(target, anonymous)],
+    ["public/webpage", () => resolveViaPostPage(target, anonymous)],
   );
   const diagnostics: string[] = [];
+  let sessionRejected = false;
   const failure = (code: string) => new Error(`${code} [${diagnostics.join(",")}]`);
   for (const [name, run] of attempts) {
+    if (sessionRejected && name.startsWith("session/")) continue;
     let code = "EMPTY";
     let throttle: InstagramThrottle | undefined;
     try {
@@ -812,12 +817,12 @@ async function resolvePost(
     if (name.startsWith("session/") && ["INSTAGRAM_CHALLENGE_REQUIRED", "INSTAGRAM_CONSENT_REQUIRED"].includes(code)) {
       throw failure(code.replace("INSTAGRAM_", "INSTAGRAM_SESSION_"));
     }
-    // A page redirect/form demanding login is authoritative. An API-only 401
-    // can still be resolved by the other supported API, so do not stop there.
-    if (name.startsWith("session/") && !session.get("sessionid")) throw failure("INSTAGRAM_SESSION_LOGIN_REQUIRED");
-    if (name === "session/webpage" && code === "INSTAGRAM_LOGIN_REQUIRED") throw failure("INSTAGRAM_SESSION_LOGIN_REQUIRED");
+    // Stop using explicitly rejected credentials. Public posts may still be
+    // accessible anonymously, with a separate jar and no account retries.
+    if (name.startsWith("session/") && !session.get("sessionid")) sessionRejected = true;
+    if (name === "session/webpage" && code === "INSTAGRAM_LOGIN_REQUIRED") sessionRejected = true;
   }
-  const rejectedSession = diagnostics.some(value => value.startsWith("session/") && value.endsWith(":INSTAGRAM_LOGIN_REQUIRED"));
+  const rejectedSession = sessionRejected || diagnostics.some(value => value.startsWith("session/") && value.endsWith(":INSTAGRAM_LOGIN_REQUIRED"));
   throw failure(rejectedSession ? "INSTAGRAM_SESSION_LOGIN_REQUIRED" : "INSTAGRAM_POST_UNAVAILABLE");
 }
 
