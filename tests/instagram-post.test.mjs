@@ -44,7 +44,8 @@ async function run({ session = '12345%3Afixture-session', env = {}, respond } = 
           ...(method === 'sendVideo' ? { video: { file_id: 'video-file-id' } } : {}) } });
       }
       if (target.hostname === 'scontent.cdninstagram.com') return new Response(null, { headers: { 'content-length': '1000000' } });
-      const call = { path: target.pathname, url: target, hostname: target.hostname, headers, signal: init.signal };
+      const call = { path: target.pathname, url: target, hostname: target.hostname, headers, signal: init.signal,
+        method: init.method || 'GET', body: init.body };
       calls.push(call);
       const custom = respond?.(call);
       if (custom) return custom;
@@ -55,6 +56,9 @@ async function run({ session = '12345%3Afixture-session', env = {}, respond } = 
         return Response.json({}, { status: target.hostname === 'i.instagram.com' ? 403 : 401 });
       }
       if (target.pathname === pagePath) return new Response('<html></html>');
+      if (target.pathname === '/graphql/query') return Response.json({ data: {
+        xdt_api__v1__media__shortcode__web_info: { items: [] },
+      } });
       throw Error('Unmocked endpoint');
     };
     const response = await worker.fetch(new Request('https://worker/telegram/webhook', {
@@ -68,11 +72,11 @@ async function run({ session = '12345%3Afixture-session', env = {}, respond } = 
 }
 
 function noObsoleteRequests(result) {
-  assert.ok(!result.calls.some(call => /graphql|oembed|embed/.test(call.path) || call.path === '/'));
-  assert.ok(result.calls.length <= 5, 'at most two public and three session operations');
+  assert.ok(!result.calls.some(call => /oembed|embed/.test(call.path) || call.path === '/'));
+  assert.ok(result.calls.length <= 7, 'each page may issue one shortcode web-info query');
 }
 
-test('the existing native API remains a bounded fallback with no legacy GraphQL/embed requests', async () => {
+test('the existing native API remains a bounded fallback when pages provide no web-info state', async () => {
   const result = await run();
   assert.equal(files(result).length, 1);
   assert.equal(result.history.at(-1).status, 'success');
@@ -127,7 +131,7 @@ test('session CSRF from the page reaches the media request instead of being lost
     }
   } });
   assert.equal(files(result).length, 1);
-  assert.equal(result.calls.length, 4);
+  assert.equal(result.calls.length, 5);
 });
 
 test('a fresh HTML CSRF token replaces the stale configured value in both cookie and header', async () => {
@@ -146,7 +150,7 @@ test('a fresh HTML CSRF token replaces the stale configured value in both cookie
   const webRequest = result.calls.find(call => call.hostname === 'www.instagram.com' && call.path === apiPath);
   assert.equal(webRequest.headers.get('x-csrftoken'), 'html-csrf');
   assert.match(webRequest.headers.get('cookie'), /csrftoken=html-csrf/);
-  assert.equal(result.calls.length, 4);
+  assert.equal(result.calls.length, 5);
 });
 
 test('anonymous cookies never become part of the configured account session', async () => {
@@ -426,4 +430,64 @@ test('rotated cookies remain isolated from the next independent download request
   const authenticated = next.calls.find(call => call.path === pagePath && call.headers.get('cookie')?.includes('sessionid='));
   assert.match(authenticated.headers.get('cookie'), /sessionid=12345%3Afixture-session/);
   assert.ok(!authenticated.headers.get('cookie').includes('renewed-session'));
+});
+
+test('public web-info GraphQL resolves the observed login-only API and metadata-free page regression', async () => {
+  const result = await run({ respond(call) {
+    if (call.path === apiPath) return redirect('https://i.instagram.com/accounts/login/');
+    if (call.path === pagePath) return new Response('<script>["LSD",[],{"token":"page-lsd"}]</script>', {
+      headers: { 'set-cookie': 'csrftoken=page-csrf; Path=/; Secure' },
+    });
+    if (call.path === '/graphql/query') return Response.json({ data: {
+      xdt_api__v1__media__shortcode__web_info: { items: [video] },
+    }, status: 'ok' });
+  } });
+  assert.equal(files(result).length, 1);
+  assert.equal(result.history.at(-1).status, 'success');
+  assert.equal(result.calls.length, 3, 'reuse the requested page; no homepage/bootstrap retry');
+  const graphql = result.calls.at(-1);
+  assert.equal(graphql.hostname, 'www.instagram.com');
+  assert.equal(graphql.path, '/graphql/query');
+  assert.equal(graphql.method, 'POST');
+  const params = new URLSearchParams(graphql.body);
+  assert.equal(params.get('doc_id'), '27128499623469141');
+  assert.equal(JSON.parse(params.get('variables')).shortcode, shortcode);
+  assert.equal(graphql.headers.get('x-csrftoken'), 'page-csrf');
+  assert.equal(graphql.headers.get('x-fb-lsd'), 'page-lsd');
+  assert.ok(result.calls.every(call => !call.headers.get('cookie')?.includes('sessionid=')));
+  assert.ok(!JSON.stringify(result.diagnostics).includes('page-csrf'));
+});
+
+test('session web-info uses refreshed page state and keeps anonymous cookies separate', async () => {
+  const result = await run({ env: { INSTAGRAM_CSRFTOKEN: 'stale-csrf' }, respond(call) {
+    const authenticated = call.headers.get('cookie')?.includes('sessionid=');
+    if (call.path === pagePath) return new Response('<html></html>', {
+      headers: { 'set-cookie': `csrftoken=${authenticated ? 'account' : 'anonymous'}-csrf; Path=/` },
+    });
+    if (call.path === '/graphql/query') return Response.json({ data: {
+      xdt_api__v1__media__shortcode__web_info: { items: authenticated ? [video] : [] },
+    } });
+  } });
+  assert.equal(files(result).length, 1);
+  const graphql = result.calls.filter(call => call.path === '/graphql/query');
+  assert.equal(graphql.length, 2);
+  assert.equal(graphql[0].headers.get('x-csrftoken'), 'anonymous-csrf');
+  assert.equal(graphql[1].headers.get('x-csrftoken'), 'account-csrf');
+  assert.ok(!graphql[1].headers.get('cookie').includes('anonymous-csrf'));
+  assert.equal(result.calls.length, 5);
+});
+
+test('web-info cannot substitute another post and classifies GraphQL rate limits before account attempts', async () => {
+  for (const limited of [false, true]) {
+    const result = await run({ session: limited ? '12345%3Afixture-session' : '', respond(call) {
+      if (call.path === pagePath) return new Response('<script>{"csrf_token":"page-csrf"}</script>');
+      if (call.path === '/graphql/query') return Response.json(limited
+        ? { data: null, errors: [{ code: 1675004, message: 'Rate limit exceeded' }] }
+        : { data: { xdt_api__v1__media__shortcode__web_info: { items: [{ ...video, code: 'AnotherPost' }] } } });
+    } });
+    assert.equal(result.calls.length, 3);
+    assert.equal(files(result).length, 0);
+    assert.match(report(result), limited ? /^INSTAGRAM_RATE_LIMIT_429/ : /^INSTAGRAM_POST_UNAVAILABLE/);
+    assert.ok(result.calls.every(call => !call.headers.get('cookie')?.includes('sessionid=')));
+  }
 });

@@ -53,6 +53,7 @@ const WEB_APP_ID = "936619743392459";
 const IOS_APP_ID = "124024574287414";
 const PRIVATE_APP_ID = "567067343352427";
 const WEB_ASBD_ID = "359341";
+const POST_WEB_INFO_DOC_ID = "27128499623469141";
 const STORY_GRAPHQL_DOC_ID = "25317500907894419";
 const IG_WWW_CLAIM_STATE_KEY = "__ig_www_claim";
 const PRIVATE_BLOKS_VERSION_ID = "7189b949425f9bf80ea8bd880cf5a3080b292d9b1c4b38a18d112f7c4b71e7a8";
@@ -498,7 +499,10 @@ function extractDtsgToken(html: string): string | null {
   );
 }
 
-async function fetchPostResponse(url: string, headers: Headers, jar: CookieJar): Promise<Response> {
+async function fetchPostResponse(
+  url: string, headers: Headers, jar: CookieJar,
+  init: Pick<RequestInit, "method" | "body"> = {},
+): Promise<Response> {
   let current = new URL(url);
   const shortcode = /^\/(?:p|reel|reels|tv)\/([A-Za-z0-9_-]+)\/?$/.exec(current.pathname)?.[1];
   const visited = new Set<string>();
@@ -513,7 +517,7 @@ async function fetchPostResponse(url: string, headers: Headers, jar: CookieJar):
     else requestHeaders.delete("x-csrftoken");
     let response: Response;
     try {
-      response = await fetch(current.href, { headers: requestHeaders, redirect: "manual", signal });
+      response = await fetch(current.href, { ...init, headers: requestHeaders, redirect: "manual", signal });
     } catch {
       throw new Error("INSTAGRAM_NETWORK_ERROR");
     }
@@ -543,8 +547,11 @@ async function fetchPostResponse(url: string, headers: Headers, jar: CookieJar):
   }
 }
 
-async function fetchJson(url: string, headers: Headers, jar: CookieJar): Promise<{ data: any }> {
-  const response = await fetchPostResponse(url, headers, jar);
+async function fetchJson(
+  url: string, headers: Headers, jar: CookieJar,
+  init: Pick<RequestInit, "method" | "body"> = {},
+): Promise<{ data: any }> {
+  const response = await fetchPostResponse(url, headers, jar, init);
   if (response.status === 429) {
     await response.body?.cancel().catch(() => undefined);
     throwForInstagramStatus(response.status);
@@ -563,6 +570,10 @@ async function fetchJson(url: string, headers: Headers, jar: CookieJar): Promise
 }
 
 function throwPostAccessFailure(data: any): void {
+  if (Array.isArray(data?.errors) && data.errors.some((error: any) =>
+    error?.code === 1675004 || /rate limit exceeded/i.test(String(error?.message || "")))) {
+    throw new Error("INSTAGRAM_RATE_LIMIT_429");
+  }
   const marker = String(data?.message || data?.error_type || "").toLowerCase();
   if (/^(?:login_required|session_expired|user_has_logged_out)$/.test(marker)) throw new Error("INSTAGRAM_LOGIN_REQUIRED");
   if (data?.challenge || data?.checkpoint_url || /^(?:challenge_required|checkpoint_required)$/.test(marker)) {
@@ -636,9 +647,9 @@ function exactPostGroups(value: unknown, shortcode: string, mediaId: string, dep
 async function resolveViaPostPage(
   target: Extract<InstagramTarget, { kind: "post" }>, jar: CookieJar,
 ): Promise<MediaCandidate[][] | null> {
-  // Public media embedded in the requested page needs neither a homepage CSRF
-  // bootstrap nor an LSD token. Bind JSON products to this exact post so a
-  // recommendation or login-page preview cannot replace the requested video.
+  // Reuse the requested page's state for web-info when Instagram sends only
+  // its app shell. The media-info API can require login for a public post.
+  const authenticated = jar.has("sessionid");
   const page = await fetchHtml(`https://www.instagram.com/p/${target.shortcode}/`, browserHeaders(jar), jar);
   // Use one jar for the whole session phase: tokens from this response must
   // reach the media-info request instead of being discarded in a resolver copy.
@@ -648,7 +659,35 @@ async function resolveViaPostPage(
   if (groups.length) return groups;
   const meta = page.match(/<meta\b[^>]*\bproperty=["']og:video(?::(?:url|secure_url))?["'][^>]*>/gi) || [];
   const fromMeta = candidatesFromHtmlMeta(meta.join("\n"));
-  return fromMeta.length ? fromMeta : null;
+  if (fromMeta.length) return fromMeta;
+  if (!jar.get("csrftoken") || (authenticated && !jar.has("sessionid"))) return null;
+
+  // The shortcode web-info query returns media omitted from the HTML app shell.
+  // Reuse page tokens rather than requiring another homepage bootstrap.
+  const headers = webHeaders(jar, target.url);
+  headers.set("content-type", "application/x-www-form-urlencoded");
+  headers.set("origin", "https://www.instagram.com");
+  headers.set("x-requested-with", "XMLHttpRequest");
+  const lsd = /\["LSD",\[\],\{"token":"([^"]+)"/.exec(page)?.[1];
+  if (lsd) headers.set("x-fb-lsd", lsd);
+  const response = await fetchJson("https://www.instagram.com/graphql/query", headers, jar, {
+    method: "POST",
+    body: new URLSearchParams({
+      doc_id: POST_WEB_INFO_DOC_ID,
+      variables: JSON.stringify({
+        shortcode: target.shortcode,
+        __relay_internal__pv__PolarisAIGMMediaWebLabelEnabledrelayprovider: false,
+      }),
+      server_timestamps: "true",
+    }).toString(),
+  });
+  const items = response.data?.data?.xdt_api__v1__media__shortcode__web_info?.items;
+  const fromWebInfo = exactPostGroups(items, target.shortcode, shortcodeToMediaId(target.shortcode));
+  if (fromWebInfo.length) {
+    console.log("instagram resolver success", { resolver: "graphql-web-info", authenticated });
+    return fromWebInfo;
+  }
+  return null;
 }
 
 function safeJsonScripts(html: string): unknown[] {
