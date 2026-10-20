@@ -318,3 +318,112 @@ test('non-JSON and network diagnostics never contain response bodies, cookies or
     noObsoleteRequests(result);
   }
 });
+
+function sessionResponse(cookies, mode, location = '/') {
+  const response = redirect(location);
+  // Match Workers' Set-Cookie API and runtimes that expose one combined field.
+  Object.defineProperty(response.headers, 'getSetCookie', { value: undefined });
+  if (mode === 'workers') {
+    Object.defineProperty(response.headers, 'getAll', { value: name => {
+      assert.equal(name.toLowerCase(), 'set-cookie');
+      return cookies;
+    } });
+    const originalGet = response.headers.get.bind(response.headers);
+    response.headers.get = name => name.toLowerCase() === 'set-cookie' ? cookies[0] : originalGet(name);
+  } else {
+    response.headers.set('set-cookie', cookies.join(', '));
+  }
+  return response;
+}
+
+test('session rotation survives the reported home redirect and reaches media info on Workers', async () => {
+  for (const mode of ['workers', 'combined']) {
+    const cookies = [
+      'csrftoken=fresh-csrf; Expires=Wed, 21 Oct 2099 07:28:00 GMT; Path=/',
+      'sessionid=12345%3Arenewed-session; Path=/; Secure; HttpOnly',
+      'ds_user_id=12345; Path=/',
+    ];
+    const result = await run({ respond(call) {
+      if (call.path === pagePath && call.headers.get('cookie')?.includes('sessionid=')) return sessionResponse(cookies, mode);
+      if (call.path === apiPath) {
+        if (call.hostname === 'www.instagram.com' && call.headers.get('cookie')?.includes('sessionid=12345%3Arenewed-session')) {
+          assert.equal(call.headers.get('x-csrftoken'), 'fresh-csrf');
+          assert.match(call.headers.get('cookie'), /ds_user_id=12345/);
+          return Response.json({ items: [video] });
+        }
+        return Response.json({ message: 'login_required' }, { status: 401 });
+      }
+    } });
+    assert.equal(files(result).length, 1, mode);
+    assert.equal(result.calls.length, 4);
+    assert.equal(result.history.at(-1).status, 'success');
+    for (const secret of ['renewed-session', 'fresh-csrf']) assert.ok(!JSON.stringify(result.diagnostics).includes(secret));
+  }
+});
+
+test('all valid response cookies survive combined fields without turning attributes into cookies', async () => {
+  const result = await run({ respond(call) {
+    if (call.path === pagePath && call.headers.get('cookie')?.includes('sessionid=')) return sessionResponse([
+      'csrftoken=fresh-csrf; Expires=Wed, 21 Oct 2099 07:28:00 GMT; Path=/',
+      'sessionid=12345%3Arenewed-session; Path=/; HttpOnly',
+      'ds_user_id=12345; Path=/', 'ig_nrcb=1; Path=/',
+    ], 'combined');
+    if (call.path === apiPath && call.hostname === 'www.instagram.com') {
+      const cookie = call.headers.get('cookie');
+      assert.match(cookie, /sessionid=12345%3Arenewed-session/);
+      assert.match(cookie, /ds_user_id=12345/);
+      assert.match(cookie, /ig_nrcb=1/);
+      assert.ok(!/Expires=|Path=|GMT/.test(cookie));
+      return Response.json({ items: [video] });
+    }
+  } });
+  assert.equal(files(result).length, 1);
+  assert.equal(result.calls.length, 4);
+});
+
+test('deleted cookies are removed and Max-Age takes precedence over Expires', async () => {
+  for (const expired of ['Max-Age=0', 'Max-Age=-1', 'Expires=Thu, 01 Jan 1970 00:00:00 GMT']) {
+    const result = await run({ env: { INSTAGRAM_CSRFTOKEN:'old-csrf', INSTAGRAM_MID:'old-mid' }, respond(call) {
+      if (call.path === pagePath && call.headers.get('cookie')?.includes('sessionid=')) return sessionResponse([
+        `csrftoken=old-csrf; ${expired}; Path=/`,
+        'mid=; Max-Age=0; Path=/',
+        'ig_did=fresh-device; Max-Age=3600; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/',
+      ], 'combined');
+      if (call.path === apiPath && call.hostname === 'www.instagram.com') {
+        const cookie = call.headers.get('cookie');
+        assert.equal(call.headers.get('x-csrftoken'), null);
+        assert.ok(!cookie.includes('csrftoken='));
+        assert.ok(!/(?:^|; )mid=/.test(cookie));
+        assert.match(cookie, /ig_did=fresh-device/);
+        return Response.json({ items: [video] });
+      }
+    } });
+    assert.equal(files(result).length, 1, expired);
+    assert.equal(result.calls.length, 4, expired);
+  }
+});
+
+test('an explicitly cleared session stops before retrying more endpoints with rejected credentials', async () => {
+  const result = await run({ respond(call) {
+    if (call.path === pagePath && call.headers.get('cookie')?.includes('sessionid=')) return sessionResponse([
+      'csrftoken=fresh-csrf; Path=/', 'sessionid=; Max-Age=0; Path=/',
+    ], 'workers');
+  } });
+  assert.equal(result.calls.length, 3);
+  assert.equal(files(result).length, 0);
+  assert.match(report(result), /^INSTAGRAM_SESSION_LOGIN_REQUIRED/);
+  assert.ok(!result.calls.some(call => call.hostname === 'www.instagram.com' && call.path === apiPath));
+  assert.ok(!JSON.stringify(result.diagnostics).includes('fresh-csrf'));
+});
+
+test('rotated cookies remain isolated from the next independent download request', async () => {
+  await run({ respond(call) {
+    if (call.path === pagePath && call.headers.get('cookie')?.includes('sessionid=')) return sessionResponse([
+      'sessionid=12345%3Arenewed-session; Path=/', 'csrftoken=fresh-csrf; Path=/',
+    ], 'workers');
+  } });
+  const next = await run();
+  const authenticated = next.calls.find(call => call.path === pagePath && call.headers.get('cookie')?.includes('sessionid='));
+  assert.match(authenticated.headers.get('cookie'), /sessionid=12345%3Afixture-session/);
+  assert.ok(!authenticated.headers.get('cookie').includes('renewed-session'));
+});

@@ -62,16 +62,6 @@ const TELEGRAM_PHOTO_URL_LIMIT = 4_800_000;
 const IG_SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 
-const PRIVATE_SUPPORTED_CAPABILITIES = [
-  {
-    value: "119.0,120.0,121.0,122.0,123.0,124.0,125.0,126.0,127.0,128.0,129.0,130.0,131.0,132.0,133.0,134.0,135.0,136.0,137.0,138.0,139.0,140.0,141.0,142.0",
-    name: "SUPPORTED_SDK_VERSIONS",
-  },
-  { value: "14", name: "FACE_TRACKER_VERSION" },
-  { value: "ETC2_COMPRESSION", name: "COMPRESSION" },
-  { value: "gyroscope_enabled", name: "gyroscope" },
-];
-
 const WEB_UA =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
 const IOS_UA =
@@ -215,18 +205,29 @@ function absorbSetCookies(headers: Headers, jar: CookieJar): void {
   const routedUserId = headers.get("ig-set-ig-u-ds-user-id")?.trim();
   if (routedUserId && /^\d+$/.test(routedUserId)) jar.set("ds_user_id", routedUserId);
 
-  const extended = headers as Headers & { getSetCookie?: () => string[] };
-  const values = typeof extended.getSetCookie === "function"
-    ? extended.getSetCookie()
+  const extended = headers as Headers & {
+    getSetCookie?: () => string[];
+    getAll?: (name: string) => string[];
+  };
+  // Workers exposes getAll("Set-Cookie"); get() can lose later cookies.
+  // Keep getSetCookie for standard runtimes and a bounded legacy fallback.
+  const values = typeof extended.getAll === "function" ? extended.getAll("Set-Cookie")
+    : typeof extended.getSetCookie === "function" ? extended.getSetCookie()
     : [headers.get("set-cookie") || ""];
 
-  for (const value of values) {
-    if (!value) continue;
-    const first = /^\s*([A-Za-z0-9_]+)=([^;]*)/.exec(value);
-    if (first?.[1]) jar.set(first[1], first[2] || "");
-    for (const name of ["csrftoken", "mid", "ig_did", "datr", "dpr", "wd", "ig_nrcb", "rur"]) {
-      const match = new RegExp(`(?:^|[,;]\\s*)${name}=([^;,\\s]+)`, "i").exec(value);
-      if (match?.[1]) jar.set(name, match[1]);
+  for (const combined of values) {
+    // A comma inside an Expires date is not a new cookie. Only split before
+    // an actual name=value pair, including on runtimes with combined fields.
+    for (const value of combined.split(/,(?=\s*[A-Za-z0-9_!#$%&'*+.^`|~-]+=)/)) {
+      const first = /^\s*([A-Za-z0-9_!#$%&'*+.^`|~-]+)=([^;]*)/.exec(value);
+      if (!first) continue;
+      const maxAge = /;\s*max-age\s*=\s*(-?\d+)\s*(?:;|$)/i.exec(value)?.[1];
+      const expires = /;\s*expires\s*=\s*([^;]+)/i.exec(value)?.[1];
+      const expired = maxAge !== undefined ? Number(maxAge) <= 0
+        : expires !== undefined && Date.parse(expires) <= Date.now();
+      const cookie = first[2].trim().replace(/^"(.*)"$/, "$1");
+      if (!cookie || expired) jar.delete(first[1]);
+      else jar.set(first[1], cookie);
     }
   }
 }
@@ -723,6 +724,7 @@ async function resolvePost(
     }
     // A page redirect/form demanding login is authoritative. An API-only 401
     // can still be resolved by the other supported API, so do not stop there.
+    if (name.startsWith("session/") && !session.get("sessionid")) throw failure("INSTAGRAM_SESSION_LOGIN_REQUIRED");
     if (name === "session/webpage" && code === "INSTAGRAM_LOGIN_REQUIRED") throw failure("INSTAGRAM_SESSION_LOGIN_REQUIRED");
   }
   const rejectedSession = diagnostics.some(value => value.startsWith("session/") && value.endsWith(":INSTAGRAM_LOGIN_REQUIRED"));
