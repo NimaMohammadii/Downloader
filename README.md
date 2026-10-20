@@ -77,6 +77,8 @@ Tests cover provider routing, exact large IDs, hostile redirects/hosts, real pin
 
 Public Reel/Post downloads are attempted without an Instagram session first. A valid Instagram session can improve reliability and is required for Stories when Instagram requires login.
 
+Post media IDs are decoded directly from the shortcode with integer precision; a blocked oEmbed endpoint cannot stop the actual media-info request. Resolution also reads metadata from the requested post's webpage without requiring homepage CSRF/LSD setup and accepts supported mobile and GraphQL response shapes. Embedded JSON is matched to the requested post, preserving carousel order and avoiding recommendations; a video's cover image is never substituted for missing video bytes. Login redirects, security challenges, non-JSON responses and network failures have distinct resolver codes instead of `EMPTY`. Resolver logs exclude credentials, response bodies and redirect query strings; explicit 429 responses stop further resolver attempts. Failed downloads show a user-facing explanation rather than asking users to provide internal resolver logs. Actual Instagram account access and source-server availability still require a post-deployment check.
+
 ## Instagram Live and replay in bot chat
 
 - Send a native `https://www.instagram.com/username/live/BROADCAST_ID/` link, or `/live username` to record an accessible active broadcast.
