@@ -28,7 +28,8 @@ const report = result => result.diagnostics.find(item => item.message === 'insta
 const files = result => result.sent.filter(item => ['sendPhoto', 'sendVideo'].includes(item.method));
 const errorText = result => result.sent.findLast(item => item.method === 'editMessageText')?.payload.text;
 
-async function run({ session = '12345%3Afixture-session', env = {}, respond } = {}) {
+async function run({ session = '12345%3Afixture-session', env = {}, respond, telegramRespond,
+  text = `https://www.instagram.com/reel/${shortcode}/?mdxt=test` } = {}) {
   const calls = [], sent = [], diagnostics = [];
   globalThis.history = [];
   const previous = { error: console.error, warn: console.warn, log: console.log };
@@ -40,6 +41,8 @@ async function run({ session = '12345%3Afixture-session', env = {}, respond } = 
       if (target.hostname === 'api.telegram.org') {
         const method = target.pathname.split('/').at(-1);
         sent.push({ method, payload: JSON.parse(init.body) });
+        const custom = telegramRespond?.(sent.at(-1));
+        if (custom) return custom;
         return Response.json({ ok: true, result: { message_id: 99,
           ...(method === 'sendVideo' ? { video: { file_id: 'video-file-id' } } : {}) } });
       }
@@ -64,7 +67,7 @@ async function run({ session = '12345%3Afixture-session', env = {}, respond } = 
     const response = await worker.fetch(new Request('https://worker/telegram/webhook', {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-telegram-bot-api-secret-token': 'test-webhook' },
       body: JSON.stringify({ update_id: 9, message: { message_id: 8, from: { id: 42 }, chat: { id: 42 },
-        text: `https://www.instagram.com/reel/${shortcode}/?mdxt=test` } }),
+        text } }),
     }), { BOT_TOKEN: 'test-telegram-token', WEBHOOK_SECRET: 'test-webhook', INSTAGRAM_SESSIONID: session, ...env }, {});
     assert.equal(response.status, 200);
   } finally { Object.assign(console, previous); }
@@ -275,8 +278,8 @@ test('a video cover is not substituted for missing video bytes', async () => {
   assert.equal(result.history.at(-1).status, 'failed');
 });
 
-test('rate-limit responses stop immediately, including feedback errors with HTTP 400', async () => {
-  for (const [status, payload] of [[429, {}], [400, { message: 'feedback_required' }], [200, { message: 'Please wait a few minutes' }]]) {
+test('rate-limit responses stop immediately', async () => {
+  for (const [status, payload] of [[429, {}], [200, { message: 'Please wait a few minutes' }]]) {
     const result = await run({ respond() { return Response.json(payload, { status }); } });
     assert.match(report(result), /^INSTAGRAM_RATE_LIMIT_429/);
     assert.equal(result.calls.length, 1);
@@ -490,4 +493,78 @@ test('web-info cannot substitute another post and classifies GraphQL rate limits
     assert.match(report(result), limited ? /^INSTAGRAM_RATE_LIMIT_429/ : /^INSTAGRAM_POST_UNAVAILABLE/);
     assert.ok(result.calls.every(call => !call.headers.get('cookie')?.includes('sessionid=')));
   }
+});
+
+test('the reported public-phase failure retains its actual HTTP status, endpoint and Retry-After', async () => {
+  const result = await run({ respond(call) {
+    if (call.path === apiPath) return Response.json({ message: 'login_required' }, { status: 401 });
+    if (call.path === pagePath) return new Response(null, { status: 429, headers: { 'retry-after': '1158' } });
+  } });
+  assert.match(report(result), /^INSTAGRAM_RATE_LIMIT_429 \[public\/mobile-api:INSTAGRAM_LOGIN_REQUIRED,public\/webpage:INSTAGRAM_RATE_LIMIT_429\]/);
+  assert.deepEqual(result.diagnostics.find(x => x.message === 'instagram download failed').info.throttle, {
+    source: 'http', httpStatus: 429, endpoint: pagePath, retryAfterSeconds: 1158,
+  });
+  assert.equal(result.calls.length, 2);
+  assert.equal(files(result).length, 0);
+  assert.match(errorText(result), /1158/);
+});
+
+test('a GraphQL throttle with HTTP 200 is distinguishable from a server HTTP 429', async () => {
+  const result = await run({ respond(call) {
+    if (call.path === pagePath) return new Response('<script>{"csrf_token":"csrf-secret"}</script>');
+    if (call.path === '/graphql/query') return Response.json({ data: null,
+      errors: [{ code: 1675004, message: 'Rate limit exceeded csrf-secret' }] });
+  } });
+  const throttle = result.diagnostics.find(x => x.message === 'instagram download failed').info.throttle;
+  assert.deepEqual(throttle, { source: 'graphql', httpStatus: 200, endpoint: '/graphql/query', graphqlCode: 1675004 });
+  assert.equal(result.calls.length, 3);
+  assert.ok(!JSON.stringify(result.diagnostics).includes('csrf-secret'));
+  assert.ok(!errorText(result).includes('این سرور'));
+});
+
+test('Retry-After dates are read without inventing a delay for missing or malformed headers', async () => {
+  for (const value of [undefined, 'invalid', '1.5', new Date(Date.now() + 120_000).toUTCString()]) {
+    const result = await run({ respond() {
+      return new Response(null, { status: 429, headers: value ? { 'retry-after': value } : {} });
+    } });
+    const throttle = result.diagnostics.find(x => x.message === 'instagram download failed').info.throttle;
+    if (value?.endsWith('GMT')) assert.ok(throttle.retryAfterSeconds >= 118 && throttle.retryAfterSeconds <= 120);
+    else assert.equal(throttle.retryAfterSeconds, undefined);
+    assert.equal(result.calls.length, 1);
+  }
+});
+
+test('feedback_required stops requests without claiming an HTTP 429 or an IP restriction', async () => {
+  const result = await run({ respond() { return Response.json({ message: 'feedback_required' }, { status: 400 }); } });
+  assert.match(report(result), /^INSTAGRAM_FEEDBACK_REQUIRED/);
+  assert.equal(result.calls.length, 1);
+  assert.equal(files(result).length, 0);
+  assert.ok(!errorText(result).includes('429'));
+});
+
+test('a kicked bot acknowledges start, unrelated text and Instagram requests without another delivery attempt', async () => {
+  for (const text of ['/start', 'hello', `https://www.instagram.com/reel/${shortcode}/`]) {
+    const result = await run({ text, telegramRespond() { return Response.json({ ok: false, error_code: 403,
+      description: 'Forbidden: bot was kicked from the supergroup chat' }, { status: 403 }); } });
+    assert.equal(result.sent.length, 1);
+    assert.equal(result.calls.length, 0);
+    assert.ok(result.diagnostics.some(x => x.message === 'telegram chat unavailable'));
+    assert.ok(!result.diagnostics.some(x => x.message === 'instagram download failed'));
+  }
+});
+
+test('kicked errors during media delivery stop without sending an error back to the inaccessible chat', async () => {
+  const result = await run({ telegramRespond(call) {
+    if (call.method === 'sendVideo') return Response.json({ ok: false, error_code: 403,
+      description: 'Forbidden: bot was kicked from the supergroup chat' }, { status: 403 });
+  } });
+  assert.deepEqual(result.sent.map(x => x.method), ['sendMessage', 'sendVideo']);
+  assert.equal(result.history.at(-1).status, 'failed');
+});
+
+test('temporary Telegram failures and invalid bot credentials are not silently acknowledged as kicked chats', async () => {
+  for (const status of [401, 500]) await assert.rejects(() => run({ text: '/start', telegramRespond() {
+    return Response.json({ ok: false, error_code: status,
+      description: 'Forbidden: bot was kicked from the supergroup chat' }, { status });
+  } }), /bot was kicked/);
 });

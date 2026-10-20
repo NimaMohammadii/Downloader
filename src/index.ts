@@ -28,7 +28,42 @@ type TelegramApiResponse<T> = {
   ok: boolean;
   result?: T;
   description?: string;
+  error_code?: number;
 };
+
+class TelegramApiError extends Error {
+  constructor(message: string, readonly code: number) { super(message); }
+}
+
+function acknowledgeKickedChat(error: unknown): boolean {
+  if (!(error instanceof TelegramApiError) || error.code !== 403 ||
+      !/bot was kicked from (?:the )?(?:supergroup|group|channel) chat/i.test(error.message)) return false;
+  console.warn("telegram chat unavailable", { code: error.code, reason: "bot_kicked" });
+  return true;
+}
+
+type InstagramThrottle = {
+  source: "http" | "graphql" | "api" | "feedback";
+  httpStatus: number;
+  endpoint: string;
+  retryAfterSeconds?: number;
+  graphqlCode?: number;
+};
+
+class InstagramThrottleError extends Error {
+  constructor(readonly throttle: InstagramThrottle, message = "INSTAGRAM_RATE_LIMIT_429") { super(message); }
+}
+
+function instagramThrottle(response: Response, url: string, source: InstagramThrottle["source"]): InstagramThrottle {
+  const info: InstagramThrottle = { source, httpStatus: response.status, endpoint: new URL(url).pathname };
+  const value = response.headers.get("retry-after")?.trim();
+  if (value) {
+    const seconds = /^\d+$/.test(value) ? Number(value)
+      : /[a-z]/i.test(value) ? Math.max(0, Math.ceil((Date.parse(value) - Date.now()) / 1000)) : NaN;
+    if (Number.isSafeInteger(seconds) && seconds >= 0) info.retryAfterSeconds = seconds;
+  }
+  return info;
+}
 
 type InstagramTarget =
   | { kind: "post"; url: string; shortcode: string }
@@ -82,7 +117,7 @@ async function telegramCall<T = unknown>(
     body: JSON.stringify(telegramCustomEmoji(method, payload)),
   });
   const data = (await response.json()) as TelegramApiResponse<T>;
-  if (!response.ok || !data.ok) throw new Error(data.description || `Telegram ${method} failed`);
+  if (!response.ok || !data.ok) throw new TelegramApiError(data.description || `Telegram ${method} failed`, data.error_code || response.status);
   return data.result as T;
 }
 
@@ -522,6 +557,10 @@ async function fetchPostResponse(
       throw new Error("INSTAGRAM_NETWORK_ERROR");
     }
     absorbSetCookies(response.headers, jar);
+    if (response.status === 429) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new InstagramThrottleError(instagramThrottle(response, current.href, "http"));
+    }
     if (response.status < 300 || response.status >= 400) return response;
     await response.body?.cancel().catch(() => undefined);
     let location: URL;
@@ -552,17 +591,23 @@ async function fetchJson(
   init: Pick<RequestInit, "method" | "body"> = {},
 ): Promise<{ data: any }> {
   const response = await fetchPostResponse(url, headers, jar, init);
-  if (response.status === 429) {
-    await response.body?.cancel().catch(() => undefined);
-    throwForInstagramStatus(response.status);
-  }
   let data: any = null;
   try { data = await response.json(); } catch (error) {
     if (!(error instanceof SyntaxError)) throw new Error("INSTAGRAM_NETWORK_ERROR");
   }
   // Instagram often returns a precise login/challenge rejection with HTTP 400
   // or 403. Classify it before reducing the response to its status alone.
-  throwPostAccessFailure(data);
+  try { throwPostAccessFailure(data); } catch (error) {
+    if (error instanceof Error && ["INSTAGRAM_RATE_LIMIT_429", "INSTAGRAM_FEEDBACK_REQUIRED"].includes(error.message)) {
+      const graphql = Array.isArray(data?.errors) ? data.errors.find((item: any) =>
+        item?.code === 1675004 || /rate limit exceeded/i.test(String(item?.message || ""))) : undefined;
+      const source = error.message === "INSTAGRAM_FEEDBACK_REQUIRED" ? "feedback" : graphql ? "graphql" : "api";
+      const info = instagramThrottle(response, url, source);
+      if (Number.isSafeInteger(graphql?.code)) info.graphqlCode = graphql.code;
+      throw new InstagramThrottleError(info, error.message);
+    }
+    throw error;
+  }
   throwForInstagramStatus(response.status);
   if (!response.ok) throw new Error(response.status === 401 ? "INSTAGRAM_LOGIN_REQUIRED" : `INSTAGRAM_HTTP_${response.status}`);
   if (!data || typeof data !== "object") throw new Error(`INSTAGRAM_NON_JSON_HTTP_${response.status}`);
@@ -580,7 +625,8 @@ function throwPostAccessFailure(data: any): void {
     throw new Error("INSTAGRAM_CHALLENGE_REQUIRED");
   }
   if (marker === "consent_required") throw new Error("INSTAGRAM_CONSENT_REQUIRED");
-  if (/feedback_required|please wait|rate_limit|too many requests/.test(marker)) throw new Error("INSTAGRAM_RATE_LIMIT_429");
+  if (marker === "feedback_required") throw new Error("INSTAGRAM_FEEDBACK_REQUIRED");
+  if (/please wait|rate_limit|too many requests/.test(marker)) throw new Error("INSTAGRAM_RATE_LIMIT_429");
   if (data?.status === "fail" || data?.errors?.length) throw new Error("INSTAGRAM_API_REJECTED");
 }
 
@@ -749,15 +795,20 @@ async function resolvePost(
   const failure = (code: string) => new Error(`${code} [${diagnostics.join(",")}]`);
   for (const [name, run] of attempts) {
     let code = "EMPTY";
+    let throttle: InstagramThrottle | undefined;
     try {
       const groups = await run();
       if (groups?.length) return groups;
     } catch (error) {
       const detail = error instanceof Error ? error.message : "";
       code = /^INSTAGRAM_[A-Z0-9_]+$/.test(detail) ? detail : "INSTAGRAM_REQUEST_ERROR";
+      if (error instanceof InstagramThrottleError) throttle = error.throttle;
     }
     diagnostics.push(`${name}:${code}`);
-    if (code === "INSTAGRAM_RATE_LIMIT_429") throw failure(code);
+    if (["INSTAGRAM_RATE_LIMIT_429", "INSTAGRAM_FEEDBACK_REQUIRED"].includes(code)) {
+      const error = failure(code);
+      throw throttle ? new InstagramThrottleError(throttle, error.message) : error;
+    }
     if (name.startsWith("session/") && ["INSTAGRAM_CHALLENGE_REQUIRED", "INSTAGRAM_CONSENT_REQUIRED"].includes(code)) {
       throw failure(code.replace("INSTAGRAM_", "INSTAGRAM_SESSION_"));
     }
@@ -1164,7 +1215,7 @@ async function resolveTarget(target: InstagramTarget, env: Env): Promise<Resolve
   return resolved;
 }
 
-function friendlyError(detail: string): string {
+function friendlyError(detail: string, throttle?: InstagramThrottle): string {
   const value = detail.toLowerCase();
   if (value.startsWith("instagram_session_challenge_required")) {
     return "❌ حساب اینستاگرام متصل نیاز به تأیید امنیتی دارد؛ ابتدا در خود اینستاگرام تأیید شود.";
@@ -1179,8 +1230,11 @@ function friendlyError(detail: string): string {
     return "❌ اطلاعات قابل دانلود این پست از اینستاگرام دریافت نشد؛ دوباره امتحان کن.";
   }
   if (value.includes("rate_limit_429")) {
-    return "❌ Instagram فعلاً درخواست‌های این سرور رو محدود کرده (429).";
+    return throttle?.retryAfterSeconds
+      ? `❌ اینستاگرام دریافت محتوا را موقتاً محدود کرده؛ حداقل ${throttle.retryAfterSeconds} ثانیه بعد دوباره امتحان کن.`
+      : "❌ اینستاگرام دریافت محتوا را موقتاً محدود کرده؛ زمان دقیق رفع محدودیت اعلام نشده است.";
   }
+  if (value.includes("feedback_required")) return "❌ اینستاگرام این درخواست را به دلیل محدودیت فعالیت نپذیرفت؛ وضعیت حساب و دسترسی آن باید بررسی شود.";
   if (value.includes("access_403")) {
     return "❌ Instagram یکی از مسیرهای دانلود رو با 403 بست؛ مسیرهای بعدی هم جواب ندادن.";
   }
@@ -1307,9 +1361,11 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
     }
   } catch (error) {
     await recordDownload(env, { ...history, status: delivered ? "partial" : "failed", delivered, detail: "دریافت یا ارسال کامل محتوا تأیید نشد." });
+    if (acknowledgeKickedChat(error)) return Response.json({ ok: true });
     const detail = error instanceof Error ? error.message : String(error);
-    console.error("instagram download failed", { target: target.kind, detail });
-    const friendly = friendlyError(detail);
+    const throttle = error instanceof InstagramThrottleError ? error.throttle : undefined;
+    console.error("instagram download failed", { target: target.kind, detail, ...(throttle ? { throttle } : {}) });
+    const friendly = friendlyError(detail, throttle);
     if (statusMessageId) {
       await safeTelegramCall(env.BOT_TOKEN, "editMessageText", {
         chat_id: message.chat.id,
@@ -1354,7 +1410,10 @@ export default {
     }
 
     if (request.method === "POST" && url.pathname === "/telegram/webhook") {
-      return handleTelegramWebhook(request, env);
+      try { return await handleTelegramWebhook(request, env); } catch (error) {
+        if (acknowledgeKickedChat(error)) return Response.json({ ok: true });
+        throw error;
+      }
     }
 
     if ((request.method === "GET" || request.method === "HEAD") && url.pathname === "/media") {
