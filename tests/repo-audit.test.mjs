@@ -53,6 +53,34 @@ test('configured webhook secret reaches YouTube, music and delegated Instagram h
   assert.ok(calls.some(url=>url.includes('instagram.com')),'delegated Instagram authorization must use the same secret');
 });
 
+test('the production entrypoint downloads an Instagram reel without depending on oEmbed', async () => {
+  const sent = [], instagram = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const target = new URL(String(url));
+    if (target.hostname === 'api.telegram.org') {
+      const method = target.pathname.split('/').at(-1);
+      sent.push({ method, body: JSON.parse(init.body) });
+      return Response.json({ ok: true, result: { message_id: 99, ...(method === 'sendVideo' ? { video: { file_id: 'fixture-video' } } : {}) } });
+    }
+    if (target.hostname === 'scontent.cdninstagram.com') return new Response(null, { headers: { 'content-length': '1000000' } });
+    instagram.push(target.pathname);
+    if (target.pathname === '/api/v1/oembed/') return new Response(null, { status: 403 });
+    if (target.pathname === '/api/v1/media/1/info/') return Response.json({ items: [{
+      code: 'B', video_versions: [{ url: 'https://scontent.cdninstagram.com/fixture.mp4', width: 720, height: 1280 }],
+    }] });
+    throw Error('Unexpected Instagram endpoint');
+  };
+  const response = await worker.fetch(new Request('https://worker/telegram/webhook', {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-telegram-bot-api-secret-token': secret },
+    body: JSON.stringify({ update_id: 92, message: { message_id: 8, from: { id: 42 }, chat: { id: -42 },
+      text: 'https://www.instagram.com/reel/B/' } }),
+  }), { BOT_TOKEN: 'fixture', WEBHOOK_SECRET: secret }, {});
+  assert.equal(response.status, 200);
+  assert.deepEqual(instagram, ['/api/v1/media/1/info/']);
+  assert.equal(sent.filter(item => item.method === 'sendVideo').length, 1);
+  assert.equal(sent.find(item => item.method === 'sendVideo').body.width, 720);
+});
+
 test('independent Instagram action completion events and cache calls retain HMAC authentication',async()=>{
   const events=[],stores=[],token='fictional',env={BOT_TOKEN:token,
     YOUTUBE_DOWNLOAD_WORKFLOW:{async get(id){return {async sendEvent(event){events.push({id,event});}};}},

@@ -466,6 +466,9 @@ function candidatesFromProduct(product: any): MediaCandidate[][] {
       continue;
     }
 
+    // A video's cover is not a successful video download.
+    if (node?.is_video === true || node?.media_type === 2 || node?.__typename === "GraphVideo") continue;
+
     const images = Array.isArray(node?.image_versions2?.candidates) ? node.image_versions2.candidates : [];
     const imageCandidates = images
       .filter((item: any) => typeof item?.url === "string" && item.url.startsWith("https://"))
@@ -539,8 +542,8 @@ function candidatesFromHtmlMeta(html: string): MediaCandidate[][] {
   const videoPatterns = [
     /["']video_url["']\s*:\s*["']([^"']+)["']/gi,
     /["']contentUrl["']\s*:\s*["']([^"']+)["']/gi,
-    /<meta[^>]+property=["']og:video(?::url)?["'][^>]+content=["']([^"']+)["'][^>]*>/gi,
-    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:video(?::url)?["'][^>]*>/gi,
+    /<meta[^>]+property=["']og:video(?::(?:url|secure_url))?["'][^>]+content=["']([^"']+)["'][^>]*>/gi,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:video(?::(?:url|secure_url))?["'][^>]*>/gi,
   ];
   for (const pattern of videoPatterns) {
     for (const match of html.matchAll(pattern)) {
@@ -595,38 +598,49 @@ async function fetchJson(
       body: init.body,
       redirect: "manual",
     });
-  } catch (error) {
-    console.warn("instagram fetch failed", {
-      path: new URL(url).pathname,
-      detail: error instanceof Error ? error.message : String(error),
-    });
-    return { data: null, status: 0, redirectedTo: null };
+  } catch {
+    throw new Error("INSTAGRAM_NETWORK_ERROR");
   }
 
   absorbSetCookies(response.headers, jar);
   const location = redirectLocation(response, url);
   if (location) {
-    console.warn("instagram request redirected", {
-      path: new URL(url).pathname,
-      status: response.status,
-      to: location.pathname,
-      authenticated: jar.has("sessionid"),
-    });
     await response.body?.cancel().catch(() => undefined);
-    return { data: null, status: response.status, redirectedTo: location.pathname };
+    throw new Error(postRedirectCode(location, response.status));
   }
 
-  throwForInstagramStatus(response.status);
   if (!response.ok) {
-    console.warn("instagram request failed", { path: new URL(url).pathname, status: response.status });
     await response.body?.cancel().catch(() => undefined);
-    return { data: null, status: response.status, redirectedTo: null };
+    throwForInstagramStatus(response.status);
+    throw new Error(response.status === 401 ? "INSTAGRAM_LOGIN_REQUIRED" : `INSTAGRAM_HTTP_${response.status}`);
   }
 
+  let data: any;
   try {
-    return { data: await response.json(), status: response.status, redirectedTo: null };
+    data = await response.json();
   } catch {
-    return { data: null, status: response.status, redirectedTo: null };
+    throw new Error(`INSTAGRAM_NON_JSON_HTTP_${response.status}`);
+  }
+  throwPostAccessFailure(data);
+  return { data, status: response.status, redirectedTo: null };
+}
+
+function postRedirectCode(location: URL, status: number): string {
+  if (/^\/(?:challenge|checkpoint)(?:\/|$)/.test(location.pathname)) return "INSTAGRAM_CHALLENGE_REQUIRED";
+  if (location.pathname.startsWith("/accounts/login")) return "INSTAGRAM_LOGIN_REQUIRED";
+  return `INSTAGRAM_REDIRECT_HTTP_${status}`;
+}
+
+function throwPostAccessFailure(data: any): void {
+  const marker = String(data?.message || data?.error_type || "").toLowerCase();
+  if (marker === "login_required") throw new Error("INSTAGRAM_LOGIN_REQUIRED");
+  if (data?.challenge || data?.checkpoint_url || /^(?:challenge_required|checkpoint_required)$/.test(marker)) {
+    throw new Error("INSTAGRAM_CHALLENGE_REQUIRED");
+  }
+  if (marker === "feedback_required") throw new Error("INSTAGRAM_FEEDBACK_REQUIRED");
+  if (data?.status === "fail") {
+    throwPostGraphqlFailure(data);
+    throw new Error("INSTAGRAM_API_REJECTED");
   }
 }
 
@@ -638,31 +652,21 @@ async function fetchHtml(
   let response: Response;
   try {
     response = await fetch(url, { headers, redirect: "manual" });
-  } catch (error) {
-    console.warn("instagram html fetch failed", {
-      path: new URL(url).pathname,
-      detail: error instanceof Error ? error.message : String(error),
-    });
-    return { html: null, status: 0, redirectedTo: null };
+  } catch {
+    throw new Error("INSTAGRAM_NETWORK_ERROR");
   }
 
   absorbSetCookies(response.headers, jar);
   const location = redirectLocation(response, url);
   if (location) {
-    console.warn("instagram html redirected", {
-      path: new URL(url).pathname,
-      status: response.status,
-      to: location.pathname,
-      authenticated: jar.has("sessionid"),
-    });
     await response.body?.cancel().catch(() => undefined);
-    return { html: null, status: response.status, redirectedTo: location.pathname };
+    throw new Error(postRedirectCode(location, response.status));
   }
 
-  throwForInstagramStatus(response.status);
   if (!response.ok) {
     await response.body?.cancel().catch(() => undefined);
-    return { html: null, status: response.status, redirectedTo: null };
+    throwForInstagramStatus(response.status);
+    throw new Error(response.status === 401 ? "INSTAGRAM_LOGIN_REQUIRED" : `INSTAGRAM_HTTP_${response.status}`);
   }
   return { html: await response.text(), status: response.status, redirectedTo: null };
 }
@@ -680,16 +684,13 @@ async function ensureWebCsrf(jar: CookieJar): Promise<{ html: string | null; ok:
   return { html: home.html, ok: Boolean(home.status === 200) };
 }
 
-async function resolveViaOembedMobile(
+async function resolveViaMobileMediaInfo(
   target: Extract<InstagramTarget, { kind: "post" }>,
   jar: CookieJar,
 ): Promise<MediaCandidate[][] | null> {
-  const oembedUrl = new URL("https://i.instagram.com/api/v1/oembed/");
-  oembedUrl.searchParams.set("url", `https://www.instagram.com/p/${target.shortcode}/`);
-
-  const oembed = await fetchJson(oembedUrl.toString(), mobileHeaders(jar), jar);
-  let mediaId = String(oembed.data?.media_id || "").match(/^\d+/)?.[0] || "";
-  if (!mediaId) mediaId = shortcodeToMediaId(target.shortcode);
+  // The ID is encoded in the shortcode. oEmbed is a separate access-controlled
+  // endpoint: its 403 must never prevent requesting the actual media info.
+  const mediaId = shortcodeToMediaId(target.shortcode);
 
   const media = await fetchJson(
     `https://i.instagram.com/api/v1/media/${mediaId}/info/`,
@@ -746,18 +747,46 @@ async function resolveViaInstaloaderGraphql(
     jar,
     { method: "POST", body },
   );
-  const product = response.data?.data?.xdt_api__v1__media__shortcode__web_info?.items?.[0];
-  if (!product) {
-    throwPostGraphqlFailure(response.data);
-    return null;
-  }
-
-  const groups = candidatesFromProduct(product);
+  const groups = firstCandidateGroups(response.data?.data);
   if (groups.length) {
     console.log("instagram resolver success", { resolver: "graphql-web-info", authenticated: jar.has("sessionid") });
     return groups;
   }
+  throwPostGraphqlFailure(response.data);
   return null;
+}
+
+function exactPostGroups(value: unknown, shortcode: string, mediaId: string, depth = 0): MediaCandidate[][] {
+  if (depth > 18 || !value || typeof value !== "object") return [];
+  if (!Array.isArray(value)) {
+    const item = value as Record<string, any>;
+    const code = item.shortcode || item.code;
+    if (code && code !== shortcode) return [];
+    if (code === shortcode || String(item.pk || item.id || "").split("_")[0] === mediaId) {
+      const groups = candidatesFromProduct(item);
+      if (groups.length) return groups;
+    }
+  }
+  for (const child of Object.values(value)) {
+    const groups = exactPostGroups(child, shortcode, mediaId, depth + 1);
+    if (groups.length) return groups;
+  }
+  return [];
+}
+
+async function resolveViaPostPage(
+  target: Extract<InstagramTarget, { kind: "post" }>, jar: CookieJar,
+): Promise<MediaCandidate[][] | null> {
+  // Public media embedded in the requested page needs neither a homepage CSRF
+  // bootstrap nor an LSD token. Bind JSON products to this exact post so a
+  // recommendation or login-page preview cannot replace the requested video.
+  const page = await fetchHtml(`https://www.instagram.com/p/${target.shortcode}/`, browserHeaders(jar), jar);
+  if (!page.html) return null;
+  const groups = exactPostGroups(safeJsonScripts(page.html), target.shortcode, shortcodeToMediaId(target.shortcode));
+  if (groups.length) return groups;
+  const meta = page.html.match(/<meta\b[^>]*\bproperty=["']og:video(?::(?:url|secure_url))?["'][^>]*>/gi) || [];
+  const fromMeta = candidatesFromHtmlMeta(meta.join("\n"));
+  return fromMeta.length ? fromMeta : null;
 }
 
 async function resolveViaCobaltGraphql(
@@ -909,7 +938,7 @@ function safeJsonScripts(html: string): unknown[] {
   const pattern = /<script\b[^>]*\bdata-sjs(?:=["'][^"']*["'])?[^>]*>([\s\S]*?)<\/script>/gi;
   for (const match of html.matchAll(pattern)) {
     const raw = match[1] || "";
-    if (!raw.includes("video") && !raw.includes("xig_polaris_media")) continue;
+    if (!raw.includes("video") && !raw.includes("xig_polaris_media") && !raw.includes("image_versions2")) continue;
     try {
       values.push(JSON.parse(raw));
     } catch {
@@ -954,12 +983,16 @@ async function tryPublicResolvers(
 ): Promise<MediaCandidate[][] | null> {
   const mediaId = shortcodeToMediaId(target.shortcode);
   const resolvers: Array<[string, () => Promise<MediaCandidate[][] | null>]> = [
-    ["mobile-api", () => resolveViaOembedMobile(target, cloneJar(jar))],
+    ["mobile-api", () => resolveViaMobileMediaInfo(target, cloneJar(jar))],
+    ["webpage", () => resolveViaPostPage(target, cloneJar(jar))],
     ["graphql-web-info", () => resolveViaInstaloaderGraphql(target, cloneJar(jar))],
     ["graphql-post-action", () => resolveViaCobaltGraphql(target, cloneJar(jar))],
     ["embed", () => resolveViaEmbed(target, cloneJar(jar))],
     ["legacy-graphql", () => resolveViaLegacyGraphql(target, mediaId, cloneJar(jar))],
   ];
+  if (jar.has("sessionid")) {
+    resolvers.splice(1, 0, ["authenticated-media-info", () => resolveAuthenticatedMediaInfo(target, mediaId, cloneJar(jar))]);
+  }
 
   for (const [name, run] of resolvers) {
     try {
@@ -971,7 +1004,7 @@ async function tryPublicResolvers(
       const detail = error instanceof Error ? error.message : String(error);
       const code = /^INSTAGRAM_[A-Z0-9_]+$/.test(detail) ? detail : "REQUEST_ERROR";
       diagnostics.push(`${jar.has("sessionid") ? "session" : "public"}/${name}:${code}`);
-      console.warn("instagram resolver failed", { resolver: name, authenticated: jar.has("sessionid"), detail });
+      console.warn("instagram resolver failed", { resolver: name, authenticated: jar.has("sessionid"), detail: code });
       if (detail === "INSTAGRAM_RATE_LIMIT_429") throw error;
     }
   }
@@ -991,11 +1024,6 @@ async function resolvePost(
 
     const withSession = await tryPublicResolvers(target, sessionJar, diagnostics);
     if (withSession?.length) return withSession;
-
-    const mediaId = shortcodeToMediaId(target.shortcode);
-    const authenticatedInfo = await resolveAuthenticatedMediaInfo(target, mediaId, cloneJar(sessionJar));
-    if (authenticatedInfo?.length) return authenticatedInfo;
-    diagnostics.push("session/authenticated-media-info:EMPTY");
   }
 
   throw new Error(`INSTAGRAM_ALL_RESOLVERS_FAILED [${diagnostics.join(",")}]`);
@@ -1398,7 +1426,13 @@ async function resolveTarget(target: InstagramTarget, env: Env): Promise<Resolve
 function friendlyError(detail: string): string {
   const value = detail.toLowerCase();
   if (value.includes("all_resolvers_failed")) {
-    return "❌ Instagram از همه‌ی مسیرهای دانلود جواب قابل استفاده نداد. لاگ resolverها رو بفرست.";
+    if (/session\/[^,\]]+:instagram_challenge_required/.test(value)) {
+      return "❌ اینستاگرام برای حساب متصل تأیید امنیتی می‌خواهد؛ حساب باید در خود اینستاگرام تأیید شود.";
+    }
+    if (/session\/[^,\]]+:instagram_login_required/.test(value)) {
+      return "❌ اینستاگرام برای دریافت این پست ورود معتبر می‌خواهد؛ نشست و دسترسی حساب متصل باید بررسی شود.";
+    }
+    return "❌ اطلاعات قابل دانلود این پست از اینستاگرام دریافت نشد؛ دوباره امتحان کن.";
   }
   if (value.includes("session_rejected")) {
     return "❌ Session اینستاگرام برای این محتوا معتبر شناخته نشد.";
