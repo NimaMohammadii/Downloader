@@ -1411,38 +1411,30 @@ export default {
         }
 
         if (isStartCommand(text)) {
+          const startText = [
+            "لینک رو بفرست، فایلش رو همین‌جا بگیر ⚡️",
+            "",
+            "⬇️ دانلود: YouTube، Pornhub، اینستاگرام، X،",
+            "Pinterest، TikTok، SoundCloud و Aparat",
+            "",
+            "🎵 آهنگ: اسم آهنگ و خواننده یا /music",
+            "🔎 تشخیص آهنگ: ویس، صدا یا ویدیو؛ در گروه ریپلای + /shazam",
+            "🔎 آهنگ اینستاگرام: «پیداکردن آهنگ» یا /findmusic لینک",
+            "🎼 پلی‌لیست: /playlist لینک 1-20",
+            "🎧 فقط صدا: دکمهٔ «فقط صدا» یا /audio لینک",
+            "",
+            "ضبط لایو: /live username",
+            "بازپخش: /replay لینک",
+            "توقف ضبط: دکمهٔ زیر پیام",
+          ].join("\n");
+          const boldLabels = ["دانلود:", "آهنگ:", "تشخیص آهنگ:", "آهنگ اینستاگرام:",
+            "پلی‌لیست:", "فقط صدا:", "ضبط لایو:", "بازپخش:"];
           await telegramCall(env.BOT_TOKEN, "sendMessage", {
             chat_id: message.chat.id,
-            text: [
-              "⚡️ <b>به ربات دانلودر خوش اومدی!</b>",
-              "لینک رو بفرست تا فایلش رو همین‌جا دریافت کنی.",
-              "",
-              "⬇️ <b>دانلود از لینک</b>",
-              "• YouTube، Pornhub و اینستاگرام",
-              "• X، Pinterest، TikTok، SoundCloud و Aparat: لینک پست یا آهنگ رو بفرست.",
-              "",
-              "🎵 <b>جست‌وجوی آهنگ</b>",
-              "اسم آهنگ و خواننده رو بنویس یا از این دستور استفاده کن:",
-              "<code>/music نام آهنگ</code>",
-              "",
-              "🔎 <b>تشخیص آهنگ</b>",
-              "ویس، فایل صوتی یا ویدیو بفرست؛ در گروه روی فایل ریپلای کن و /shazam بنویس.",
-              "برای اینستاگرام: دکمهٔ «پیداکردن آهنگ» یا <code>/findmusic لینک</code>",
-              "",
-              "🎼 <b>پلی‌لیست YouTube</b>",
-              "لینک پلی‌لیست رو بفرست یا بازهٔ آهنگ‌ها رو مشخص کن:",
-              "<code>/playlist لینک 1-20</code>",
-              "",
-              "🎧 <b>دریافت فقط صدا</b>",
-              "برای ویدیوی اینستاگرام، دکمهٔ «فقط صدا» رو بزن یا بنویس:",
-              "<code>/audio لینک ویدیو</code>",
-              "",
-              "🔴 <b>لایو و بازپخش اینستاگرام</b>",
-              "• ضبط لایو: <code>/live username</code>",
-              "• بازپخش منتشرشده: <code>/replay لینک بازپخش</code>",
-              "توقف ضبط با دکمهٔ زیر پیام ضبط انجام می‌شه.",
-            ].join("\n"),
-            parse_mode: "HTML",
+            text: startText,
+            entities: boldLabels.map(label => ({
+              type: "bold", offset: startText.indexOf(label), length: label.length,
+            })),
           });
           return Response.json({ ok: true });
         }
