@@ -300,6 +300,13 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       );
       CREATE INDEX IF NOT EXISTS idx_download_history_user ON download_history(user_id, created_at DESC, key);
 
+      CREATE TABLE IF NOT EXISTS membership_access (
+        user_id TEXT PRIMARY KEY, first_download_at INTEGER NOT NULL
+      );
+      INSERT OR IGNORE INTO membership_access(user_id, first_download_at)
+        SELECT user_id, MIN(created_at) FROM download_history WHERE delivered > 0 GROUP BY user_id;
+      INSERT OR IGNORE INTO counters(key, value) VALUES ('membership_enabled', 1);
+
       CREATE TABLE IF NOT EXISTS telegram_file_cache (
         key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at INTEGER NOT NULL
       );
@@ -398,6 +405,20 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       } satisfies AdminUsage);
     }
 
+    if (url.pathname === "/membership") {
+      const sql = this.ctx.storage.sql;
+      if (request.method === "POST") {
+        const payload = await request.json() as { enabled?: boolean };
+        if (typeof payload.enabled !== "boolean") return new Response("Invalid setting", { status: 400 });
+        sql.exec("UPDATE counters SET value = ? WHERE key = 'membership_enabled'", payload.enabled ? 1 : 0);
+      } else if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
+      const user = url.searchParams.get("user");
+      if (user !== null && !/^[1-9]\d{0,15}$/.test(user)) return new Response("Invalid user", { status: 400 });
+      const enabled = sql.exec("SELECT value FROM counters WHERE key = 'membership_enabled'").one();
+      const access = user ? sql.exec("SELECT user_id FROM membership_access WHERE user_id = ?", user).toArray() : [];
+      return Response.json({ enabled: asNumber(enabled.value) === 1, downloaded: access.length > 0 });
+    }
+
     if (request.method === "POST" && url.pathname === "/file-cache") {
       const payload = await request.json() as { op: string; key: string; value?: CachedTelegramFile };
       if (!/^[A-Za-z0-9:_-]{1,180}$/.test(payload.key || "")) return new Response("Invalid key", { status: 400 });
@@ -483,7 +504,17 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         terminal ? displayText(payload.detail, 240) : null,
         Math.max(0, Math.min(100, Math.floor(Number(payload.delivered) || 0))), now, now,
       );
-      return Response.json({ ok: true });
+      let firstDownload = false;
+      if ((payload.status === "success" || payload.status === "partial") && Number(payload.delivered) > 0) {
+        const access = this.ctx.storage.sql.exec(
+          `INSERT OR IGNORE INTO membership_access(user_id, first_download_at)
+           SELECT user_id, ? FROM download_history
+           WHERE key = ? AND user_id = ? AND status IN ('success','partial') AND delivered > 0`,
+          now, payload.key, String(payload.userId),
+        );
+        firstDownload = access.rowsWritten > 0;
+      }
+      return Response.json({ ok: true, firstDownload });
     }
 
     if (request.method === "GET" && url.pathname === "/user") {
@@ -759,6 +790,7 @@ export function adminDashboardKeyboard(): Record<string, unknown> {
         { text: "فعال‌های ۷ روز", callback_data: "admin:users:0:week" }],
       [{ text: "لینک‌فرستاده‌های ۲۴ ساعت", callback_data: "admin:used:0:day" },
         { text: "لینک‌فرستاده‌های ۷ روز", callback_data: "admin:used:0:week" }],
+      [{ text: "عضویت اجباری کانال", callback_data: "admin:membership" }],
       [{ text: "🔄 بروزرسانی آمار", callback_data: "admin:stats" }],
     ],
   };
@@ -799,13 +831,22 @@ function displayText(value: unknown, limit: number): string | null {
   return text ? text.slice(0, limit) : null;
 }
 
-export async function recordDownload(env: Partial<AdminStatsEnv>, record: DownloadRecord): Promise<void> {
+export async function recordDownload(env: Partial<AdminStatsEnv> & { BOT_TOKEN?: string }, record: DownloadRecord): Promise<void> {
   if (!env.ADMIN_STATS || record.userId === ADMIN_USER_ID) return;
   try {
     const response = await statsStub(env as AdminStatsEnv).fetch("https://admin-stats/download", {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(record),
     });
     if (!response.ok) console.warn("download history rejected", { status: response.status });
+    else {
+      const result = await response.json() as { firstDownload?: boolean };
+      if (result.firstDownload && env.BOT_TOKEN) {
+        try {
+          const { notifyFirstDownload } = await import("./membership");
+          await notifyFirstDownload(env, record.userId);
+        } catch { console.warn("first-download membership prompt unavailable"); }
+      }
+    }
   } catch { console.warn("download history unavailable"); }
 }
 

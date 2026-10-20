@@ -1,3 +1,5 @@
+import { enforceMembership } from "./membership";
+import { type AdminStatsEnv } from "./admin";
 import youtubeWorker from "./youtube-main";
 export { AdminStatsStore, DownloadPool, YoutubeDownloaderContainer, YoutubeDownloadWorkflow } from "./youtube-main";
 import { MINI_APP_HTML } from "./mini-app-ui";
@@ -5,9 +7,10 @@ import { WEB_APP_HTML } from "./web-ui";
 import { applyWebBackground } from "./web-mesh-background";
 import { applyWebViewport } from "./web-viewport";
 
-type Env = {
+type Env = Partial<AdminStatsEnv> & {
   BOT_TOKEN: string;
   WEBHOOK_SECRET?: string;
+  MEMBERSHIP_CHANNEL?: string;
   INSTAGRAM_SESSIONID?: string;
   INSTAGRAM_CSRFTOKEN?: string;
   INSTAGRAM_DS_USER_ID?: string;
@@ -87,6 +90,8 @@ export default {
       return disabledContainerResponse(request);
     }
 
+    const membershipResponse = await enforceMembership(request, env);
+    if (membershipResponse) return membershipResponse;
     return youtubeWorker.fetch(request, env as any, ctx);
   },
 } satisfies ExportedHandler<Env>;

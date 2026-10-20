@@ -1,3 +1,4 @@
+import { membershipState, setMembershipEnabled } from "./membership";
 import downloaderWorker from "./entry";
 import {
   telegramTextMotion,
@@ -139,6 +140,26 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
   await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: query.id });
 
   try {
+    const membershipMatch = /^admin:membership(?::(enable|disable))?$/.exec(data);
+    if (membershipMatch) {
+      if (membershipMatch[1]) await setMembershipEnabled(env, membershipMatch[1] === "enable");
+      const state = await membershipState(env);
+      const title = "عضویت اجباری کانال";
+      const status = `وضعیت: ${state.enabled ? "فعال ✅" : "غیرفعال"}`;
+      const text = `${title}\n\n${status}\nپس از اولین دانلود موفق، ادامهٔ استفاده نیازمند عضویت در کانال است.`;
+      await telegramCall(env.BOT_TOKEN, "editMessageText", {
+        chat_id: message.chat.id, message_id: message.message_id, text,
+        entities: [{ type: "bold", offset: 0, length: title.length },
+          { type: "bold", offset: text.indexOf(status), length: status.length }],
+        reply_markup: { inline_keyboard: [
+          [{ text: state.enabled ? "غیرفعال کردن عضویت اجباری" : "فعال کردن عضویت اجباری",
+            callback_data: `admin:membership:${state.enabled ? "disable" : "enable"}` }],
+          [{ text: "بازگشت به پنل", callback_data: "admin:stats" }],
+        ] },
+      });
+      return Response.json({ ok: true });
+    }
+
     if (data === "admin:stats") {
       const summary = await getAdminSummary(env);
       await telegramCall(env.BOT_TOKEN, "editMessageText", {
