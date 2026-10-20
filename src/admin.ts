@@ -113,11 +113,30 @@ export type DownloadRecord = {
 export type AdminDownload = DownloadRecord & { createdAt: number; updatedAt: number; stale: boolean };
 export type AdminUserDetail = {
   user: AdminUserRow;
+  usage?: UsageTotals;
   activity: { visits: number; interactions: number; starts: number; trackingSince: number } | null;
   counts: { total: number; success: number; failed: number; partial: number; active: number; stale: number; results: number; delivered: number };
   downloads: AdminDownload[];
   page: number;
   totalPages: number;
+};
+
+// Container measurements are event-driven. User resource shares are estimates
+// when jobs overlap; global measurements include idle time and unattributed work.
+export type UsageSample = {
+  key: string; userId: number; start: number; end: number;
+  runtimeMs: number; cpuSeconds: number | null; ingressBytes: number | null; egressBytes: number | null;
+};
+export type ContainerRun = { key: string; start: number; end: number | null };
+export type MediaUsage = { key: string; userId: number; at: number; bytes: number | null; cached?: boolean };
+export type UsageTotals = {
+  downloads: number; bytes: number; unknownSizes: number; cached: number;
+  runtimeMs: number; cpuSeconds: number; ingressBytes: number; egressBytes: number;
+  cpuMeasuredMs: number; networkMeasuredMs: number;
+};
+export type AdminUsage = {
+  trackingSince: number; now: number; lastMeasured: number | null; userId?: string;
+  all: UsageTotals; day: UsageTotals; week: UsageTotals;
 };
 
 type StoreEnv = Record<string, never>;
@@ -287,10 +306,97 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       CREATE INDEX IF NOT EXISTS idx_telegram_file_cache_at ON telegram_file_cache(created_at);
     `);
     this.ctx.storage.sql.exec("INSERT OR IGNORE INTO counters(key, value) VALUES ('links_tracking_since', ?)", Date.now());
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS container_runs (key TEXT PRIMARY KEY, start_at REAL NOT NULL, end_at REAL);
+      CREATE TABLE IF NOT EXISTS usage_samples (
+        key TEXT PRIMARY KEY, user_id TEXT NOT NULL, start_at REAL NOT NULL, end_at REAL NOT NULL,
+        runtime_ms REAL NOT NULL, cpu_seconds REAL, ingress_bytes REAL, egress_bytes REAL
+      );
+      CREATE INDEX IF NOT EXISTS idx_usage_samples_user_time ON usage_samples(user_id, end_at);
+      CREATE TABLE IF NOT EXISTS media_usage (
+        key TEXT PRIMARY KEY, user_id TEXT NOT NULL, recorded_at INTEGER NOT NULL,
+        bytes INTEGER, cached INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_media_usage_user_time ON media_usage(user_id, recorded_at);
+      CREATE INDEX IF NOT EXISTS idx_media_usage_time ON media_usage(recorded_at);
+    `);
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO counters(key,value) VALUES ('usage_tracking_since',?)", Date.now());
+  }
+
+  private usageTotals(since: number, until: number, userId?: string): UsageTotals {
+    const sql = this.ctx.storage.sql;
+    // Split intervals at rolling-window boundaries. Resource samples are taken
+    // at events, so allocation inside each interval assumes uniform consumption.
+    const resource = sql.exec(`SELECT
+      COALESCE(SUM(runtime_ms * fraction),0) AS runtimeMs,
+      COALESCE(SUM(cpu_seconds * fraction),0) AS cpuSeconds,
+      COALESCE(SUM(ingress_bytes * fraction),0) AS ingressBytes,
+      COALESCE(SUM(egress_bytes * fraction),0) AS egressBytes,
+      COALESCE(SUM(CASE WHEN cpu_seconds IS NOT NULL THEN runtime_ms * fraction ELSE 0 END),0) AS cpuMeasuredMs,
+      COALESCE(SUM(CASE WHEN ingress_bytes IS NOT NULL AND egress_bytes IS NOT NULL THEN runtime_ms * fraction ELSE 0 END),0) AS networkMeasuredMs
+      FROM (SELECT *, MAX(0, MIN(end_at, ?) - MAX(start_at, ?)) / (end_at - start_at) AS fraction
+        FROM usage_samples WHERE user_id = ? AND end_at > ? AND start_at < ?)`,
+      until, since, userId || "0", since, until).one();
+    if (!userId) {
+      const runs = sql.exec(`SELECT COUNT(*) AS count,
+        COALESCE(SUM(MAX(0, MIN(COALESCE(end_at, ?), ?) - MAX(start_at, ?))),0) AS ms
+        FROM container_runs`, until, until, since).one();
+      if (asNumber(runs.count)) resource.runtimeMs = asNumber(runs.ms);
+    }
+    const media = sql.exec(`SELECT COUNT(*) AS downloads, COALESCE(SUM(bytes),0) AS bytes,
+      COALESCE(SUM(bytes IS NULL),0) AS unknownSizes, COALESCE(SUM(cached),0) AS cached
+      FROM media_usage WHERE recorded_at >= ? AND recorded_at <= ? ${userId ? "AND user_id = ?" : ""}`,
+      since, until, ...(userId ? [userId] : [])).one();
+    return Object.fromEntries(Object.entries({ ...resource, ...media }).map(([key, value]) => [key, asNumber(value)])) as UsageTotals;
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+
+    if (request.method === "POST" && url.pathname === "/usage") {
+      const body = await request.json() as { samples?: UsageSample[]; deliveries?: MediaUsage[]; runs?: ContainerRun[] };
+      const runs = body.runs ?? [];
+      const validId = (id: number) => Number.isSafeInteger(id) && id >= 0;
+      const metric = (n: unknown) => n === null || (typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 1e15);
+      const validKey = (key: string) => typeof key === "string" && /^[A-Za-z0-9:_-]{1,180}$/.test(key);
+      const now = Date.now();
+      if (!Array.isArray(body.samples) || !Array.isArray(body.deliveries) || !Array.isArray(runs) || runs.length > 250 || body.samples.length > 250 || body.deliveries.length > 250
+        || runs.some(v => !v || !validKey(v.key) || !Number.isFinite(v.start) || v.start < 0 || v.start > now + 60000
+          || !(v.end === null || (Number.isFinite(v.end) && v.end >= v.start && v.end <= now + 60000)))
+        || body.samples.some(v => !v || !validKey(v.key) || !validId(v.userId)
+          || !Number.isFinite(v.start) || !Number.isFinite(v.end) || v.start < 0 || v.end <= v.start || v.end > now + 60000
+          || typeof v.runtimeMs !== "number" || !Number.isFinite(v.runtimeMs) || v.runtimeMs < 0 || v.runtimeMs > v.end - v.start + 1
+          || !metric(v.cpuSeconds) || !metric(v.ingressBytes) || !metric(v.egressBytes))
+        || body.deliveries.some(v => !v || !validKey(v.key) || !validId(v.userId) || v.userId === 0
+          || !Number.isSafeInteger(v.at) || v.at < 0 || v.at > now + 60000
+          || !(v.bytes === null || (Number.isSafeInteger(v.bytes) && v.bytes >= 0 && v.bytes <= 2_000_000_000)))) {
+        return new Response("Invalid usage", { status: 400 });
+      }
+      this.ctx.storage.transactionSync(() => {
+        for (const v of runs) this.ctx.storage.sql.exec(`INSERT INTO container_runs VALUES (?,?,?)
+          ON CONFLICT(key) DO UPDATE SET end_at = COALESCE(container_runs.end_at, excluded.end_at)
+          WHERE container_runs.start_at = excluded.start_at`, v.key, v.start, v.end);
+        for (const v of body.samples!) this.ctx.storage.sql.exec(
+          "INSERT OR IGNORE INTO usage_samples VALUES (?,?,?,?,?,?,?,?)",
+          v.key, String(v.userId), v.start, v.end, v.runtimeMs, v.cpuSeconds, v.ingressBytes, v.egressBytes);
+        for (const v of body.deliveries!) this.ctx.storage.sql.exec(
+          "INSERT OR IGNORE INTO media_usage VALUES (?,?,?,?,?)", v.key, String(v.userId), v.at, v.bytes, v.cached ? 1 : 0);
+      });
+      return Response.json({ ok: true });
+    }
+
+    if (request.method === "GET" && url.pathname === "/usage") {
+      const id = url.searchParams.get("id") || undefined;
+      if (id && !/^[1-9]\d{0,15}$/.test(id)) return new Response("Invalid user", { status: 400 });
+      const now = Date.now();
+      const tracking = this.ctx.storage.sql.exec("SELECT value FROM counters WHERE key = 'usage_tracking_since'").one();
+      const latest = this.ctx.storage.sql.exec("SELECT MAX(end_at) AS at FROM usage_samples WHERE user_id = ?", id || "0").one();
+      return Response.json({ trackingSince: asNumber(tracking.value), now,
+        lastMeasured: latest.at === null ? null : asNumber(latest.at), userId: id,
+        all: this.usageTotals(0, now, id), day: this.usageTotals(now - 86400_000, now, id),
+        week: this.usageTotals(now - 7 * 86400_000, now, id),
+      } satisfies AdminUsage);
+    }
 
     if (request.method === "POST" && url.pathname === "/file-cache") {
       const payload = await request.json() as { op: string; key: string; value?: CachedTelegramFile };
@@ -413,6 +519,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         activity: activity ? { visits: asNumber(activity.visits), interactions: asNumber(activity.interactions),
           starts: asNumber(activity.starts), trackingSince: asNumber(activity.tracking_since) } : null,
         counts: Object.fromEntries(Object.entries(counts).map(([key, value]) => [key, asNumber(value)])),
+        usage: this.usageTotals(0, Date.now(), id),
         downloads, page, totalPages,
       });
     }
@@ -645,6 +752,7 @@ export function formatAdminDashboard(summary: AdminSummary): string {
 export function adminDashboardKeyboard(): Record<string, unknown> {
   return {
     inline_keyboard: [
+      [{ text: "📊 مصرف، ترافیک و هزینه", callback_data: "admin:usage" }],
       [{ text: "👥 لیست کاربران", callback_data: "admin:users:0" }],
       [{ text: "کاربران استفاده‌کننده", callback_data: "admin:used:0" }],
       [{ text: "فعال‌های ۲۴ ساعت", callback_data: "admin:users:0:day" },
@@ -731,6 +839,9 @@ export function formatAdminUserDetail(detail: AdminUserDetail): string {
     `🔗 لینک‌های ارسالی: ${user.linksSent}`, `📥 درخواست‌های ثبت‌شده: ${counts.total} • فایل‌های تحویل‌شده: ${counts.delivered}`,
     `✅ موفق: ${counts.success} • ❌ ناموفق: ${counts.failed} • ⚠️ ناقص: ${counts.partial}`,
     `⏳ باز: ${counts.active} • ❔ نتیجه نامشخص: ${counts.stale} • 🔎 جست‌وجو: ${counts.results}`, "",
+    ...(detail.usage ? [`📦 حجم تحویل ثبت‌شده: ${bytesLabel(detail.usage.bytes)} • سهم تخمینی زمان کانتینر: ${durationLabel(detail.usage.runtimeMs)}`,
+      `سهم ترافیک ↓ ${bytesLabel(detail.usage.ingressBytes)} • ↑ ${bytesLabel(detail.usage.egressBytes)}`,
+      `هزینهٔ تخمینی ناخالص: ${usageCostLabel(detail.usage)}`, ""] : []),
     `📋 سابقه • صفحه ${detail.page + 1}/${detail.totalPages}`,
     "سابقه و تعداد برگشت‌های پیش از فعال‌شدن ثبت جدید در دسترس نیست.",
   ];
@@ -754,7 +865,84 @@ export function adminUserDetailKeyboard(detail: AdminUserDetail, usersPage: numb
   if (detail.page + 1 < detail.totalPages) nav.push({ text: "قدیمی‌تر ›", callback_data: callback(detail.page + 1) });
   return { inline_keyboard: [
     ...(nav.length ? [nav] : []),
+    [{ text: "📊 مصرف و هزینهٔ این کاربر", callback_data: `admin:usage:${detail.user.id}:${usersPage}:${detail.page}${usedOnly ? ":used" : ""}${periodSuffix}` }],
     [{ text: "🔄 بروزرسانی", callback_data: callback(detail.page) }],
     [{ text: usedOnly ? "بازگشت به استفاده‌کنندگان" : "👥 بازگشت به کاربران", callback_data: `admin:${usedOnly ? "used" : "users"}:${usersPage}${periodSuffix}` }, { text: "🏠 آمار", callback_data: "admin:stats" }],
   ] };
+}
+
+// Telemetry failures must never reject a download or replay a Telegram send.
+export async function recordUsage(env: Partial<AdminStatsEnv>, samples: UsageSample[] = [], deliveries: MediaUsage[] = [], runs: ContainerRun[] = []): Promise<boolean> {
+  if (!env.ADMIN_STATS) return false;
+  try {
+    const response = await statsStub(env as AdminStatsEnv).fetch("https://admin-stats/usage", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ samples, deliveries, runs }),
+      signal: AbortSignal.timeout(1500),
+    });
+    return response.ok;
+  } catch { console.warn("admin usage unavailable"); return false; }
+}
+
+export function telegramMediaBytes(result: unknown): number | null {
+  const message = result as Record<string, any> | null;
+  if (!message || typeof message !== "object") return null;
+  const media = message.video || message.audio || message.document || message.animation || (Array.isArray(message.photo) ? message.photo.at(-1) : null);
+  const size = media?.file_size;
+  return Number.isSafeInteger(size) && size >= 0 && size <= 2_000_000_000 ? size : null;
+}
+
+export async function getAdminUsage(env: AdminStatsEnv, userId?: string): Promise<AdminUsage> {
+  const response = await statsStub(env).fetch(`https://admin-stats/usage${userId ? `?id=${userId}` : ""}`);
+  if (!response.ok) throw new Error(`ADMIN_USAGE_${response.status}`);
+  return await response.json() as AdminUsage;
+}
+
+function bytesLabel(value: number): string {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const index = value > 0 ? Math.max(0, Math.min(4, Math.floor(Math.log(value) / Math.log(1000)))) : 0;
+  return `${(value / 1000 ** index).toFixed(index ? 2 : 0)} ${units[index]}`;
+}
+function durationLabel(ms: number): string {
+  return `${(ms / 3600000).toFixed(3)} ساعت`;
+}
+
+function usageCostLabel(value: UsageTotals): string {
+  // standard-2: 6 GiB RAM, 12 GB disk. CPU is measured from the container
+  // cgroup, never inferred from elapsed time. Gross rates verified 2026-10-20.
+  const fixed = value.runtimeMs / 1000 * (6 * 0.0000025 + 12 * 0.00000007);
+  const cpu = value.cpuSeconds * 0.000020;
+  const low = fixed + cpu + value.egressBytes / 1e9 * 0.025;
+  const high = fixed + cpu + value.egressBytes / 1e9 * 0.05;
+  return `$${low.toFixed(5)} تا $${high.toFixed(5)}`;
+}
+
+export function formatAdminUsage(usage: AdminUsage): string {
+  const lines = [usage.userId ? `📊 مصرف کاربر ${usage.userId}` : "📊 مصرف، ترافیک و هزینهٔ دانلودر",
+    `شروع ثبت: ${dateLabel(usage.trackingSince)}`, ""];
+  for (const [label, value] of [["کل از شروع ثبت", usage.all], ["۲۴ ساعت گذشته", usage.day], ["۷ روز گذشته", usage.week]] as const) {
+    lines.push(`• ${label}`, `فایل تحویل‌شده: ${value.downloads} • از کش تلگرام: ${value.cached}`,
+      `حجم فایل‌های تحویل‌شده: ${bytesLabel(value.bytes)}${value.unknownSizes ? ` + ${value.unknownSizes} فایل با حجم نامشخص` : ""}`,
+      `${usage.userId ? "سهم تخمینی زمان کانتینر" : "زمان روشن ثبت‌شدهٔ کانتینرها"}: ${durationLabel(value.runtimeMs)}`,
+      `CPU ثبت‌شده: ${value.cpuSeconds.toFixed(3)} vCPU-s`,
+      `ترافیک کانتینر ↓ ${bytesLabel(value.ingressBytes)} • ↑ ${bytesLabel(value.egressBytes)}`,
+      `هزینهٔ تخمینی ناخالص: ${usageCostLabel(value)}`,
+      ...(value.cpuMeasuredMs + 1 < value.runtimeMs || value.networkMeasuredMs + 1 < value.runtimeMs
+        ? ["⚠️ بخشی از اندازه‌گیری CPU یا شبکه در دسترس نیست؛ برآورد ناقص است."] : []), "");
+  }
+  lines.push("نوع فعلی: standard-2؛ تعرفه‌ها: ۲۰ اکتبر ۲۰۲۶.",
+    "هزینه تخمینی است؛ سهمیهٔ رایگان/ماهانه و هزینهٔ Workers، DO، لاگ و پلن لحاظ نشده. ترافیک شبکه الزاماً برابر ترافیک قابل‌صورتحساب نیست.",
+    usage.userId ? "مصرف هم‌زمان بر اساس تعداد کارهای فعال تقسیم می‌شود؛ بیکاری و کارهای بدون شناسه فقط در آمار کل است." : "آمار کل شامل بیکاری و کارهای بدون شناسه است؛ جمع سهم کاربران ممکن است کمتر باشد.",
+    "نمونه‌برداری در رویدادهای کار است؛ سهم هر بازه بین نمونه‌ها تقریبی است. توقف ناگهانی ممکن است آخرین نمونه را از دست بدهد.",
+    usage.lastMeasured ? `آخرین نمونه: ${dateLabel(usage.lastMeasured)}` : "هنوز نمونهٔ مصرف کانتینر ثبت نشده.",
+    "آمار پیش از شروع ثبت قابل بازیابی نیست؛ حجم تحویل فایل با ترافیک کانتینر متفاوت است.");
+  return lines.join("\n");
+}
+
+export async function recordMediaDelivery(env: Partial<AdminStatsEnv> & { BOT_TOKEN: string }, userId: number, chatId: number,
+  result: unknown, cached = false, fallbackBytes?: number): Promise<void> {
+  const messageId = (result as { message_id?: number } | null)?.message_id;
+  if (!Number.isSafeInteger(messageId)) return;
+  const bytes = telegramMediaBytes(result) ?? (Number.isSafeInteger(fallbackBytes) && fallbackBytes! >= 0 ? fallbackBytes! : null);
+  await recordUsage(env, [], [{ key: `tg:${env.BOT_TOKEN.split(":")[0]}:${chatId}:${messageId}`,
+    userId, at: Date.now(), bytes, cached }]);
 }

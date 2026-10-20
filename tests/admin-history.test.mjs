@@ -370,3 +370,136 @@ test('period lists paginate and retain their filter throughout user detail navig
       assert.ok(buttons.some(b => b.callback_data === `admin:${kind}:0:${period}`));
   } finally { globalThis.fetch = previousFetch; f.close(); }
 });
+
+test('usage batches are durable, idempotent, isolated per user and split across rolling boundaries', async () => {
+  const f = fixture(true);
+  try {
+    const now = 1_800_000_000_000;
+    Date.now = () => now;
+    const hour = 3600000;
+    const sample = { key: 'u:run:1:0', userId: 0, start: now - 25 * hour, end: now - 23 * hour,
+      runtimeMs: 2 * hour, cpuSeconds: 100, ingressBytes: 2000000000, egressBytes: 1000000000 };
+    const body = { samples: [sample, { ...sample, key: 'u:run:1:42', userId: 42, runtimeMs: hour, cpuSeconds: 50,
+      ingressBytes: 1000000000, egressBytes: 500000000 }], deliveries: [
+        { key: 'tg:1:42:7', userId: 42, at: now - hour, bytes: 500000000 },
+        { key: 'tg:1:43:8', userId: 43, at: now - 25 * hour, bytes: null, cached: true },
+        { key: 'tg:1:42:9', userId: 42, at: now - 8 * 24 * hour, bytes: 1000000 },
+      ] };
+    assert.equal((await f.request('/usage', body)).status, 200);
+    assert.equal((await f.request('/usage', body)).status, 200);
+    const usage = await admin.getAdminUsage(f.env);
+    assert.equal(usage.all.downloads, 3);
+    assert.equal(usage.all.bytes, 501000000);
+    assert.equal(usage.all.unknownSizes, 1);
+    assert.equal(usage.day.downloads, 1);
+    assert.equal(usage.week.downloads, 2);
+    assert.equal(usage.day.runtimeMs, hour);
+    assert.equal(usage.day.cpuSeconds, 50);
+    assert.equal(usage.day.egressBytes, 500000000);
+    const user = await admin.getAdminUsage(f.env, '42');
+    assert.equal(user.all.downloads, 2);
+    assert.equal(user.all.unknownSizes, 0);
+    assert.equal(user.day.runtimeMs, hour / 2);
+    assert.equal((await f.detail()).usage.bytes, 501000000);
+    assert.equal((await admin.getAdminSummary(f.env)).successfulDownloads, 27);
+    const text = admin.formatAdminUsage(usage);
+    assert.ok(text.length < 4096);
+    assert.match(text, /ناخالص/);
+    assert.match(text, /۲۴ ساعت/);
+    assert.match(text, /۷ روز/);
+    assert.match(text, /حجم نامشخص/);
+  } finally { f.close(); }
+});
+
+test('invalid usage batches fail atomically, missing measurements remain unknown and delivery failures are harmless', async () => {
+  const f = fixture();
+  try {
+    const now = Date.now();
+    const s = { key: 'u:run:0', userId: 0, start: now - 10000, end: now,
+      runtimeMs: 10000, cpuSeconds: null, ingressBytes: null, egressBytes: null };
+    assert.equal((await f.request('/usage', { samples: [s, { ...s, key: 'bad', runtimeMs: -1 }], deliveries: [] })).status, 400);
+    assert.equal((await admin.getAdminUsage(f.env)).all.runtimeMs, 0);
+    await admin.recordUsage(f.env, [s]);
+    const usage = await admin.getAdminUsage(f.env);
+    assert.equal(usage.all.cpuMeasuredMs, 0);
+    assert.match(admin.formatAdminUsage(usage), /برآورد ناقص/);
+    assert.equal((await f.request('/usage', { samples: [], deliveries: [{ key: 'd:1', userId: 42, at: now, bytes: -100 }] })).status, 400);
+    await admin.recordMediaDelivery(f.env, 42, -123, { message_id: 77, video: { file_size: 1234 } });
+    await admin.recordMediaDelivery(f.env, 42, -123, { message_id: 77, video: { file_size: 1234 } });
+    await admin.recordMediaDelivery(f.env, 42, 42, { message_id: 78, photo: [{ file_size: 100 }, { file_size: 1000 }] });
+    await admin.recordMediaDelivery(f.env, 42, 42, { message_id: 79 }, true, 55);
+    await admin.recordMediaDelivery(f.env, 42, 42, { message_id: 80 });
+    const total = (await admin.getAdminUsage(f.env, '42')).all;
+    assert.equal(total.downloads, 4);
+    assert.equal(total.bytes, 2289);
+    assert.equal(total.unknownSizes, 1);
+    assert.equal(total.cached, 1);
+    const unavailable = { BOT_TOKEN: 'fake', ADMIN_STATS: { getByName() { throw Error('offline'); } } };
+    await admin.recordMediaDelivery(unavailable, 42, 42, { message_id: 1 });
+    assert.equal(await admin.recordUsage(unavailable), false);
+  } finally { f.close(); }
+});
+
+test('production usage reports require admin access and preserve user-list navigation', async () => {
+  const f = fixture();
+  const originalFetch = globalThis.fetch;
+  const messages = [];
+  globalThis.fetch = async (input, init) => {
+    messages.push(JSON.parse(init.body));
+    return Response.json({ ok: true, result: true });
+  };
+  try {
+    const callback = (id, data) => new Request('https://worker/telegram/webhook', { method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-telegram-bot-api-secret-token': f.env.WEBHOOK_SECRET },
+      body: JSON.stringify({ update_id: 101, callback_query: { id: 'usage', from: { id }, data,
+        message: { message_id: 10, chat: { id } } } }) });
+    await admin.worker.fetch(callback(99, 'admin:usage'), f.env, {});
+    assert.equal(messages.length, 0);
+    await admin.worker.fetch(callback(admin.ADMIN_USER_ID, 'admin:usage'), f.env, {});
+    assert.ok(messages.at(-1).text.includes('مصرف، ترافیک'));
+    await admin.worker.fetch(callback(admin.ADMIN_USER_ID, 'admin:usage:42:3:2:used:week'), f.env, {});
+    assert.equal(messages.at(-1).reply_markup.inline_keyboard[1][0].callback_data, 'admin:user:42:3:2:used:week');
+    const token = await crypto.subtle.importKey('raw', new TextEncoder().encode(f.env.BOT_TOKEN), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const signature = [...new Uint8Array(await crypto.subtle.sign('HMAC', token, new TextEncoder().encode('usage:0')))].map(b => b.toString(16).padStart(2, '0')).join('');
+    const request = secret => new Request('https://worker/container-usage/0', { method: 'POST',
+      headers: { 'x-admin-usage-token': secret }, body: JSON.stringify({ samples: [], deliveries: [] }) });
+    assert.equal((await admin.worker.fetch(request('forged'), f.env, {})).status, 403);
+    assert.equal((await admin.worker.fetch(request(signature), f.env, {})).status, 200);
+    assert.equal((await admin.worker.fetch(new Request('https://worker/container-usage/0', { method: 'POST',
+      headers: { 'x-admin-usage-token': signature }, body: 'x'.repeat(200001) }), f.env, {})).status, 413);
+  } finally { globalThis.fetch = originalFetch; f.close(); }
+});
+
+test('container lifetimes include idle and live runtime without duplicate starts or replay reopening a stopped run', async () => {
+  const f = fixture();
+  try {
+    const now = Date.now(), hour = 3600000;
+    Date.now = () => now;
+    const run = { key: 'run:abc', start: now - 2 * hour, end: null };
+    await admin.recordUsage(f.env, [], [], [run]);
+    await admin.recordUsage(f.env, [], [], [run]);
+    assert.equal((await admin.getAdminUsage(f.env)).all.runtimeMs, 2 * hour);
+    await admin.recordUsage(f.env, [], [], [{ ...run, end: now - hour }]);
+    await admin.recordUsage(f.env, [], [], [run]); // delayed start cannot reopen a run
+    assert.equal((await admin.getAdminUsage(f.env)).all.runtimeMs, hour);
+    const crossing = { key: 'run:previous', start: now - 25 * hour, end: now - 23 * hour };
+    await admin.recordUsage(f.env, [], [], [crossing]);
+    const usage = await admin.getAdminUsage(f.env);
+    assert.equal(usage.day.runtimeMs, 2 * hour);
+    assert.equal(usage.all.runtimeMs, 3 * hour);
+    assert.equal((await admin.getAdminUsage(f.env, '42')).all.runtimeMs, 0);
+    assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM container_runs').get().n, 2);
+  } finally { f.close(); }
+});
+
+test('gross cost estimate uses actual CPU and standard-2 memory/disk rates with regional egress range', async () => {
+  const f = fixture();
+  try {
+    const now = Date.now();
+    await admin.recordUsage(f.env, [{ key: 'u:cost:0', userId: 0, start: now - 3600000, end: now,
+      runtimeMs: 3600000, cpuSeconds: 50, ingressBytes: 0, egressBytes: 1000000000 }]);
+    // 6 GiB RAM + 12 GB disk for one hour = $0.057024; 50 CPU-s = $0.001;
+    // 1 GB egress adds $0.025 to $0.05 before account-wide monthly credits.
+    assert.match(admin.formatAdminUsage(await admin.getAdminUsage(f.env)), /\$0\.08302 تا \$0\.10802/);
+  } finally { f.close(); }
+});

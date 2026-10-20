@@ -11,6 +11,8 @@ import {
   getAdminUserDetail,
   formatAdminDashboard,
   formatAdminUsers,
+  getAdminUsage,
+  formatAdminUsage,
   getAdminSummary,
   getAdminUsersPage,
   isInstagramDownloadLink,
@@ -144,6 +146,17 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
         message_id: message.message_id,
         text: formatAdminDashboard(summary),
         reply_markup: adminDashboardKeyboard(),
+      });
+      return Response.json({ ok: true });
+    }
+
+    const usageMatch = /^admin:usage(?::([1-9]\d{0,15}):(\d{1,8}):(\d{1,8})(:used)?(?::(day|week))?)?$/.exec(data);
+    if (usageMatch) {
+      const usage = await getAdminUsage(env, usageMatch[1]);
+      const back = usageMatch[1] ? `admin:user:${usageMatch[1]}:${usageMatch[2]}:${usageMatch[3]}${usageMatch[4] || ""}${usageMatch[5] ? `:${usageMatch[5]}` : ""}` : "admin:stats";
+      await telegramCall(env.BOT_TOKEN, "editMessageText", {
+        chat_id: message.chat.id, message_id: message.message_id, text: formatAdminUsage(usage),
+        reply_markup: { inline_keyboard: [[{ text: "🔄 بروزرسانی", callback_data: data }], [{ text: "بازگشت", callback_data: back }]] },
       });
       return Response.json({ ok: true });
     }

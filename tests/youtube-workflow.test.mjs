@@ -30,7 +30,7 @@ const { outputFiles } = await build({
         export const recordDownload = async(_env,record)=>{(globalThis.downloadHistory ||= []).push(record);};
         export const isInstagramDownloadLink = text=>/instagram.com\\//.test(text);
         export const telegramTextMotion=async()=>{};
-        export const telegramCustomEmoji=(_method,payload)=>payload;
+        export const recordUsage=async(...args)=>globalThis.usageTelemetry ? globalThis.usageTelemetry(...args) : true; export const recordMediaDelivery=async()=>{}; export const telegramCustomEmoji=(_method,payload)=>payload;
         export const telegramFileCache=async(...args)=>globalThis.testFileCache ? globalThis.testFileCache(...args) : null; export class AdminStatsStore {}
         export const ADMIN_USER_ID = 1;
         export const recordSuccessfulDelivery = async () => { globalThis.delivered++; };
@@ -584,4 +584,38 @@ test('unknown, invalid and ambiguous results never take the Telegram continuatio
     assert.ok(!result.steps.some(([,config]) => config.sleep));
     assert.equal(result.delivered, 0);
   }
+});
+
+test('usage refresh never starts a sleeping container or renews activity; lifecycle starts remain idempotent', async () => {
+  const storage = memoryStorage();
+  const calls = [];
+  globalThis.usageTelemetry = async (...args) => { calls.push(args); return true; };
+  const host = { running: false, getTcpPort() { throw Error('sleeping container must not be contacted'); } };
+  const container = new YoutubeDownloaderContainer({ storage, container: host }, { BOT_TOKEN: 'bot' });
+  container.startAndWaitForPorts = async () => { throw Error('stats must never start a container'); };
+  try {
+    await container.refreshUsage();
+    assert.equal(calls.length, 0);
+    await container.onStart();
+    const first = await storage.get('adminUsageRun');
+    await container.onStart();
+    assert.equal((await storage.get('adminUsageRun')).key, first.key);
+    const samples = [{ key: 'u:abc:1:0', userId: 0, start: 1000, end: 2000,
+      runtimeMs: 1000, cpuSeconds: 1, ingressBytes: 100, egressBytes: 50 }];
+    host.running = true;
+    host.getTcpPort = port => {
+      assert.equal(port, 8080);
+      return { async fetch(url) { assert.equal(url, 'http://container/admin-usage'); return Response.json({ samples, deliveries: [] }); } };
+    };
+    await container.refreshUsage();
+    assert.deepEqual(calls.at(-1)[1], samples);
+    assert.equal(container.renewed, undefined);
+    host.running = false;
+    await container.onStop();
+    const closed = await storage.get('adminUsageRun');
+    assert.equal(closed.key, first.key);
+    assert.ok(closed.end >= first.start);
+    await container.onStart();
+    assert.notEqual((await storage.get('adminUsageRun')).key, first.key);
+  } finally { delete globalThis.usageTelemetry; }
 });

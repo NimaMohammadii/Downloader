@@ -26,7 +26,7 @@ const { outputFiles } = await build({
         export const recordDownload = async(_env,record)=>{(globalThis.downloadHistory ||= []).push(record);};
         export const isInstagramDownloadLink = text=>/instagram.com\\//.test(text);
         export const telegramTextMotion=async()=>{};
-        export const telegramCustomEmoji=(_method,payload)=>payload;
+        export const recordUsage=async()=>true; export const recordMediaDelivery=async()=>{}; export const telegramCustomEmoji=(_method,payload)=>payload;
         export const telegramFileCache=async(...args)=>globalThis.testFileCache ? globalThis.testFileCache(...args) : null; export class AdminStatsStore{} export const ADMIN_USER_ID=1;
         export const recordUserActivity=async()=>{};
         export const recordSuccessfulDelivery=async()=>{globalThis.delivered++;};` };

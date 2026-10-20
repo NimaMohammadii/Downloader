@@ -25,6 +25,171 @@ from urllib.parse import parse_qs, urlparse, urljoin
 
 import requests
 
+USAGE_USER: ContextVar[int] = ContextVar("usage_user", default=0)
+
+
+class UsageMeter:
+    """One event-driven ledger for this container, including child-process CPU.
+
+    Global counters are measured once. Concurrent jobs share each interval in
+    proportion to active scopes; user shares are estimates, never billing data.
+    Telemetry uses a bounded queue and a single nonblocking reporter, no polling.
+    """
+    def __init__(self):
+        self.url = os.environ.get("ADMIN_USAGE_URL", "")
+        self.token = os.environ.get("ADMIN_USAGE_TOKEN", "")
+        self.enabled = bool(re.fullmatch(r"https://downloader\.vexaagent\.workers\.dev/container-usage/\d+", self.url)
+                            and re.fullmatch(r"[a-f0-9]{64}", self.token))
+        self.lock = threading.RLock()
+        self.session = secrets.token_hex(16)
+        self.sequence = 0
+        self.active: dict[int, int] = {}
+        self.samples: dict[str, dict] = {}
+        self.deliveries: dict[str, dict] = {}
+        self.reporting = False
+        self.last_clock = time.monotonic()
+        self.last_at = time.time() * 1000
+        self.last_cpu, self.last_network = self.counters() if self.enabled else (None, None)
+
+    @staticmethod
+    def counters():
+        cpu, network = None, None
+        try:
+            values = dict(line.split() for line in Path("/sys/fs/cgroup/cpu.stat").read_text().splitlines())
+            cpu = int(values["usage_usec"]) / 1_000_000
+        except (OSError, ValueError, KeyError):
+            try:
+                cpu = int(Path("/sys/fs/cgroup/cpuacct/cpuacct.usage").read_text()) / 1_000_000_000
+            except (OSError, ValueError):
+                pass
+        try:
+            rx, tx = 0, 0
+            for line in Path("/proc/net/dev").read_text().splitlines()[2:]:
+                interface, raw = line.split(":", 1)
+                if interface.strip() != "lo":
+                    values = raw.split()
+                    rx += int(values[0])
+                    tx += int(values[8])
+            network = (rx, tx)
+        except (OSError, ValueError, IndexError):
+            pass
+        return cpu, network
+
+    def sample(self):
+        if not self.enabled:
+            return
+        with self.lock:
+            clock = time.monotonic()
+            elapsed = max(0, (clock - self.last_clock) * 1000)
+            cpu, network = self.counters()
+            start, end = self.last_at, self.last_at + elapsed
+            cpu_delta = max(0, cpu - self.last_cpu) if cpu is not None and self.last_cpu is not None else None
+            rx = max(0, network[0] - self.last_network[0]) if network is not None and self.last_network is not None else None
+            tx = max(0, network[1] - self.last_network[1]) if network is not None and self.last_network is not None else None
+            self.last_clock, self.last_at, self.last_cpu, self.last_network = clock, end, cpu, network
+            if elapsed <= 0:
+                return
+            self.sequence += 1
+            shares = {0: 1.0}
+            total = sum(self.active.values())
+            shares.update({user: count / total for user, count in self.active.items() if user > 0})
+            for user, share in shares.items():
+                key = f"u:{self.session}:{self.sequence}:{user}"
+                self.samples[key] = {"key": key, "userId": user, "start": start, "end": end,
+                    "runtimeMs": elapsed * share,
+                    "cpuSeconds": cpu_delta * share if cpu_delta is not None else None,
+                    "ingressBytes": rx * share if rx is not None else None,
+                    "egressBytes": tx * share if tx is not None else None}
+            if len(self.samples) > 10000:
+                # Keep memory bounded during prolonged stats-service outages.
+                for key in list(self.samples)[:len(self.samples) - 10000]:
+                    del self.samples[key]
+                print("admin usage queue overflow: some measurements unavailable", flush=True)
+
+    def report(self):
+        if not self.enabled:
+            return
+        with self.lock:
+            if self.reporting:
+                return
+            self.reporting = True
+        def send():
+            try:
+                self.flush()
+            finally:
+                with self.lock:
+                    self.reporting = False
+        try:
+            threading.Thread(target=send, daemon=True).start()
+        except Exception:
+            with self.lock:
+                self.reporting = False
+
+    def flush(self):
+        if not self.enabled:
+            return
+        try:
+            # Batches are idempotent by key, including simultaneous final flush.
+            for _ in range(4):
+                with self.lock:
+                    samples = list(self.samples.values())[:250]
+                    deliveries = list(self.deliveries.values())[:250]
+                if not samples and not deliveries:
+                    return
+                response = requests.post(self.url, headers={"x-admin-usage-token": self.token},
+                    json={"samples": samples, "deliveries": deliveries}, timeout=(1, 2), allow_redirects=False)
+                if not response.ok:
+                    return
+                with self.lock:
+                    for item in samples:
+                        self.samples.pop(item["key"], None)
+                    for item in deliveries:
+                        self.deliveries.pop(item["key"], None)
+        except Exception:
+            pass  # The next work event or idle exit retries the same keys.
+
+    @contextmanager
+    def scope(self, user):
+        user = user if type(user) is int and user > 0 else 0
+        context = USAGE_USER.set(user)
+        try:
+            if self.enabled:
+                with self.lock:
+                    self.sample()
+                    self.active[user] = self.active.get(user, 0) + 1
+                self.report()
+            yield
+        finally:
+            if self.enabled:
+                with self.lock:
+                    self.sample()
+                    self.active[user] -= 1
+                    if not self.active[user]:
+                        del self.active[user]
+                self.report()
+            USAGE_USER.reset(context)
+
+    def delivery(self, token, chat, result, size=None, cached=False):
+        if not self.enabled or not USAGE_USER.get() or not isinstance(result, dict):
+            return
+        message_id = result.get("message_id")
+        if type(message_id) is not int:
+            return
+        if type(size) is not int or size < 0 or size > 2_000_000_000:
+            size = None
+        key = f"tg:{token.split(':')[0]}:{chat}:{message_id}"
+        with self.lock:
+            if len(self.deliveries) >= 10000 and key not in self.deliveries:
+                print("admin delivery queue overflow: some measurements unavailable", flush=True)
+                return
+            self.deliveries[key] = {"key": key, "userId": USAGE_USER.get(), "at": int(time.time() * 1000),
+                                    "bytes": size, "cached": cached}
+        self.report()
+
+
+USAGE = UsageMeter()
+
+
 class JobCapacity:
     """Nonblocking admission shared by metadata, downloads and background jobs."""
 
@@ -126,6 +291,16 @@ class IdleExit:
             self.timer.start()
 
     def _expire(self, generation: int) -> None:
+        with self.lock:
+            if generation != self.generation or self.active or self.busy():
+                return
+        # Do not hold the admission lock during telemetry I/O. A new request
+        # changes the generation and cancels this pending idle exit as before.
+        try:
+            USAGE.sample()
+            USAGE.flush()
+        except Exception:
+            pass  # Stats failures cannot keep an idle container running.
         with self.lock:
             if generation != self.generation or self.active or self.busy():
                 return
@@ -1007,7 +1182,18 @@ TELEGRAM_UPLOADER = TelegramUploader()
 
 
 async def upload_complete_file(token: str, method: str, data: dict[str, Any], file: tuple) -> Any:
-    return await TELEGRAM_UPLOADER.upload(token, method, data, file)
+    # Observe only confirmed delivery; retries and failed uploads retain their
+    # existing behavior and never become successful-download statistics.
+    try:
+        size = Path(file[1].name).stat().st_size
+    except (OSError, AttributeError, TypeError):
+        size = None
+    result = await TELEGRAM_UPLOADER.upload(token, method, data, file)
+    try:
+        USAGE.delivery(token, data.get("chat_id"), result, size)
+    except Exception:
+        pass  # A confirmed send must remain successful if metering is unavailable.
+    return result
 
 
 async def _upload_complete_file(uploader: TelegramUploader, token: str, method: str, data: dict[str, Any], file: tuple) -> Any:
@@ -1302,7 +1488,12 @@ def reuse_cached_file(payload: dict[str, Any], key: str | None, caption: str | N
     data.update({"chat_id": payload["chatId"], "reply_parameters": {"message_id": payload["requestMessageId"]},
                  "audio" if cached["method"] == "sendAudio" else "video": cached["fileId"]})
     try:
-        telegram_call(payload["botToken"], cached["method"], json_payload=data, timeout=90)
+        sent = telegram_call(payload["botToken"], cached["method"], json_payload=data, timeout=90)
+        media = (sent.get("video") or sent.get("audio") or {}) if isinstance(sent, dict) else {}
+        try:
+            USAGE.delivery(payload["botToken"], payload["chatId"], sent, media.get("file_size", cached.get("fileSize")), cached=True)
+        except Exception:
+            pass
         return True
     except Exception as exc:
         if re.search(r"wrong.*file|file.*(?:invalid|expired)|file_reference|failed to get.*file", str(exc), re.I):
@@ -1589,7 +1780,7 @@ class InstagramCapture:
         self.safe_status("❌ اعلام نتیجهٔ پلی‌لیست به ربات کامل نشد؛ پیش از درخواست دوباره، فایل‌های ارسال‌شده را بررسی کن." if self.source.get("playlist") else "❌ فایل دریافت شد ولی اعلام نتیجه به ربات کامل نشد؛ لینک را دوباره بفرست.")
 
     def run_active(self) -> None:
-        with server_activity(), request_cache():
+        with server_activity(), request_cache(), USAGE.scope(getattr(self, "payload", {}).get("userId")):
             self.run()
 
     def run(self) -> None:
@@ -2031,7 +2222,8 @@ def instagram_action(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     if action == "stop":
         return {"ok": job.stop(), "message": "ضبط تمام شده یا در حال ارسال است."}
     if action == "send":
-        return job.send()
+        with USAGE.scope(job.payload.get("userId")):
+            return job.send()
     if action == "cleanup":
         job.cleanup()
         with INSTAGRAM_LOCK:
@@ -2053,6 +2245,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
+        if self.path == "/admin-usage":
+            # A stats read is not download activity and must not postpone sleep.
+            USAGE.sample()
+            with USAGE.lock:
+                payload = {"samples": list(USAGE.samples.values())[-250:],
+                           "deliveries": list(USAGE.deliveries.values())[-250:]}
+            self._send_json(200, payload)
+            USAGE.report()
+            return
         with server_activity():
             self.handle_get()
 
@@ -2084,7 +2285,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(429, {"ok": False, "message": "ظرفیت هم‌زمان این سرور پر است."})
                     return
                 try:
-                    with request_cache(str(payload.get("url") or "")):
+                    with request_cache(str(payload.get("url") or "")), USAGE.scope(payload.get("userId")):
                         if self.path == "/metadata":
                             url = str(payload.get("url") or "")
                             if not url:

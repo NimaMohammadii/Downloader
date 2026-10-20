@@ -143,6 +143,19 @@ A visit begins with the first recorded interaction or an interaction after at le
 
 History records the source, URL/query, available title, time, outcome, confirmed file count and failure explanation. YouTube inspection and its quality selection share one history entry. Successful delivery requires a successful Telegram send response; fetching the `/media` proxy alone no longer counts as delivery. Partial batches, song search results, pending requests and failures have separate labels. Requests without a final outcome after four hours show an unknown result rather than a guessed success or failure. A partially delivered playlist includes its confirmed file count and requested range.
 
+### Download traffic and container usage (admin only)
+
+`/admin` → **📊 مصرف، ترافیک و هزینه** shows confirmed file deliveries, known delivered bytes, cache deliveries, measured container RX/TX, cgroup CPU seconds, recorded container runtime and a gross USD cost estimate for all recorded usage, rolling 24 hours and rolling 7 days. Each user detail has the same report and retains the original list filter/back navigation. Existing lifetime download counters and history are preserved; unrecorded historical file sizes and resource usage cannot be reconstructed.
+
+Measurements extend the existing AdminStatsStore, Container class and complete-file sender. Sample/delivery keys are persisted idempotently; concurrent jobs share measured resources by active-job count. Idle time and unidentified work belong only to global usage. CPU includes subprocesses via cgroup accounting. Network-interface counters include protocol/internal traffic and must not be treated as Cloudflare's billable egress. Missing measurements/unknown file sizes are labeled. Resource intervals crossing a reporting boundary are prorated; abrupt shutdown or a prolonged telemetry outage can lose the last measurements.
+
+Runtime comes from persisted container lifecycle records, including idle time and currently open runs. Admin report refreshes sample only already-running instances through their existing port; they do not boot sleeping containers or renew idle timers. Reporting is event-driven with no polling; telemetry failures do not reject downloads or trigger another Telegram send.
+
+The estimate uses the current `standard-2` configuration (6 GiB RAM, 12 GB disk), measured CPU and a region-dependent egress range. Rates were verified against [Cloudflare Containers pricing](https://developers.cloudflare.com/containers/platform/pricing/) on 2026-10-20: $0.0000025/GiB-second RAM, $0.00000007/GB-second disk, $0.000020/vCPU-second, $0.025–$0.05/GB egress. Estimates are **before account-wide included usage**, and exclude the Workers plan, Workers requests, Durable Objects and logs; they are not invoices. Update the estimator if the instance type or rates change.
+
+Deploy the Worker **and rebuilt container image together** with the existing `npm run deploy` command. No new binding, migration tag, external billing token or manually entered secret is needed. The current per-container HMAC capability secures telemetry; only the existing admin can view reports. Recording begins after deployment, not at the date of the previous download history.
+
+
 The existing users, link totals and global success counter are preserved. New tables are created automatically in the existing SQLite Durable Object; no new binding or class migration is required. Visits and per-user download history start when this version runs and cannot reconstruct previously unrecorded activity. History is retained without automatic deletion; activity deduplication and the existing media cache keep their own expiry policies. Recording outages do not block downloads; missing final records remain visibly unresolved.
 
 ## Required Cloudflare secret

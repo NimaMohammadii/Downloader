@@ -13,6 +13,11 @@ import {
   recordSuccessfulDelivery,
   recordUserActivity,
   recordDownload,
+  recordUsage,
+  recordMediaDelivery,
+  type UsageSample,
+  type ContainerRun,
+  type MediaUsage,
   isInstagramDownloadLink,
   type DownloadRecord,
   type DownloadStatus,
@@ -205,7 +210,34 @@ export class YoutubeDownloaderContainer extends Container<Env> {
   private starting?: Promise<void>;
   private idleShutdownRequested = false;
 
-  override onStart(): void { this.idleShutdownRequested = false; }
+  override async onStart(): Promise<void> {
+    this.idleShutdownRequested = false;
+    await this.trackContainerRun(false);
+  }
+
+  private async trackContainerRun(stopped: boolean): Promise<void> {
+    try {
+      const saved = await this.ctx.storage.get<ContainerRun>("adminUsageRun");
+      if (stopped && !saved) return;
+      const run: ContainerRun = stopped ? { ...saved!, end: saved!.end ?? Date.now() }
+        : saved?.end === null ? saved : { key: `run:${crypto.randomUUID()}`, start: Date.now(), end: null };
+      await this.ctx.storage.put("adminUsageRun", run);
+      // Retry the previous closed run too, in case its stop report was lost.
+      await recordUsage(this.env, [], [], !stopped && saved?.end != null ? [saved, run] : [run]);
+    } catch { console.warn("container lifecycle stats unavailable"); }
+  }
+
+  async refreshUsage(): Promise<void> {
+    // Read the existing process directly: never start a stopped container or
+    // renew its activity timeout merely because an admin opened a report.
+    if (!this.ctx.container?.running) return;
+    try {
+      const response = await this.ctx.container.getTcpPort(8080).fetch("http://container/admin-usage", { signal: AbortSignal.timeout(1500) });
+      if (!response.ok) return;
+      const body = await response.json() as { samples: UsageSample[]; deliveries: MediaUsage[] };
+      await recordUsage(this.env, body.samples, body.deliveries);
+    } catch { /* Last persisted samples remain available during a restart. */ }
+  }
 
   async startShared(index: number): Promise<void> {
     if (!Number.isInteger(index) || index < 0 || index >= POOL_INSTANCES) throw new Error("DOWNLOAD_POOL_ASSIGNMENT");
@@ -215,6 +247,8 @@ export class YoutubeDownloaderContainer extends Container<Env> {
         const saved = await this.ctx.storage.get<{ tag: string; session: string }>("telegramSession");
         this.envVars = { ...this.envVars,
           TELEGRAM_BOT_SESSION: saved?.tag === tag ? saved.session : "",
+          ADMIN_USAGE_URL: `https://downloader.vexaagent.workers.dev/container-usage/${index}`,
+          ADMIN_USAGE_TOKEN: await instagramSignature(this.env.BOT_TOKEN, `usage:${index}`),
           TELEGRAM_SESSION_URL: `https://downloader.vexaagent.workers.dev/telegram-session/${index}`,
           TELEGRAM_SESSION_TOKEN: await instagramSignature(this.env.BOT_TOKEN, `telegram-session:${index}:${this.env.API_ID}:${this.env.API_HASH}`),
         };
@@ -295,10 +329,14 @@ export class YoutubeDownloaderContainer extends Container<Env> {
     return active.length > 0;
   }
 
-  override async onStop(): Promise<void> { await this.instagramInterrupted(); }
+  override async onStop(): Promise<void> {
+    await this.trackContainerRun(true);
+    await this.instagramInterrupted();
+  }
   override async onError(error: unknown): Promise<void> {
     const idleShutdownRequested = this.idleShutdownRequested;
     this.idleShutdownRequested = false;
+    if (!this.ctx.container?.running) await this.trackContainerRun(true);
     if (await this.instagramInterrupted()) return;
     const message = error instanceof Error ? error.message : String(error);
     if (idleShutdownRequested && message === "The RPC call destroy() was called") {
@@ -349,10 +387,11 @@ async function sendCachedMedia(env: Env, job: YoutubeDownloadJob, statusId?: num
   const cached = await telegramFileCache(env, "get", key);
   if (!cached) return false;
   try {
-    await telegramCall(env.BOT_TOKEN, cached.method, {
+    const sent = await telegramCall(env.BOT_TOKEN, cached.method, {
       ...cached.data, [cached.method === "sendAudio" ? "audio" : "video"]: cached.fileId,
       chat_id: job.chatId, reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
     });
+    await recordMediaDelivery(env, job.userId, job.chatId, sent, true, cached.fileSize);
   } catch (error) {
     if (/wrong.*file|file.*(?:invalid|expired)|file_reference|failed to get.*file/i.test(error instanceof Error ? error.message : "")) {
       await telegramFileCache(env, "delete", key);
@@ -483,7 +522,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
               new Request("http://container/metadata", {
                 method: "POST",
                 headers: { "content-type": "application/json" },
-                body: JSON.stringify({ url: job.url }),
+                body: JSON.stringify({ url: job.url, userId: job.userId }),
               }),
             );
           },
@@ -1301,6 +1340,34 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const requestUrl = new URL(request.url);
 
+    const usageRequest = /^\/container-usage\/(\d+)$/.exec(requestUrl.pathname);
+    if (request.method === "POST" && usageRequest) {
+      const index = Number(usageRequest[1]);
+      if (index < 0 || index >= POOL_INSTANCES) return new Response("Invalid container", { status: 400 });
+      const expected = await instagramSignature(env.BOT_TOKEN, `usage:${index}`);
+      if (!equalSignature(request.headers.get("x-admin-usage-token") || "", expected)) return new Response("Forbidden", { status: 403 });
+      // Limit the body before decoding JSON, including requests without Content-Length.
+      const reader = request.body?.getReader();
+      if (!reader) return new Response("Invalid usage", { status: 400 });
+      let size = 0;
+      const chunks: Uint8Array[] = [];
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        size += chunk.value.byteLength;
+        if (size > 200000) { await reader.cancel(); return new Response("Too large", { status: 413 }); }
+        chunks.push(chunk.value);
+      }
+      try {
+        const bytes = new Uint8Array(size);
+        let offset = 0;
+        for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+        const body = JSON.parse(new TextDecoder().decode(bytes)) as { samples: UsageSample[]; deliveries: MediaUsage[] };
+        const ok = await recordUsage(env, body.samples, body.deliveries);
+        return Response.json({ ok }, { status: ok ? 200 : 503 });
+      } catch { return new Response("Invalid usage", { status: 400 }); }
+    }
+
     // Only the assigned Container receives this capability. Sessions never go
     // into Workflow results, the media cache, logs, or a public read endpoint.
     const sessionRequest = /^\/telegram-session\/(\d+)$/.exec(requestUrl.pathname);
@@ -1362,6 +1429,10 @@ export default {
       // Count every authenticated interaction once, including routes delegated to older handlers.
       const actor = update?.callback_query?.from || update?.message?.from;
       const activityText = (update?.message?.text || update?.message?.caption || "").trim();
+      if (actor?.id === ADMIN_USER_ID && update?.callback_query?.data?.startsWith("admin:usage") && env.YOUTUBE_DOWNLOADER_CONTAINER) {
+        await Promise.allSettled(Array.from({ length: POOL_INSTANCES }, async (_, index) =>
+          pooledContainer(env, { containerIndex: index }).refreshUsage()));
+      }
       if (actor && actor.id !== ADMIN_USER_ID && !update?.callback_query?.data?.startsWith("admin:")
           && !/^\/admin(?:@[A-Za-z0-9_]+)?$/i.test(activityText)) {
         const linkSent = Boolean(isInstagramDownloadLink(activityText) || extractYouTubeUrl(activityText)

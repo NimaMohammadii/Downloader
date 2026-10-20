@@ -1,4 +1,4 @@
-import { telegramCustomEmoji, telegramTextMotion, telegramFileCache, recordDownload, recordSuccessfulDelivery, type AdminStatsEnv } from "./admin";
+import { recordMediaDelivery, telegramCustomEmoji, telegramTextMotion, telegramFileCache, recordDownload, recordSuccessfulDelivery, type AdminStatsEnv } from "./admin";
 
 type Env = Partial<AdminStatsEnv> & {
   BOT_TOKEN: string;
@@ -1320,8 +1320,10 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
       const proxyUrl = await createMediaProxyUrl(env.BOT_TOKEN, item.url);
       const caption = media.length > 1 ? `Instagram • ${index + 1}/${media.length}` : "Instagram";
 
+      let usageSent: unknown;
+      let usageCached = false;
       if (item.kind === "photo") {
-        await telegramCall(env.BOT_TOKEN, "sendPhoto", {
+        usageSent = await telegramCall(env.BOT_TOKEN, "sendPhoto", {
           chat_id: message.chat.id,
           photo: proxyUrl,
           caption,
@@ -1342,17 +1344,21 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
           }, { text: "🔎 پیداکردن آهنگ", callback_data: `igm|p|${target.shortcode}|${index}|${message.from.id}` }]] } : undefined,
           reply_parameters: index === 0 ? { message_id: message.message_id, allow_sending_without_reply: true } : undefined,
         };
+        usageCached = Boolean(cached?.method === "sendVideo");
         let sent: TelegramMessage;
         try { sent = await telegramCall<TelegramMessage>(env.BOT_TOKEN, "sendVideo", payload); }
         catch (error) {
           if (!cached || !/wrong.*file|file.*(?:invalid|expired)|file_reference|failed to get.*file/i.test(String(error))) throw error;
+          usageCached = false;
           await telegramFileCache(env, "delete", cacheKey!);
           sent = await telegramCall<TelegramMessage>(env.BOT_TOKEN, "sendVideo", { ...payload, video: proxyUrl });
         }
+        usageSent = sent;
         if (cacheKey && sent.video?.file_id) await telegramFileCache(env, "put", cacheKey, {
           method: "sendVideo", fileId: sent.video.file_id, data: { caption, supports_streaming: true },
         });
       }
+      await recordMediaDelivery(env, message.from?.id || message.chat.id, message.chat.id, usageSent, usageCached);
       delivered++;
       if (env.ADMIN_STATS) await recordSuccessfulDelivery(env as AdminStatsEnv, `${history.key}:${index}`);
     }

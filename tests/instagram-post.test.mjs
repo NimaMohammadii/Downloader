@@ -7,7 +7,7 @@ const { outputFiles } = await build({
   plugins: [{ name: 'instagram-post-bindings', setup(build) {
     build.onResolve({ filter: /^\.\/admin$/ }, args => ({ path: args.path, namespace: 'test' }));
     build.onLoad({ filter: /.*/, namespace: 'test' }, () => ({ contents: `
-      export const telegramCustomEmoji = (_method, payload) => payload;
+      export const recordUsage=async()=>true; export const recordMediaDelivery=async()=>{}; export const telegramCustomEmoji = (_method, payload) => payload;
       export const telegramTextMotion = async () => {};
       export const telegramFileCache = async () => null;
       export const recordDownload = async (_env, value) => { (globalThis.history ||= []).push(value); };
