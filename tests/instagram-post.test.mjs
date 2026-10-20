@@ -164,13 +164,11 @@ test('anonymous cookies never become part of the configured account session', as
   assert.ok(authenticated.every(call => !call.headers.get('cookie').includes('anonymous-mid')));
 });
 
-test('confirmed session account redirects stop without retrying rejected account endpoints', async () => {
+test('explicit session login, challenge or consent redirects stop without retrying rejected endpoints', async () => {
   for (const [path, code, text] of [
     ['/accounts/login/?private=redirect-secret', 'LOGIN_REQUIRED', /نشست/],
     ['/challenge/?private=redirect-secret', 'CHALLENGE_REQUIRED', /تأیید امنیتی/],
     ['/consent/?private=redirect-secret', 'CONSENT_REQUIRED', /پذیرش شرایط/],
-    ['/accounts/onetap/?private=redirect-secret', 'ACCOUNT_ACTION_REQUIRED', /تأیید حساب/],
-    ['/?private=redirect-secret', 'ACCOUNT_ACTION_REQUIRED', /تأیید حساب/],
   ]) {
     const result = await run({ respond(call) {
       if (call.path === pagePath && call.headers.get('cookie')?.includes('sessionid=')) return redirect(path);
@@ -181,6 +179,23 @@ test('confirmed session account redirects stop without retrying rejected account
     assert.match(errorText(result), text);
     assert.ok(!JSON.stringify(result.diagnostics).includes('redirect-secret'));
     noObsoleteRequests(result);
+  }
+});
+
+test('a home or generic account redirect must not claim consent or block the existing media APIs', async () => {
+  for (const destination of ['/?secret=redirect-secret', '/accounts/onetap/?secret=redirect-secret', '/accounts/unknown/?secret=redirect-secret']) {
+    for (const webWorks of [true, false]) {
+      const result = await run({ respond(call) {
+        if (call.path === pagePath && call.headers.get('cookie')?.includes('sessionid=')) return redirect(destination);
+        if (webWorks && call.path === apiPath && call.hostname === 'www.instagram.com') return Response.json({ items: [video] });
+      } });
+      assert.equal(files(result).length, 1, `${destination}: the supported API is still accessible`);
+      assert.equal(result.calls.length, webWorks ? 4 : 5);
+      assert.equal(result.history.at(-1).status, 'success');
+      assert.ok(!JSON.stringify(result.sent).includes('پذیرش شرایط'));
+      assert.ok(!JSON.stringify(result.diagnostics).includes('redirect-secret'));
+      noObsoleteRequests(result);
+    }
   }
 });
 
