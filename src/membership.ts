@@ -1,7 +1,7 @@
 import { ADMIN_USER_ID, telegramCustomEmoji, type AdminStatsEnv } from "./admin";
 
 // The channel must be public and this bot must be a channel administrator.
-export const MEMBERSHIP_CHANNEL = "@VexaToolsBot";
+export const MEMBERSHIP_CHANNEL = "@VexaOrder";
 
 type MembershipEnv = Partial<AdminStatsEnv> & { BOT_TOKEN?: string; WEBHOOK_SECRET?: string; MEMBERSHIP_CHANNEL?: string };
 export type MembershipState = { enabled: boolean; downloaded: boolean };
@@ -28,8 +28,19 @@ async function telegram(env: MembershipEnv, method: string, payload: Record<stri
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify(telegramCustomEmoji(method, payload)), signal: AbortSignal.timeout(8000),
   });
-  const body = await response.json() as { ok: boolean; result?: unknown };
-  if (!response.ok || !body.ok) throw new Error("MEMBERSHIP_TELEGRAM_UNAVAILABLE");
+  const body = await response.json() as { ok: boolean; result?: unknown; error_code?: number; description?: string };
+  if (!response.ok || !body.ok) {
+    const description = typeof body.description === "string" ? body.description : "";
+    // Repeated check callbacks can try to edit an already-updated message.
+    if (method === "editMessageText" && /message is not modified/i.test(description)) return;
+    // Log bounded classifications, never the request URL, bot token or raw response.
+    const reason = /chat not found|chat_id.*invalid|username.*not found/i.test(description) ? "channel_not_found"
+      : /CHAT_ADMIN_REQUIRED|not enough rights|not an administrator|member list is inaccessible|bot is not a member|bot was kicked/i.test(description) ? "bot_channel_access"
+      : body.error_code === 429 ? "rate_limited" : "telegram_error";
+    console.warn("membership Telegram request failed", { method, status: response.status,
+      errorCode: body.error_code, reason });
+    throw new Error("MEMBERSHIP_TELEGRAM_UNAVAILABLE");
+  }
   return body.result;
 }
 
@@ -95,8 +106,14 @@ export async function enforceMembership(request: Request, env: MembershipEnv): P
   }
   if (callback?.id) await telegram(env, "answerCallbackQuery", { callback_query_id: callback.id,
     text: checking ? "هنوز عضو کانال نیستی؛ اول عضو شو و دوباره بررسی کن." : "برای ادامه، اول عضو کانال شو.", show_alert: true });
-  if (!checking) await telegram(env, "sendMessage", {
-    chat_id: update.message?.chat?.id || callback.message?.chat?.id || actor.id, ...membershipPrompt(env.MEMBERSHIP_CHANNEL || MEMBERSHIP_CHANNEL),
+  const prompt = membershipPrompt(env.MEMBERSHIP_CHANNEL || MEMBERSHIP_CHANNEL);
+  if (checking && callback.message?.chat?.id === actor.id) {
+    // Refresh old prompts too, so channel corrections fix their existing join button.
+    await telegram(env, "editMessageText", {
+      chat_id: actor.id, message_id: callback.message.message_id, ...prompt,
+    });
+  } else if (!checking) await telegram(env, "sendMessage", {
+    chat_id: update.message?.chat?.id || callback.message?.chat?.id || actor.id, ...prompt,
   });
   return Response.json({ ok: true });
 }

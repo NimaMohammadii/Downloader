@@ -30,15 +30,16 @@ function fixture() {
   } } };
   let store = new api.AdminStatsStore(ctx, {});
   const calls = [], jobs = [], originalFetch = globalThis.fetch;
-  let member = { status: 'left' }, unavailable = false;
+  let member = { status: 'left' }, unavailable = false, failure = {}, editUnchanged = false;
   globalThis.fetch = async (input, init) => {
     const method = String(input).split('/').at(-1), body = JSON.parse(init.body);
     calls.push({ method, body });
     if (method === 'getChatMember') {
-      assert.equal(body.chat_id, '@fixture_channel');
-      if (unavailable) return Response.json({ ok: false }, { status: 403 });
+      assert.equal(body.chat_id, env.MEMBERSHIP_CHANNEL || api.MEMBERSHIP_CHANNEL);
+      if (unavailable) return Response.json({ ok: false, ...failure }, { status: 403 });
       return Response.json({ ok: true, result: member });
     }
+    if (method === 'editMessageText' && editUnchanged) return Response.json({ ok: false, error_code: 400, description: 'Bad Request: message is not modified' }, {status:400});
     return Response.json({ ok: true, result: { message_id: 80 } });
   };
   const env = { BOT_TOKEN: 'fixture-token', WEBHOOK_SECRET: 'test-secret', MEMBERSHIP_CHANNEL: '@fixture_channel',
@@ -52,7 +53,8 @@ function fixture() {
       : { update_id: 7, message: { message_id: 7, from: { id: user }, chat: { id: user }, text } }),
   });
   return { db, env, calls, jobs, request, webhook,
-    setMember(value) { member = value; }, setUnavailable(value) { unavailable = value; },
+    setMember(value) { member = value; }, setUnavailable(value, details = {}) { unavailable = value; failure = details; },
+    setEditUnchanged(value) { editUnchanged = value; },
     restart() { store = new api.AdminStatsStore(ctx, {}); },
     close() { globalThis.fetch = originalFetch; db.close(); },
   };
@@ -134,7 +136,7 @@ test('joining unlocks, leaving locks again, and only real members pass the check
     }
     f.setMember({ status: 'left' });
     await api.enforceMembership(f.webhook('', 42, 'membership:check'), f.env);
-    assert.match(f.calls.at(-1).body.text, /هنوز عضو/);
+    assert.match(f.calls.filter(c => c.method === 'answerCallbackQuery').at(-1).body.text, /هنوز عضو/);
     f.setMember({ status: 'restricted', is_member: false });
     assert.ok(await api.enforceMembership(f.webhook(), f.env));
     f.setMember({ status: 'member' });
@@ -204,3 +206,45 @@ test('legacy delivered downloads require membership and ignored records cannot c
   } finally { f.close(); }
 });
 
+
+
+test('corrected default channel is used for real checks and old private prompt buttons are refreshed', async () => {
+  const f = fixture();
+  try {
+    delete f.env.MEMBERSHIP_CHANNEL;
+    await f.request('/download', download);
+    await api.worker.fetch(f.webhook('', 42, 'membership:check'), f.env, {});
+    const check = f.calls.find(c => c.method === 'getChatMember');
+    assert.equal(check.body.chat_id, '@VexaOrder');
+    const updated = f.calls.find(c => c.method === 'editMessageText').body;
+    assert.equal(updated.message_id, 70);
+    assert.ok(updated.reply_markup.inline_keyboard.flat().some(b => b.url === 'https://t.me/VexaOrder'));
+    // A duplicate callback still acknowledges the update when its message is already identical.
+    f.setEditUnchanged(true);
+    assert.equal((await api.worker.fetch(f.webhook('', 42, 'membership:check'), f.env, {})).status, 200);
+    f.calls.length = 0;
+    f.setMember({ status: 'member' });
+    await api.worker.fetch(f.webhook('', 42, 'membership:check'), f.env, {});
+    assert.match(f.calls.find(c => c.method === 'answerCallbackQuery').body.text, /دسترسی فعاله/);
+    assert.equal(await api.enforceMembership(f.webhook('/start'), f.env), null);
+  } finally { f.close(); }
+});
+
+test('channel lookup and missing admin rights have distinct safe diagnostics without granting access', async () => {
+  const f = fixture(), warnings = [], warn = console.warn;
+  console.warn = (...args) => warnings.push(args);
+  try {
+    await f.request('/download', download);
+    for (const [description, reason] of [
+      ['Bad Request: chat not found', 'channel_not_found'],
+      ['Bad Request: member list is inaccessible', 'bot_channel_access'],
+      ['Forbidden: bot is not a member of the channel chat', 'bot_channel_access'],
+    ]) {
+      f.setUnavailable(true, { error_code: 400, description });
+      assert.equal((await api.worker.fetch(f.webhook('https://youtube.com/watch?v=abcdefghijk'), f.env, {})).status, 200);
+      assert.equal(f.jobs.length, 0);
+      assert.equal(warnings.at(-1)[1].reason, reason);
+      assert.ok(!JSON.stringify(warnings).includes(f.env.BOT_TOKEN));
+    }
+  } finally { console.warn = warn; f.close(); }
+});
