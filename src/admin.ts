@@ -133,10 +133,17 @@ export type TrackedUser = {
   lastName?: string;
 };
 
+export type AdminPeriod = "day" | "week";
+
 export type AdminSummary = {
   totalUsers: number;
   linksSent: number;
   successfulDownloads: number;
+  active24h: number;
+  active7d: number;
+  linkUsers24h: number;
+  linkUsers7d: number;
+  linksTrackingSince: number;
 };
 
 export type AdminUserRow = {
@@ -156,6 +163,7 @@ export type AdminUsersPage = {
   pageSize: number;
   totalPages: number;
   usedOnly?: boolean;
+  period?: AdminPeriod;
 };
 
 type RecordPayload = {
@@ -257,6 +265,10 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         tracking_since INTEGER NOT NULL,
         last_activity INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS user_link_activity (
+        user_id TEXT PRIMARY KEY, last_link_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_user_link_activity_at ON user_link_activity(last_link_at);
       CREATE TABLE IF NOT EXISTS activity_events (
         event_id TEXT PRIMARY KEY, recorded_at INTEGER NOT NULL
       );
@@ -274,6 +286,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       );
       CREATE INDEX IF NOT EXISTS idx_telegram_file_cache_at ON telegram_file_cache(created_at);
     `);
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO counters(key, value) VALUES ('links_tracking_since', ?)", Date.now());
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -331,6 +344,10 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
              interactions = interactions + 1, starts = starts + excluded.starts,
              last_activity = excluded.last_activity`,
           id, payload.start ? 1 : 0, now, now, VISIT_IDLE_MS,
+        );
+        if (payload.linkSent) sql.exec(
+          `INSERT INTO user_link_activity(user_id, last_link_at) VALUES (?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET last_link_at = excluded.last_link_at`, id, now,
         );
         sql.exec("DELETE FROM activity_events WHERE recorded_at < ?", now - 7 * 86400_000);
       });
@@ -434,7 +451,20 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         "SELECT value FROM counters WHERE key = 'successful_downloads'",
       ).one() as CounterSqlRow;
 
+      const now = Date.now();
+      const active = this.ctx.storage.sql.exec(
+        "SELECT COALESCE(SUM(last_seen >= ?),0) AS day, COALESCE(SUM(last_seen >= ?),0) AS week FROM users",
+        now - 86400_000, now - 7 * 86400_000,
+      ).one();
+      const links = this.ctx.storage.sql.exec(
+        "SELECT COALESCE(SUM(last_link_at >= ?),0) AS day, COALESCE(SUM(last_link_at >= ?),0) AS week FROM user_link_activity",
+        now - 86400_000, now - 7 * 86400_000,
+      ).one();
+      const tracking = this.ctx.storage.sql.exec("SELECT value FROM counters WHERE key = 'links_tracking_since'").one();
       return Response.json({
+        active24h: asNumber(active.day), active7d: asNumber(active.week),
+        linkUsers24h: asNumber(links.day), linkUsers7d: asNumber(links.week),
+        linksTrackingSince: asNumber(tracking.value),
         totalUsers: asNumber(summary.total_users),
         linksSent: asNumber(summary.links_sent),
         successfulDownloads: asNumber(success.value),
@@ -445,10 +475,16 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       const rawPage = Number(url.searchParams.get("page") || "0");
       const page = Number.isSafeInteger(rawPage) && rawPage >= 0 ? rawPage : 0;
       const usedOnly = url.searchParams.get("used") === "1";
+      const requestedPeriod = url.searchParams.get("period");
+      const period: AdminPeriod | undefined = requestedPeriod === "day" || requestedPeriod === "week" ? requestedPeriod : undefined;
+      const since = Date.now() - (period === "day" ? 1 : 7) * 86400_000;
       // Include legacy link counters as well as newer non-link requests; /start alone is not usage.
-      const filter = usedOnly ? "WHERE links_sent > 0 OR EXISTS (SELECT 1 FROM download_history WHERE user_id = users.id)" : "";
+      const filter = period
+        ? usedOnly ? "WHERE EXISTS (SELECT 1 FROM user_link_activity WHERE user_id = users.id AND last_link_at >= ?)" : "WHERE last_seen >= ?"
+        : usedOnly ? "WHERE links_sent > 0 OR EXISTS (SELECT 1 FROM download_history WHERE user_id = users.id)" : "";
+      const params = period ? [since] : [];
       const count = this.ctx.storage.sql.exec(
-        `SELECT COUNT(*) AS total_users FROM users ${filter}`,
+        `SELECT COUNT(*) AS total_users FROM users ${filter}`, ...params,
       ).one() as CountSqlRow;
       const totalUsers = asNumber(count.total_users);
       const totalPages = Math.max(1, Math.ceil(totalUsers / ADMIN_USERS_PAGE_SIZE));
@@ -460,7 +496,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
          ${filter}
          ORDER BY last_seen DESC, id ASC
          LIMIT ? OFFSET ?`,
-        ADMIN_USERS_PAGE_SIZE,
+        ...params, ADMIN_USERS_PAGE_SIZE,
         offset,
       ).toArray() as unknown as UserSqlRow[];
 
@@ -481,6 +517,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         pageSize: ADMIN_USERS_PAGE_SIZE,
         totalPages,
         ...(usedOnly ? { usedOnly: true } : {}),
+        ...(period ? { period } : {}),
       } satisfies AdminUsersPage);
     }
 
@@ -553,10 +590,11 @@ export async function getAdminSummary(env: AdminStatsEnv): Promise<AdminSummary>
   return (await response.json()) as AdminSummary;
 }
 
-export async function getAdminUsersPage(env: AdminStatsEnv, page: number, usedOnly = false): Promise<AdminUsersPage> {
+export async function getAdminUsersPage(env: AdminStatsEnv, page: number, usedOnly = false, period?: AdminPeriod): Promise<AdminUsersPage> {
   const url = new URL("https://admin-stats/users");
   url.searchParams.set("page", String(Math.max(0, Math.floor(page))));
   if (usedOnly) url.searchParams.set("used", "1");
+  if (period) url.searchParams.set("period", period);
   const response = await statsStub(env).fetch(url.toString());
   if (!response.ok) throw new Error(`ADMIN_USERS_${response.status}`);
   return (await response.json()) as AdminUsersPage;
@@ -593,6 +631,14 @@ export function formatAdminDashboard(summary: AdminSummary): string {
     `👥 کاربران: ${summary.totalUsers}`,
     `🔗 لینک‌های ارسال‌شده: ${summary.linksSent}`,
     `✅ دانلودهای موفق: ${summary.successfulDownloads}`,
+    "",
+    `👤 کاربران فعال در ۲۴ ساعت گذشته: ${summary.active24h}`,
+    `👤 کاربران فعال در ۷ روز گذشته: ${summary.active7d}`,
+    "",
+    `🔗 ارسال‌کنندگان لینک در ۲۴ ساعت گذشته: ${summary.linkUsers24h}`,
+    `🔗 ارسال‌کنندگان لینک در ۷ روز گذشته: ${summary.linkUsers7d}`,
+    ...(Date.now() - summary.linksTrackingSince < 7 * 86400_000
+      ? [`ثبت زمان ارسال لینک از ${dateLabel(summary.linksTrackingSince)}`] : []),
   ].join("\n");
 }
 
@@ -601,12 +647,21 @@ export function adminDashboardKeyboard(): Record<string, unknown> {
     inline_keyboard: [
       [{ text: "👥 لیست کاربران", callback_data: "admin:users:0" }],
       [{ text: "کاربران استفاده‌کننده", callback_data: "admin:used:0" }],
+      [{ text: "فعال‌های ۲۴ ساعت", callback_data: "admin:users:0:day" },
+        { text: "فعال‌های ۷ روز", callback_data: "admin:users:0:week" }],
+      [{ text: "لینک‌فرستاده‌های ۲۴ ساعت", callback_data: "admin:used:0:day" },
+        { text: "لینک‌فرستاده‌های ۷ روز", callback_data: "admin:used:0:week" }],
       [{ text: "🔄 بروزرسانی آمار", callback_data: "admin:stats" }],
     ],
   };
 }
 
 export function formatAdminUsers(page: AdminUsersPage): string {
+  if (page.period) return [
+    `${page.usedOnly ? "ارسال‌کنندگان لینک" : "کاربران فعال"} در ${page.period === "day" ? "۲۴ ساعت" : "۷ روز"} گذشته (${page.totalUsers})`,
+    `صفحه ${page.page + 1}/${page.totalPages}`, "",
+    page.users.length ? "برای مشاهده آمار و سابقه دانلود، کاربر را انتخاب کنید:" : "کاربری در این بازه ثبت نشده.",
+  ].join("\n");
   return [page.usedOnly ? `کاربران استفاده‌کننده (${page.totalUsers})` : `👥 لیست کاربران (${page.totalUsers})`,
     `صفحه ${page.page + 1}/${page.totalPages}`, "",
     ...(page.usedOnly ? ["ارسال لینک یا درخواست ثبت‌شدهٔ دانلود، جست‌وجو، استخراج صدا یا تشخیص آهنگ.",
@@ -617,15 +672,16 @@ export function formatAdminUsers(page: AdminUsersPage): string {
 
 export function adminUsersKeyboard(page: AdminUsersPage): Record<string, unknown> {
   const list = page.usedOnly ? "used" : "users";
-  const suffix = page.usedOnly ? ":used" : "";
+  const periodSuffix = page.period ? `:${page.period}` : "";
+  const suffix = (page.usedOnly ? ":used" : "") + periodSuffix;
   const rows = page.users.map(user => [{
     text: `${displayText(userDisplayName(user), 35)} • ${user.id}`,
     callback_data: `admin:user:${user.id}:${page.page}:0${suffix}`,
   }]);
   const nav: Array<{ text: string; callback_data: string }> = [];
-  if (page.page > 0) nav.push({ text: "‹ قبلی", callback_data: `admin:${list}:${page.page - 1}` });
+  if (page.page > 0) nav.push({ text: "‹ قبلی", callback_data: `admin:${list}:${page.page - 1}${periodSuffix}` });
   nav.push({ text: "🏠 آمار", callback_data: "admin:stats" });
-  if (page.page + 1 < page.totalPages) nav.push({ text: "بعدی ›", callback_data: `admin:${list}:${page.page + 1}` });
+  if (page.page + 1 < page.totalPages) nav.push({ text: "بعدی ›", callback_data: `admin:${list}:${page.page + 1}${periodSuffix}` });
   return { inline_keyboard: [...rows, nav] };
 }
 
@@ -690,14 +746,15 @@ export function formatAdminUserDetail(detail: AdminUserDetail): string {
   return lines.join("\n");
 }
 
-export function adminUserDetailKeyboard(detail: AdminUserDetail, usersPage: number, usedOnly = false): Record<string, unknown> {
-  const callback = (page: number) => `admin:user:${detail.user.id}:${usersPage}:${page}${usedOnly ? ":used" : ""}`;
+export function adminUserDetailKeyboard(detail: AdminUserDetail, usersPage: number, usedOnly = false, period?: AdminPeriod): Record<string, unknown> {
+  const periodSuffix = period ? `:${period}` : "";
+  const callback = (page: number) => `admin:user:${detail.user.id}:${usersPage}:${page}${usedOnly ? ":used" : ""}${periodSuffix}`;
   const nav: Array<{ text: string; callback_data: string }> = [];
   if (detail.page > 0) nav.push({ text: "‹ جدیدتر", callback_data: callback(detail.page - 1) });
   if (detail.page + 1 < detail.totalPages) nav.push({ text: "قدیمی‌تر ›", callback_data: callback(detail.page + 1) });
   return { inline_keyboard: [
     ...(nav.length ? [nav] : []),
     [{ text: "🔄 بروزرسانی", callback_data: callback(detail.page) }],
-    [{ text: usedOnly ? "بازگشت به استفاده‌کنندگان" : "👥 بازگشت به کاربران", callback_data: `admin:${usedOnly ? "used" : "users"}:${usersPage}` }, { text: "🏠 آمار", callback_data: "admin:stats" }],
+    [{ text: usedOnly ? "بازگشت به استفاده‌کنندگان" : "👥 بازگشت به کاربران", callback_data: `admin:${usedOnly ? "used" : "users"}:${usersPage}${periodSuffix}` }, { text: "🏠 آمار", callback_data: "admin:stats" }],
   ] };
 }

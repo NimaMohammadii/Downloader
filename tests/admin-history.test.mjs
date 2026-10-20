@@ -55,7 +55,7 @@ test('existing users and counters survive migration; historical visits remain ex
     assert.equal(before.activity, null);
     assert.equal(before.counts.total, 0);
     assert.match(admin.formatAdminUserDetail(before), /در دسترس نیست/);
-    assert.deepEqual(await (await f.request('/summary')).json(), { totalUsers: 1, linksSent: 12, successfulDownloads: 27 });
+    assert.deepEqual(await (await f.request('/summary')).json(), { totalUsers: 1, linksSent: 12, successfulDownloads: 27, active24h: 0, active7d: 0, linkUsers24h: 0, linkUsers7d: 0, linksTrackingSince: Number(f.db.prepare("SELECT value FROM counters WHERE key = 'links_tracking_since'").get().value) });
     await f.record(1);
     const after = await f.detail();
     assert.equal(after.user.firstSeen, 1000);
@@ -292,5 +292,81 @@ test('admin-only drill-down works through the production entry; other users cann
     assert.equal(edit.link_preview_options.is_disabled, true);
     assert.ok(edit.reply_markup.inline_keyboard.flat().some(b => b.callback_data === 'admin:users:0'));
     assert.equal((await f.detail()).activity.interactions, 1);
+  } finally { globalThis.fetch = previousFetch; f.close(); }
+});
+
+
+test('rolling activity and link senders count distinct users with independent timestamps and exact boundaries', async () => {
+  const f = fixture();
+  try {
+    const end = 1_800_000_000_000, day = 86400_000;
+    const record = async (id, time, linkSent = false, eventId = id) => {
+      Date.now = () => time;
+      await f.record(eventId, { user: { id, firstName: `User ${id}` }, linkSent });
+    };
+    await record(40, end - 7 * day - 1, true);
+    await record(41, end - 7 * day, true);
+    await record(42, end - day, true);
+    await record(43, end - day - 1, true);
+    await record(44, end, false);
+    await record(43, end, false, 100);
+    // A duplicate link update must not move its original link timestamp.
+    await record(42, end, true, 42);
+    await record(45, end, true);
+    await record(45, end, true, 101);
+    // Non-link searches and download completion do not count as a new sent link.
+    await f.request('/download', { ...base, userId: 44, status: 'results' });
+    const summary = await (await f.request('/summary')).json();
+    assert.equal(summary.active24h, 4);
+    assert.equal(summary.active7d, 5);
+    assert.equal(summary.linkUsers24h, 2);
+    assert.equal(summary.linkUsers7d, 4);
+    for (const [used, period, expected] of [
+      [false, 'day', ['42','43','44','45']], [false, 'week', ['41','42','43','44','45']],
+      [true, 'day', ['42','45']], [true, 'week', ['41','42','43','45']],
+    ]) {
+      const page = await admin.getAdminUsersPage(f.env, 0, used, period);
+      assert.deepEqual(page.users.map(u => u.id).sort(), expected);
+      assert.equal(page.totalUsers, expected.length);
+      assert.equal(page.period, period);
+    }
+    const text = admin.formatAdminDashboard(summary);
+    assert.match(text, /کاربران فعال در ۲۴ ساعت گذشته: 4/);
+    assert.match(text, /ارسال‌کنندگان لینک در ۷ روز گذشته: 4/);
+    // Rolling windows expire while lifetime counters remain unchanged.
+    Date.now = () => end + 7 * day + 1;
+    const expired = await (await f.request('/summary')).json();
+    assert.equal(expired.active7d, 0); assert.equal(expired.linkUsers7d, 0);
+    assert.equal(expired.totalUsers, 6);
+  } finally { f.close(); }
+});
+
+test('period lists paginate and retain their filter throughout user detail navigation', async () => {
+  const f = fixture(); const calls = [], previousFetch = globalThis.fetch;
+  try {
+    for (let i = 0; i < 10; i++) await f.record(i, { user: { id: 42 + i }, linkSent: true });
+    globalThis.fetch = async (input, init) => {
+      calls.push({ url: String(input), body: JSON.parse(init.body) });
+      return Response.json({ ok: true, result: { message_id: 10 } });
+    };
+    const callback = (id, data) => ({ update_id: 20, callback_query: { id: 'period', from: { id }, data,
+      message: { message_id: 10, chat: { id } } } });
+    const edit = () => calls.filter(c => c.url.endsWith('/editMessageText')).at(-1).body;
+    for (const kind of ['users', 'used']) for (const period of ['day','week']) {
+      calls.length = 0;
+      await admin.worker.fetch(webhook(callback(99, `admin:${kind}:0:${period}`)), f.env, {});
+      assert.equal(calls.length, 0);
+      await admin.worker.fetch(webhook(callback(admin.ADMIN_USER_ID, `admin:${kind}:0:${period}`)), f.env, {});
+      assert.ok(edit().reply_markup.inline_keyboard.flat().some(b => b.callback_data === `admin:${kind}:1:${period}`));
+      await admin.worker.fetch(webhook(callback(admin.ADMIN_USER_ID, `admin:${kind}:1:${period}`)), f.env, {});
+      assert.match(edit().text, /صفحه 2\/2/);
+      const button = edit().reply_markup.inline_keyboard[0][0];
+      assert.ok(button.callback_data.endsWith(`${kind === 'used' ? ':used' : ''}:${period}`));
+      await admin.worker.fetch(webhook(callback(admin.ADMIN_USER_ID, button.callback_data)), f.env, {});
+      assert.ok(edit().reply_markup.inline_keyboard.flat().some(b => b.callback_data === `admin:${kind}:1:${period}`));
+    }
+    const buttons = admin.adminDashboardKeyboard().inline_keyboard.flat();
+    for (const kind of ['users','used']) for (const period of ['day','week'])
+      assert.ok(buttons.some(b => b.callback_data === `admin:${kind}:0:${period}`));
   } finally { globalThis.fetch = previousFetch; f.close(); }
 });
