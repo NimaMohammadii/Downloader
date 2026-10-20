@@ -139,6 +139,30 @@ async function workflow(ready = {ok:true}, input = job, sendResult = {ok:true}) 
   return {calls,steps,messages};
 }
 
+test('large Instagram posts reuse the existing upload lifecycle, status and resolved source without another login', async () => {
+  const post = { shortcode: 'B', url: 'https://instagram.com/reel/B/', chatId: 42, requestMessageId: 7, userId: 42,
+    statusMessageId: 88, media: [{ kind: 'video', url: 'https://scontent.cdninstagram.com/big.mp4', width: 1080, height: 1920, size: 120000000 }] };
+  const result = await workflow({ok:true}, { ...job, instagram: undefined, instagramPost: post }, {ok:true, parts:1});
+  assert.deepEqual(result.calls, ['start','start','send','cleanup','release']);
+  assert.deepEqual(globalThis.startedPayload.source.instagramPost, { shortcode: post.shortcode, media: post.media });
+  assert.equal(globalThis.startedPayload.statusMessageId, 88);
+  assert.equal(result.messages.length, 0);
+  assert.equal(globalThis.delivered, 1);
+  assert.equal(globalThis.downloadHistory.at(-1).key, 'ig:42:7:42');
+  assert.equal(globalThis.downloadHistory.at(-1).status, 'success');
+});
+
+test('partial large Instagram albums record only confirmed items and report a post failure', async () => {
+  const post = { shortcode:'B', url:'https://instagram.com/p/B/', chatId:42, requestMessageId:7, userId:42,
+    statusMessageId:88, media:[] };
+  const result = await workflow({ok:true}, { ...job, instagram: undefined, instagramPost: post },
+    {ok:false, parts:1, message:'❌ ارسال کامل نشد؛ یک فایل تأیید شده است.'});
+  assert.equal(globalThis.delivered, 1);
+  assert.equal(globalThis.downloadHistory.at(-1).status, 'partial');
+  assert.equal(globalThis.downloadHistory.at(-1).delivered, 1);
+  assert.match(result.messages.at(-1).text, /یک فایل/);
+});
+
 test('recording waits for a completion event and sends one whole file', async()=>{
   const r=await workflow();
   assert.deepEqual(r.calls,['start','start','send','cleanup','release']);

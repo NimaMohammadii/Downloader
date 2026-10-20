@@ -1786,6 +1786,24 @@ class InstagramCapture:
     def run(self) -> None:
         watchdog = wall_timer = None
         try:
+            if self.source.get("instagramPost"):
+                post = self.source["instagramPost"]
+                items = post.get("media")
+                if (not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", str(post.get("shortcode") or ""))
+                        or not isinstance(items, list) or not 1 <= len(items) <= 20):
+                    raise UserVisibleError("❌ اطلاعات پست اینستاگرام معتبر نیست.")
+                for item in items:
+                    instagram_safe_url(item["url"])
+                    if item.get("kind") not in {"photo", "video"}:
+                        raise UserVisibleError("❌ نوع فایل اینستاگرام معتبر نیست.")
+                    size = item.get("size")
+                    if size is not None and (type(size) is not int or not 0 < size <= DIRECT_TELEGRAM_LIMIT):
+                        raise UserVisibleError("❌ حجم فایل از سقف ارسال ۲ گیگابایت بیشتر است.")
+                self.post_sent = 0
+                self.result = {"ok": True}
+                with self.lock:
+                    self.state = "ready"
+                return
             if self.source.get("musicSearch"):
                 from youtube_pipeline import music_candidates
                 results = music_candidates(str(self.source.get("musicQuery") or ""))[:5]
@@ -2039,6 +2057,8 @@ class InstagramCapture:
     def send(self) -> dict[str, Any]:
         with self.lock:
             if self.state == "sent":
+                if self.source.get("instagramPost"):
+                    return {"ok": True, "parts": self.post_sent}
                 return {"ok": True, "parts": self.social_sent} if self.source.get("social") else {"ok": True}
             if self.state != "ready":
                 return {"ok": False, "message": "فایل آمادهٔ ارسال نیست یا قبلاً ارسال آن شروع شده است."}
@@ -2052,6 +2072,8 @@ class InstagramCapture:
             self.state = "sending"
         uploading = False
         try:
+            if self.source.get("instagramPost"):
+                return self.send_instagram_post()
             if self.source.get("musicSearch"):
                 expiry = int(time.time()) + 86400
                 owner = int(self.payload["userId"])
@@ -2131,6 +2153,104 @@ class InstagramCapture:
         if markup:
             data["reply_markup"] = json.dumps(markup)
         return data, markup
+
+    def download_post_item(self, item: dict[str, Any], path: Path, deadline: float) -> None:
+        url = item["url"]
+        limit = DIRECT_TELEGRAM_LIMIT if item["kind"] == "video" else 4_800_000
+        for _ in range(4):
+            instagram_safe_url(url)
+            with requests.get(url, headers={"Referer": "https://www.instagram.com/", "Accept-Encoding": "identity"},
+                              stream=True, allow_redirects=False, timeout=(15, 30)) as response:
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    url = urljoin(url, response.headers.get("location", ""))
+                    continue
+                if response.status_code != 200:
+                    raise UserVisibleError("❌ دریافت فایل اینستاگرام کامل نشد؛ آدرس فایل ممکن است منقضی شده باشد.")
+                length = int(response.headers.get("content-length") or 0)
+                if length > limit:
+                    raise UserVisibleError("❌ حجم فایل از سقف ارسال بیشتر است؛ فایل ناقص ارسال نشد.")
+                size = 0
+                with path.open("wb") as output:
+                    for chunk in response.iter_content(1024 * 1024):
+                        size += len(chunk)
+                        if size > limit or self.cleanup_requested or time.monotonic() >= deadline:
+                            raise UserVisibleError("❌ دریافت فایل کامل نشد یا از سقف ارسال بیشتر است؛ فایل ناقص ارسال نشد.")
+                        output.write(chunk)
+                if not size or (length and size != length) or (item.get("size") and size != item["size"]):
+                    raise UserVisibleError("❌ فایل اینستاگرام ناقص دریافت شد؛ فایل ناقص ارسال نشد.")
+                return
+        raise UserVisibleError("❌ آدرس فایل اینستاگرام بیش از حد تغییر مسیر داد.")
+
+    def send_instagram_post(self) -> dict[str, Any]:
+        post = self.source["instagramPost"]
+        items = post["media"]
+        deadline = time.monotonic() + 25 * 60
+        uploading = False
+        path = None
+        try:
+            while self.post_sent < len(items):
+                index = self.post_sent
+                item = items[index]
+                if self.cleanup_requested or time.monotonic() >= deadline:
+                    raise UserVisibleError("❌ ارسال پست به سقف زمان رسید.")
+                video = item["kind"] == "video"
+                method = "sendVideo" if video else "sendPhoto"
+                caption = f"Instagram • {index + 1}/{len(items)}" if len(items) > 1 else "Instagram"
+                data = {"chat_id": str(self.payload["chatId"]), "caption": caption}
+                if index == 0:
+                    data["reply_parameters"] = json.dumps({"message_id": self.payload["requestMessageId"], "allow_sending_without_reply": True})
+                key = f"ig:{self.payload['userId']}:{post['shortcode']}:{index}:video" if video else None
+                markup = {"inline_keyboard": [[
+                    {"text": "🎵 فقط صدا", "callback_data": f"iga|p|{post['shortcode']}|{index}|{self.payload['userId']}"},
+                    {"text": "🔎 پیداکردن آهنگ", "callback_data": f"igm|p|{post['shortcode']}|{index}|{self.payload['userId']}"},
+                ]]} if video else None
+                if key and reuse_cached_file(self.payload, key, caption, reply_markup=markup):
+                    self.post_sent += 1
+                    continue
+                path = self.workdir / f"Instagram-{index}.{'mp4' if video else 'jpg'}"
+                if not path.exists():
+                    self.safe_status(f"⬇️ در حال دریافت فایل {index + 1}/{len(items)} اینستاگرام…")
+                    self.download_post_item(item, path, deadline)
+                if video:
+                    info = subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
+                                          capture_output=True, text=True, check=True, timeout=45)
+                    metadata = json.loads(info.stdout)
+                    stream = next((s for s in metadata.get("streams", []) if s.get("codec_type") == "video"), None)
+                    duration = float(metadata.get("format", {}).get("duration") or 0)
+                    if not stream or duration <= 0:
+                        raise UserVisibleError("❌ فایل ویدیوی سالم برای ارسال دریافت نشد.")
+                    data.update(width=stream.get("width", item.get("width", 0)), height=stream.get("height", item.get("height", 0)),
+                                duration=duration, supports_streaming=True, reply_markup=json.dumps(markup))
+                self.safe_status(f"📤 در حال ارسال فایل {index + 1}/{len(items)} اینستاگرام…")
+                with path.open("rb") as handle:
+                    uploading = True
+                    sent = asyncio.run(asyncio.wait_for(upload_complete_file(self.payload["botToken"], method, data,
+                        (path.name, handle, "video/mp4" if video else "image/jpeg")), timeout=max(1, deadline - time.monotonic())))
+                    uploading = False
+                self.post_sent += 1
+                if key:
+                    store_uploaded_file(self.payload, [key], method, data, sent, file_size=path.stat().st_size)
+                path.unlink(missing_ok=True)
+            with self.lock:
+                self.state = "sent"
+            delete_status(self.payload["botToken"], self.payload["chatId"], self.payload["statusMessageId"])
+            return {"ok": True, "parts": self.post_sent}
+        except Exception as exc:
+            diagnostic = upload_error_diagnostic(exc, self.payload["botToken"])
+            if (uploading and diagnostic.get("rpcCode") == 420
+                    and diagnostic.get("errorCode") in {"FLOOD_WAIT", "SLOWMODE_WAIT"}
+                    and type(diagnostic.get("retryAfterSeconds")) is int and not self.cleanup_requested
+                    and path is not None and path.is_file()):
+                with self.lock:
+                    self.state = "ready"
+                return {"ok": False, "phase": "upload", "parts": self.post_sent, "retrySafe": True,
+                        "message": "⏳ تلگرام ارسال را موقتاً متوقف کرده؛ ارسال فایل خودکار ادامه پیدا می‌کند.", **diagnostic}
+            print(json.dumps({"message": "instagram post upload failed", "jobId": self.id, **diagnostic}, ensure_ascii=False), flush=True)
+            with self.lock:
+                self.state = "failed"
+            detail = str(exc) if isinstance(exc, UserVisibleError) else "❌ دریافت یا ارسال پست اینستاگرام کامل نشد."
+            return {"ok": False, "parts": self.post_sent,
+                    "message": f"{detail}\n{self.post_sent} فایل تأیید شده است؛ پیش از درخواست دوباره چت را بررسی کن."}
 
     def send_social(self) -> dict[str, Any]:
         # Resolve every item and prepare cache misses before publishing. An

@@ -6,6 +6,7 @@ import {
   type WorkflowStep,
 } from "cloudflare:workers";
 import storyWorker, { parseInstagramVideoTarget, parseInstagramAudioTarget, resolveInstagramVideo, instagramVideoErrorText, type InstagramVideoTarget, type InstagramVideoSource } from "./story-main";
+import type { InstagramPostUpload } from "./index";
 import {
   telegramTextMotion,
   telegramCustomEmoji,
@@ -35,7 +36,8 @@ type YoutubeAudioMode = "low" | "hq";
 type RecognitionInput = { fileId: string; fileSize?: number };
 type PlaylistInput = { url: string; start: number; end: number };
 type SocialInput = { platform: "x" | "pinterest" | "tiktok" | "soundcloud" | "aparat"; url: string; audioOnly?: boolean; itemIndex?: number };
-type MediaSource = InstagramVideoSource & { recognition?: RecognitionInput; playlist?: PlaylistInput; social?: SocialInput };
+type MediaSource = InstagramVideoSource & { recognition?: RecognitionInput; playlist?: PlaylistInput; social?: SocialInput;
+  instagramPost?: Pick<InstagramPostUpload, "shortcode" | "media"> };
 const RECOGNITION_FILE_LIMIT = 20_000_000;
 
 type YoutubeDownloadJob = {
@@ -50,6 +52,7 @@ type YoutubeDownloadJob = {
   audioMode?: YoutubeAudioMode;
   statusMessageId?: number;
   instagram?: InstagramVideoTarget;
+  instagramPost?: InstagramPostUpload;
   recognition?: RecognitionInput;
   playlist?: PlaylistInput;
   social?: SocialInput;
@@ -443,6 +446,8 @@ async function containerResult<T>(env: Env, job: YoutubeDownloadJob, request: Re
 }
 
 function jobHistory(job: YoutubeDownloadJob): Omit<DownloadRecord, "status"> {
+  if (job.instagramPost) return { key: `ig:${job.chatId}:${job.requestMessageId}:${job.userId}`,
+    userId: job.userId, source: "Instagram post", request: job.instagramPost.url };
   const ig = job.instagram;
   const source = job.social ? socialName(job.social.platform) : job.playlist ? "YouTube Playlist"
     : job.recognition ? "تشخیص آهنگ" : ig ? ig.kind === "music" ? "جست‌وجو و دانلود آهنگ" : `Instagram ${ig.kind}`
@@ -462,9 +467,9 @@ async function trackJob(env: Env, job: YoutubeDownloadJob, status: DownloadStatu
 export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDownloadJob> {
   async run(event: WorkflowEvent<YoutubeDownloadJob>, step: WorkflowStep) {
     const job: YoutubeDownloadJob = { ...event.payload };
-    const inspect = !job.instagram && !job.recognition && !job.playlist && !job.social && !job.quality && !job.audioMode && job.source !== "pornhub";
+    const inspect = !job.instagram && !job.instagramPost && !job.recognition && !job.playlist && !job.social && !job.quality && !job.audioMode && job.source !== "pornhub";
     await step.do("track download request", () => trackJob(this.env, job, inspect ? "pending" : "processing"));
-    if (job.instagram || job.recognition || job.playlist || job.social) return this.runInstagram(job, step);
+    if (job.instagram || job.instagramPost || job.recognition || job.playlist || job.social) return this.runInstagram(job, step);
     return this.runYoutube(job, step);
   }
 
@@ -702,6 +707,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
     let phase = "status";
     try {
       statusId = await step.do("show instagram video status", async () => {
+        if (job.instagramPost) return job.instagramPost.statusMessageId;
         const message = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
           chat_id: job.chatId, reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
           text: job.social ? `⬇️ دارم ${job.social.audioOnly ? "صدای ویدیوی" : "فایل"} ${socialName(job.social.platform)} را دریافت می‌کنم…` : job.playlist ? `🎵 دارم آهنگ‌های ${job.playlist.start}-${job.playlist.end} پلی‌لیست را به‌صورت MP3 آماده می‌کنم…` : job.recognition || job.instagram?.recognizeMusic ? "🎧 دارم آهنگ داخل فایل را شناسایی می‌کنم…" : job.instagram?.kind === "music" ? "🔎 دارم آهنگ را پیدا می‌کنم…" : job.instagram?.kind === "audio" ? "🎵 دارم صدای ویدیوی اینستاگرام را آماده می‌کنم…" : "🔎 دارم لایو یا بازپخش اینستاگرام را بررسی می‌کنم…",
@@ -722,7 +728,9 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       phase = "resolution";
       const resolution = await step.do("resolve instagram live or replay", { retries: { limit: 0, delay: "1 second" }, timeout: "2 minutes" }, async () => {
         try {
-          const source: MediaSource = job.social ? { mode: "replay", title: socialName(job.social.platform), social: job.social } : job.playlist ? { mode: "replay", title: "YouTube Playlist", audioOnly: true, playlist: job.playlist } : job.recognition
+          const source: MediaSource = job.instagramPost ? { mode: "replay", title: "Instagram",
+            instagramPost: { shortcode: job.instagramPost.shortcode, media: job.instagramPost.media } }
+            : job.social ? { mode: "replay", title: socialName(job.social.platform), social: job.social } : job.playlist ? { mode: "replay", title: "YouTube Playlist", audioOnly: true, playlist: job.playlist } : job.recognition
             ? { mode: "replay", title: "Music recognition", audioOnly: true, recognition: job.recognition }
             : await resolveInstagramVideo(job.instagram!, this.env);
           return { source };
@@ -811,7 +819,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         if (!(job.instagram?.kind === "music" && !job.instagram.musicVideoId)) await step.do("record instagram video delivery", async () => {
           for (let i = 0; i < Math.min(20, result.parts || 1); i++) await recordSuccessfulDelivery(this.env, `instagram:${job.id}${i ? `:${i}` : ""}`);
         });
-      } else if (job.social && result.message) {
+      } else if ((job.social || job.instagramPost) && result.message) {
         await step.do("track partial media result", () => trackJob(this.env, job, result.parts ? "partial" : "failed", {
           title: result.title || source.title, delivered: result.parts || 0, detail: result.message,
         }));
@@ -832,6 +840,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       await step.do("notify instagram video failure", async () => {
         const text = error instanceof Error && /YT_CONFIG|DOWNLOAD_POOL_FULL|max.*instance|provision/i.test(error.message)
           ? workflowFailureMessage(error.message, "startup")
+          : job.instagramPost ? "❌ دریافت یا ارسال پست اینستاگرام کامل نشد؛ اگر فایلی دریافت کرده‌ای، پیش از درخواست دوباره بررسی کن."
           : job.social ? `❌ دریافت یا ارسال فایل ${socialName(job.social.platform)} کامل نشد؛ اگر فایلی دریافت کرده‌ای، پیش از درخواست دوباره بررسی کن.` : job.recognition || job.playlist || job.instagram?.kind === "music" || job.instagram?.kind === "audio" ? "❌ دریافت یا ارسال فایل صوتی کامل نشد؛ درخواست را دوباره بفرست." : "❌ ضبط یا ارسال لایو کامل نشد؛ لینک را دوباره بفرست. ممکن است سرور ری‌استارت شده باشد.";
         await safeTelegramCall(this.env.BOT_TOKEN, statusId ? "editMessageText" : "sendMessage", {
           chat_id: job.chatId, message_id: statusId, text, reply_markup: { inline_keyboard: [] },
@@ -1537,7 +1546,16 @@ export default {
       }
     }
 
-    // Instagram, admin panel and media proxy remain on the existing worker unchanged.
-    return storyWorker.fetch(request, env as any, ctx);
+    return storyWorker.fetch(request, { ...env,
+      uploadInstagramPost: async (post: InstagramPostUpload) => {
+        const id = `igdl-${post.chatId}-${post.requestMessageId}-${post.userId}`;
+        const job: YoutubeDownloadJob = { id, chatId: post.chatId, requestMessageId: post.requestMessageId,
+          userId: post.userId, url: post.url, instagramPost: post };
+        try { await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id, params: job }); }
+        catch (error) {
+          if (!/already|exists|duplicate|conflict/i.test(error instanceof Error ? error.message : String(error))) throw error;
+        }
+      },
+    } as any, ctx);
   },
 } satisfies ExportedHandler<Env>;

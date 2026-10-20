@@ -9,7 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'container'))
 import youtube_app as app
@@ -103,6 +103,7 @@ class LifecycleTests(unittest.TestCase):
 
         job = app.InstagramCapture(payload('replay'))
         job.path.write_bytes(b'prepared recording fixture')
+        job.video = {'width': '160', 'height': '120', 'duration': '2'}
         job.state = 'ready'
         calls = []
 
@@ -139,6 +140,7 @@ class LifecycleTests(unittest.TestCase):
         for fail_after_delivery in (False, True):
             job = app.InstagramCapture(payload('replay'))
             job.path.write_bytes(b'prepared recording fixture')
+            job.video = {'width': '160', 'height': '120', 'duration': '2'}
             job.state = 'ready'
             calls = []
 
@@ -178,6 +180,62 @@ class FFmpegTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.directory.cleanup()
+
+    def test_post_larger_than_url_limit_streams_complete_mp4_and_keeps_its_original_bytes(self):
+        # A legal MP4 free box makes a real playable fixture exceed 20 MB.
+        import hashlib
+        large = Path(self.directory.name) / 'large-post.mp4'
+        with large.open('wb') as out:
+            out.write(self.fixture.read_bytes())
+            padding = 24_000_000
+            out.write((padding + 8).to_bytes(4, 'big') + b'free')
+            for _ in range(24):
+                out.write(b'\0' * 1_000_000)
+        size = large.stat().st_size
+        expected = hashlib.sha256(large.read_bytes()).hexdigest()
+
+        class QuietHandler(SimpleHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), partial(QuietHandler, directory=self.directory.name))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        data = payload('replay')
+        data['userId'] = 42
+        data['source'] = {'mode': 'replay', 'title': 'Instagram', 'instagramPost': {'shortcode': 'B', 'media': [
+            {'kind': 'video', 'url': CDN + 'large-post.mp4', 'width': 160, 'height': 120, 'size': size},
+        ]}}
+        job = app.InstagramCapture(data)
+        real_get = app.requests.get
+        uploaded = []
+
+        async def upload(token, method, fields, file):
+            digest = hashlib.sha256()
+            total = 0
+            for chunk in iter(lambda: file[1].read(1024 * 1024), b''):
+                total += len(chunk)
+                digest.update(chunk)
+            uploaded.append((total, digest.hexdigest()))
+            self.assertEqual(method, 'sendVideo')
+            self.assertGreater(float(fields['duration']), 0)
+            return {'message_id': 12, 'file_id': 'test-large-file'}
+
+        try:
+            with patch.object(app.requests, 'get', side_effect=lambda url, **kw: real_get(
+                    f'http://127.0.0.1:{server.server_port}/large-post.mp4', **kw)), \
+                    patch.object(job, 'safe_status'), patch.object(job, 'notify'), \
+                    patch.object(app, 'reuse_cached_file', return_value=False), patch.object(app, 'store_uploaded_file'), \
+                    patch.object(app, 'delete_status'), patch.object(app, 'upload_complete_file', side_effect=upload):
+                job.run()
+                self.assertEqual(job.send(), {'ok': True, 'parts': 1})
+                self.assertEqual(uploaded, [(size, expected)])
+                self.assertGreater(size, 20_000_000)
+        finally:
+            job.cleanup()
+            server.shutdown()
+            server.server_close()
+            thread.join(5)
 
     def capture(self, mode, stop=False, expected=None, fail=False, audio=False):
         data = payload(mode)
@@ -318,6 +376,147 @@ class FFmpegTests(unittest.TestCase):
             job.cleanup()
             server.shutdown()
             server.server_close()
+
+
+class PostUploadTests(unittest.TestCase):
+    def setUp(self):
+        data = payload('replay')
+        data['userId'] = 42
+        data['source'] = {'mode': 'replay', 'title': 'Instagram', 'instagramPost': {'shortcode': 'B', 'media': [
+            {'kind': 'photo', 'url': CDN + 'photo.jpg', 'size': 4},
+            {'kind': 'video', 'url': CDN + 'video.mp4', 'size': 4},
+        ]}}
+        self.job = app.InstagramCapture(data)
+        self.status = patch.object(self.job, 'safe_status').start()
+        self.notify = patch.object(self.job, 'notify').start()
+        self.addCleanup(patch.stopall)
+        self.addCleanup(self.job.cleanup)
+        self.info = json.dumps({'streams': [{'codec_type': 'video', 'width': 1080, 'height': 1920}],
+                                'format': {'duration': '12.5'}})
+
+    def response(self, body=b'abcd', length='4', status=200, location=None):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.status_code = status
+        response.headers = {'content-length': length} if length else {}
+        if location:
+            response.headers['location'] = location
+        response.iter_content.return_value = [body]
+        return response
+
+    def test_mixed_album_uploads_in_order_without_transcoding_and_retrying_send_does_not_duplicate(self):
+        calls = []
+
+        async def upload(token, method, data, file):
+            calls.append((method, data, file[1].read()))
+            return {'message_id': len(calls), 'file_id': 'sent-file'}
+
+        with patch.object(app.requests, 'get', side_effect=lambda *args, **kwargs: self.response()) as get, \
+                patch.object(app, 'reuse_cached_file', return_value=False), \
+                patch.object(app.subprocess, 'run', return_value=MagicMock(stdout=self.info)) as probe, \
+                patch.object(app, 'upload_complete_file', side_effect=upload), \
+                patch.object(app, 'store_uploaded_file') as cache, patch.object(app, 'delete_status'):
+            self.job.run()
+            self.assertEqual(self.job.state, 'ready')
+            self.assertEqual(get.call_count, 0)
+            self.assertEqual(self.job.send(), {'ok': True, 'parts': 2})
+            self.assertEqual(self.job.send(), {'ok': True, 'parts': 2})
+            self.assertEqual([c[0] for c in calls], ['sendPhoto', 'sendVideo'])
+            self.assertEqual([c[2] for c in calls], [b'abcd', b'abcd'])
+            self.assertEqual(calls[0][1]['caption'], 'Instagram • 1/2')
+            self.assertIn('reply_parameters', calls[0][1])
+            self.assertNotIn('reply_parameters', calls[1][1])
+            self.assertEqual(json.loads(calls[1][1]['reply_markup'])['inline_keyboard'][0][0]['callback_data'], 'iga|p|B|1|42')
+            self.assertEqual(cache.call_args.args[1], ['ig:42:B:1:video'])
+            self.assertEqual(probe.call_args.args[0][0], 'ffprobe')
+            self.assertEqual(get.call_count, 2)
+            self.assertFalse(get.call_args.kwargs['allow_redirects'])
+            self.assertNotIn('Cookie', get.call_args.kwargs['headers'])
+            self.assertEqual(list(self.job.workdir.iterdir()), [])
+
+    def test_partial_or_over_limit_download_is_never_uploaded(self):
+        cases = [self.response(body=b'a'), self.response(length='2000000001'),
+                 self.response(body=b'abcde', length=None)]
+        for response in cases:
+            with self.subTest(response=response):
+                path = self.job.workdir / 'download.mp4'
+                with patch.object(app.requests, 'get', return_value=response), self.assertRaises(app.UserVisibleError):
+                    self.job.download_post_item({'kind': 'video', 'url': CDN + 'video.mp4', 'size': 4}, path, app.time.monotonic() + 60)
+                path.unlink(missing_ok=True)
+
+    def test_stream_enforces_limit_even_without_a_content_length(self):
+        with patch.object(app.requests, 'get', return_value=self.response(body=b'abcde', length=None)), \
+                patch.object(app, 'DIRECT_TELEGRAM_LIMIT', 4), self.assertRaises(app.UserVisibleError):
+            self.job.download_post_item({'kind': 'video', 'url': CDN + 'video.mp4'}, self.job.workdir / 'download.mp4', app.time.monotonic() + 60)
+
+    def test_video_reuses_telegram_cache_only_after_the_current_post_was_resolved(self):
+        self.job.source['instagramPost']['media'] = [self.job.source['instagramPost']['media'][1]]
+        with patch.object(app, 'reuse_cached_file', return_value=True) as cache, \
+                patch.object(app.requests, 'get') as get, patch.object(app, 'upload_complete_file') as upload, \
+                patch.object(app, 'delete_status'):
+            self.job.run()
+            self.assertEqual(self.job.send(), {'ok': True, 'parts': 1})
+            self.assertEqual(cache.call_args.args[1], 'ig:42:B:0:video')
+            get.assert_not_called()
+            upload.assert_not_called()
+
+    def test_redirects_cannot_escape_instagram_cdn(self):
+        with patch.object(app.requests, 'get', return_value=self.response(status=302, location='http://127.0.0.1/private')) as get, \
+                self.assertRaises(app.UserVisibleError):
+            self.job.download_post_item({'kind': 'video', 'url': CDN + 'video.mp4'}, self.job.workdir / 'download.mp4', app.time.monotonic() + 60)
+        self.assertEqual(get.call_count, 1)
+
+    def test_incomplete_file_after_an_earlier_delivery_records_only_confirmed_items(self):
+        with patch.object(app.requests, 'get', side_effect=[self.response(), self.response(body=b'a')]), \
+                patch.object(app, 'reuse_cached_file', return_value=False), \
+                patch.object(app, 'upload_complete_file', new_callable=AsyncMock) as upload, \
+                patch.object(app, 'delete_status'):
+            self.job.run()
+            result = self.job.send()
+            self.assertFalse(result['ok'])
+            self.assertEqual(result['parts'], 1)
+            self.assertEqual(upload.await_count, 1)
+            self.assertEqual(self.job.state, 'failed')
+            self.assertFalse(self.job.send()['ok'])
+
+    def test_flood_wait_keeps_current_file_and_resumes_without_resending_previous_items(self):
+        class Flood(Exception):
+            code = 420
+            seconds = 1158
+            message = 'FLOOD_WAIT_1158'
+        calls = []
+
+        async def upload(token, method, data, file):
+            calls.append((method, file[1].read()))
+            if len(calls) == 2:
+                raise Flood('wait 1158 seconds')
+            return {'message_id': len(calls), 'file_id': 'sent-file'}
+
+        with patch.object(app.requests, 'get', side_effect=lambda *args, **kwargs: self.response()) as get, \
+                patch.object(app, 'reuse_cached_file', return_value=False), \
+                patch.object(app.subprocess, 'run', return_value=MagicMock(stdout=self.info)), \
+                patch.object(app, 'upload_complete_file', side_effect=upload), \
+                patch.object(app, 'store_uploaded_file'), patch.object(app, 'delete_status'):
+            self.job.run()
+            result = self.job.send()
+            self.assertTrue(result['retrySafe'])
+            self.assertEqual(result['retryAfterSeconds'], 1158)
+            self.assertEqual(result['parts'], 1)
+            self.assertEqual(self.job.state, 'ready')
+            self.assertEqual(self.job.send(), {'ok': True, 'parts': 2})
+            self.assertEqual([c[0] for c in calls], ['sendPhoto', 'sendVideo', 'sendVideo'])
+            self.assertEqual(get.call_count, 2)
+
+    def test_ambiguous_send_failure_never_reuploads(self):
+        with patch.object(app.requests, 'get', return_value=self.response()), \
+                patch.object(app, 'upload_complete_file', new_callable=AsyncMock, side_effect=TimeoutError('ambiguous')) as upload:
+            self.job.run()
+            result = self.job.send()
+            self.assertFalse(result['ok'])
+            self.assertNotIn('retrySafe', result)
+            self.assertEqual(result['parts'], 0)
+            self.assertFalse(self.job.send()['ok'])
+            self.assertEqual(upload.await_count, 1)
 
 
 if __name__ == '__main__':

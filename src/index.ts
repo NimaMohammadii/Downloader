@@ -8,6 +8,7 @@ type Env = Partial<AdminStatsEnv> & {
   INSTAGRAM_DS_USER_ID?: string;
   INSTAGRAM_MID?: string;
   INSTAGRAM_IG_DID?: string;
+  uploadInstagramPost?: (post: InstagramPostUpload) => Promise<void>;
 };
 
 type TelegramMessage = {
@@ -80,6 +81,15 @@ type MediaCandidate = {
 };
 
 type ResolvedMedia = MediaCandidate & { size: number | null };
+export type InstagramPostUpload = {
+  shortcode: string;
+  url: string;
+  chatId: number;
+  requestMessageId: number;
+  userId: number;
+  statusMessageId: number;
+  media: ResolvedMedia[];
+};
 type CookieJar = Map<string, string>;
 
 const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
@@ -94,6 +104,7 @@ const IG_WWW_CLAIM_STATE_KEY = "__ig_www_claim";
 const PRIVATE_BLOKS_VERSION_ID = "7189b949425f9bf80ea8bd880cf5a3080b292d9b1c4b38a18d112f7c4b71e7a8";
 const MEDIA_LINK_TTL_SECONDS = 10 * 60;
 const TELEGRAM_VIDEO_URL_LIMIT = 19_000_000;
+const TELEGRAM_VIDEO_UPLOAD_LIMIT = 2_000_000_000;
 const TELEGRAM_PHOTO_URL_LIMIT = 4_800_000;
 const IG_SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
@@ -1108,9 +1119,10 @@ async function probeSize(url: string): Promise<number | null> {
   }
 }
 
-async function chooseCandidate(group: MediaCandidate[]): Promise<ResolvedMedia> {
+async function chooseCandidate(group: MediaCandidate[], uploadVideo = false): Promise<ResolvedMedia> {
   const sorted = [...group].sort((a, b) => b.width * b.height - a.width * a.height);
-  const limit = sorted[0]?.kind === "photo" ? TELEGRAM_PHOTO_URL_LIMIT : TELEGRAM_VIDEO_URL_LIMIT;
+  const limit = sorted[0]?.kind === "photo" ? TELEGRAM_PHOTO_URL_LIMIT
+    : uploadVideo ? TELEGRAM_VIDEO_UPLOAD_LIMIT : TELEGRAM_VIDEO_URL_LIMIT;
   let unknown: MediaCandidate | null = null;
 
   for (const candidate of sorted) {
@@ -1119,6 +1131,7 @@ async function chooseCandidate(group: MediaCandidate[]): Promise<ResolvedMedia> 
     if (size === null) unknown = candidate;
   }
   if (unknown) return { ...unknown, size: null };
+  if (uploadVideo && sorted[0]?.kind === "video") throw new Error("INSTAGRAM_VIDEO_UPLOAD_TOO_LARGE");
   throw new Error(sorted[0]?.kind === "photo" ? "INSTAGRAM_PHOTO_TOO_LARGE" : "INSTAGRAM_VIDEO_TOO_LARGE");
 }
 
@@ -1216,7 +1229,7 @@ async function handleMediaProxy(request: Request, env: Env, url: URL): Promise<R
 async function resolveTarget(target: InstagramTarget, env: Env): Promise<ResolvedMedia[]> {
   const groups = target.kind === "post" ? await resolvePost(target, env) : await resolveStory(target, env);
   const resolved: ResolvedMedia[] = [];
-  for (const group of groups) resolved.push(await chooseCandidate(group));
+  for (const group of groups) resolved.push(await chooseCandidate(group, target.kind === "post" && Boolean(env.uploadInstagramPost)));
   return resolved;
 }
 
@@ -1255,6 +1268,7 @@ function friendlyError(detail: string, throttle?: InstagramThrottle): string {
   if (value.includes("story_expired")) {
     return "❌ این Story دیگه در دسترس نیست یا منقضی شده.";
   }
+  if (value.includes("video_upload_too_large")) return "❌ حجم ویدیو از سقف ارسال ۲ گیگابایت بیشتر است.";
   if (value.includes("too_large") || value.includes("too big")) {
     return "❌ حجم این فایل برای ارسال مستقیم با Bot API تلگرام زیادی بالاست.";
   }
@@ -1314,6 +1328,16 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
 
     const media = await resolveTarget(target, env);
     if (!media.length) throw new Error("INSTAGRAM_NO_MEDIA");
+
+    // Hand off the entire ordered post before publishing any item. Small posts
+    // retain URL delivery; unknown video sizes need the bounded file uploader.
+    if (target.kind === "post" && env.uploadInstagramPost && media.some(item =>
+      item.kind === "video" && (item.size === null || item.size > TELEGRAM_VIDEO_URL_LIMIT))) {
+      await env.uploadInstagramPost({ shortcode: target.shortcode, url: target.url,
+        chatId: message.chat.id, requestMessageId: message.message_id,
+        userId: message.from?.id || message.chat.id, statusMessageId, media });
+      return Response.json({ ok: true });
+    }
 
     for (let index = 0; index < media.length; index++) {
       const item = media[index];
