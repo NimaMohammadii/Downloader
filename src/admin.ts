@@ -1,3 +1,4 @@
+import { BroadcastManager } from "./broadcast";
 import { DurableObject } from "cloudflare:workers";
 
 const telegramEmojiIds: Record<string, string> = {
@@ -144,7 +145,7 @@ export type AdminUsage = {
   all: UsageTotals; day: UsageTotals; week: UsageTotals;
 };
 
-type StoreEnv = Record<string, never>;
+type StoreEnv = { BOT_TOKEN?: string };
 
 export type AdminStatsEnv = {
   ADMIN_STATS: DurableObjectNamespace<AdminStatsStore>;
@@ -255,8 +256,10 @@ function cleanText(value: unknown): string | null {
 }
 
 export class AdminStatsStore extends DurableObject<StoreEnv> {
+  private broadcasts: BroadcastManager;
   constructor(ctx: DurableObjectState, env: StoreEnv) {
     super(ctx, env);
+    this.broadcasts = new BroadcastManager(ctx, env);
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS users (
         id TEXT PRIMARY KEY,
@@ -362,8 +365,11 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
     return Object.fromEntries(Object.entries({ ...resource, ...media }).map(([key, value]) => [key, asNumber(value)])) as UsageTotals;
   }
 
+  async alarm(): Promise<void> { await this.broadcasts.alarm(); }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === "/broadcast") return this.broadcasts.fetch(request);
 
     if (request.method === "POST" && url.pathname === "/usage") {
       const body = await request.json() as { samples?: UsageSample[]; deliveries?: MediaUsage[]; runs?: ContainerRun[] };
@@ -788,6 +794,7 @@ export function formatAdminDashboard(summary: AdminSummary): string {
 export function adminDashboardKeyboard(): Record<string, unknown> {
   return {
     inline_keyboard: [
+      [{ text: "📤 پیام همگانی", callback_data: "admin:broadcast" }],
       [{ text: "📊 مصرف، ترافیک و هزینه", callback_data: "admin:usage" }],
       [{ text: "👥 لیست کاربران", callback_data: "admin:users:0" }],
       [{ text: "کاربران استفاده‌کننده", callback_data: "admin:used:0" }],

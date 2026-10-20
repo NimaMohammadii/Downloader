@@ -1,3 +1,4 @@
+import { handleBroadcastUpdate } from "./broadcast";
 import { enforceMembership } from "./membership";
 import { type AdminStatsEnv } from "./admin";
 import youtubeWorker from "./youtube-main";
@@ -90,6 +91,8 @@ export default {
       return disabledContainerResponse(request);
     }
 
+    const broadcastResponse = await handleBroadcastUpdate(request, env);
+    if (broadcastResponse) return broadcastResponse;
     const membershipResponse = await enforceMembership(request, env, ctx);
     if (membershipResponse) return membershipResponse;
     return youtubeWorker.fetch(request, env as any, ctx);

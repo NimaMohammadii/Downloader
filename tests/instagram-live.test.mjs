@@ -216,7 +216,7 @@ test('music buttons bind chat, owner, exact video and expiry before creating an 
 
 test('native text motion is bounded, preserves formatting and final delivery survives preview failures',async()=>{
   const text=await readFile(new URL('../src/admin.ts',import.meta.url),'utf8');
-  const result=await build({stdin:{contents:text,loader:'ts'},bundle:true,format:'esm',write:false,
+  const result=await build({stdin:{contents:text,loader:'ts',resolveDir:new URL('../src',import.meta.url).pathname},bundle:true,format:'esm',write:false,
     plugins:[{name:'motion-runtime',setup(b){b.onResolve({filter:/^cloudflare:workers$/},a=>({path:a.path,namespace:'runtime'}));
       b.onLoad({filter:/.*/,namespace:'runtime'},()=>({contents:'export class DurableObject {}'}));}}]});
   const {telegramTextMotion,telegramCustomEmoji}=await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString('base64')}`);
@@ -576,7 +576,7 @@ test('persistent Telegram cache sanitizes context, expires entries, bounds stora
     return {toArray:()=>rows,one:()=>rows[0],rowsWritten:changes};
   }};
   const adminSource=await readFile(new URL('../src/admin.ts',import.meta.url),'utf8');
-  const result=await build({stdin:{contents:adminSource,loader:'ts'},bundle:true,format:'esm',write:false,
+  const result=await build({stdin:{contents:adminSource,loader:'ts',resolveDir:new URL('../src',import.meta.url).pathname},bundle:true,format:'esm',write:false,
     plugins:[{name:'durable-object',setup(b){b.onResolve({filter:/cloudflare:workers/},a=>({path:a.path,namespace:'stub'}));b.onLoad({filter:/.*/,namespace:'stub'},()=>({contents:'export class DurableObject {constructor(ctx,env){this.ctx=ctx;this.env=env;}}'}));}}]});
   const admin=await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString('base64')}`);
   const instance=new admin.AdminStatsStore({storage:{sql}},{});
