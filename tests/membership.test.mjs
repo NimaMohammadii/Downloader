@@ -141,8 +141,9 @@ test('joining unlocks, leaving locks again, and only real members pass the check
     assert.ok(await api.enforceMembership(f.webhook(), f.env));
     f.setMember({ status: 'member' });
     await api.enforceMembership(f.webhook('', 42, 'membership:check'), f.env);
-    assert.equal(f.calls.at(-1).method, 'editMessageText');
-    assert.match(f.calls.at(-1).body.text, /دسترسی فعاله/);
+    assert.equal(f.calls.at(-1).method, 'deleteMessage');
+    const confirmation = f.calls.filter(c => c.method === 'sendMessage').at(-1).body;
+    assert.ok(confirmation.entities.some(e => e.custom_emoji_id === '5400130177319580649'));
     f.setMember({ status: 'kicked' });
     assert.ok(await api.enforceMembership(f.webhook(), f.env));
   } finally { f.close(); }
@@ -247,4 +248,67 @@ test('channel lookup and missing admin rights have distinct safe diagnostics wit
       assert.ok(!JSON.stringify(warnings).includes(f.env.BOT_TOKEN));
     }
   } finally { console.warn = warn; f.close(); }
+});
+
+
+test('member confirmation deletes the prompt, sends the requested emoji and removes it after exactly four seconds', async t => {
+  const f = fixture(), pending = [];
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    await f.request('/download', download);
+    f.setMember({ status: 'member' });
+    const response = await api.enforceMembership(f.webhook('', 42, 'membership:check'), f.env,
+      { waitUntil(promise) { pending.push(promise); } });
+    assert.equal(response.status, 200);
+    assert.equal(pending.length, 1);
+    const sent = f.calls.filter(c => ['deleteMessage','sendMessage'].includes(c.method));
+    assert.deepEqual(sent.map(c => c.method), ['deleteMessage','sendMessage']);
+    assert.equal(sent[0].body.message_id, 70);
+    const confirmation = sent[1].body;
+    assert.equal(confirmation.chat_id, 42);
+    assert.deepEqual(confirmation.entities, [{ type:'custom_emoji', offset:0, length:1, custom_emoji_id:'5400130177319580649' }]);
+    assert.ok(!f.calls.some(c => c.method === 'editMessageText'));
+    t.mock.timers.tick(3999);
+    await Promise.resolve();
+    assert.equal(f.calls.filter(c => c.method === 'deleteMessage').length, 1);
+    t.mock.timers.tick(1);
+    await Promise.all(pending);
+    assert.equal(f.calls.at(-1).method, 'deleteMessage');
+    assert.equal(f.calls.at(-1).body.message_id, 80);
+  } finally { t.mock.timers.reset(); f.close(); }
+});
+
+test('membership prompt uses channel wording and the explicit join-button icon', () => {
+  const prompt = api.membershipPrompt();
+  assert.ok(!prompt.text.includes('کانال'));
+  const join = prompt.reply_markup.inline_keyboard.flat().find(button => button.url);
+  assert.equal(join.text, 'ورود به چنل');
+  assert.equal(join.icon_custom_emoji_id, '5260285114448891086');
+});
+
+test('panel text motion progressively reveals edits without splitting graphemes or bold entities', async () => {
+  const calls = [], pauses = [], previousFetch = globalThis.fetch, previousTimeout = globalThis.setTimeout;
+  try {
+    globalThis.fetch = async (input, init) => {
+      calls.push({ method:String(input).split('/').at(-1), body:JSON.parse(init.body) });
+      return Response.json({ ok:true, result:true });
+    };
+    globalThis.setTimeout = (callback, delay) => { pauses.push(delay); return previousTimeout(callback, 0); };
+    const text = '⚡️ عضویت اجباری چنل\n\nوضعیت: فعال ✅\nادامهٔ استفاده پس از دانلود اول نیازمند عضویت در چنل است.';
+    const payload = { chat_id:7138547731, message_id:70, text, entities:[{type:'bold',offset:0,length:text.length}],
+      reply_markup: { inline_keyboard:[] } };
+    await api.telegramTextMotion('panel-motion-test', 'editMessageText', payload, { animateEdits:true });
+    assert.equal(calls.length, 3);
+    assert.deepEqual(pauses, [450,450,450]);
+    const boundaries = new Set(Array.from(new Intl.Segmenter('fa',{granularity:'grapheme'}).segment(text), s => s.index + s.segment.length));
+    for (const [index, frame] of calls.entries()) {
+      assert.equal(frame.method, 'editMessageText');
+      assert.equal(frame.body.message_id, 70);
+      assert.ok(text.startsWith(frame.body.text));
+      assert.ok(boundaries.has(frame.body.text.length));
+      assert.ok(frame.body.entities.every(e => e.offset + e.length <= frame.body.text.length));
+      if (index) assert.ok(frame.body.text.length > calls[index-1].body.text.length);
+    }
+    assert.ok(calls.at(-1).body.text.length < text.length);
+  } finally { globalThis.fetch = previousFetch; globalThis.setTimeout = previousTimeout; }
 });

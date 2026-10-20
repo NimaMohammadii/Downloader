@@ -76,7 +76,7 @@ async function telegramCall<T = unknown>(
   method: string,
   payload: Record<string, unknown>,
 ): Promise<T> {
-  await telegramTextMotion(token, method, payload);
+  await telegramTextMotion(token, method, payload, { animateEdits: true });
   const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -144,9 +144,9 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
     if (membershipMatch) {
       if (membershipMatch[1]) await setMembershipEnabled(env, membershipMatch[1] === "enable");
       const state = await membershipState(env);
-      const title = "عضویت اجباری کانال";
+      const title = "عضویت اجباری چنل";
       const status = `وضعیت: ${state.enabled ? "فعال ✅" : "غیرفعال"}`;
-      const text = `${title}\n\n${status}\nپس از اولین دانلود موفق، ادامهٔ استفاده نیازمند عضویت در کانال است.`;
+      const text = `${title}\n\n${status}\nپس از اولین دانلود موفق، ادامهٔ استفاده نیازمند عضویت در چنل است.`;
       await telegramCall(env.BOT_TOKEN, "editMessageText", {
         chat_id: message.chat.id, message_id: message.message_id, text,
         entities: [{ type: "bold", offset: 0, length: title.length },

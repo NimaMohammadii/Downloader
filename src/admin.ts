@@ -51,18 +51,21 @@ export function telegramCustomEmoji(method: string, payload: Record<string, unkn
 
 const textMotionChats = new Map<string, number>();
 
-// Seed the draft, then let Telegram animate the complete append in one pass.
-// Repeated coarse updates restart the client animation and make it stutter.
-export async function telegramTextMotion(token: string, method: string, payload: Record<string, unknown>): Promise<void> {
-  if (method !== "sendMessage" || typeof payload.text !== "string" || payload.parse_mode ||
+// Drafts use Telegram’s native append animation. Panel edits opt into a bounded
+// reveal on the existing message; other edit callers keep their current behavior.
+export async function telegramTextMotion(
+  token: string, method: string, payload: Record<string, unknown>, options: { animateEdits?: boolean } = {},
+): Promise<void> {
+  const editing = method === "editMessageText" && options.animateEdits && Number.isSafeInteger(payload.message_id);
+  if ((method !== "sendMessage" && !editing) || typeof payload.text !== "string" || payload.parse_mode ||
       payload.text.length < 2 || payload.inline_message_id || payload.business_connection_id) return;
   const chat = Number(payload.chat_id);
   if (!Number.isSafeInteger(chat) || chat <= 0) return;
-  const key = `${token.split(":")[0]}:${chat}`;
+  const key = `${token.split(":")[0]}:${chat}${editing ? ":edit" : ""}`;
   const now = Date.now();
   if (now < (textMotionChats.get(key) || 0)) return;
   if (textMotionChats.size >= 512) textMotionChats.delete(textMotionChats.keys().next().value!);
-  textMotionChats.set(key, now + 10000);
+  textMotionChats.set(key, now + (editing ? 1500 : 10000));
   const deadline = performance.now() + 4500;
   const post = async (action: string, body: Record<string, unknown>) => {
     const response = await fetch(`https://api.telegram.org/bot${token}/${action}`, {
@@ -77,18 +80,20 @@ export async function telegramTextMotion(token: string, method: string, payload:
     const chars = Array.from(new Intl.Segmenter("fa", { granularity: "grapheme" }).segment(payload.text), part => part.segment);
     if (chars.length < 2) return;
     const draft_id = crypto.getRandomValues(new Uint32Array(1))[0] % 2147483646 + 1;
-    for (let frame = 0; frame < 2; frame++) {
+    for (let frame = 0; frame < (editing ? 3 : 2); frame++) {
       if (performance.now() >= deadline) break;
-      const end = frame === 0 ? 1 : chars.length;
+      const end = editing ? Math.max(1, Math.floor(chars.length * (frame + 1) / 4)) : frame === 0 ? 1 : chars.length;
       const text = chars.slice(0, end).join("");
       if (!text.trim()) continue;
       const entities = Array.isArray(payload.entities) ? (payload.entities as Record<string, unknown>[])
         .filter(e => Number(e.offset) < text.length && (e.type !== "custom_emoji" || Number(e.offset) + Number(e.length) <= text.length))
         .map(e => ({ ...e, length: Math.min(Number(e.length), text.length - Number(e.offset)) })) : undefined;
-      await post("sendMessageDraft", { chat_id: chat, message_thread_id: payload.message_thread_id, draft_id, text, entities });
+      await post(editing ? "editMessageText" : "sendMessageDraft", editing
+        ? { chat_id: chat, message_id: payload.message_id, text, entities, reply_markup: payload.reply_markup }
+        : { chat_id: chat, message_thread_id: payload.message_thread_id, draft_id, text, entities });
       // Wait after acknowledgement: network time must not consume the reveal time.
       // Persisting immediately would replace the draft before its animation finishes.
-      const pause = frame === 0 ? 120 : Math.min(1000, Math.max(500, chars.length * 12));
+      const pause = editing ? 450 : frame === 0 ? 120 : Math.min(1000, Math.max(500, chars.length * 12));
       await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(pause, deadline - performance.now()))));
     }
   } catch { /* Motion is optional; the complete original send/edit must always run. */ }
@@ -790,7 +795,7 @@ export function adminDashboardKeyboard(): Record<string, unknown> {
         { text: "فعال‌های ۷ روز", callback_data: "admin:users:0:week" }],
       [{ text: "لینک‌فرستاده‌های ۲۴ ساعت", callback_data: "admin:used:0:day" },
         { text: "لینک‌فرستاده‌های ۷ روز", callback_data: "admin:used:0:week" }],
-      [{ text: "عضویت اجباری کانال", callback_data: "admin:membership" }],
+      [{ text: "عضویت اجباری چنل", callback_data: "admin:membership" }],
       [{ text: "🔄 بروزرسانی آمار", callback_data: "admin:stats" }],
     ],
   };

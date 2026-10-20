@@ -1,4 +1,4 @@
-import { ADMIN_USER_ID, telegramCustomEmoji, type AdminStatsEnv } from "./admin";
+import { ADMIN_USER_ID, telegramCustomEmoji, telegramTextMotion, type AdminStatsEnv } from "./admin";
 
 // The channel must be public and this bot must be a channel administrator.
 export const MEMBERSHIP_CHANNEL = "@VexaOrder";
@@ -24,6 +24,7 @@ export async function setMembershipEnabled(env: AdminStatsEnv, enabled: boolean)
 
 async function telegram(env: MembershipEnv, method: string, payload: Record<string, unknown>): Promise<any> {
   if (!env.BOT_TOKEN) throw new Error("MEMBERSHIP_BOT_UNAVAILABLE");
+  await telegramTextMotion(env.BOT_TOKEN, method, payload, { animateEdits: true });
   const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify(telegramCustomEmoji(method, payload)), signal: AbortSignal.timeout(8000),
@@ -33,6 +34,7 @@ async function telegram(env: MembershipEnv, method: string, payload: Record<stri
     const description = typeof body.description === "string" ? body.description : "";
     // Repeated check callbacks can try to edit an already-updated message.
     if (method === "editMessageText" && /message is not modified/i.test(description)) return;
+    if (method === "deleteMessage" && /message to delete not found/i.test(description)) return;
     // Log bounded classifications, never the request URL, bot token or raw response.
     const reason = /chat not found|chat_id.*invalid|username.*not found/i.test(description) ? "channel_not_found"
       : /CHAT_ADMIN_REQUIRED|not enough rights|not an administrator|member list is inaccessible|bot is not a member|bot was kicked/i.test(description) ? "bot_channel_access"
@@ -53,11 +55,11 @@ export async function isChannelMember(env: MembershipEnv, userId: number): Promi
 }
 
 export function membershipPrompt(channel = MEMBERSHIP_CHANNEL): Record<string, unknown> {
-  const title = "ادامه با عضویت در کانال";
-  const text = `⚡️ ${title}\nعضو کانالمون شو؛ ابزارها و قابلیت‌های جدید هم اونجاست!\nبعد از عضویت، «عضو شدم» رو بزن.`;
+  const title = "ادامه با عضویت در چنل";
+  const text = `⚡️ ${title}\nعضو چنلمون شو؛ ابزارها و قابلیت‌های جدید هم اونجاست!\nبعد از عضویت، «عضو شدم» رو بزن.`;
   return { text, entities: [{ type: "bold", offset: text.indexOf(title), length: title.length }],
     reply_markup: { inline_keyboard: [[
-      { text: "ورود به کانال", url: `https://t.me/${channel.replace(/^@/, "")}` },
+      { text: "ورود به چنل", icon_custom_emoji_id: "5260285114448891086", url: `https://t.me/${channel.replace(/^@/, "")}` },
       { text: "✅ عضو شدم", callback_data: "membership:check" },
     ]] },
   };
@@ -71,7 +73,7 @@ export async function notifyFirstDownload(env: MembershipEnv, userId: number): P
 }
 
 // Run once at the production webhook boundary, before any delegated command or callback.
-export async function enforceMembership(request: Request, env: MembershipEnv): Promise<Response | null> {
+export async function enforceMembership(request: Request, env: MembershipEnv, ctx?: Pick<ExecutionContext, "waitUntil">): Promise<Response | null> {
   if (!env.ADMIN_STATS || !env.BOT_TOKEN || request.method !== "POST"
       || new URL(request.url).pathname !== "/telegram/webhook"
       || request.headers.get("x-telegram-bot-api-secret-token") !== (env.WEBHOOK_SECRET || "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1")) return null;
@@ -97,15 +99,28 @@ export async function enforceMembership(request: Request, env: MembershipEnv): P
   if (!state.enabled || !state.downloaded || member) {
     if (!checking) return null;
     await telegram(env, "answerCallbackQuery", { callback_query_id: callback.id, text: "✅ دسترسی فعاله؛ درخواستت رو بفرست." });
-    // Remove the gate only in the user's private chat; shared messages belong to everyone.
-    if (callback.message?.chat?.id === actor.id) await telegram(env, "editMessageText", {
+    // Shared group prompts stay available to other users; confirmation is private.
+    if (callback.message?.chat?.id === actor.id) await telegram(env, "deleteMessage", {
       chat_id: actor.id, message_id: callback.message.message_id,
-      text: "✅ دسترسی فعاله؛ درخواستت رو بفرست.", reply_markup: { inline_keyboard: [] },
     });
+    const confirmation = await telegram(env, "sendMessage", {
+      chat_id: actor.id, text: "✅",
+      entities: [{ type: "custom_emoji", offset: 0, length: 1, custom_emoji_id: "5400130177319580649" }],
+    });
+    if (Number.isSafeInteger(confirmation?.message_id)) {
+      const cleanup = (async () => {
+        await new Promise(resolve => setTimeout(resolve, 4000));
+        try {
+          await telegram(env, "deleteMessage", { chat_id: actor.id, message_id: confirmation.message_id });
+        } catch { console.warn("membership confirmation cleanup unavailable"); }
+      })();
+      if (typeof ctx?.waitUntil === "function") ctx.waitUntil(cleanup);
+      else await cleanup;
+    }
     return Response.json({ ok: true });
   }
   if (callback?.id) await telegram(env, "answerCallbackQuery", { callback_query_id: callback.id,
-    text: checking ? "هنوز عضو کانال نیستی؛ اول عضو شو و دوباره بررسی کن." : "برای ادامه، اول عضو کانال شو.", show_alert: true });
+    text: checking ? "هنوز عضو چنل نیستی؛ اول عضو شو و دوباره بررسی کن." : "برای ادامه، اول عضو چنل شو.", show_alert: true });
   const prompt = membershipPrompt(env.MEMBERSHIP_CHANNEL || MEMBERSHIP_CHANNEL);
   if (checking && callback.message?.chat?.id === actor.id) {
     // Refresh old prompts too, so channel corrections fix their existing join button.

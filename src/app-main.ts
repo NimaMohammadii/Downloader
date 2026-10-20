@@ -90,7 +90,7 @@ export default {
       return disabledContainerResponse(request);
     }
 
-    const membershipResponse = await enforceMembership(request, env);
+    const membershipResponse = await enforceMembership(request, env, ctx);
     if (membershipResponse) return membershipResponse;
     return youtubeWorker.fetch(request, env as any, ctx);
   },
