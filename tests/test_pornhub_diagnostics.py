@@ -54,6 +54,7 @@ for raw in (json.dumps(entries), netscape):
                     except ExtractorError as exc:
                         message = str(exc)
                         assert 'httpOnlyCookies=2;' in message, message
+                        assert 'probe=ph-session-v2' in message, message
                         assert 'suppliedCookies=3;' in message and 'matchingCookies=yes;' in message, message
                         assert 'PRIVATE_' not in message
                     else:
@@ -109,6 +110,7 @@ cases = [
 for final, domain, kind, count, matched in cases:
     result = run(final, domain)
     assert f'redirectKind={kind};' in result and count in result and matched in result, result
+    assert 'probe=ph-session-v2' in result, result
 
 # A normal response is passed through exactly, without adding requests.
 with YoutubeDL({'quiet': True}) as ydl:

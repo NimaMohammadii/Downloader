@@ -73,6 +73,16 @@ class PornhubTests(unittest.TestCase):
                          'suppliedCookieCount': 12, 'matchingCookies': True, 'httpOnlyCookieCount': 1})
         self.assertNotIn('fictional-ph-session', json.dumps(result))
 
+    def test_probe_versions_survive_parsing_and_unknown_versions_are_ignored(self):
+        prefix = ('Redirection detected; redirectKind=homepage; '
+                  'suppliedCookies=38; matchingCookies=yes; httpOnlyCookies=2; probe=')
+        for version in ('ph-session-v1', 'ph-session-v2'):
+            self.assertEqual(pornhub.source_diagnostics(prefix + version + '\n'),
+                             {'probeVersion': version, 'redirectKind': 'homepage',
+                              'suppliedCookieCount': 38, 'matchingCookies': True, 'httpOnlyCookieCount': 2})
+        for version in ('ph-session-v3', 'ph-session-v20', 'PRIVATE_COOKIE'):
+            self.assertIsNone(pornhub.source_diagnostics(prefix + version))
+
     def test_status_failure_must_not_discard_a_ready_video(self):
         with patch.object(pornhub, 'download', return_value=(Path('/fixture.mp4'), 'Example')), \
              patch.object(app, 'edit_status', side_effect=RuntimeError('message to edit not found')), \

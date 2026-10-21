@@ -437,12 +437,12 @@ function redactDiagnostic(detail: string, env: Env): string {
 }
 
 function safeSourceDiagnostics(value: ContainerResult["sourceDiagnostics"]): ContainerResult["sourceDiagnostics"] {
-  if (!value || value.probeVersion !== "ph-session-v1"
+  if (!value || !["ph-session-v1", "ph-session-v2"].includes(value.probeVersion)
       || !["login", "age_verification", "access_restricted", "homepage", "external", "other"].includes(value.redirectKind)
       || typeof value.matchingCookies !== "boolean"
       || ![value.suppliedCookieCount, value.httpOnlyCookieCount].every(n => Number.isSafeInteger(n) && n >= 0 && n <= 999999)) return undefined;
   // Copy only fixed categories, booleans and counts; never trust arbitrary fields.
-  return { probeVersion: "ph-session-v1", redirectKind: value.redirectKind,
+  return { probeVersion: value.probeVersion, redirectKind: value.redirectKind,
     suppliedCookieCount: value.suppliedCookieCount, matchingCookies: value.matchingCookies,
     httpOnlyCookieCount: value.httpOnlyCookieCount };
 }
@@ -802,182 +802,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       started = true;
       phase = "capture";
       await step.do("begin instagram capture", { retries: { limit: 2, delay: "3 seconds" }, timeout: "1 minute" }, async () => {
-        const signature = (await instagramSignature(this.env.BOT_TOKEN, `stop:${job.chatId}:${job.requestMessageId}:${job.userId}`)).slice(0, 16);
-        const result = await pooledContainer(this.env, job).instagramRequest("start", {
-          id: job.id, source, botToken: this.env.BOT_TOKEN, chatId: job.chatId, requestMessageId: job.requestMessageId, userId: job.userId,
-          statusMessageId: statusId,
-          stopData: `igs|${job.requestMessageId}|${job.userId}|${signature}`,
-          completionUrl: `https://downloader.vexaagent.workers.dev/instagram/events/${job.id}`,
-          completionToken: await instagramSignature(this.env.BOT_TOKEN, `event:${job.id}`),
-          ...await mediaCacheContext(this.env, job),
-        });
-        if (!result.ok) throw new Error("IG_START_FAILED");
-        return true;
-      });
-      // A completion event may arrive before this call; Workflows buffers it.
-      phase = "wait";
-      const ready = await step.waitForEvent<ContainerResult>("await instagram recording", { type: "instagram-ready", timeout: "150 minutes" });
-      if (!ready.payload.ok) {
-        await step.do("track capture failure", () => trackJob(this.env, job, "failed", { title: source.title, detail: ready.payload.message || "دریافت محتوا کامل نشد." }));
-        await step.do("show instagram capture failure", () => telegramCall<boolean>(this.env.BOT_TOKEN, "editMessageText", {
-          chat_id: job.chatId, message_id: statusId, text: ready.payload.message || "❌ دریافت لایو کامل نشد؛ دوباره لینک را بفرست.", reply_markup: { inline_keyboard: [] },
-        }));
-        return;
-      }
-      phase = "upload";
-      let result: ContainerResult;
-      let telegramWait = 0;
-      while (true) {
-        const suffix = telegramWait ? ` after telegram wait ${telegramWait}` : "";
-        result = await step.do(`send complete instagram recording${suffix}`, { retries: { limit: 0, delay: "1 second" }, timeout: "30 minutes" }, () =>
-          pooledContainer(this.env, job).instagramRequest("send", { id: job.id }),
-        );
-        if (result.ok || !result.retrySafe || result.phase !== "upload" || result.rpcCode !== 420
-            || !["FLOOD_WAIT", "SLOWMODE_WAIT"].includes(result.errorCode || "")
-            || !Number.isSafeInteger(result.retryAfterSeconds) || result.retryAfterSeconds! < 0) break;
-        telegramWait++;
-        console.info("instagram delivery waiting for telegram", { jobId: job.id, rpcMethod: result.rpcMethod,
-          retryAfterSeconds: result.retryAfterSeconds });
-        await step.do(`track instagram telegram wait ${telegramWait}`, () =>
-          trackJob(this.env, job, "processing", { detail: result.message }));
-        // Unlike YouTube, the prepared Instagram file lives in this assigned Container.
-        // Keep its lease and job while the Workflow sleeps; never replay an ambiguous send.
-        phase = "telegram_wait";
-        await step.sleep(`wait for instagram telegram ${telegramWait}`, `${Math.max(1, result.retryAfterSeconds!)} seconds`);
-        phase = "upload";
-      }
-      if (result.ok) {
-        const searchOnly = job.instagram?.kind === "music" && !job.instagram.musicVideoId;
-        await step.do("track media result", () => trackJob(this.env, job, searchOnly ? "results" : result.partial ? "partial" : "success", {
-          title: result.title || source.title, delivered: searchOnly ? 0 : Math.min(20, result.parts || 1),
-          detail: result.partial ? result.message : undefined,
-        }));
-        // Search results are messages, not downloaded files.
-        if (!(job.instagram?.kind === "music" && !job.instagram.musicVideoId)) await step.do("record instagram video delivery", async () => {
-          for (let i = 0; i < Math.min(20, result.parts || 1); i++) await recordSuccessfulDelivery(this.env, `instagram:${job.id}${i ? `:${i}` : ""}`);
-        });
-      } else if ((job.social || job.instagramPost) && result.message) {
-        await step.do("track partial media result", () => trackJob(this.env, job, result.parts ? "partial" : "failed", {
-          title: result.title || source.title, delivered: result.parts || 0, detail: result.message,
-        }));
-        if (result.parts) await step.do("record partial social delivery", async () => {
-          for (let i = 0; i < Math.min(20, result.parts || 0); i++) await recordSuccessfulDelivery(this.env, `instagram:${job.id}${i ? `:${i}` : ""}`);
-        });
-        await step.do("show social delivery failure", () => telegramCall<boolean>(this.env.BOT_TOKEN, "editMessageText", {
-          chat_id: job.chatId, message_id: statusId, text: result.message,
-        }));
-      } else throw new Error(`IG_SEND_FAILED ${redactDiagnostic([result.errorCode, result.diagnostic, result.message].filter(Boolean).join(": "), this.env)}`);
-    } catch (error) {
-      console.error("instagram video workflow failed", { jobId: job.id, phase,
-        type: error instanceof Error ? error.name : "error",
-        detail: redactDiagnostic(error instanceof Error ? error.message : String(error), this.env) });
-      await step.do("track media failure", () => trackJob(this.env, job, "failed", {
-        detail: "دریافت یا ارسال کامل نشد؛ تحویل فایل تأیید نشده است.",
-      }));
-      await step.do("notify instagram video failure", async () => {
-        const text = error instanceof Error && /YT_CONFIG|DOWNLOAD_POOL_FULL|max.*instance|provision/i.test(error.message)
-          ? workflowFailureMessage(error.message, "startup")
-          : job.instagramPost ? "❌ دریافت یا ارسال پست اینستاگرام کامل نشد؛ اگر فایلی دریافت کرده‌ای، پیش از درخواست دوباره بررسی کن."
-          : job.social ? `❌ دریافت یا ارسال فایل ${socialName(job.social.platform)} کامل نشد؛ اگر فایلی دریافت کرده‌ای، پیش از درخواست دوباره بررسی کن.` : job.recognition || job.playlist || job.instagram?.kind === "music" || job.instagram?.kind === "audio" ? "❌ دریافت یا ارسال فایل صوتی کامل نشد؛ درخواست را دوباره بفرست." : "❌ ضبط یا ارسال لایو کامل نشد؛ لینک را دوباره بفرست. ممکن است سرور ری‌استارت شده باشد.";
-        await safeTelegramCall(this.env.BOT_TOKEN, statusId ? "editMessageText" : "sendMessage", {
-          chat_id: job.chatId, message_id: statusId, text, reply_markup: { inline_keyboard: [] },
-        });
-        return true;
-      });
-    } finally {
-      try {
-        if (started) await step.do("release instagram recording", { retries: { limit: 1, delay: "2 seconds" }, timeout: "1 minute" }, async () => {
-          const container = pooledContainer(this.env, job);
-          try { await container.instagramRequest("cleanup", { id: job.id }); }
-          finally { await container.releaseInstagram(job.id); }
-          return true;
-        });
-      } finally {
-        if (lease) await step.do("release download capacity", { retries: { limit: 3, delay: "1 second" }, timeout: "1 minute" }, () => downloadPool(this.env).release(job.id, lease!.token));
-      }
-    }
-  }
-}
-
-async function telegramCall<T = unknown>(
-  token: string,
-  method: string,
-  payload: Record<string, unknown>,
-): Promise<T> {
-  await telegramTextMotion(token, method, payload);
-  const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(telegramCustomEmoji(method, payload)),
-  });
-  const data = (await response.json()) as TelegramApiResponse<T>;
-  if (!response.ok || !data.ok) {
-    throw new Error(data.description || `Telegram ${method} failed`);
-  }
-  return data.result as T;
-}
-
-async function safeTelegramCall(
-  token: string,
-  method: string,
-  payload: Record<string, unknown>,
-): Promise<void> {
-  try {
-    await telegramCall(token, method, payload);
-  } catch (error) {
-    console.warn("youtube telegram call failed", {
-      method,
-      detail: error instanceof Error ? error.message : String(error),
-    });
-  }
-}
-
-function isYoutubeQuality(value: number): value is YoutubeQuality {
-  return SUPPORTED_QUALITIES.includes(value as YoutubeQuality);
-}
-
-function normalizeQualities(values: number[] | undefined): YoutubeQuality[] {
-  if (!Array.isArray(values)) return [];
-  return SUPPORTED_QUALITIES.filter((quality) => values.includes(quality));
-}
-
-function formatVideoTitle(title: string | undefined): string {
-  const clean = (title || "YouTube video").replace(/\s+/g, " ").trim();
-  const truncated = clean.length > 120 ? `${clean.slice(0, 117)}…` : clean;
-  return `🎬 ${truncated}`;
-}
-
-function qualityLabel(quality: YoutubeQuality): string {
-  if (quality === 360) return "360p Low";
-  if (quality === 480) return "480p Standard";
-  if (quality === 720) return "⭐ 720p HD";
-  return "1080p Full HD";
-}
-
-function formatSelection(job: Pick<YoutubeDownloadJob, "quality" | "audioMode">): string {
-  if (job.audioMode === "low") return "🎵 Audio Low";
-  if (job.audioMode === "hq") return "🎧 Audio HQ";
-  return qualityLabel(job.quality!);
-}
-
-function fileSizeLabel(size: YoutubeFileSize | undefined): string {
-  if (!size || !Number.isFinite(size.bytes) || size.bytes <= 0) return "Size unknown";
-  const bytes = size.bytes;
-  const label = bytes >= 1_000_000_000 ? `${(bytes / 1_000_000_000).toFixed(2)} GB`
-    : bytes >= 1_000_000 ? `${(bytes / 1_000_000).toFixed(1)} MB`
-    : `${Math.max(1, Math.round(bytes / 1000))} KB`;
-  return label;
-}
-
-function buildQualityKeyboard(
-  qualities: YoutubeQuality[],
-  audioAvailable: boolean,
-  videoId: string,
-  requestMessageId: number,
-  userId: number,
-  sizes?: Record<string, YoutubeFileSize>,
-): Array<Array<{ text: string; callback_data: string }>> {
-  const buttons = qualities.map((quality) => ({
+        const signature = (await instagramSignature(this.env.BOT_TOKEN, `stop:${job.chatId}:${job.requestMessageId}…2926 tokens truncated…y) => ({
     text: `${qualityLabel(quality)} ${fileSizeLabel(sizes?.[String(quality)])}`,
     callback_data: `ytq|${videoId}|${quality}|${requestMessageId}|${userId}`,
   }));

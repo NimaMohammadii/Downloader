@@ -158,11 +158,14 @@ test('redirect observations keep counts despite cookie redaction and discard arb
   const raw = JSON.stringify([{ domain: '.pornhub.com', name: 'flag', value: '1' }]);
   try {
     console.error = (message, detail) => logs.push({ message, detail });
-    await run({ pornhub: true, pornhubCookies: raw, result: { ok: false, phase: 'metadata',
-      errorCode: 'SOURCE_REDIRECTED', sourceDiagnostics: { ...observation, cookie: 'PRIVATE_COOKIE', url: 'PRIVATE_URL' } } });
-    assert.deepEqual(logs.at(-1).detail.sourceDiagnostics, observation);
+    for (const probeVersion of ['ph-session-v1', 'ph-session-v2']) {
+      const expected = { ...observation, probeVersion };
+      await run({ pornhub: true, pornhubCookies: raw, result: { ok: false, phase: 'metadata',
+        errorCode: 'SOURCE_REDIRECTED', sourceDiagnostics: { ...expected, cookie: 'PRIVATE_COOKIE', url: 'PRIVATE_URL' } } });
+      assert.deepEqual(logs.at(-1).detail.sourceDiagnostics, expected);
+    }
     assert.ok(!JSON.stringify(logs).includes('PRIVATE_'));
-    for (const bad of [{ redirectKind: 'PRIVATE_COOKIE' }, { probeVersion: 'PRIVATE_COOKIE' },
+    for (const bad of [{ redirectKind: 'PRIVATE_COOKIE' }, { probeVersion: 'PRIVATE_COOKIE' }, { probeVersion: 'ph-session-v3' },
       { matchingCookies: 'PRIVATE_COOKIE' }, { suppliedCookieCount: -1 }]) {
       await run({ pornhub: true, result: { ok: false, sourceDiagnostics: { ...observation, ...bad } } });
       assert.equal(logs.at(-1).detail.sourceDiagnostics, undefined);

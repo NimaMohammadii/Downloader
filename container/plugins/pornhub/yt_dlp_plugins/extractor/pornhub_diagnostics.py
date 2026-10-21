@@ -65,5 +65,5 @@ class PornHubIE(UpstreamPornHubIE, plugin_name="session_diagnostics"):
             kind = redirect_kind(final)
             summary = getattr(self, '_session_summary', 'suppliedCookies=unknown; matchingCookies=unknown')
             raise ExtractorError(
-                f'Redirection detected; redirectKind={kind}; {summary}; probe=ph-session-v1', expected=True)
+                f'Redirection detected; redirectKind={kind}; {summary}; probe=ph-session-v2', expected=True)
         return result

@@ -28,6 +28,7 @@ COPY container/start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
 # The base image is a command-line downloader; run our HTTP server instead.
+LABEL io.downloader.pornhub-probe="ph-session-v2"
 ENTRYPOINT []
 EXPOSE 8080
 CMD ["/app/start.sh"]

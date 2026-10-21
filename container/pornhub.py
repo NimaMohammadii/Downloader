@@ -32,11 +32,11 @@ class DownloadError(app.UserVisibleError):
 def source_diagnostics(stderr: str) -> dict | None:
     match = re.search(
         r"Redirection detected; redirectKind=(login|age_verification|access_restricted|homepage|external|other); "
-        r"suppliedCookies=(\d{1,6}); matchingCookies=(yes|no); httpOnlyCookies=(\d{1,6}); probe=ph-session-v1", stderr)
+        r"suppliedCookies=(\d{1,6}); matchingCookies=(yes|no); httpOnlyCookies=(\d{1,6}); probe=(ph-session-v[12])(?:\s|$)", stderr)
     if not match:
         return None
-    kind, count, matching, http_only = match.groups()
-    return {"probeVersion": "ph-session-v1", "redirectKind": kind,
+    kind, count, matching, http_only, probe_version = match.groups()
+    return {"probeVersion": probe_version, "redirectKind": kind,
             "suppliedCookieCount": int(count), "matchingCookies": matching == "yes",
             "httpOnlyCookieCount": int(http_only)}
 
