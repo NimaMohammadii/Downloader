@@ -79,6 +79,51 @@ function noObsoleteRequests(result) {
   assert.ok(result.calls.length <= 7, 'each page may issue one shortcode web-info query');
 }
 
+test('browser cookies resolve on the web without triggering the reported mobile feedback rejection', async () => {
+  const result = await run({ respond(call) {
+    if (call.hostname === 'i.instagram.com' && call.headers.get('cookie')?.includes('sessionid=')) {
+      return Response.json({ message: 'feedback_required', feedback_message: 'Try again later' }, { status: 400 });
+    }
+    if (call.path === pagePath && call.headers.get('cookie')?.includes('sessionid=')) return new Response(html(video));
+  } });
+  assert.equal(files(result).length, 1);
+  assert.deepEqual(result.calls.map(call => `${call.hostname}:${call.path}`), [`www.instagram.com:${pagePath}`]);
+  assert.equal(result.calls[0].headers.get('authorization'), null);
+  assert.ok(!result.calls[0].headers.get('user-agent').includes('Instagram '));
+});
+
+test('browser media-info runs before mobile fallback when the page contains only an app shell', async () => {
+  const result = await run({ respond(call) {
+    if (call.hostname === 'i.instagram.com') return Response.json({ message: 'feedback_required' }, { status: 400 });
+    if (call.hostname === 'www.instagram.com' && call.path === apiPath) return Response.json({ items: [video] });
+  } });
+  assert.equal(files(result).length, 1);
+  assert.deepEqual(result.calls.map(call => `${call.hostname}:${call.path}`), [
+    `www.instagram.com:${pagePath}`, `www.instagram.com:${apiPath}`,
+  ]);
+});
+
+test('a browser security challenge stops before requesting the private mobile API', async () => {
+  const result = await run({ respond(call) {
+    if (call.path === pagePath) return redirect('/challenge/');
+  } });
+  assert.equal(files(result).length, 0);
+  assert.equal(result.calls.length, 1);
+  assert.match(report(result), /^INSTAGRAM_SESSION_CHALLENGE_REQUIRED/);
+});
+
+test('actual browser API feedback stops without mobile or anonymous fallback', async () => {
+  const result = await run({ respond(call) {
+    if (call.hostname === 'www.instagram.com' && call.path === apiPath) {
+      return Response.json({ message: 'feedback_required' }, { status: 400 });
+    }
+  } });
+  assert.equal(files(result).length, 0);
+  assert.equal(result.calls.length, 2);
+  assert.match(report(result), /^INSTAGRAM_FEEDBACK_REQUIRED \[session\/webpage:EMPTY,session\/authenticated-media-info:INSTAGRAM_FEEDBACK_REQUIRED\]/);
+  assert.ok(result.calls.every(call => call.hostname === 'www.instagram.com'));
+});
+
 test('a large Reel uses the existing upload workflow without repeating Instagram resolution', async () => {
   const uploads = [];
   const result = await run({ env: { uploadInstagramPost: async post => uploads.push(post) },
@@ -90,7 +135,7 @@ test('a large Reel uses the existing upload workflow without repeating Instagram
   assert.equal(uploads[0].statusMessageId, 99);
   assert.equal(uploads[0].shortcode, shortcode);
   assert.equal(files(result).length, 0);
-  assert.equal(result.calls.length, 1);
+  assert.equal(result.calls.length, 3);
   assert.ok(!JSON.stringify(uploads).includes('fixture-session'));
   assert.ok(!result.history.some(item => item.status === 'success'));
   assert.ok(!result.sent.some(item => item.method === 'deleteMessage'));
@@ -198,14 +243,15 @@ test('the production entry point hands a large post to the existing workflow and
   assert.ok(!JSON.stringify(jobs).includes('fixture-session'));
 });
 
-test('the connected account uses the existing native API without unnecessary public probes', async () => {
+test('legacy mobile sessions remain a fallback after the existing web paths without anonymous probes', async () => {
   const result = await run();
   assert.equal(files(result).length, 1);
   assert.equal(result.history.at(-1).status, 'success');
   assert.deepEqual(result.calls.map(call => `${call.hostname}:${call.path}`), [
+    `www.instagram.com:${pagePath}`, `www.instagram.com:${apiPath}`,
     `i.instagram.com:${apiPath}`,
   ]);
-  assert.match(result.calls[0].headers.get('authorization'), /^Bearer IGT:2:/);
+  assert.match(result.calls.at(-1).headers.get('authorization'), /^Bearer IGT:2:/);
   noObsoleteRequests(result);
 });
 
@@ -251,7 +297,7 @@ test('session CSRF from the page reaches the media request instead of being lost
     }
   } });
   assert.equal(files(result).length, 1);
-  assert.equal(result.calls.length, 4);
+  assert.equal(result.calls.length, 3);
 });
 
 test('a fresh HTML CSRF token replaces the stale configured value in both cookie and header', async () => {
@@ -270,7 +316,7 @@ test('a fresh HTML CSRF token replaces the stale configured value in both cookie
   const webRequest = result.calls.find(call => call.hostname === 'www.instagram.com' && call.path === apiPath);
   assert.equal(webRequest.headers.get('x-csrftoken'), 'html-csrf');
   assert.match(webRequest.headers.get('cookie'), /csrftoken=html-csrf/);
-  assert.equal(result.calls.length, 4);
+  assert.equal(result.calls.length, 3);
 });
 
 test('public fallback and account requests never share their cookie jars', async () => {
@@ -300,7 +346,7 @@ test('explicit session login, challenge or consent redirects stop without retryi
       if (call.path === pagePath && call.headers.get('cookie')?.includes('sessionid=')) return redirect(path);
     } });
     assert.match(report(result), new RegExp(`^INSTAGRAM_SESSION_${code}`));
-    assert.equal(result.calls.length, code === 'LOGIN_REQUIRED' ? 4 : 2);
+    assert.equal(result.calls.length, code === 'LOGIN_REQUIRED' ? 3 : 1);
     assert.ok(!result.calls.some(call => call.hostname === 'www.instagram.com' && call.path === apiPath));
     assert.equal(files(result).length, 0);
     assert.match(errorText(result), text);
@@ -316,7 +362,7 @@ test('a home or generic account redirect must not claim consent or block the exi
       if (call.path === apiPath && call.hostname === 'www.instagram.com') return Response.json({ items: [video] });
     } });
     assert.equal(files(result).length, 1, `${destination}: the supported API is still accessible`);
-    assert.equal(result.calls.length, 3);
+    assert.equal(result.calls.length, 2);
     assert.equal(result.history.at(-1).status, 'success');
     assert.ok(!JSON.stringify(result.sent).includes('پذیرش شرایط'));
     assert.ok(!JSON.stringify(result.diagnostics).includes('redirect-secret'));
@@ -344,7 +390,7 @@ test('HTTP 200 login forms are classified without mistaking a normal login link 
     if (call.path === pagePath) return new Response('<form id="loginForm" action="/accounts/login/"></form>');
   } });
   assert.match(report(rejected), /^INSTAGRAM_SESSION_LOGIN_REQUIRED/);
-  assert.equal(rejected.calls.length, 4);
+  assert.equal(rejected.calls.length, 3);
   const accessible = await run({ session: '', respond(call) {
     if (call.path === pagePath) return new Response('<a href="/accounts/login/">Log in</a>' + html(video));
   } });
@@ -480,7 +526,7 @@ test('session rotation survives the reported home redirect and reaches media inf
       }
     } });
     assert.equal(files(result).length, 1, mode);
-    assert.equal(result.calls.length, 3);
+    assert.equal(result.calls.length, 2);
     assert.equal(result.history.at(-1).status, 'success');
     for (const secret of ['renewed-session', 'fresh-csrf']) assert.ok(!JSON.stringify(result.diagnostics).includes(secret));
   }
@@ -503,7 +549,7 @@ test('all valid response cookies survive combined fields without turning attribu
     }
   } });
   assert.equal(files(result).length, 1);
-  assert.equal(result.calls.length, 3);
+  assert.equal(result.calls.length, 2);
 });
 
 test('deleted cookies are removed and Max-Age takes precedence over Expires', async () => {
@@ -524,7 +570,7 @@ test('deleted cookies are removed and Max-Age takes precedence over Expires', as
       }
     } });
     assert.equal(files(result).length, 1, expired);
-    assert.equal(result.calls.length, 3, expired);
+    assert.equal(result.calls.length, 2, expired);
   }
 });
 
@@ -534,7 +580,7 @@ test('an explicitly cleared session stops before retrying more endpoints with re
       'csrftoken=fresh-csrf; Path=/', 'sessionid=; Max-Age=0; Path=/',
     ], 'workers');
   } });
-  assert.equal(result.calls.length, 4);
+  assert.equal(result.calls.length, 3);
   assert.equal(files(result).length, 0);
   assert.match(report(result), /^INSTAGRAM_SESSION_LOGIN_REQUIRED/);
   assert.ok(!result.calls.some(call => call.hostname === 'www.instagram.com' && call.path === apiPath));
@@ -594,7 +640,7 @@ test('session web-info uses refreshed page state and keeps anonymous cookies sep
   assert.equal(graphql.length, 1);
   assert.equal(graphql[0].headers.get('x-csrftoken'), 'account-csrf');
   assert.ok(!graphql[0].headers.get('cookie').includes('anonymous-csrf'));
-  assert.equal(result.calls.length, 3);
+  assert.equal(result.calls.length, 2);
 });
 
 test('anonymous web-info cannot substitute another post and classifies GraphQL rate limits', async () => {
@@ -696,8 +742,9 @@ test('a healthy connected account resolves before the reported anonymous LOGIN_R
     if (!call.headers.get('cookie')?.includes('sessionid=')) return new Response(null, { status: 429 });
   } });
   assert.equal(files(result).length, 1);
-  assert.equal(result.calls.length, 1, 'do not send anonymous probes when authenticated media is available');
-  assert.match(result.calls[0].headers.get('authorization'), /^Bearer IGT:2:/);
+  assert.equal(result.calls.length, 3, 'web paths precede mobile fallback without any anonymous probes');
+  assert.ok(result.calls.every(call => call.headers.get('cookie')?.includes('sessionid=')));
+  assert.match(result.calls.at(-1).headers.get('authorization'), /^Bearer IGT:2:/);
   assert.equal(result.history.at(-1).status, 'success');
 });
 
@@ -725,7 +772,7 @@ test('an explicitly rejected session is not reused while an accessible public po
     if (call.path === apiPath) return Response.json({ items: [video] });
   } });
   assert.equal(files(result).length, 1);
-  assert.equal(result.calls.length, 3);
+  assert.equal(result.calls.length, 2);
   assert.equal(result.calls.at(-1).headers.get('authorization'), null);
   assert.equal(result.calls.at(-1).headers.get('cookie'), null);
   assert.ok(!result.calls.some(call => call.hostname === 'www.instagram.com' && call.path === apiPath));
@@ -739,6 +786,6 @@ test('an authenticated throttle stops immediately even if an anonymous endpoint 
   } });
   assert.equal(files(result).length, 0);
   assert.equal(result.calls.length, 1);
-  assert.match(report(result), /session\/mobile-api:INSTAGRAM_RATE_LIMIT_429/);
+  assert.match(report(result), /session\/webpage:INSTAGRAM_RATE_LIMIT_429/);
   assert.match(errorText(result), /120/);
 });

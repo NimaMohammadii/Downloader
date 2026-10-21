@@ -602,6 +602,10 @@ async function fetchJson(
   init: Pick<RequestInit, "method" | "body"> = {},
 ): Promise<{ data: any }> {
   const response = await fetchPostResponse(url, headers, jar, init);
+  return readPostJson(response, url);
+}
+
+async function readPostJson(response: Response, url: string): Promise<{ data: any }> {
   let data: any = null;
   try { data = await response.json(); } catch (error) {
     if (!(error instanceof SyntaxError)) throw new Error("INSTAGRAM_NETWORK_ERROR");
@@ -647,6 +651,12 @@ async function fetchHtml(
   jar: CookieJar,
 ): Promise<string> {
   const response = await fetchPostResponse(url, headers, jar);
+  // Webpage requests can also return a JSON security/activity rejection. Use
+  // the same classifier and stop before another authenticated endpoint runs.
+  if (response.headers.get("content-type")?.includes("application/json")) {
+    await readPostJson(response, url);
+    return "";
+  }
   if (!response.ok) {
     await response.body?.cancel().catch(() => undefined);
     throwForInstagramStatus(response.status);
@@ -794,12 +804,13 @@ async function resolvePost(
   const session = secretCookies(env);
   const mediaId = shortcodeToMediaId(target.shortcode);
   const attempts: Array<[string, () => Promise<MediaCandidate[][] | null>]> = [];
-  // Use the connected account before public probes. Anonymous web throttling
-  // must not prevent a healthy authenticated media request from ever running.
+  // These secrets contain browser cookies: use the existing web paths before
+  // asking the private mobile API to accept that session as an Android login.
+  // Keep all account paths before anonymous probes and stop on real restrictions.
   if (session.get("sessionid")) attempts.push(
-    ["session/mobile-api", () => resolveViaMobileMediaInfo(target, session)],
     ["session/webpage", () => resolveViaPostPage(target, session)],
     ["session/authenticated-media-info", () => resolveAuthenticatedMediaInfo(target, mediaId, session)],
+    ["session/mobile-api", () => resolveViaMobileMediaInfo(target, session)],
   );
   attempts.push(
     ["public/mobile-api", () => resolveViaMobileMediaInfo(target, anonymous)],
