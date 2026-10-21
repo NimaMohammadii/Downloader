@@ -132,6 +132,13 @@ type ContainerResult = {
   rpcCode?: number;
   retryAfterSeconds?: number;
   retrySafe?: boolean;
+  sourceDiagnostics?: {
+    probeVersion: string;
+    redirectKind: string;
+    suppliedCookieCount: number;
+    matchingCookies: boolean;
+    httpOnlyCookieCount: number;
+  };
 };
 
 type YoutubeFileSize = { bytes: number; estimated: boolean };
@@ -429,6 +436,17 @@ function redactDiagnostic(detail: string, env: Env): string {
     .replace(/\b(?:authorization|cookie|sessionid)\b["']?\s*[:=]\s*[^\r\n]+/gi, "[redacted]").slice(0, 2000);
 }
 
+function safeSourceDiagnostics(value: ContainerResult["sourceDiagnostics"]): ContainerResult["sourceDiagnostics"] {
+  if (!value || value.probeVersion !== "ph-session-v1"
+      || !["login", "age_verification", "access_restricted", "homepage", "external", "other"].includes(value.redirectKind)
+      || typeof value.matchingCookies !== "boolean"
+      || ![value.suppliedCookieCount, value.httpOnlyCookieCount].every(n => Number.isSafeInteger(n) && n >= 0 && n <= 999999)) return undefined;
+  // Copy only fixed categories, booleans and counts; never trust arbitrary fields.
+  return { probeVersion: "ph-session-v1", redirectKind: value.redirectKind,
+    suppliedCookieCount: value.suppliedCookieCount, matchingCookies: value.matchingCookies,
+    httpOnlyCookieCount: value.httpOnlyCookieCount };
+}
+
 function workflowFailureMessage(detail: string, phase: string): string {
   if (detail.includes("YT_CONFIG")) {
     return "❌ تنظیمات ارسال فایل آماده نیست؛ API_ID و API_HASH باید در Secretهای همین Worker تنظیم شوند.";
@@ -643,7 +661,10 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
               new Request("http://container/download", {
                 method: "POST",
                 headers: { "content-type": "application/json" },
-                body: JSON.stringify({ ...job, statusMessageId, botToken: this.env.BOT_TOKEN, ...await mediaCacheContext(this.env, job) }),
+                body: JSON.stringify({ ...job, statusMessageId, botToken: this.env.BOT_TOKEN,
+                  ...(job.source === "pornhub" ? { pornhubSessionTag: await instagramSignature(this.env.BOT_TOKEN,
+                    `pornhub-session:${this.env.PORNHUB_COOKIES || ""}`) } : {}),
+                  ...await mediaCacheContext(this.env, job) }),
               }),
             );
           },
@@ -678,6 +699,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         console.error(`${source} download rejected`, { source, jobId: job.id, phase: result.phase || "transfer",
           code: result.errorCode || "SOURCE_REJECTED",
           type: result.errorType, rpcMethod: result.rpcMethod, rpcCode: result.rpcCode, retryAfterSeconds: result.retryAfterSeconds,
+          sourceDiagnostics: source === "pornhub" ? safeSourceDiagnostics(result.sourceDiagnostics) : undefined,
           detail: redactDiagnostic(result.diagnostic || result.message || "download failed", this.env) });
         await step.do("track youtube rejection", () => trackJob(this.env, job, "failed", { title: result.title, detail: result.message || "دریافت یا ارسال فایل ناموفق بود." }));
       }

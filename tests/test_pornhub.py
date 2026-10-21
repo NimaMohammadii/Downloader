@@ -1,4 +1,6 @@
 import json
+import hashlib
+import hmac
 import os
 import io
 from contextlib import redirect_stderr, redirect_stdout
@@ -37,6 +39,39 @@ class PornhubTests(unittest.TestCase):
     def payload(self):
         return {'id': 'ytdl-42-7-42', 'source': 'pornhub', 'url': 'https://pornhub.com/embed/ph123',
                 'botToken': 'fictional', 'chatId': 42, 'requestMessageId': 7, 'statusMessageId': 10}
+
+    def test_stale_container_session_is_rejected_before_extraction_or_upload(self):
+        expected = hmac.new(b'fictional', ('pornhub-session:' + self.cookies()).encode(), hashlib.sha256).hexdigest()
+        for tag in [expected, 'not-a-tag', 'غیرمعتبر']:
+            with self.subTest(tag=tag), patch.dict(os.environ, {'PORNHUB_COOKIES': 'old-session'}), \
+                 patch.object(pornhub, 'download') as download, patch.object(app, 'edit_status'), \
+                 patch.object(app, 'send_media_file') as send:
+                result = app.process_job({**self.payload(), 'pornhubSessionTag': tag})
+            self.assertEqual(result['errorCode'], 'SOURCE_SESSION_STALE')
+            self.assertEqual(result['phase'], 'configuration')
+            download.assert_not_called()
+            send.assert_not_called()
+
+    def test_current_worker_and_container_session_tags_allow_download(self):
+        tag = hmac.new(b'fictional', ('pornhub-session:' + self.cookies()).encode(), hashlib.sha256).hexdigest()
+        with patch.dict(os.environ, {'PORNHUB_COOKIES': self.cookies()}), \
+             patch.object(pornhub, 'download', return_value=(Path('/fixture.mp4'), 'Example')) as download, \
+             patch.object(app, 'edit_status'), patch.object(app, 'delete_status'), patch.object(app, 'send_media_file'):
+            result = app.process_job({**self.payload(), 'pornhubSessionTag': tag})
+        self.assertTrue(result['ok'])
+        download.assert_called_once()
+
+    def test_redirect_observation_survives_short_cookie_value_redaction(self):
+        raw = self.cookies() + '.pornhub.com\tTRUE\t/\tTRUE\t0\tflag\t1\n'
+        error = ('ERROR: [PornHub+session_diagnostics] ph123: Redirection detected; redirectKind=homepage; '
+                 'suppliedCookies=12; matchingCookies=yes; httpOnlyCookies=1; probe=ph-session-v1')
+        with patch.dict(os.environ, {'PORNHUB_COOKIES': raw}), patch.object(app, 'edit_status'), \
+             patch.object(pipeline, '_run', side_effect=subprocess.CalledProcessError(1, 'yt-dlp', stderr=error)):
+            result = app.process_job(self.payload())
+        self.assertEqual(result['errorCode'], 'SOURCE_REDIRECTED')
+        self.assertEqual(result['sourceDiagnostics'], {'probeVersion': 'ph-session-v1', 'redirectKind': 'homepage',
+                         'suppliedCookieCount': 12, 'matchingCookies': True, 'httpOnlyCookieCount': 1})
+        self.assertNotIn('fictional-ph-session', json.dumps(result))
 
     def test_status_failure_must_not_discard_a_ready_video(self):
         with patch.object(pornhub, 'download', return_value=(Path('/fixture.mp4'), 'Example')), \
@@ -279,6 +314,11 @@ class PornhubTests(unittest.TestCase):
                  ('This video is private', 'SOURCE_UNAVAILABLE'),
                  ('Login required', 'SOURCE_AUTH_REQUIRED'),
                  ('Redirection detected; the video may be deleted or require login', 'SOURCE_REDIRECTED'),
+                 ('Redirection detected; redirectKind=login; suppliedCookies=0; matchingCookies=no;', 'SOURCE_SESSION_MISSING'),
+                 ('Redirection detected; redirectKind=login; suppliedCookies=2; matchingCookies=no;', 'SOURCE_SESSION_DOMAIN_MISMATCH'),
+                 ('Redirection detected; redirectKind=login; suppliedCookies=2; matchingCookies=yes;', 'SOURCE_AUTH_REQUIRED'),
+                 ('Redirection detected; redirectKind=age_verification; suppliedCookies=2; matchingCookies=yes;', 'SOURCE_AGE_VERIFICATION_REQUIRED'),
+                 ('Redirection detected; redirectKind=access_restricted; suppliedCookies=2; matchingCookies=yes;', 'SOURCE_ACCESS_RESTRICTED'),
                  ('CERTIFICATE_VERIFY_FAILED', 'SOURCE_TLS_ERROR')]
         for detail, code in cases:
             with self.subTest(code=code), \

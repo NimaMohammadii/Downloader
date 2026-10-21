@@ -1,5 +1,7 @@
 """Single-video Pornhub downloads using the shared complete-file Telegram sender."""
 import json
+import hashlib
+import hmac
 import math
 import os
 import re
@@ -24,6 +26,19 @@ class DownloadError(app.UserVisibleError):
     def __init__(self, code: str, phase: str, message: str, detail: str = "") -> None:
         super().__init__(message)
         self.error_code, self.phase, self.detail = code, phase, detail
+        self.source_diagnostics = None
+
+
+def source_diagnostics(stderr: str) -> dict | None:
+    match = re.search(
+        r"Redirection detected; redirectKind=(login|age_verification|access_restricted|homepage|external|other); "
+        r"suppliedCookies=(\d{1,6}); matchingCookies=(yes|no); httpOnlyCookies=(\d{1,6}); probe=ph-session-v1", stderr)
+    if not match:
+        return None
+    kind, count, matching, http_only = match.groups()
+    return {"probeVersion": "ph-session-v1", "redirectKind": kind,
+            "suppliedCookieCount": int(count), "matchingCookies": matching == "yes",
+            "httpOnlyCookieCount": int(http_only)}
 
 
 def source_error(detail: str) -> tuple[str, str]:
@@ -35,6 +50,16 @@ def source_error(detail: str) -> tuple[str, str]:
     if "429" in detail or "too many requests" in detail:
         return "SOURCE_RATE_LIMITED", "❌ Pornhub درخواست‌های این سرور را موقتاً محدود کرده؛ کمی بعد امتحان کن."
     if "redirection detected" in detail:
+        if "suppliedcookies=0;" in detail:
+            return "SOURCE_SESSION_MISSING", "❌ سرور دانلود بدون کوکی نشست به Pornhub وصل شد؛ تنظیمات نشست باید روی همین سرور اعمال شود."
+        if "matchingcookies=no;" in detail:
+            return "SOURCE_SESSION_DOMAIN_MISMATCH", "❌ کوکی‌های ذخیره‌شده برای دامنه یا مسیر این لینک ارسال نمی‌شوند؛ از همان دامنهٔ لینک خروجی کوکی بگیر."
+        if "redirectkind=age_verification;" in detail:
+            return "SOURCE_AGE_VERIFICATION_REQUIRED", "❌ Pornhub سرور را به صفحهٔ تأیید سن هدایت کرد؛ تأیید نشست از این سرور پذیرفته نشده است."
+        if "redirectkind=login;" in detail:
+            return "SOURCE_AUTH_REQUIRED", "❌ Pornhub سرور را به صفحهٔ ورود هدایت کرد؛ نشست ورود از این سرور پذیرفته نشده است."
+        if "redirectkind=access_restricted;" in detail:
+            return "SOURCE_ACCESS_RESTRICTED", "❌ Pornhub سرور را به صفحهٔ محدودیت دسترسی هدایت کرد؛ ممکن است محدودیت منطقه یا دسترسی سرور باشد."
         return "SOURCE_REDIRECTED", "❌ Pornhub درخواست را به صفحهٔ دیگری هدایت کرد؛ ممکن است تأیید سن یا ورود لازم باشد، یا ویدیو در دسترس نباشد."
     if any(word in detail for word in ("requested format is not available", "no video formats", "only images")):
         return "SOURCE_FORMAT_UNAVAILABLE", "❌ فرمت قابل دانلود این ویدیوی Pornhub دریافت نشد."
@@ -61,7 +86,9 @@ def run_source(command: list[str], timeout: int, phase: str) -> subprocess.Compl
         # Keep one extractor error line for diagnosis, never its command or a
         # provider response dump. The job boundary redacts secrets and URLs.
         errors = [line.strip() for line in stderr.splitlines() if line.lstrip().startswith("ERROR:")]
-        raise DownloadError(code, phase, message, errors[-1] if errors else "") from exc
+        error = DownloadError(code, phase, message, errors[-1] if errors else "")
+        error.source_diagnostics = source_diagnostics(stderr)
+        raise error from exc
 
 
 def video_url(value: str) -> str:
@@ -189,6 +216,7 @@ def download(url: str, workdir: Path) -> tuple[Path, str]:
 
 def _download(url: str, workdir: Path, cookies: list[str]) -> tuple[Path, str]:
     args = [app.REAL_YTDLP, "--ignore-config", "--no-playlist", "--use-extractors", "PornHub",
+            "--plugin-dirs", str(Path(__file__).resolve().parent / "plugins"),
             "--compat-options", "no-certifi",
             "--force-ipv4", "--socket-timeout", "15", "--retries", "2", "--fragment-retries", "2", *cookies]
     info_path = workdir / "source.info.json"
@@ -265,6 +293,16 @@ def process_job(payload: dict) -> dict:
     try:
         if not token:
             raise ValueError("Missing bot token")
+        expected_tag = payload.get("pornhubSessionTag")
+        if expected_tag is not None:
+            actual_tag = hmac.new(token.encode(),
+                                  ("pornhub-session:" + os.environ.get("PORNHUB_COOKIES", "")).encode(),
+                                  hashlib.sha256).hexdigest()
+            if (not isinstance(expected_tag, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_tag)
+                    or not hmac.compare_digest(expected_tag, actual_tag)):
+                raise DownloadError("SOURCE_SESSION_STALE", "configuration",
+                                    "❌ نشست جدید هنوز به سرور دانلود نرسیده؛ پس از پایان کارها و راه‌اندازی مجدد سرور، دوباره امتحان کن.",
+                                    "cookieExportReason=runtime_session_stale")
         path, title = download(str(payload.get("url") or ""), workdir)
         status("📤 ویدیوی Pornhub آماده شد؛ دارم می‌فرستم…")
         app.job_timeout(1800)  # Expired downloads must never start publishing.
@@ -278,6 +316,8 @@ def process_job(payload: dict) -> dict:
         diagnostic = app.upload_error_diagnostic(exc, token)
         if isinstance(exc, DownloadError):
             diagnostic["errorCode"] = exc.error_code
+            if exc.source_diagnostics:
+                diagnostic["sourceDiagnostics"] = exc.source_diagnostics
             if exc.detail:
                 diagnostic["diagnostic"] = app.upload_error_diagnostic(RuntimeError(exc.detail), token)["diagnostic"]
         print(json.dumps({"message": "pornhub job failed", "jobId": payload.get("id"),

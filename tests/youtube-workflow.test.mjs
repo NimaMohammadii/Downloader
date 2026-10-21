@@ -151,6 +151,25 @@ test('authorized sessions survive cold starts only on their own Container and ma
   await assert.rejects(first.startShared(20), /DOWNLOAD_POOL_ASSIGNMENT/);
 });
 
+test('redirect observations keep counts despite cookie redaction and discard arbitrary fields', async () => {
+  const logs = [], previous = console.error;
+  const observation = { probeVersion: 'ph-session-v1', redirectKind: 'homepage',
+    suppliedCookieCount: 12, matchingCookies: true, httpOnlyCookieCount: 1 };
+  const raw = JSON.stringify([{ domain: '.pornhub.com', name: 'flag', value: '1' }]);
+  try {
+    console.error = (message, detail) => logs.push({ message, detail });
+    await run({ pornhub: true, pornhubCookies: raw, result: { ok: false, phase: 'metadata',
+      errorCode: 'SOURCE_REDIRECTED', sourceDiagnostics: { ...observation, cookie: 'PRIVATE_COOKIE', url: 'PRIVATE_URL' } } });
+    assert.deepEqual(logs.at(-1).detail.sourceDiagnostics, observation);
+    assert.ok(!JSON.stringify(logs).includes('PRIVATE_'));
+    for (const bad of [{ redirectKind: 'PRIVATE_COOKIE' }, { probeVersion: 'PRIVATE_COOKIE' },
+      { matchingCookies: 'PRIVATE_COOKIE' }, { suppliedCookieCount: -1 }]) {
+      await run({ pornhub: true, result: { ok: false, sourceDiagnostics: { ...observation, ...bad } } });
+      assert.equal(logs.at(-1).detail.sourceDiagnostics, undefined);
+    }
+  } finally { console.error = previous; }
+});
+
 test('session storage requires the host-specific capability and never returns a session', async () => {
   const writes = [];
   globalThis.container = { async saveTelegramSession(session) { writes.push(session); } };
@@ -430,6 +449,8 @@ async function run({ inspect = false, startupError, httpError, result, sizes, cr
       if (pornhubCookies && new URL(request.url).pathname === '/download') {
         const body = await request.clone().text();
         assert.ok(!body.includes('PORNHUB_COOKIES') && !body.includes('fictional-ph-session'));
+        assert.equal(JSON.parse(body).pornhubSessionTag,
+          createHmac('sha256', 'secret-token').update(`pornhub-session:${pornhubCookies}`).digest('hex'));
       }
       if (httpError) return new Response(httpError.body, { status: httpError.status });
       if (results?.length && new URL(request.url).pathname === "/download") return Response.json(results.shift());
