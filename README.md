@@ -36,7 +36,18 @@ The five-minute, per-video catalog cache now serves repeated quality requests, a
 
 ## Pornhub in bot chat
 
-Send a direct Pornhub video URL (`view_video.php?viewkey=...` or `/embed/...`) on `pornhub.com`, `pornhub.org` or `pornhub.net`, including mobile/language subdomains. The bot downloads immediately using yt-dlp, selecting the best available resolution without a fixed 1080p ceiling, and sends one complete MP4 through the existing Telegram sender. Formats with unknown dimensions remain eligible. No new secrets or bindings are required. Deploy both the Worker and rebuilt Container to enable it.
+Send a direct Pornhub video URL (`view_video.php?viewkey=...` or `/embed/...`) on `pornhub.com`, `pornhub.org` or `pornhub.net`, including mobile/language subdomains. The bot downloads immediately using yt-dlp, selecting the best available resolution without a fixed 1080p ceiling, and sends one complete MP4 through the existing Telegram sender. Formats with unknown dimensions remain eligible. Public videos accessible without a session need no additional secret. Deploy both the Worker and rebuilt Container to enable it.
+
+If Pornhub requires login or age verification, complete its official verification in your own account first. The bot's server does not inherit your browser session or Telegram users' ages. Export only that site's cookies in Netscape `cookies.txt` format using a trusted local browser tool and keep the file outside this repository. Set its contents as a Worker secret from your local terminal:
+
+```sh
+npx wrangler secret put PORNHUB_COOKIES < /absolute/private/path/pornhub.cookies.txt
+npx wrangler deploy
+```
+
+The deploy must include the rebuilt Container image. Existing running Containers need to restart to receive a changed secret; allow active jobs to finish and hosts to stop normally before testing the new session. The optional secret is forwarded through the Container environment, never Workflow job parameters. Each Pornhub job creates its own mode-0600 cookie file, filters it to `pornhub.com`, `pornhub.org`, `pornhub.net` and their subdomains, removes expired cookies (preserving browser session cookies), and deletes the file on success or failure. Download retries preserve that job's updated cookie jar. Other providers do not receive this cookie file. Cookie values are redacted from Python and Worker diagnostics. Invalid files or files with no current Pornhub cookies stop with `SOURCE_SESSION_INVALID` before extraction. Do not paste cookies into chat, commit them, or put them in `wrangler.jsonc`; local cookie text exports are also ignored by Git.
+
+An accepted file format does not establish that the session has completed verification. Expired/revoked sessions must be exported again after login and the secret updated. A session may be tied to the browser or IP and still be rejected from the server. This feature supplies an existing authorized session; it does not bypass verification or guarantee access. The extractor's ambiguous `Redirection detected; the video may be deleted or require login` message is reported as `SOURCE_REDIRECTED`, not proof of a login requirement. Explicit authentication errors still report `SOURCE_AUTH_REQUIRED`.
 
 The 2,000,000,000-byte sender limit still applies; removing the quality ceiling does not remove Telegram's file limit. Failed fragments abort downloads; the output must be nonempty, have a readable video stream and a finite positive duration. When source duration is available, the output must also pass the duration completeness check. Missing source duration alone does not reject otherwise valid media. Private/deleted videos and login, region or server-access restrictions can prevent downloads. Channel, search and playlist links are not supported.
 

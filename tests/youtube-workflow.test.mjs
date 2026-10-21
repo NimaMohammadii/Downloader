@@ -101,6 +101,24 @@ test('five simultaneous cold starts share one startup and a failed startup can b
   assert.equal(starts, 3);
 });
 
+test('Pornhub session is supplied only through the container environment', async () => {
+  const raw = '# Netscape HTTP Cookie File\n.pornhub.com\tTRUE\t/\tTRUE\t0\tsession\tfictional-ph-session\n';
+  const container = new YoutubeDownloaderContainer({ storage: memoryStorage() }, { BOT_TOKEN: 'fake', PORNHUB_COOKIES: raw });
+  container.startAndWaitForPorts = async () => {};
+  await container.startShared(0);
+  assert.equal(container.envVars.PORNHUB_COOKIES, raw);
+  const logs = [], previous = console.error;
+  try {
+    console.error = (message, detail) => logs.push({ message, detail });
+    await run({ pornhub: true, pornhubCookies: raw, result: { ok: false, phase: 'metadata',
+      errorCode: 'SOURCE_REDIRECTED', diagnostic: `ERROR: fictional-ph-session ${raw}` } });
+    const failure = logs.find(x => x.message === 'pornhub download rejected');
+    assert.equal(failure.detail.code, 'SOURCE_REDIRECTED');
+    assert.ok(!JSON.stringify(logs).includes('fictional-ph-session'));
+    assert.ok(failure.detail.detail.includes('[redacted]'));
+  } finally { console.error = previous; }
+});
+
 test('authorized sessions survive cold starts only on their own Container and matching credentials', async () => {
   const storage = memoryStorage();
   const env = { BOT_TOKEN: 'bot-token', API_ID: '123', API_HASH: 'api-hash' };
@@ -388,7 +406,7 @@ test('text and caption Pornhub links queue a deterministic direct-download job',
   assert.equal(jobs[0].params.quality, undefined);
 });
 
-async function run({ inspect = false, startupError, httpError, result, sizes, credentials = true, pornhub = false, pool = poolBinding(), results, onSleep, checkpoints = new Map() } = {}) {
+async function run({ inspect = false, startupError, httpError, result, sizes, credentials = true, pornhub = false, pornhubCookies, pool = poolBinding(), results, onSleep, checkpoints = new Map() } = {}) {
   const messages = [];
   const calls = [];
   const steps = [];
@@ -405,6 +423,10 @@ async function run({ inspect = false, startupError, httpError, result, sizes, cr
     },
     async fetch(request) {
       calls.push([new URL(request.url).pathname]);
+      if (pornhubCookies && new URL(request.url).pathname === '/download') {
+        const body = await request.clone().text();
+        assert.ok(!body.includes('PORNHUB_COOKIES') && !body.includes('fictional-ph-session'));
+      }
       if (httpError) return new Response(httpError.body, { status: httpError.status });
       if (results?.length && new URL(request.url).pathname === "/download") return Response.json(results.shift());
       if (result) return Response.json(result);
@@ -430,7 +452,8 @@ async function run({ inspect = false, startupError, httpError, result, sizes, cr
     url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
     ...(pornhub ? { source: 'pornhub', url: 'https://www.pornhub.com/view_video.php?viewkey=ph123' } : inspect ? {} : { quality: 720, statusMessageId: 10 }),
   };
-  await new YoutubeDownloadWorkflow({}, { BOT_TOKEN: 'secret-token', DOWNLOAD_POOL: pool, ...(credentials ? { API_ID: '123', API_HASH: 'secret-hash' } : {}) }).run({ payload: job }, step);
+  await new YoutubeDownloadWorkflow({}, { BOT_TOKEN: 'secret-token', DOWNLOAD_POOL: pool, PORNHUB_COOKIES: pornhubCookies,
+    ...(credentials ? { API_ID: '123', API_HASH: 'secret-hash' } : {}) }).run({ payload: job }, step);
   return { calls, messages, steps, delivered: globalThis.delivered };
 }
 

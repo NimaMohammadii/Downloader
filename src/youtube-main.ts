@@ -63,6 +63,7 @@ type Env = AdminStatsEnv & {
   WEBHOOK_SECRET?: string;
   API_ID?: string;
   API_HASH?: string;
+  PORNHUB_COOKIES?: string;
   YOUTUBE_DOWNLOAD_WORKFLOW: Workflow<YoutubeDownloadJob>;
   YOUTUBE_DOWNLOADER_CONTAINER: DurableObjectNamespace<YoutubeDownloaderContainer>;
   DOWNLOAD_POOL: DurableObjectNamespace<DownloadPool>;
@@ -209,7 +210,10 @@ export class YoutubeDownloaderContainer extends Container<Env> {
   defaultPort = 8080;
   sleepAfter: string | number = "5m";
   enableInternet = true;
-  envVars: Record<string, string> = { API_ID: this.env.API_ID || "", API_HASH: this.env.API_HASH || "" };
+  envVars: Record<string, string> = {
+    API_ID: this.env.API_ID || "", API_HASH: this.env.API_HASH || "",
+    PORNHUB_COOKIES: this.env.PORNHUB_COOKIES || "",
+  };
   private starting?: Promise<void>;
   private idleShutdownRequested = false;
 
@@ -407,8 +411,12 @@ async function sendCachedMedia(env: Env, job: YoutubeDownloadJob, statusId?: num
 }
 
 function redactDiagnostic(detail: string, env: Env): string {
-  for (const secret of [env.BOT_TOKEN, env.API_HASH, env.INSTAGRAM_SESSIONID]) {
-    if (secret) detail = detail.split(secret).join("[redacted]");
+  const cookieValues = (env.PORNHUB_COOKIES || "").split(/\r?\n/)
+    .map(line => line.split("\t")).filter(fields => fields.length === 7).map(fields => fields[6]);
+  const secrets = [env.BOT_TOKEN, env.API_HASH, env.INSTAGRAM_SESSIONID, env.PORNHUB_COOKIES, ...cookieValues]
+    .filter((secret): secret is string => Boolean(secret)).sort((a, b) => b.length - a.length);
+  for (const secret of secrets) {
+    detail = detail.split(secret).join("[redacted]");
   }
   return detail.replace(/https?:\/\/[^\s"'<>]+/gi, "[url]")
     .replace(/\b(?:authorization|cookie|sessionid)\b["']?\s*[:=]\s*[^\r\n]+/gi, "[redacted]").slice(0, 2000);

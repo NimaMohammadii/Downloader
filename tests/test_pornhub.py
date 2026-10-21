@@ -1,5 +1,8 @@
 import json
 import os
+import io
+from contextlib import redirect_stderr, redirect_stdout
+from http.cookiejar import MozillaCookieJar
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -18,6 +21,12 @@ import pornhub
 
 
 class PornhubTests(unittest.TestCase):
+    def cookies(self):
+        return ('# Netscape HTTP Cookie File\n'
+                '#HttpOnly_.pornhub.com\tTRUE\t/\tTRUE\t0\tsession\tfictional-ph-session\n'
+                '.pornhub.com\tTRUE\t/\tTRUE\t1\told\tfictional-expired\n'
+                '.other.test\tTRUE\t/\tTRUE\t0\tsession\tfictional-unrelated\n')
+
     def payload(self):
         return {'id': 'ytdl-42-7-42', 'source': 'pornhub', 'url': 'https://pornhub.com/embed/ph123',
                 'botToken': 'fictional', 'chatId': 42, 'requestMessageId': 7, 'statusMessageId': 10}
@@ -110,12 +119,73 @@ class PornhubTests(unittest.TestCase):
                 command = call.args[0]
                 self.assertEqual(command[command.index('--use-extractors') + 1], 'PornHub')
                 self.assertNotIn('--extractor-args', command)
+                self.assertNotIn('--cookies', command)
                 self.assertEqual(command[command.index('--compat-options') + 1], 'no-certifi')
             self.assertEqual(calls[0].args[0][-2], '--')
             self.assertIn('--load-info-json', calls[1].args[0])
             self.assertNotIn('https://pornhub.com/view_video.php?viewkey=ph123', calls[1].args[0])
             self.assertIn('--abort-on-unavailable-fragments', calls[1].args[0])
             self.assertIn(str(app.DIRECT_TELEGRAM_LIMIT), calls[1].args[0])
+
+    def test_cookie_file_is_private_scoped_and_removed_on_metadata_failure(self):
+        paths = []
+        def run(command, timeout):
+            path = Path(command[command.index('--cookies') + 1])
+            paths.append(path)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            jar = MozillaCookieJar(str(path))
+            jar.load(ignore_discard=True)
+            self.assertEqual([(c.name, c.value) for c in jar], [('session', 'fictional-ph-session')])
+            self.assertNotIn('fictional-ph-session', ' '.join(command))
+            raise subprocess.CalledProcessError(1, command, stderr='ERROR: Login required')
+        with patch.dict(os.environ, {'PORNHUB_COOKIES': self.cookies()}), \
+             patch.object(pipeline, '_run', side_effect=run):
+            for _ in range(2):
+                with tempfile.TemporaryDirectory() as directory:
+                    with self.assertRaises(pornhub.DownloadError):
+                        pornhub.download(self.payload()['url'], Path(directory))
+                    self.assertFalse(paths[-1].exists())
+        self.assertNotEqual(*paths)
+
+    def test_cookie_file_is_used_for_metadata_and_download_then_removed(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(os.environ, {'PORNHUB_COOKIES': self.cookies()}):
+            _, calls = self.download(directory)
+            for call in calls:
+                self.assertEqual(call.args[0][call.args[0].index('--cookies') + 1],
+                                 str(Path(directory) / 'source.cookies.txt'))
+            self.assertFalse((Path(directory) / 'source.cookies.txt').exists())
+            self.assertEqual((Path(directory) / 'source.info.json').stat().st_mode & 0o777, 0o600)
+
+    def test_invalid_session_never_runs_extractor_or_leaks_cookie_rows(self):
+        cases = ['not a cookie file', '{"session": "fictional-ph-session"}',
+                 '# Netscape HTTP Cookie File\n',
+                 '# Netscape HTTP Cookie File\n.pornhub.com\tFALSE\t/\tTRUE\t0\tsession\tfictional-ph-session\n',
+                 '# Netscape HTTP Cookie File\n.other.test\tTRUE\t/\tTRUE\t0\tsession\tfictional-unrelated\n',
+                 '# Netscape HTTP Cookie File\n.pornhub.com\tTRUE\t/\tTRUE\t1\tsession\tfictional-expired\n']
+        for raw in cases:
+            output = io.StringIO()
+            with self.subTest(raw=raw), patch.dict(os.environ, {'PORNHUB_COOKIES': raw}), \
+                 patch.object(pipeline, '_run') as run, patch.object(app, 'edit_status'), \
+                 patch.object(app, 'send_media_file') as send, redirect_stdout(output), redirect_stderr(output):
+                result = app.process_job(self.payload())
+            self.assertEqual(result['errorCode'], 'SOURCE_SESSION_INVALID')
+            self.assertEqual(result['phase'], 'configuration')
+            for secret in ['fictional-ph-session', 'fictional-unrelated', 'fictional-expired']:
+                self.assertNotIn(secret, output.getvalue() + json.dumps(result))
+            run.assert_not_called()
+            send.assert_not_called()
+
+    def test_session_values_are_redacted_from_error_logs_and_result(self):
+        output = io.StringIO()
+        with patch.dict(os.environ, {'PORNHUB_COOKIES': self.cookies()}), \
+             patch.object(pipeline, '_run', side_effect=subprocess.CalledProcessError(1, 'yt-dlp',
+                          stderr='ERROR: failed fictional-ph-session fictional-unrelated fictional-expired')), \
+             patch.object(app, 'edit_status'), redirect_stdout(output):
+            result = app.process_job(self.payload())
+        for secret in ['fictional-ph-session', 'fictional-unrelated', 'fictional-expired']:
+            self.assertNotIn(secret, output.getvalue() + json.dumps(result))
+        self.assertIn('[redacted]', result['diagnostic'])
 
     def test_selector_accepts_best_quality_above_1080_and_unknown_dimensions(self):
         from yt_dlp import YoutubeDL
@@ -143,6 +213,7 @@ class PornhubTests(unittest.TestCase):
                  ('Requested format is not available', 'SOURCE_FORMAT_UNAVAILABLE'),
                  ('This video is private', 'SOURCE_UNAVAILABLE'),
                  ('Login required', 'SOURCE_AUTH_REQUIRED'),
+                 ('Redirection detected; the video may be deleted or require login', 'SOURCE_REDIRECTED'),
                  ('CERTIFICATE_VERIFY_FAILED', 'SOURCE_TLS_ERROR')]
         for detail, code in cases:
             with self.subTest(code=code), \
@@ -185,6 +256,8 @@ class PornhubTests(unittest.TestCase):
             calls = []
             def run(command, timeout):
                 calls.append(command)
+                cookie_path = Path(command[command.index('--cookies') + 1])
+                self.assertIn('fictional-ph-session', cookie_path.read_text())
                 if '--dump-single-json' in command:
                     if len(calls) == 3:
                         self.assertFalse((folder / 'Pornhub.mp4.part').exists())
@@ -196,10 +269,12 @@ class PornhubTests(unittest.TestCase):
                 path.write_bytes(b'complete fixture')
                 return subprocess.CompletedProcess(command, 0, str(path))
             with patch.object(pipeline, '_run', side_effect=run), \
+                 patch.dict(os.environ, {'PORNHUB_COOKIES': self.cookies()}), \
                  patch.object(app, 'probe_duration', return_value=60), \
                  patch.object(pipeline, '_probe_geometry', return_value=(1280, 720, 16/9)):
                 pornhub.download(self.payload()['url'], folder)
             self.assertEqual(len(calls), 4)
+            self.assertFalse((folder / 'source.cookies.txt').exists())
 
     def test_repeated_rejected_download_links_stop_after_one_refresh(self):
         info = subprocess.CompletedProcess([], 0, json.dumps({'duration': 60}))
@@ -213,9 +288,14 @@ class PornhubTests(unittest.TestCase):
         send.assert_not_called()
 
     def test_real_ytdlp_and_ffprobe_deliver_complete_bytes_despite_a_missing_status_message(self):
+        cookie_headers = []
         class Handler(SimpleHTTPRequestHandler):
             def log_message(self, *args):
                 pass
+
+            def do_GET(self):
+                cookie_headers.append(self.headers.get('Cookie'))
+                super().do_GET()
 
         with tempfile.TemporaryDirectory() as directory:
             video = Path(directory) / 'fixture.mp4'
@@ -242,6 +322,7 @@ class PornhubTests(unittest.TestCase):
                 return {'message_id': 123}
             try:
                 with patch.object(pornhub, 'run_source', side_effect=run), \
+                     patch.dict(os.environ, {'PORNHUB_COOKIES': self.cookies()}), \
                      patch.object(app, 'REAL_YTDLP', str(Path(sys.executable).with_name('yt-dlp'))), \
                      patch.object(app, 'send_media_file', wraps=pipeline.send_media_file), \
                      patch.object(app, 'telegram_call', side_effect=telegram), \
@@ -250,6 +331,8 @@ class PornhubTests(unittest.TestCase):
                     result = app.process_job(self.payload())
                 self.assertTrue(result['ok'], result)
                 self.assertEqual(sent, [video.read_bytes()])
+                self.assertTrue(cookie_headers)
+                self.assertTrue(all(header is None for header in cookie_headers))
             finally:
                 server.shutdown()
                 server.server_close()
