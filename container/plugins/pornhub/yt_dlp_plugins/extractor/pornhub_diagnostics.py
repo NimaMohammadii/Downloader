@@ -1,4 +1,5 @@
 """Observe Pornhub redirects without exposing URLs, page contents or cookies."""
+import os
 import re
 from urllib.parse import parse_qs, urlparse
 
@@ -22,6 +23,24 @@ def redirect_kind(url: str) -> str:
 
 
 class PornHubIE(UpstreamPornHubIE, plugin_name="session_diagnostics"):
+    def _imported_http_only_count(self, cookies):
+        flagged = {(c.domain, c.path, c.name) for c in cookies if c.has_nonstandard_attr('HTTPOnly')}
+        # yt-dlp strips #HttpOnly_ when loading Netscape files. The cookie is
+        # still sent; recover only its diagnostic flag from the private file.
+        cookiefile = self._downloader.params.get('cookiefile')
+        if isinstance(cookiefile, (str, os.PathLike)):
+            try:
+                with open(cookiefile, encoding='utf-8') as handle:
+                    for line in handle:
+                        if line.startswith('#HttpOnly_'):
+                            fields = line[len('#HttpOnly_'):].rstrip('\r\n').split('\t')
+                            if len(fields) == 7:
+                                flagged.add((fields[0], fields[2], fields[5]))
+            except (OSError, UnicodeError):
+                # Diagnostics must never break extraction or expose file data.
+                pass
+        return sum((c.domain, c.path, c.name) in flagged for c in cookies)
+
     def _real_extract(self, url):
         host = self._match_valid_url(url).group('host') or 'pornhub.com'
         target = f'https://www.{host}/view_video.php'
@@ -30,7 +49,7 @@ class PornHubIE(UpstreamPornHubIE, plugin_name="session_diagnostics"):
         self._session_summary = (
             f"suppliedCookies={len(cookies)}; "
             f"matchingCookies={'yes' if self.cookiejar.get_cookie_header(target) else 'no'}; "
-            f"httpOnlyCookies={sum(c.has_nonstandard_attr('HTTPOnly') for c in cookies)}"
+            f"httpOnlyCookies={self._imported_http_only_count(cookies)}"
         )
         return super()._real_extract(url)
 
