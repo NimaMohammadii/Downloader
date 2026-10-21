@@ -3,6 +3,7 @@ node_modules/
 .dev.vars
 .env
 .env.*
+*cookies*.txt
 __pycache__/
 *.pyc
 .DS_Store

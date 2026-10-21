@@ -1,16 +1,23 @@
 """Single-video Pornhub downloads using the shared complete-file Telegram sender."""
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+import warnings
+from contextlib import contextmanager
+from http.cookiejar import LoadError, MozillaCookieJar
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import youtube_app as app
 import youtube_pipeline as pipeline
+
+_COOKIE_LOAD_LOCK = threading.Lock()
 
 
 class DownloadError(app.UserVisibleError):
@@ -27,6 +34,8 @@ def source_error(detail: str) -> tuple[str, str]:
         return "TELEGRAM_FILE_TOO_LARGE", "❌ حجم این ویدیو از سقف ارسال ۲ گیگابایت تلگرام بیشتر است."
     if "429" in detail or "too many requests" in detail:
         return "SOURCE_RATE_LIMITED", "❌ Pornhub درخواست‌های این سرور را موقتاً محدود کرده؛ کمی بعد امتحان کن."
+    if "redirection detected" in detail:
+        return "SOURCE_REDIRECTED", "❌ Pornhub درخواست را به صفحهٔ دیگری هدایت کرد؛ ممکن است تأیید سن یا ورود لازم باشد، یا ویدیو در دسترس نباشد."
     if any(word in detail for word in ("requested format is not available", "no video formats", "only images")):
         return "SOURCE_FORMAT_UNAVAILABLE", "❌ فرمت قابل دانلود این ویدیوی Pornhub دریافت نشد."
     if any(word in detail for word in ("private", "removed", "video unavailable", "404", "not available")):
@@ -70,11 +79,51 @@ def video_url(value: str) -> str:
         raise app.UserVisibleError("❌ لینک مستقیم ویدیوی Pornhub معتبر نیست.") from exc
 
 
+@contextmanager
+def source_cookie_args(workdir: Path):
+    """Use an operator-provided session; never synthesize verification cookies."""
+    raw = os.environ.get("PORNHUB_COOKIES", "")
+    if not raw.strip():
+        yield []
+        return
+    path = workdir / "source.cookies.txt"
+    try:
+        try:
+            # Each concurrent job owns its cookie jar, including yt-dlp updates.
+            with open(path, "x", encoding="utf-8", opener=lambda name, flags: os.open(name, flags, 0o600)) as handle:
+                handle.write(raw)
+            jar = MozillaCookieJar(str(path))
+            # cookiejar's malformed-input warning can contain a full secret row.
+            with _COOKIE_LOAD_LOCK, warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                jar.load(ignore_discard=True, ignore_expires=True)
+            for cookie in list(jar):
+                if not re.fullmatch(r"(?:[a-z0-9-]+\.)*pornhub\.(?:com|org|net)", cookie.domain.removeprefix("."), re.I):
+                    jar.clear(cookie.domain, cookie.path, cookie.name)
+                elif cookie.expires == 0:
+                    # Browser exports and yt-dlp also use zero for session cookies.
+                    cookie.expires, cookie.discard = None, True
+            if not any(not cookie.is_expired() for cookie in jar):
+                raise ValueError("No current Pornhub cookies")
+            jar.save(ignore_discard=True, ignore_expires=False)
+        except (OSError, LoadError, ValueError):
+            raise DownloadError("SOURCE_SESSION_INVALID", "configuration",
+                                "❌ تنظیمات نشست Pornhub معتبر نیست؛ مدیر ربات باید نشست تأییدشده را به‌روزرسانی کند.") from None
+        yield ["--cookies", str(path)]
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def download(url: str, workdir: Path) -> tuple[Path, str]:
     url = video_url(url)
+    with source_cookie_args(workdir) as cookies:
+        return _download(url, workdir, cookies)
+
+
+def _download(url: str, workdir: Path, cookies: list[str]) -> tuple[Path, str]:
     args = [app.REAL_YTDLP, "--ignore-config", "--no-playlist", "--use-extractors", "PornHub",
             "--compat-options", "no-certifi",
-            "--force-ipv4", "--socket-timeout", "15", "--retries", "2", "--fragment-retries", "2"]
+            "--force-ipv4", "--socket-timeout", "15", "--retries", "2", "--fragment-retries", "2", *cookies]
     info_path = workdir / "source.info.json"
     for attempt in range(2):
         info = run_source([*args, "--skip-download", "--dump-single-json", "--", url],
@@ -87,7 +136,8 @@ def download(url: str, workdir: Path) -> tuple[Path, str]:
             raise DownloadError("SOURCE_INVALID_METADATA", "metadata", "❌ اطلاعات ویدیوی Pornhub کامل دریافت نشد.") from exc
         app.validate_video_metadata(metadata)
         # Keep the exact catalog/headers just extracted; do not hit the webpage twice.
-        info_path.write_text(json.dumps(metadata), encoding="utf-8")
+        with open(info_path, "w", encoding="utf-8", opener=lambda name, flags: os.open(name, flags, 0o600)) as handle:
+            json.dump(metadata, handle)
         try:
             result = run_source([
                 *args, "--abort-on-unavailable-fragments", "--max-filesize", str(app.DIRECT_TELEGRAM_LIMIT),
@@ -103,7 +153,7 @@ def download(url: str, workdir: Path) -> tuple[Path, str]:
             if attempt or exc.error_code != "SOURCE_LINK_REJECTED":
                 raise
             for path in workdir.iterdir():
-                if path.is_file():
+                if path.is_file() and path.name != "source.cookies.txt":
                     path.unlink()
 
     path = app.result_path(result, workdir)

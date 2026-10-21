@@ -339,6 +339,13 @@ class UserVisibleError(Exception):
     pass
 
 
+def pornhub_cookie_secrets() -> list[str]:
+    raw = os.environ.get("PORNHUB_COOKIES", "")
+    # Include individual values: an extractor may quote one row, not the jar.
+    return [raw, *(fields[6] for line in raw.splitlines()
+                   if len(fields := line.split("\t", 6)) == 7)]
+
+
 def upload_error_diagnostic(exc: BaseException, token: str) -> dict[str, Any]:
     if isinstance(exc, BaseExceptionGroup):
         children = [upload_error_diagnostic(child, token) for child in exc.exceptions[:3]]
@@ -347,8 +354,10 @@ def upload_error_diagnostic(exc: BaseException, token: str) -> dict[str, Any]:
     detail = str(getattr(exc, "message", None) or str(exc))
     if isinstance(exc, subprocess.SubprocessError):
         detail = "subprocess failed"  # Commands can contain signed URLs and account headers.
-    for secret in (token, os.environ.get("API_HASH", ""), os.environ.get("INSTAGRAM_SESSIONID", ""),
-                   os.environ.get("TELEGRAM_BOT_SESSION", ""), os.environ.get("TELEGRAM_SESSION_TOKEN", "")):
+    secrets_to_redact = (token, os.environ.get("API_HASH", ""), os.environ.get("INSTAGRAM_SESSIONID", ""),
+                        os.environ.get("TELEGRAM_BOT_SESSION", ""), os.environ.get("TELEGRAM_SESSION_TOKEN", ""),
+                        *pornhub_cookie_secrets())
+    for secret in sorted(set(secrets_to_redact), key=len, reverse=True):
         if secret:
             detail = detail.replace(secret, "[redacted]")
     detail = re.sub(r"https?://[^\s\"'<>]+", "[url]", detail)
