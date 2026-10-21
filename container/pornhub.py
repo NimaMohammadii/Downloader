@@ -10,7 +10,7 @@ import threading
 import time
 import warnings
 from contextlib import contextmanager
-from http.cookiejar import LoadError, MozillaCookieJar
+from http.cookiejar import Cookie, LoadError, MozillaCookieJar
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -79,6 +79,59 @@ def video_url(value: str) -> str:
         raise app.UserVisibleError("❌ لینک مستقیم ویدیوی Pornhub معتبر نیست.") from exc
 
 
+def session_error(reason: str, message: str) -> DownloadError:
+    # Only fixed reason tags leave this parser; exceptions may contain cookie rows.
+    return DownloadError("SOURCE_SESSION_INVALID", "configuration", message,
+                         f"cookieExportReason={reason}")
+
+
+def cookie_domain(domain: str) -> bool:
+    return bool(re.fullmatch(r"(?:[a-z0-9-]+\.)*pornhub\.(?:com|org|net)", domain.removeprefix("."), re.I))
+
+
+def json_cookie_jar(raw: str, path: Path) -> MozillaCookieJar:
+    """Convert browser exports locally, preserving domain scope and real expiry."""
+    try:
+        entries = json.loads(raw)
+        if isinstance(entries, dict):
+            entries = entries.get("cookies")
+        if not isinstance(entries, list):
+            raise ValueError()
+        jar = MozillaCookieJar(str(path))
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("domain"), str):
+                raise ValueError()
+            domain = entry["domain"].lower()
+            if not cookie_domain(domain):
+                continue
+            name, value, cookie_path = entry.get("name"), entry.get("value"), entry.get("path", "/")
+            if (not all(isinstance(field, str) for field in (name, value, cookie_path))
+                    or not name or not cookie_path.startswith("/")
+                    or any(re.search(r"[\x00-\x1f\x7f]", field) for field in (name, value, cookie_path))):
+                raise ValueError()
+            for flag in ("hostOnly", "secure", "httpOnly", "session"):
+                if flag in entry and not isinstance(entry[flag], bool):
+                    raise ValueError()
+            if "hostOnly" in entry:
+                domain = domain.removeprefix(".") if entry["hostOnly"] else "." + domain.removeprefix(".")
+            expires = entry.get("expirationDate", entry.get("expires"))
+            if isinstance(expires, bool):
+                raise ValueError()
+            if entry.get("session") or expires is None or expires == "" or expires == 0:
+                expires = None
+            else:
+                if not math.isfinite(float(expires)):
+                    raise ValueError()
+                expires = int(float(expires))
+            jar.set_cookie(Cookie(0, name, value, None, False, domain, domain.startswith("."),
+                                  domain.startswith("."), cookie_path, True, entry.get("secure", False),
+                                  expires, expires is None, None, None,
+                                  {"HTTPOnly": ""} if entry.get("httpOnly") else {}))
+        return jar
+    except (ValueError, TypeError, OverflowError):
+        raise session_error("json_invalid", "❌ خروجی JSON کوکی Pornhub ناقص یا نامعتبر است؛ محتوای کامل خروجی کوکی‌ها را در PORNHUB_COOKIES قرار بده.") from None
+
+
 @contextmanager
 def source_cookie_args(workdir: Path):
     """Use an operator-provided session; never synthesize verification cookies."""
@@ -86,29 +139,43 @@ def source_cookie_args(workdir: Path):
     if not raw.strip():
         yield []
         return
+    # Clipboard exports can include a BOM and leading blank lines. Preserve
+    # trailing tabs/values: stripping the whole file corrupts empty values.
+    raw = raw.lstrip("\ufeff \t\r\n")
     path = workdir / "source.cookies.txt"
     try:
         try:
             # Each concurrent job owns its cookie jar, including yt-dlp updates.
             with open(path, "x", encoding="utf-8", opener=lambda name, flags: os.open(name, flags, 0o600)) as handle:
-                handle.write(raw)
-            jar = MozillaCookieJar(str(path))
-            # cookiejar's malformed-input warning can contain a full secret row.
-            with _COOKIE_LOAD_LOCK, warnings.catch_warnings():
-                warnings.simplefilter("ignore", UserWarning)
-                jar.load(ignore_discard=True, ignore_expires=True)
+                if not raw.startswith(("[", "{")):
+                    handle.write(raw)
+            if raw.startswith(("[", "{")):
+                jar = json_cookie_jar(raw, path)
+            else:
+                if not raw.startswith("#"):
+                    raise session_error("format_unknown", "❌ قالب کوکی Pornhub شناخته نشد؛ محتوای کامل خروجی Netscape cookies.txt یا JSON را در PORNHUB_COOKIES قرار بده.")
+                jar = MozillaCookieJar(str(path))
+                try:
+                    # cookiejar's malformed-input warning can contain a full secret row.
+                    with _COOKIE_LOAD_LOCK, warnings.catch_warnings():
+                        warnings.simplefilter("ignore", UserWarning)
+                        jar.load(ignore_discard=True, ignore_expires=True)
+                except (LoadError, ValueError):
+                    raise session_error("netscape_invalid", "❌ قالب فایل cookies.txt معتبر نیست؛ محتوای کامل فایل با خط اول و جداکننده‌های اصلی را وارد کن، یا خروجی JSON بگیر.") from None
             for cookie in list(jar):
-                if not re.fullmatch(r"(?:[a-z0-9-]+\.)*pornhub\.(?:com|org|net)", cookie.domain.removeprefix("."), re.I):
+                if not cookie_domain(cookie.domain):
                     jar.clear(cookie.domain, cookie.path, cookie.name)
                 elif cookie.expires == 0:
                     # Browser exports and yt-dlp also use zero for session cookies.
                     cookie.expires, cookie.discard = None, True
+            if not list(jar):
+                raise session_error("no_pornhub_cookies", "❌ کوکیِ دامنه‌های Pornhub در این خروجی پیدا نشد؛ پس از ورود و تأیید سن، از همان سایت خروجی تازه بگیر.")
             if not any(not cookie.is_expired() for cookie in jar):
-                raise ValueError("No current Pornhub cookies")
+                raise session_error("all_expired", "❌ همهٔ کوکی‌های Pornhub در این خروجی منقضی شده‌اند؛ از نشست فعلی مرورگر خروجی تازه بگیر.")
             jar.save(ignore_discard=True, ignore_expires=False)
-        except (OSError, LoadError, ValueError):
-            raise DownloadError("SOURCE_SESSION_INVALID", "configuration",
-                                "❌ تنظیمات نشست Pornhub معتبر نیست؛ مدیر ربات باید نشست تأییدشده را به‌روزرسانی کند.") from None
+        except OSError:
+            raise DownloadError("SOURCE_SESSION_STORAGE_ERROR", "configuration",
+                                "❌ آماده‌سازی فایل موقت نشست Pornhub روی سرور ناموفق بود.") from None
         yield ["--cookies", str(path)]
     finally:
         path.unlink(missing_ok=True)

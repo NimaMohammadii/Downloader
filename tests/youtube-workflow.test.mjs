@@ -102,21 +102,25 @@ test('five simultaneous cold starts share one startup and a failed startup can b
 });
 
 test('Pornhub session is supplied only through the container environment', async () => {
-  const raw = '# Netscape HTTP Cookie File\n.pornhub.com\tTRUE\t/\tTRUE\t0\tsession\tfictional-ph-session\n';
-  const container = new YoutubeDownloaderContainer({ storage: memoryStorage() }, { BOT_TOKEN: 'fake', PORNHUB_COOKIES: raw });
-  container.startAndWaitForPorts = async () => {};
-  await container.startShared(0);
-  assert.equal(container.envVars.PORNHUB_COOKIES, raw);
-  const logs = [], previous = console.error;
-  try {
-    console.error = (message, detail) => logs.push({ message, detail });
-    await run({ pornhub: true, pornhubCookies: raw, result: { ok: false, phase: 'metadata',
-      errorCode: 'SOURCE_REDIRECTED', diagnostic: `ERROR: fictional-ph-session ${raw}` } });
-    const failure = logs.find(x => x.message === 'pornhub download rejected');
-    assert.equal(failure.detail.code, 'SOURCE_REDIRECTED');
-    assert.ok(!JSON.stringify(logs).includes('fictional-ph-session'));
-    assert.ok(failure.detail.detail.includes('[redacted]'));
-  } finally { console.error = previous; }
+  const entries = [{ domain: '.pornhub.com', name: 'session', value: 'fictional-ph-session' }];
+  const exports = ['# Netscape HTTP Cookie File\n.pornhub.com\tTRUE\t/\tTRUE\t0\tsession\tfictional-ph-session\n',
+    JSON.stringify(entries), '\uFEFF' + JSON.stringify({ cookies: entries }).replace('fictional-ph-session', 'fictional-ph-\\u0073ession')];
+  for (const raw of exports) {
+    const container = new YoutubeDownloaderContainer({ storage: memoryStorage() }, { BOT_TOKEN: 'fake', PORNHUB_COOKIES: raw });
+    container.startAndWaitForPorts = async () => {};
+    await container.startShared(0);
+    assert.equal(container.envVars.PORNHUB_COOKIES, raw);
+    const logs = [], previous = console.error;
+    try {
+      console.error = (message, detail) => logs.push({ message, detail });
+      await run({ pornhub: true, pornhubCookies: raw, result: { ok: false, phase: 'metadata',
+        errorCode: 'SOURCE_REDIRECTED', diagnostic: `ERROR: fictional-ph-session ${raw}` } });
+      const failure = logs.find(x => x.message === 'pornhub download rejected');
+      assert.equal(failure.detail.code, 'SOURCE_REDIRECTED');
+      assert.ok(!JSON.stringify(logs).includes('fictional-ph-session'));
+      assert.ok(failure.detail.detail.includes('[redacted]'));
+    } finally { console.error = previous; }
+  }
 });
 
 test('authorized sessions survive cold starts only on their own Container and matching credentials', async () => {

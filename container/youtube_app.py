@@ -342,8 +342,18 @@ class UserVisibleError(Exception):
 def pornhub_cookie_secrets() -> list[str]:
     raw = os.environ.get("PORNHUB_COOKIES", "")
     # Include individual values: an extractor may quote one row, not the jar.
-    return [raw, *(fields[6] for line in raw.splitlines()
-                   if len(fields := line.split("\t", 6)) == 7)]
+    values = [raw, *(fields[6] for line in raw.splitlines()
+                     if len(fields := line.split("\t", 6)) == 7)]
+    try:
+        entries = json.loads(raw.lstrip("\ufeff \t\r\n"))
+        if isinstance(entries, dict):
+            entries = entries.get("cookies")
+        if isinstance(entries, list):
+            values.extend(entry["value"] for entry in entries
+                          if isinstance(entry, dict) and isinstance(entry.get("value"), str))
+    except ValueError:
+        pass
+    return values
 
 
 def upload_error_diagnostic(exc: BaseException, token: str) -> dict[str, Any]:

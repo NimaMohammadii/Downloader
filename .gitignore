@@ -4,6 +4,7 @@ node_modules/
 .env
 .env.*
 *cookies*.txt
+*cookies*.json
 __pycache__/
 *.pyc
 .DS_Store

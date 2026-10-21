@@ -413,6 +413,13 @@ async function sendCachedMedia(env: Env, job: YoutubeDownloadJob, statusId?: num
 function redactDiagnostic(detail: string, env: Env): string {
   const cookieValues = (env.PORNHUB_COOKIES || "").split(/\r?\n/)
     .map(line => line.split("\t")).filter(fields => fields.length === 7).map(fields => fields[6]);
+  try {
+    const exported = JSON.parse((env.PORNHUB_COOKIES || "").replace(/^[\uFEFF \t\r\n]+/, ""));
+    const entries = Array.isArray(exported) ? exported : exported?.cookies;
+    if (Array.isArray(entries)) {
+      for (const entry of entries) if (typeof entry?.value === "string") cookieValues.push(entry.value);
+    }
+  } catch { /* Invalid exports are reported without their contents by the Container. */ }
   const secrets = [env.BOT_TOKEN, env.API_HASH, env.INSTAGRAM_SESSIONID, env.PORNHUB_COOKIES, ...cookieValues]
     .filter((secret): secret is string => Boolean(secret)).sort((a, b) => b.length - a.length);
   for (const secret of secrets) {

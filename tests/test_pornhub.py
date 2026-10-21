@@ -27,6 +27,13 @@ class PornhubTests(unittest.TestCase):
                 '.pornhub.com\tTRUE\t/\tTRUE\t1\told\tfictional-expired\n'
                 '.other.test\tTRUE\t/\tTRUE\t0\tsession\tfictional-unrelated\n')
 
+    def json_cookies(self):
+        return [{'domain': '.pornhub.com', 'hostOnly': False, 'path': '/', 'secure': True,
+                 'httpOnly': True, 'session': True, 'name': 'session', 'value': 'fictional-ph-session'},
+                {'domain': '.pornhub.com', 'path': '/', 'expirationDate': 1,
+                 'name': 'old', 'value': 'fictional-expired'},
+                {'domain': '.other.test', 'name': 'session', 'value': 'fictional-unrelated'}]
+
     def payload(self):
         return {'id': 'ytdl-42-7-42', 'source': 'pornhub', 'url': 'https://pornhub.com/embed/ph123',
                 'botToken': 'fictional', 'chatId': 42, 'requestMessageId': 7, 'statusMessageId': 10}
@@ -157,13 +164,58 @@ class PornhubTests(unittest.TestCase):
             self.assertFalse((Path(directory) / 'source.cookies.txt').exists())
             self.assertEqual((Path(directory) / 'source.info.json').stat().st_mode & 0o777, 0o600)
 
+    def test_mobile_exports_preserve_cookie_values_flags_and_scope(self):
+        exports = ['\ufeff\r\n' + self.cookies().replace('\n', '\r\n'),
+                   json.dumps(self.json_cookies()), '\ufeff \t\n' + json.dumps({'cookies': self.json_cookies()})]
+        for raw in exports:
+            with self.subTest(format=raw[:1]), tempfile.TemporaryDirectory() as directory, \
+                 patch.dict(os.environ, {'PORNHUB_COOKIES': raw}):
+                with pornhub.source_cookie_args(Path(directory)) as args:
+                    path = Path(args[1])
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                    jar = MozillaCookieJar(str(path))
+                    jar.load(ignore_discard=True)
+                    cookies = list(jar)
+                    self.assertEqual(len(cookies), 1)
+                    cookie = cookies[0]
+                    self.assertEqual((cookie.name, cookie.value, cookie.domain),
+                                     ('session', 'fictional-ph-session', '.pornhub.com'))
+                    self.assertTrue(cookie.secure)
+                    self.assertTrue(cookie.has_nonstandard_attr('HTTPOnly'))
+                    self.assertIsNone(cookie.expires)
+                self.assertFalse(path.exists())
+
+    def test_json_expiry_and_host_only_scope_are_preserved(self):
+        expires = int(time.time()) + 600
+        entries = [{'domain': '.www.pornhub.org', 'hostOnly': True, 'path': '/',
+                    'name': 'host-session', 'value': 'host-value', 'expires': expires},
+                   {'domain': 'pornhub.net', 'hostOnly': False, 'path': '/',
+                    'name': 'domain-session', 'value': 'domain-value', 'expirationDate': 0}]
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(os.environ, {'PORNHUB_COOKIES': json.dumps(entries)}):
+            with pornhub.source_cookie_args(Path(directory)) as args:
+                jar = MozillaCookieJar(args[1])
+                jar.load(ignore_discard=True)
+                host, domain = list(jar)
+                self.assertEqual((host.domain, host.domain_specified, host.expires),
+                                 ('www.pornhub.org', False, expires))
+                self.assertEqual((domain.domain, domain.domain_specified, domain.expires),
+                                 ('.pornhub.net', True, None))
+
     def test_invalid_session_never_runs_extractor_or_leaks_cookie_rows(self):
-        cases = ['not a cookie file', '{"session": "fictional-ph-session"}',
-                 '# Netscape HTTP Cookie File\n',
-                 '# Netscape HTTP Cookie File\n.pornhub.com\tFALSE\t/\tTRUE\t0\tsession\tfictional-ph-session\n',
-                 '# Netscape HTTP Cookie File\n.other.test\tTRUE\t/\tTRUE\t0\tsession\tfictional-unrelated\n',
-                 '# Netscape HTTP Cookie File\n.pornhub.com\tTRUE\t/\tTRUE\t1\tsession\tfictional-expired\n']
-        for raw in cases:
+        cases = [('not a cookie file', 'format_unknown'),
+                 ('session=fictional-ph-session;', 'format_unknown'),
+                 ('{"session": "fictional-ph-session"}', 'json_invalid'),
+                 ('[{"domain": ".pornhub.com", "value": "fictional-ph-session"}]', 'json_invalid'),
+                 (json.dumps([{**self.json_cookies()[0], 'value': 'fictional-ph-session\nInjected'}]), 'json_invalid'),
+                 (json.dumps([{**self.json_cookies()[0], 'session': False, 'expires': 'bad', 'expirationDate': 'NaN'}]), 'json_invalid'),
+                 ('[]', 'no_pornhub_cookies'),
+                 (json.dumps([self.json_cookies()[1]]), 'all_expired'),
+                 ('# Netscape HTTP Cookie File\n', 'no_pornhub_cookies'),
+                 ('# Netscape HTTP Cookie File\n.pornhub.com\tFALSE\t/\tTRUE\t0\tsession\tfictional-ph-session\n', 'netscape_invalid'),
+                 ('# Netscape HTTP Cookie File\n.other.test\tTRUE\t/\tTRUE\t0\tsession\tfictional-unrelated\n', 'no_pornhub_cookies'),
+                 ('# Netscape HTTP Cookie File\n.pornhub.com\tTRUE\t/\tTRUE\t1\tsession\tfictional-expired\n', 'all_expired')]
+        for raw, reason in cases:
             output = io.StringIO()
             with self.subTest(raw=raw), patch.dict(os.environ, {'PORNHUB_COOKIES': raw}), \
                  patch.object(pipeline, '_run') as run, patch.object(app, 'edit_status'), \
@@ -171,21 +223,34 @@ class PornhubTests(unittest.TestCase):
                 result = app.process_job(self.payload())
             self.assertEqual(result['errorCode'], 'SOURCE_SESSION_INVALID')
             self.assertEqual(result['phase'], 'configuration')
+            self.assertEqual(result['diagnostic'], f'cookieExportReason={reason}')
             for secret in ['fictional-ph-session', 'fictional-unrelated', 'fictional-expired']:
                 self.assertNotIn(secret, output.getvalue() + json.dumps(result))
             run.assert_not_called()
             send.assert_not_called()
 
     def test_session_values_are_redacted_from_error_logs_and_result(self):
+        for raw in [self.cookies(), json.dumps(self.json_cookies()), '\ufeff' + json.dumps({'cookies': self.json_cookies()})]:
+            output = io.StringIO()
+            with self.subTest(format=raw[:1]), patch.dict(os.environ, {'PORNHUB_COOKIES': raw}), \
+                 patch.object(pipeline, '_run', side_effect=subprocess.CalledProcessError(1, 'yt-dlp',
+                              stderr='ERROR: failed fictional-ph-session fictional-unrelated fictional-expired')), \
+                 patch.object(app, 'edit_status'), redirect_stdout(output):
+                result = app.process_job(self.payload())
+            for secret in ['fictional-ph-session', 'fictional-unrelated', 'fictional-expired']:
+                self.assertNotIn(secret, output.getvalue() + json.dumps(result))
+            self.assertIn('[redacted]', result['diagnostic'])
+
+    def test_cookie_storage_failure_is_not_reported_as_an_invalid_export(self):
         output = io.StringIO()
         with patch.dict(os.environ, {'PORNHUB_COOKIES': self.cookies()}), \
-             patch.object(pipeline, '_run', side_effect=subprocess.CalledProcessError(1, 'yt-dlp',
-                          stderr='ERROR: failed fictional-ph-session fictional-unrelated fictional-expired')), \
-             patch.object(app, 'edit_status'), redirect_stdout(output):
+             patch('builtins.open', side_effect=PermissionError('fictional-ph-session')), \
+             patch.object(pipeline, '_run') as run, patch.object(app, 'edit_status'), redirect_stdout(output):
             result = app.process_job(self.payload())
-        for secret in ['fictional-ph-session', 'fictional-unrelated', 'fictional-expired']:
-            self.assertNotIn(secret, output.getvalue() + json.dumps(result))
-        self.assertIn('[redacted]', result['diagnostic'])
+        self.assertEqual(result['errorCode'], 'SOURCE_SESSION_STORAGE_ERROR')
+        self.assertEqual(result['phase'], 'configuration')
+        self.assertNotIn('fictional-ph-session', output.getvalue() + json.dumps(result))
+        run.assert_not_called()
 
     def test_selector_accepts_best_quality_above_1080_and_unknown_dimensions(self):
         from yt_dlp import YoutubeDL
@@ -322,7 +387,7 @@ class PornhubTests(unittest.TestCase):
                 return {'message_id': 123}
             try:
                 with patch.object(pornhub, 'run_source', side_effect=run), \
-                     patch.dict(os.environ, {'PORNHUB_COOKIES': self.cookies()}), \
+                     patch.dict(os.environ, {'PORNHUB_COOKIES': json.dumps(self.json_cookies())}), \
                      patch.object(app, 'REAL_YTDLP', str(Path(sys.executable).with_name('yt-dlp'))), \
                      patch.object(app, 'send_media_file', wraps=pipeline.send_media_file), \
                      patch.object(app, 'telegram_call', side_effect=telegram), \
