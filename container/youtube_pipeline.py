@@ -10,6 +10,9 @@ import subprocess
 import sys
 import time
 import unicodedata
+import warnings
+from contextlib import contextmanager
+from http.cookiejar import MozillaCookieJar, LoadError
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urljoin, parse_qsl, urlencode
@@ -986,8 +989,11 @@ def social_error(platform: str, detail: str) -> app.UserVisibleError:
     s = detail.lower()
     if any(x in s for x in ("429", "rate limit", "ip address is blocked", "captcha", "challenge", "403", "sign in", "login", "log in", "authorization", "private")):
         return app.UserVisibleError(f"❌ {name} دسترسی این سرور به پست را نپذیرفت یا پست نیاز به ورود دارد؛ دانلود انجام نشد.")
-    if (any(x in s for x in ("404", "not found", "deleted", "unavailable", "no video", "empty"))
-            or (platform == "pinterest" and any(x in s for x in ("notfounderror", "requested pin could not be found")))):
+    if platform == "pinterest" and any(x in s for x in ("404", "not found", "notfounderror", "requested pin could not be found")):
+        # Pinterest can conceal an inaccessible Pin behind a not-found response.
+        # This does not establish that the post was deleted.
+        return app.UserVisibleError("❌ Pinterest اطلاعات این پست را به سرور نداد؛ نشست حساب Pinterest و دسترسی آن به پست باید بررسی شود.")
+    if any(x in s for x in ("404", "not found", "deleted", "unavailable", "no video", "empty")):
         return app.UserVisibleError(f"❌ پست {name} حذف شده، در دسترس نیست یا رسانهٔ قابل دانلود ندارد.")
     return app.UserVisibleError(f"❌ دریافت فایل {name} کامل نشد؛ لینک عمومی پست یا آهنگ را دوباره بفرست.")
 
@@ -1154,11 +1160,70 @@ def aparat_entries(url: str) -> list[dict[str, Any]]:
         raise social_error("aparat", type(exc).__name__) from exc
 
 
+@contextmanager
+def pinterest_cookie_args(platform: str):
+    """Import browser cookies into the same native extractor, scoped to Pinterest."""
+    raw = os.environ.get("PINTEREST_COOKIES", "").lstrip("\ufeff \t\r\n") if platform == "pinterest" else ""
+    if not raw:
+        yield []
+        return
+    with tempfile.TemporaryDirectory(prefix="pinterest-cookies-") as directory:
+        path = Path(directory) / "cookies.txt"
+        path.touch(mode=0o600)
+        try:
+            if len(raw) > 1_000_000:
+                raise ValueError()
+            if raw.startswith(("[", "{")):
+                entries = json.loads(raw)
+                if isinstance(entries, dict):
+                    entries = entries.get("cookies")
+                if not isinstance(entries, list):
+                    raise ValueError()
+                rows = ["# Netscape HTTP Cookie File"]
+                for cookie in entries:
+                    if not isinstance(cookie, dict):
+                        raise ValueError()
+                    domain = cookie.get("domain", ".pinterest.com")
+                    name, value = cookie.get("name"), cookie.get("value")
+                    cookie_path = cookie.get("path", "/")
+                    if not all(isinstance(v, str) and not re.search(r"[\x00-\x1f\x7f]", v)
+                               for v in (domain, name, value, cookie_path)):
+                        raise ValueError()
+                    if cookie.get("httpOnly"):
+                        domain = "#HttpOnly_" + domain
+                    expires = int(cookie.get("expirationDate") or cookie.get("expires") or 0)
+                    rows.append("\t".join((domain, "TRUE" if cookie.get("domain", ".pinterest.com").startswith(".") else "FALSE",
+                                           cookie_path, "TRUE" if cookie.get("secure", True) else "FALSE",
+                                           str(max(0, expires)), name, value)))
+                raw = "\n".join(rows) + "\n"
+            path.write_text(raw, encoding="utf-8")
+            jar = MozillaCookieJar(str(path))
+            # The stdlib warns with parser exception text on malformed files;
+            # that text can contain a cookie value. Return only our safe error.
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="http.cookiejar bug!.*", category=UserWarning)
+                jar.load(ignore_discard=True, ignore_expires=True)
+            for cookie in list(jar):
+                domain = cookie.domain.lstrip(".").lower()
+                allowed = any(domain == "pinterest." + d or domain.endswith(".pinterest." + d) for d in PINTEREST_DOMAINS)
+                if not allowed or (cookie.expires and cookie.expires <= time.time()):
+                    jar.clear(cookie.domain, cookie.path, cookie.name)
+                elif cookie.expires == 0:
+                    cookie.expires, cookie.discard = None, True
+            if not any(c.name == "_pinterest_sess" and c.value for c in jar):
+                raise ValueError()
+            jar.save(ignore_discard=True, ignore_expires=True)
+        except (ValueError, TypeError, OverflowError, OSError, LoadError):
+            raise app.UserVisibleError("❌ کوکی Pinterest نامعتبر یا منقضی است؛ خروجی کامل و تازهٔ cookies.txt یا JSON حساب واردشده را در PINTEREST_COOKIES قرار بده.") from None
+        yield ["--cookies", str(path)]
+
+
 def social_gallery_entries(url: str, platform: str) -> list[dict[str, Any]]:
-    data = social_json([sys.executable, "-m", "gallery_dl", "--config-ignore", "--no-input", "--dump-json",
+    with pinterest_cookie_args(platform) as cookie_args:
+        data = social_json([sys.executable, "-m", "gallery_dl", "--config-ignore", "--no-input", "--dump-json",
                         "--range", f"1-{SOCIAL_MAX_ITEMS + 1}", "--retries", "1", "--http-timeout", "15",
                         "-o", "extractor.tiktok.audio=false", "-o", "extractor.tiktok.covers=false",
-                        "-o", "output.private=true", "--", url], platform)
+                        "-o", "output.private=true", *cookie_args, "--", url], platform)
     entries = []
     for row in data if isinstance(data, list) else []:
         if not isinstance(row, list) or len(row) != 3 or row[0] != 3 or not isinstance(row[2], dict):

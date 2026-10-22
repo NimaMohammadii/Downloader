@@ -62,6 +62,15 @@ function poolBinding() {
   return { getByName() { return pool; } };
 }
 
+test('Pinterest browser cookies reach only the container environment without changing existing secrets', () => {
+  const raw=JSON.stringify([{domain:'.pinterest.com',name:'_pinterest_sess',value:'fixture-pinterest-session'}]);
+  const instance=new YoutubeDownloaderContainer({storage:memoryStorage()}, {PINTEREST_COOKIES:raw,API_ID:'123',API_HASH:'fixture-hash'});
+  assert.equal(instance.envVars.PINTEREST_COOKIES,raw);
+  assert.equal(instance.envVars.API_ID,'123');
+  assert.equal(instance.envVars.API_HASH,'fixture-hash');
+  assert.equal(new YoutubeDownloaderContainer({storage:memoryStorage()},{}).envVars.PINTEREST_COOKIES,'');
+});
+
 test('100 simultaneous admissions use exactly 20 hosts and five slots per host', async () => {
   const storage = memoryStorage();
   const pool = new DownloadPool({ storage }, {});

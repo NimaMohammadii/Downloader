@@ -66,6 +66,7 @@ type Env = AdminStatsEnv & {
   API_ID?: string;
   API_HASH?: string;
   PORNHUB_COOKIES?: string;
+  PINTEREST_COOKIES?: string;
   YOUTUBE_DOWNLOAD_WORKFLOW: Workflow<YoutubeDownloadJob>;
   YOUTUBE_DOWNLOADER_CONTAINER: DurableObjectNamespace<YoutubeDownloaderContainer>;
   DOWNLOAD_POOL: DurableObjectNamespace<DownloadPool>;
@@ -222,6 +223,7 @@ export class YoutubeDownloaderContainer extends Container<Env> {
   envVars: Record<string, string> = {
     API_ID: this.env.API_ID || "", API_HASH: this.env.API_HASH || "",
     PORNHUB_COOKIES: this.env.PORNHUB_COOKIES || "",
+    PINTEREST_COOKIES: this.env.PINTEREST_COOKIES || "",
   };
   private starting?: Promise<void>;
   private idleShutdownRequested = false;

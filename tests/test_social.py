@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+import warnings
 from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'container'))
@@ -159,8 +160,9 @@ class SocialBoundaryTests(unittest.TestCase):
         # metadata API returns HTTP 404/code 50 before any media is downloaded.
         data=[[-1,{'error':'NotFoundError','message':'Requested pin could not be found'}]]
         command=[sys.executable,'-c',f'print({json.dumps(data)!r})']
-        with self.assertRaisesRegex(app.UserVisibleError,'پست Pinterest حذف شده، در دسترس نیست'):
+        with self.assertRaisesRegex(app.UserVisibleError,'نشست حساب Pinterest'):
             p.social_json(command,'pinterest')
+        self.assertNotIn('حذف شده',str(p.social_error('pinterest','404 Pin not found.')))
         self.assertIn('دریافت فایل',str(p.social_error('pinterest','TimeoutExpired')))
         self.assertIn('دسترسی',str(p.social_error('pinterest','NotFoundError: private pin, login required')))
 
@@ -171,6 +173,99 @@ class SocialBoundaryTests(unittest.TestCase):
             with self.assertRaises(app.UserVisibleError):p.social_json(command(data),'pinterest')
         with self.assertRaises(app.UserVisibleError):p.social_json(command('{}',1),'x')
         with self.assertRaises(app.UserVisibleError):p.social_json([sys.executable,'-c','print("a"*12000001)'],'x')
+
+
+class PinterestSessionTests(unittest.TestCase):
+    session='fixture-pinterest-session'
+
+    def exports(self):
+        cookies=[{'domain':'.pinterest.com','name':'_pinterest_sess','value':self.session,
+                  'path':'/','secure':True,'httpOnly':True,'expirationDate':time.time()+3600},
+                 {'domain':'.pinterest.com','name':'csrftoken','value':'fixture-csrf','path':'/'},
+                 {'domain':'.other.example','name':'unrelated','value':'never-forward','path':'/'}]
+        netscape=('# Netscape HTTP Cookie File\n'
+                  '#HttpOnly_.pinterest.com\tTRUE\t/\tTRUE\t0\t_pinterest_sess\t'+self.session+'\n'
+                  '.pinterest.com\tTRUE\t/\tTRUE\t0\tcsrftoken\tfixture-csrf\n'
+                  '.other.example\tTRUE\t/\tTRUE\t0\tunrelated\tnever-forward\n')
+        return [netscape,json.dumps(cookies),'\ufeff'+json.dumps({'cookies':cookies})]
+
+    def test_native_extractor_receives_session_in_private_file_and_removes_it(self):
+        from gallery_dl import config
+        from gallery_dl.extractor import find
+        from requests import Response
+        from http.cookiejar import MozillaCookieJar
+        for raw in self.exports():
+            config.clear()
+            requests=[]
+            def send(_session,request,**kwargs):
+                requests.append(request)
+                self.assertEqual(request.url.split('?')[0],'https://www.pinterest.com/resource/PinResource/get/')
+                self.assertIn('_pinterest_sess='+self.session,request.headers['Cookie'])
+                self.assertNotIn('never-forward',request.headers['Cookie'])
+                r=Response();r.status_code=200;r.url=request.url
+                r._content=json.dumps({'resource_response':{'data':{'id':'929360073127369107',
+                    'images':{'orig':{'url':'https://i.pinimg.com/originals/fixture.jpg'}}}}}).encode()
+                return r
+            try:
+                with patch.dict(os.environ,{'PINTEREST_COOKIES':raw}),p.pinterest_cookie_args('pinterest') as args:
+                    self.assertEqual(args[0],'--cookies');path=Path(args[1])
+                    self.assertEqual(path.stat().st_mode & 0o777,0o600)
+                    jar=MozillaCookieJar(str(path));jar.load(ignore_discard=True,ignore_expires=True)
+                    self.assertTrue(all(c.domain.endswith('pinterest.com') for c in jar))
+                    self.assertNotIn(self.session,str(args))
+                    config.set(('extractor',),'cookies',str(path))
+                    with patch.object(p.requests.Session,'send',send):
+                        rows=list(find('https://www.pinterest.com/pin/929360073127369107/'))
+                    self.assertEqual([row[1] for row in rows if row[0]==3],['https://i.pinimg.com/originals/fixture.jpg'])
+                self.assertEqual(len(requests),1)
+                self.assertFalse(path.exists())
+                self.assertFalse(path.parent.exists())
+            finally:config.clear()
+
+    def test_cookie_file_is_removed_when_extractor_fails(self):
+        with patch.dict(os.environ,{'PINTEREST_COOKIES':self.exports()[0]}):
+            with self.assertRaisesRegex(app.UserVisibleError,'fixture failure'):
+                with p.pinterest_cookie_args('pinterest') as args:
+                    path=Path(args[1]);raise app.UserVisibleError('fixture failure')
+            self.assertFalse(path.exists())
+
+    def test_malformed_netscape_values_never_escape_through_stdlib_warnings(self):
+        raw=('# Netscape HTTP Cookie File\n.pinterest.com\tTRUE\t/\tTRUE\t'+self.session+'\t_pinterest_sess\t'+self.session+'\n')
+        with warnings.catch_warnings(record=True) as seen,patch.dict(os.environ,{'PINTEREST_COOKIES':raw}):
+            warnings.simplefilter('always')
+            with self.assertRaises(app.UserVisibleError) as error:
+                with p.pinterest_cookie_args('pinterest'):self.fail('invalid cookies accepted')
+            self.assertNotIn(self.session,str(error.exception))
+            self.assertEqual(seen,[])
+
+    def test_missing_session_expired_malformed_and_foreign_exports_stop_before_extraction(self):
+        exports=['invalid export','[{"name":"_pinterest_sess","value":"secret\\nvalue"}]',
+                 json.dumps([{'domain':'.evil.example','name':'_pinterest_sess','value':self.session}]),
+                 json.dumps([{'name':'_pinterest_sess','value':self.session,'expirationDate':1}]),
+                 json.dumps([{'name':'csrftoken','value':'missing-session'}]),'x'*1_000_001]
+        for raw in exports:
+            with self.subTest(raw=raw[:50]),patch.dict(os.environ,{'PINTEREST_COOKIES':raw}),patch.object(p,'social_json') as extract:
+                with self.assertRaisesRegex(app.UserVisibleError,'PINTEREST_COOKIES') as error:
+                    p.social_gallery_entries('https://www.pinterest.com/pin/123/','pinterest')
+                self.assertNotIn(self.session,str(error.exception))
+                extract.assert_not_called()
+
+    def test_existing_gallery_command_passes_only_the_cookie_path_and_keeps_tiktok_unchanged(self):
+        row=[3,'https://i.pinimg.com/originals/fixture.jpg',{'category':'pinterest','extension':'jpg','id':'123'}]
+        paths=[]
+        def extract(command,platform):
+            self.assertEqual(platform,'pinterest')
+            paths.append(Path(command[command.index('--cookies')+1]))
+            self.assertTrue(paths[-1].is_file())
+            self.assertNotIn(self.session,str(command))
+            return [row]
+        with patch.dict(os.environ,{'PINTEREST_COOKIES':self.exports()[0]}),patch.object(p,'social_json',side_effect=extract):
+            self.assertEqual(p.social_gallery_entries('https://www.pinterest.com/pin/123/','pinterest')[0]['id'],'123')
+        self.assertFalse(paths[0].exists())
+        with patch.dict(os.environ,{'PINTEREST_COOKIES':'invalid'}),p.pinterest_cookie_args('tiktok') as args:
+            self.assertEqual(args,[])
+        with patch.dict(os.environ,{'PINTEREST_COOKIES':''}),p.pinterest_cookie_args('pinterest') as args:
+            self.assertEqual(args,[])
 
 
 class SocialExtractorTests(unittest.TestCase):
