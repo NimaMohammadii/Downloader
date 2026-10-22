@@ -1841,7 +1841,9 @@ class InstagramCapture:
                 return
             if self.source.get("social"):
                 from youtube_pipeline import prepare_social_media
-                self.social_url, self.social_items = prepare_social_media(self.source["social"], self.workdir, cache_payload=self.payload)
+                credentials = ({"pinterest_cookies": self.payload.pop("pinterestCookies", "")}
+                               if self.source["social"].get("platform") == "pinterest" else {})
+                self.social_url, self.social_items = prepare_social_media(self.source["social"], self.workdir, cache_payload=self.payload, **credentials)
                 self.social_sent = 0
                 self.result = {"ok": True}
                 with self.lock:

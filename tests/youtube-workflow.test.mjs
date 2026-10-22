@@ -62,13 +62,30 @@ function poolBinding() {
   return { getByName() { return pool; } };
 }
 
-test('Pinterest browser cookies reach only the container environment without changing existing secrets', () => {
+test('Pinterest requests receive current secrets on a running container, including rotation and removal', async () => {
   const raw=JSON.stringify([{domain:'.pinterest.com',name:'_pinterest_sess',value:'fixture-pinterest-session'}]);
-  const instance=new YoutubeDownloaderContainer({storage:memoryStorage()}, {PINTEREST_COOKIES:raw,API_ID:'123',API_HASH:'fixture-hash'});
-  assert.equal(instance.envVars.PINTEREST_COOKIES,raw);
+  const env={PINTEREST_COOKIES:raw,API_ID:'123',API_HASH:'fixture-hash'};
+  const instance=new YoutubeDownloaderContainer({storage:memoryStorage()},env);
+  const received=[],logs=[],previous=console.info;
+  instance.containerFetch=async(_url,init)=>{received.push(JSON.parse(init.body));return Response.json({ok:true});};
+  console.info=(message,data)=>logs.push({message,data});
+  const payload={id:'igdl-42-7-42',source:{mode:'replay',social:{platform:'pinterest',url:'https://www.pinterest.com/pin/123/'}}};
+  try {
+    await instance.instagramRequest('start',payload);
+    env.PINTEREST_COOKIES=raw.replace('fixture-pinterest-session','rotated-private-session');
+    await instance.instagramRequest('start',payload);
+    delete env.PINTEREST_COOKIES;
+    await instance.instagramRequest('start',payload);
+    assert.deepEqual(received.map(r=>r.pinterestCookies),[raw,raw.replace('fixture-pinterest-session','rotated-private-session'),'']);
+    assert.equal(payload.pinterestCookies,undefined);
+    await instance.instagramRequest('start',{...payload,source:{mode:'replay',social:{platform:'x',url:'https://x.com/i/status/123'}}});
+    assert.equal(received.at(-1).pinterestCookies,undefined);
+    assert.deepEqual(logs.map(l=>l.data.configured),[true,true,false]);
+    assert.ok(!JSON.stringify(logs).includes('private-session')&&!JSON.stringify(logs).includes('fixture-pinterest-session'));
+  } finally {console.info=previous;}
+  assert.equal(instance.envVars.PINTEREST_COOKIES,undefined);
   assert.equal(instance.envVars.API_ID,'123');
   assert.equal(instance.envVars.API_HASH,'fixture-hash');
-  assert.equal(new YoutubeDownloaderContainer({storage:memoryStorage()},{}).envVars.PINTEREST_COOKIES,'');
 });
 
 test('100 simultaneous admissions use exactly 20 hosts and five slots per host', async () => {

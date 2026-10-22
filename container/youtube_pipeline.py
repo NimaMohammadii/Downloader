@@ -984,6 +984,10 @@ def social_url(value: str, platform: str) -> str:
     raise app.UserVisibleError("❌ لینک یک پست یا آهنگ را بفرست؛ پروفایل، بورد و پلی‌لیست پشتیبانی نمی‌شود.")
 
 
+class PinterestAccessError(app.UserVisibleError):
+    pass
+
+
 def social_error(platform: str, detail: str) -> app.UserVisibleError:
     name = SOCIAL_NAMES[platform]
     s = detail.lower()
@@ -992,7 +996,7 @@ def social_error(platform: str, detail: str) -> app.UserVisibleError:
     if platform == "pinterest" and any(x in s for x in ("404", "not found", "notfounderror", "requested pin could not be found")):
         # Pinterest can conceal an inaccessible Pin behind a not-found response.
         # This does not establish that the post was deleted.
-        return app.UserVisibleError("❌ Pinterest اطلاعات این پست را به سرور نداد؛ نشست حساب Pinterest و دسترسی آن به پست باید بررسی شود.")
+        return PinterestAccessError("❌ Pinterest اطلاعات این پست را به سرور نداد؛ نشست حساب Pinterest و دسترسی آن به پست باید بررسی شود.")
     if any(x in s for x in ("404", "not found", "deleted", "unavailable", "no video", "empty")):
         return app.UserVisibleError(f"❌ پست {name} حذف شده، در دسترس نیست یا رسانهٔ قابل دانلود ندارد.")
     return app.UserVisibleError(f"❌ دریافت فایل {name} کامل نشد؛ لینک عمومی پست یا آهنگ را دوباره بفرست.")
@@ -1161,9 +1165,13 @@ def aparat_entries(url: str) -> list[dict[str, Any]]:
 
 
 @contextmanager
-def pinterest_cookie_args(platform: str):
+def pinterest_cookie_args(platform: str, raw: str = ""):
     """Import browser cookies into the same native extractor, scoped to Pinterest."""
-    raw = os.environ.get("PINTEREST_COOKIES", "").lstrip("\ufeff \t\r\n") if platform == "pinterest" else ""
+    if platform != "pinterest":
+        raw = ""
+    if not isinstance(raw, str):
+        raise app.UserVisibleError("❌ مقدار PINTEREST_COOKIES باید متن کامل خروجی کوکی‌ها باشد.")
+    raw = raw.lstrip("\ufeff \t\r\n")
     if not raw:
         yield []
         return
@@ -1218,12 +1226,20 @@ def pinterest_cookie_args(platform: str):
         yield ["--cookies", str(path)]
 
 
-def social_gallery_entries(url: str, platform: str) -> list[dict[str, Any]]:
-    with pinterest_cookie_args(platform) as cookie_args:
-        data = social_json([sys.executable, "-m", "gallery_dl", "--config-ignore", "--no-input", "--dump-json",
+def social_gallery_entries(url: str, platform: str, *, pinterest_cookies: str = "") -> list[dict[str, Any]]:
+    with pinterest_cookie_args(platform, pinterest_cookies) as cookie_args:
+        try:
+            data = social_json([sys.executable, "-m", "gallery_dl", "--config-ignore", "--no-input", "--dump-json",
                         "--range", f"1-{SOCIAL_MAX_ITEMS + 1}", "--retries", "1", "--http-timeout", "15",
                         "-o", "extractor.tiktok.audio=false", "-o", "extractor.tiktok.covers=false",
                         "-o", "output.private=true", *cookie_args, "--", url], platform)
+        except app.UserVisibleError as exc:
+            if platform == "pinterest":
+                print(json.dumps({"message": "pinterest metadata rejected", "cookiesLoaded": bool(cookie_args),
+                                  "code": "PIN_NOT_ACCESSIBLE" if isinstance(exc, PinterestAccessError) else "EXTRACTOR_FAILED"}), flush=True)
+                if isinstance(exc, PinterestAccessError) and not cookie_args:
+                    raise app.UserVisibleError("❌ درخواست Pinterest بدون نشست حساب اجرا شد؛ Secret با نام PINTEREST_COOKIES را در Worker بررسی کن.") from None
+            raise
     entries = []
     for row in data if isinstance(data, list) else []:
         if not isinstance(row, list) or len(row) != 3 or row[0] != 3 or not isinstance(row[2], dict):
@@ -1407,14 +1423,16 @@ def social_cache_key(platform: str, url: str, index: int, entry: dict[str, Any],
     return "social:" + hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def prepare_social_media(social: dict[str, Any], workdir: Path, *, cache_payload: dict[str, Any] | None = None) -> tuple[str, list[dict[str, Any]]]:
+def prepare_social_media(social: dict[str, Any], workdir: Path, *, cache_payload: dict[str, Any] | None = None,
+                         pinterest_cookies: str = "") -> tuple[str, list[dict[str, Any]]]:
     platform = str(social.get("platform") or "")
     url = resolve_social_url(str(social.get("url") or ""), platform)
     deadline = time.monotonic() + 1500
     if platform == "aparat":
         entries = aparat_entries(url)
     elif platform == "pinterest" or (platform == "tiktok" and "/photo/" in url):
-        entries = social_gallery_entries(url, platform)
+        credentials = {"pinterest_cookies": pinterest_cookies} if platform == "pinterest" and pinterest_cookies else {}
+        entries = social_gallery_entries(url, platform, **credentials)
     else:
         try:
             entries = social_ytdlp_entries(url, platform)

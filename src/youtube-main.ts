@@ -223,7 +223,6 @@ export class YoutubeDownloaderContainer extends Container<Env> {
   envVars: Record<string, string> = {
     API_ID: this.env.API_ID || "", API_HASH: this.env.API_HASH || "",
     PORNHUB_COOKIES: this.env.PORNHUB_COOKIES || "",
-    PINTEREST_COOKIES: this.env.PINTEREST_COOKIES || "",
   };
   private starting?: Promise<void>;
   private idleShutdownRequested = false;
@@ -299,8 +298,13 @@ export class YoutubeDownloaderContainer extends Container<Env> {
         await storage.put("instagramJobs", jobs);
       });
     }
+    const pinterest = action === "start" && (payload.source as MediaSource | undefined)?.social?.platform === "pinterest";
+    // Read the current Worker secret for each job; a running Container keeps
+    // its startup environment even after a secret is replaced or removed.
+    const requestPayload = pinterest ? { ...payload, pinterestCookies: this.env.PINTEREST_COOKIES || "" } : payload;
+    if (pinterest) console.info("pinterest session supplied", { configured: Boolean(this.env.PINTEREST_COOKIES?.trim()) });
     const response = await this.containerFetch(`http://container/instagram/${action}`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload),
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(requestPayload),
     });
     if (!response.ok) throw new Error(`IG_CONTAINER_${response.status}`);
     return response.json() as Promise<ContainerResult>;
