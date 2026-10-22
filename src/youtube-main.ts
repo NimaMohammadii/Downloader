@@ -5,8 +5,8 @@ import {
   type WorkflowEvent,
   type WorkflowStep,
 } from "cloudflare:workers";
-import storyWorker, { parseInstagramVideoTarget, parseInstagramAudioTarget, resolveInstagramVideo, instagramVideoErrorText, type InstagramVideoTarget, type InstagramVideoSource } from "./story-main";
-import type { InstagramPostUpload } from "./index";
+import storyWorker, { instagramProfileStories, parseInstagramProfileCommand, parseInstagramVideoTarget, parseInstagramAudioTarget, resolveInstagramVideo, instagramVideoErrorText, type InstagramVideoTarget, type InstagramVideoSource } from "./story-main";
+import { instagramProfilePage, instagramProfilePostMedia, instagramProfileErrorText, type InstagramPostUpload } from "./index";
 import {
   telegramTextMotion,
   telegramCustomEmoji,
@@ -37,7 +37,7 @@ type RecognitionInput = { fileId: string; fileSize?: number };
 type PlaylistInput = { url: string; start: number; end: number };
 type SocialInput = { platform: "x" | "pinterest" | "tiktok" | "soundcloud" | "aparat"; url: string; audioOnly?: boolean; itemIndex?: number };
 type MediaSource = InstagramVideoSource & { recognition?: RecognitionInput; playlist?: PlaylistInput; social?: SocialInput;
-  instagramPost?: Pick<InstagramPostUpload, "shortcode" | "media"> };
+  instagramPost?: Pick<InstagramPostUpload, "shortcode" | "storyId" | "media"> };
 const RECOGNITION_FILE_LIMIT = 20_000_000;
 
 type YoutubeDownloadJob = {
@@ -53,6 +53,8 @@ type YoutubeDownloadJob = {
   statusMessageId?: number;
   instagram?: InstagramVideoTarget;
   instagramPost?: InstagramPostUpload;
+  instagramProfile?: { username: string; kind?: "posts" | "story" };
+  instagramProfileParent?: { id: string; eventType: string };
   recognition?: RecognitionInput;
   playlist?: PlaylistInput;
   social?: SocialInput;
@@ -479,6 +481,8 @@ async function containerResult<T>(env: Env, job: YoutubeDownloadJob, request: Re
 }
 
 function jobHistory(job: YoutubeDownloadJob): Omit<DownloadRecord, "status"> {
+  if (job.instagramProfile) return { key: job.id, userId: job.userId, source: job.instagramProfile.kind === "story" ? "Instagram profile stories" : "Instagram profile posts", request: job.url };
+  if (job.instagramProfileParent) return { key: job.id, userId: job.userId, source: job.instagramPost?.storyId ? "Instagram story" : "Instagram post", request: job.url };
   if (job.instagramPost) return { key: `ig:${job.chatId}:${job.requestMessageId}:${job.userId}`,
     userId: job.userId, source: "Instagram post", request: job.instagramPost.url };
   const ig = job.instagram;
@@ -500,10 +504,113 @@ async function trackJob(env: Env, job: YoutubeDownloadJob, status: DownloadStatu
 export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDownloadJob> {
   async run(event: WorkflowEvent<YoutubeDownloadJob>, step: WorkflowStep) {
     const job: YoutubeDownloadJob = { ...event.payload };
-    const inspect = !job.instagram && !job.instagramPost && !job.recognition && !job.playlist && !job.social && !job.quality && !job.audioMode && job.source !== "pornhub";
+    const inspect = !job.instagramProfile && !job.instagram && !job.instagramPost && !job.recognition && !job.playlist && !job.social && !job.quality && !job.audioMode && job.source !== "pornhub";
     await step.do("track download request", () => trackJob(this.env, job, inspect ? "pending" : "processing"));
-    if (job.instagram || job.instagramPost || job.recognition || job.playlist || job.social) return this.runInstagram(job, step);
+    if (job.instagramProfile) return this.runInstagramProfile(job, step);
+    if (job.instagram || job.instagramPost || job.recognition || job.playlist || job.social) {
+      const result = await this.runInstagram(job, step).catch(error => {
+        if (!job.instagramProfileParent) throw error;
+        console.warn("instagram profile item interrupted", { jobId: job.id });
+        return { ok: false } as ContainerResult;
+      });
+      if (job.instagramProfileParent) await step.do("notify instagram profile parent", async () => {
+        const parent = await this.env.YOUTUBE_DOWNLOAD_WORKFLOW.get(job.instagramProfileParent!.id);
+        await parent.sendEvent({ type: job.instagramProfileParent!.eventType,
+          payload: { ok: result.ok && !result.partial,
+            parts: result.parts || (result.ok ? job.instagramPost?.media.length || 1 : 0) } });
+        return true;
+      });
+      return;
+    }
     return this.runYoutube(job, step);
+  }
+
+  private async runInstagramProfile(job: YoutubeDownloadJob, step: WorkflowStep): Promise<void> {
+    let statusId: number | undefined;
+    const stories = job.instagramProfile!.kind === "story";
+    const label = stories ? "استوری" : "پست";
+    let delivered = 0;
+    let count = 0;
+    let after: string | null = null;
+    const seen = new Set<string>();
+    const cursors = new Set<string>();
+    try {
+      statusId = await step.do("show instagram profile status", async () => {
+        const status = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
+          chat_id: job.chatId, text: `⏳ دارم ${label}‌های @${job.instagramProfile!.username} را دریافت می‌کنم…`,
+          reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
+        });
+        return status.message_id;
+      });
+      for (let pageNumber = 0; ; pageNumber++) {
+        // Persist precise failures as well as pages: replay must not re-probe a
+        // rejected account or create another batch of already delivered posts.
+        const page = await step.do(`read instagram profile page ${pageNumber}`, { retries: { limit: 0, delay: "1 second" }, timeout: "5 minutes" }, async () => {
+          try { return { value: stories
+            ? { posts: await instagramProfileStories(job.instagramProfile!.username, this.env), next: null }
+            : await instagramProfilePage(job.instagramProfile!.username, after, this.env) }; }
+          catch (error) { return { error: stories ? instagramVideoErrorText(error) : instagramProfileErrorText(error) }; }
+        });
+        if (!page.value) throw new Error(page.error);
+        for (const post of page.value.posts) {
+          if (seen.has(post.shortcode)) continue;
+          seen.add(post.shortcode);
+          const sequence = ++count;
+          const eventType = `profile-post-${sequence}`;
+          const childId = `${job.id}-profile-${sequence}`;
+          const prepared = await step.do(`prepare instagram profile post ${sequence}`, { retries: { limit: 0, delay: "1 second" }, timeout: "5 minutes" }, async () => {
+            try { return { media: await instagramProfilePostMedia(post, this.env) }; }
+            catch (error) { return { error: instagramProfileErrorText(error) }; }
+          });
+          if (!prepared.media) throw new Error(prepared.error);
+          const childStatus = await step.do(`show instagram profile post ${sequence}`, async () => {
+            const status = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
+              chat_id: job.chatId, text: `⬇️ در حال دریافت ${label} ${sequence} از @${job.instagramProfile!.username}…`,
+            });
+            return status.message_id;
+          });
+          await step.do(`start instagram profile post ${sequence}`, async () => {
+            const child: YoutubeDownloadJob = { id: childId, chatId: job.chatId, userId: job.userId,
+              requestMessageId: job.requestMessageId, url: post.url,
+              instagramProfileParent: { id: job.id, eventType },
+              instagramPost: { shortcode: post.shortcode, ...(post.storyId ? { storyId: post.storyId } : {}), url: post.url, chatId: job.chatId,
+                userId: job.userId, requestMessageId: job.requestMessageId, statusMessageId: childStatus, media: prepared.media! } };
+            try { await this.env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id: childId, params: child }); }
+            catch (error) {
+              if (!/already|exists|duplicate|conflict/i.test(error instanceof Error ? error.message : String(error))) throw error;
+            }
+            return true;
+          });
+          const result = await step.waitForEvent<{ ok: boolean; parts: number }>(`await instagram profile post ${sequence}`,
+            { type: eventType, timeout: "24 hours" });
+          delivered += result.payload.parts;
+          if (!result.payload.ok) throw new Error(`❌ دریافت یا ارسال ${label} کامل نشد؛ برای جلوگیری از تکرار فایل، ادامه متوقف شد.`);
+          await step.do(`track instagram profile progress ${sequence}`, () => trackJob(this.env, job, "processing", { delivered }));
+        }
+        if (!page.value.next) break;
+        if (cursors.has(page.value.next)) throw new Error("❌ ادامهٔ فهرست پست‌ها تکراری بود؛ دریافت متوقف شد.");
+        cursors.add(page.value.next);
+        after = page.value.next;
+      }
+      await step.do("complete instagram profile", async () => {
+        await trackJob(this.env, job, "success", { delivered });
+        await telegramCall(this.env.BOT_TOKEN, "editMessageText", { chat_id: job.chatId, message_id: statusId,
+          text: count ? `✅ دریافت ${count} ${label} از @${job.instagramProfile!.username} تمام شد؛ ${delivered} فایل ارسال شد.`
+            : `این حساب ${label} قابل دسترسی برای نشست متصل ندارد.` });
+        return true;
+      });
+    } catch (error) {
+      const text = error instanceof Error && error.message.startsWith("❌") ? error.message
+        : `❌ دریافت ${label}‌های حساب کامل نشد؛ دسترسی حساب و وضعیت ارسال را بررسی کن.`;
+      await step.do("fail instagram profile", async () => {
+        await trackJob(this.env, job, delivered ? "partial" : "failed", { delivered, detail: text });
+        await safeTelegramCall(this.env.BOT_TOKEN, statusId ? "editMessageText" : "sendMessage", {
+          chat_id: job.chatId, message_id: statusId,
+          text: `${text}${delivered ? `\n${delivered} فایل پیش از توقف ارسال شد.` : ""}`,
+        });
+        return true;
+      });
+    }
   }
 
   private async runYoutube(job: YoutubeDownloadJob, step: WorkflowStep): Promise<void> {
@@ -737,7 +844,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
     }
   }
 
-  private async runInstagram(job: YoutubeDownloadJob, step: WorkflowStep): Promise<void> {
+  private async runInstagram(job: YoutubeDownloadJob, step: WorkflowStep): Promise<ContainerResult> {
     let statusId: number | undefined;
     let started = false;
     let lease: PoolLease | undefined;
@@ -759,14 +866,14 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           await recordSuccessfulDelivery(this.env, `instagram:${job.id}`);
           await trackJob(this.env, job, "success", { delivered: 1 });
         });
-        return;
+        return { ok: true, parts: 1 };
       }
       // Return friendly failures durably, without retrying rejected Instagram sessions.
       phase = "resolution";
       const resolution = await step.do("resolve instagram live or replay", { retries: { limit: 0, delay: "1 second" }, timeout: "2 minutes" }, async () => {
         try {
           const source: MediaSource = job.instagramPost ? { mode: "replay", title: "Instagram",
-            instagramPost: { shortcode: job.instagramPost.shortcode, media: job.instagramPost.media } }
+            instagramPost: { shortcode: job.instagramPost.shortcode, ...(job.instagramPost.storyId ? { storyId: job.instagramPost.storyId } : {}), media: job.instagramPost.media } }
             : job.social ? { mode: "replay", title: socialName(job.social.platform), social: job.social } : job.playlist ? { mode: "replay", title: "YouTube Playlist", audioOnly: true, playlist: job.playlist } : job.recognition
             ? { mode: "replay", title: "Music recognition", audioOnly: true, recognition: job.recognition }
             : await resolveInstagramVideo(job.instagram!, this.env);
@@ -779,7 +886,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         await step.do("show instagram resolution error", () => telegramCall<boolean>(this.env.BOT_TOKEN, "editMessageText", {
           chat_id: job.chatId, message_id: statusId, text: resolution.message,
         }));
-        return;
+        return { ok: false };
       }
       const source = resolution.source;
       if (needsAccessCheck && await step.do("reuse accessible instagram file", { retries: { limit: 0, delay: "1 second" }, timeout: "1 minute" }, () => sendCachedMedia(this.env, job, statusId))) {
@@ -787,7 +894,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           await recordSuccessfulDelivery(this.env, `instagram:${job.id}`);
           await trackJob(this.env, job, "success", { delivered: 1 });
         });
-        return;
+        return { ok: true, parts: 1 };
       }
       phase = "startup";
       if (!/^\d+$/.test(this.env.API_ID || "") || !this.env.API_HASH?.trim()) throw new Error("YT_CONFIG");
@@ -822,7 +929,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         await step.do("show instagram capture failure", () => telegramCall<boolean>(this.env.BOT_TOKEN, "editMessageText", {
           chat_id: job.chatId, message_id: statusId, text: ready.payload.message || "❌ دریافت لایو کامل نشد؛ دوباره لینک را بفرست.", reply_markup: { inline_keyboard: [] },
         }));
-        return;
+        return { ok: false };
       }
       phase = "upload";
       let result: ContainerResult;
@@ -867,6 +974,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           chat_id: job.chatId, message_id: statusId, text: result.message,
         }));
       } else throw new Error(`IG_SEND_FAILED ${redactDiagnostic([result.errorCode, result.diagnostic, result.message].filter(Boolean).join(": "), this.env)}`);
+      return result;
     } catch (error) {
       console.error("instagram video workflow failed", { jobId: job.id, phase,
         type: error instanceof Error ? error.name : "error",
@@ -884,6 +992,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         });
         return true;
       });
+      return { ok: false };
     } finally {
       try {
         if (started) await step.do("release instagram recording", { retries: { limit: 1, delay: "2 seconds" }, timeout: "1 minute" }, async () => {
@@ -1432,7 +1541,7 @@ export default {
       } catch { return new Response("Session storage unavailable", { status: 503 }); }
     }
 
-    const cacheRequest = /^\/media-cache\/((?:igdl|ytdl)--?\d+-\d+-\d+(?:-(?:audio|song|music-[A-Za-z0-9_-]{11}))?)$/.exec(requestUrl.pathname);
+    const cacheRequest = /^\/media-cache\/((?:igdl|ytdl)--?\d+-\d+-\d+(?:-(?:audio|song|music-[A-Za-z0-9_-]{11}|profile-\d+))?)$/.exec(requestUrl.pathname);
     if (request.method === "POST" && cacheRequest) {
       const expected = await instagramSignature(env.BOT_TOKEN, `cache:${cacheRequest[1]}`);
       if (!equalSignature(request.headers.get("x-media-cache-token") || "", expected)) return new Response("Forbidden", { status: 403 });
@@ -1445,7 +1554,7 @@ export default {
       } catch { return new Response("Invalid cache request", { status: 400 }); }
     }
 
-    const completion = /^\/instagram\/events\/(igdl--?\d+-\d+-\d+(?:-(?:audio|song|music-[A-Za-z0-9_-]{11}))?)$/.exec(requestUrl.pathname);
+    const completion = /^\/instagram\/events\/(igdl--?\d+-\d+-\d+(?:-(?:audio|song|music-[A-Za-z0-9_-]{11}|profile-\d+))?)$/.exec(requestUrl.pathname);
     if (request.method === "POST" && completion) {
       const expected = await instagramSignature(env.BOT_TOKEN, `event:${completion[1]}`);
       if (!equalSignature(request.headers.get("x-instagram-event-token") || "", expected)) return new Response("Forbidden", { status: 403 });
@@ -1481,7 +1590,7 @@ export default {
       }
       if (actor && actor.id !== ADMIN_USER_ID && !update?.callback_query?.data?.startsWith("admin:")
           && !/^\/admin(?:@[A-Za-z0-9_]+)?$/i.test(activityText)) {
-        const linkSent = Boolean(isInstagramDownloadLink(activityText) || extractYouTubeUrl(activityText)
+        const linkSent = Boolean(parseInstagramProfileCommand(activityText) || isInstagramDownloadLink(activityText) || extractYouTubeUrl(activityText)
           || extractPornhubUrl(activityText) || parseSocialUrl(activityText) || parsePlaylist(activityText));
         await recordUserActivity(env, { id: actor.id, username: actor.username, firstName: actor.first_name, lastName: actor.last_name },
           linkSent, update?.update_id, isStartCommand(activityText));
@@ -1499,6 +1608,24 @@ export default {
       const message = update?.message;
       if (update && message) {
         const text = (message.text || message.caption || "").trim();
+
+        const profileCommand = parseInstagramProfileCommand(text);
+        if (profileCommand) {
+          const id = `igdl-${message.chat.id}-${message.message_id}-${message.from?.id || message.chat.id}`;
+          const job: YoutubeDownloadJob = { id, chatId: message.chat.id, requestMessageId: message.message_id,
+            userId: message.from?.id || message.chat.id, url: `https://www.instagram.com/${profileCommand.username}/`,
+            instagramProfile: { username: profileCommand.username, kind: profileCommand.kind } };
+          try { await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id, params: job }); }
+          catch (error) {
+            if (!/already|exists|duplicate|conflict/i.test(error instanceof Error ? error.message : String(error))) throw error;
+          }
+          return Response.json({ ok: true });
+        }
+        if (!profileCommand && /^اینستاگرام\s+(?:استوری|پست)(?:\s|$)/.test(text)) {
+          await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id,
+            text: "دستور را همراه یوزرنیم بفرست:\nاینستاگرام استوری username\nاینستاگرام پست username" });
+          return Response.json({ ok: true });
+        }
 
         const recognitionCommand = /^\/(?:recognize|shazam|findmusic)(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text);
         const inputMedia = recognitionMedia(message) || (recognitionCommand && message.reply_to_message ? recognitionMedia(message.reply_to_message) : undefined);

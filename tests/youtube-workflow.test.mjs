@@ -5,6 +5,7 @@ import test from 'node:test';
 import { createHmac } from 'node:crypto';
 
 const source = await readFile(new URL('../src/youtube-main.ts', import.meta.url), 'utf8');
+const instagram = await readFile(new URL('../src/index.ts', import.meta.url), 'utf8');
 const { outputFiles } = await build({
   stdin: { contents: source + '\nexport {extractPornhubUrl};', loader: 'ts', resolveDir: process.cwd() },
   bundle: true, format: 'esm', write: false,
@@ -25,7 +26,8 @@ const { outputFiles } = await build({
         export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }
         export class WorkflowEntrypoint { constructor(ctx, env) { this.env = env; } }
       ` };
-      if (args.path === './story-main') return { contents: 'export default { fetch() {} }; export const parseInstagramVideoTarget = () => null; export const parseInstagramAudioTarget = () => null; export const resolveInstagramVideo = () => {}; export const instagramVideoErrorText = () => "error";' };
+      if (args.path === './story-main') return { contents: 'export default { fetch() {} }; export const instagramProfileStories = async () => []; export const parseInstagramProfileCommand = () => null; export const parseInstagramVideoTarget = () => null; export const parseInstagramAudioTarget = () => null; export const resolveInstagramVideo = () => {}; export const instagramVideoErrorText = () => "error";' };
+      if (args.path === './index') return { contents: instagram, loader: 'ts' };
       if (args.path === './admin') return { contents: `
         export const recordDownload = async(_env,record)=>{(globalThis.downloadHistory ||= []).push(record);};
         export const isInstagramDownloadLink = text=>/instagram.com\\//.test(text);

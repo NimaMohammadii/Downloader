@@ -83,6 +83,7 @@ type MediaCandidate = {
 type ResolvedMedia = MediaCandidate & { size: number | null };
 export type InstagramPostUpload = {
   shortcode: string;
+  storyId?: string;
   url: string;
   chatId: number;
   requestMessageId: number;
@@ -91,6 +92,66 @@ export type InstagramPostUpload = {
   media: ResolvedMedia[];
 };
 type CookieJar = Map<string, string>;
+
+export type InstagramProfilePost = { shortcode: string; storyId?: string; url: string; groups: MediaCandidate[][] };
+
+// Use the logged-in web profile query used by Instaloader's get_posts(). Each
+// Workflow step reads one page; security failures retain the existing classifier.
+export async function instagramProfilePage(username: string, after: string | null, env: Env): Promise<{
+  posts: InstagramProfilePost[]; next: string | null;
+}> {
+  if (!/^[A-Za-z0-9_.]{1,30}$/.test(username)) throw new Error("INSTAGRAM_PROFILE_INVALID");
+  const jar = secretCookies(env);
+  if (!jar.get("sessionid")) throw new Error("INSTAGRAM_SESSION_LOGIN_REQUIRED");
+  const referer = `https://www.instagram.com/${username}/`;
+  const headers = webHeaders(jar, referer);
+  headers.set("origin", "https://www.instagram.com");
+  headers.set("content-type", "application/x-www-form-urlencoded");
+  const variables = { data: { count: 12, include_reel_media_seen_timestamp: true,
+    include_relationship_info: true, latest_besties_reel_media: true, latest_reel_media: true },
+    first: 12, ...(after ? { after } : {}), include_multi_captions: true, username,
+    __relay_internal__pv__PolarisMultiCaptionCarouselEnabledrelayprovider: true,
+    __relay_internal__pv__PolarisShortDramaEnabledrelayprovider: false,
+    __relay_internal__pv__PolarisReelsRecoDebugOverlayEnabledrelayprovider: false };
+  const body = new URLSearchParams({ doc_id: "28975909992013618", variables: JSON.stringify(variables) });
+  const { data } = await fetchJson("https://www.instagram.com/graphql/query", headers, jar,
+    { method: "POST", body: body.toString() });
+  const feed = data?.data?.xdt_api__v1__feed__user_timeline_graphql_connection;
+  if (!Array.isArray(feed?.edges) || typeof feed?.page_info?.has_next_page !== "boolean") {
+    throw new Error("INSTAGRAM_PROFILE_UNAVAILABLE");
+  }
+  const posts: InstagramProfilePost[] = [];
+  for (const edge of feed.edges) {
+    const item = edge?.node;
+    const shortcode = String(item?.code || item?.shortcode || "");
+    if (!/^[A-Za-z0-9_-]{1,20}$/.test(shortcode)) throw new Error("INSTAGRAM_PROFILE_UNAVAILABLE");
+    const nodes = Array.isArray(item?.carousel_media) ? item.carousel_media : [item];
+    const groups = candidatesFromProduct(item);
+    const incomplete = groups.length !== nodes.length || nodes.some((node: any) =>
+      (node?.media_type === 2 || node?.is_video === true) && !node?.video_versions?.length && !node?.video_url);
+    posts.push({ shortcode, url: `https://www.instagram.com/p/${shortcode}/`, groups: incomplete ? [] : groups });
+  }
+  const next = feed.page_info.has_next_page ? feed.page_info.end_cursor : null;
+  if (next !== null && (typeof next !== "string" || !next || next.length > 4096 || next === after)) {
+    throw new Error("INSTAGRAM_PROFILE_PAGINATION");
+  }
+  return { posts, next };
+}
+
+export async function instagramProfilePostMedia(post: InstagramProfilePost, env: Env): Promise<ResolvedMedia[]> {
+  const groups = post.groups.length ? post.groups : await resolvePost({ kind: "post", url: post.url, shortcode: post.shortcode }, env);
+  if (!groups.length || groups.length > 20) throw new Error("INSTAGRAM_NO_MEDIA");
+  const media: ResolvedMedia[] = [];
+  for (const group of groups) media.push(await chooseCandidate(group, true));
+  return media;
+}
+
+export function instagramProfileErrorText(error: unknown): string {
+  const detail = error instanceof Error ? error.message : "INSTAGRAM_PROFILE_UNAVAILABLE";
+  if (/^INSTAGRAM_PROFILE_/.test(detail)) return "❌ فهرست پست‌های این حساب کامل دریافت نشد؛ وجود حساب و دسترسی نشست متصل به آن را بررسی کن.";
+  return friendlyError(detail.replace(/^INSTAGRAM_(CHALLENGE_REQUIRED|CONSENT_REQUIRED|LOGIN_REQUIRED)/, "INSTAGRAM_SESSION_$1"),
+    error instanceof InstagramThrottleError ? error.throttle : undefined);
+}
 
 const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
 const BASE_URL = "https://downloader.vexaagent.workers.dev";

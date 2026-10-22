@@ -1,4 +1,5 @@
 import appWorker from "./main";
+import type { InstagramProfilePost } from "./index";
 import {
   telegramTextMotion,
   telegramCustomEmoji,
@@ -35,7 +36,7 @@ type TelegramApiResponse<T> = { ok: boolean; result?: T; description?: string };
 type StoryTarget =
   | { kind: "story"; url: string; username: string; storyId: string | null }
   | { kind: "highlight"; url: string; highlightId: string };
-type MediaCandidate = { kind: "video" | "photo"; url: string; width: number; height: number };
+type MediaCandidate = { kind: "video" | "photo"; url: string; width: number; height: number; storyId?: string; variants?: MediaCandidate[] };
 type CookieJar = Map<string, string>;
 
 const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
@@ -82,6 +83,12 @@ async function safeTelegramCall(token: string, method: string, payload: Record<s
       detail: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+export function parseInstagramProfileCommand(text: string): { kind: "story" | "posts"; username: string } | null {
+  const match = /^اینستاگرام\s+(استوری|پست)\s+@?([A-Za-z0-9_](?:[A-Za-z0-9_.]{0,28}[A-Za-z0-9_])?)$/i.exec(text.trim());
+  if (!match || match[2].includes("..")) return null;
+  return { kind: match[1] === "استوری" ? "story" : "posts", username: match[2] };
 }
 
 function parseStoryTarget(text: string): StoryTarget | null {
@@ -448,9 +455,10 @@ async function probeSize(url: string): Promise<number | null> {
   }
 }
 
-async function chooseCandidate(item: any): Promise<MediaCandidate | null> {
+async function chooseCandidate(item: any, upload = false): Promise<MediaCandidate | null> {
   const candidates = itemCandidates(item).sort((a, b) => b.width * b.height - a.width * a.height);
   if (!candidates.length) return null;
+  if (upload) return candidates[0];
   const limit = candidates[0].kind === "photo" ? PHOTO_LIMIT : VIDEO_LIMIT;
   let unknown: MediaCandidate | null = null;
   for (const candidate of candidates) {
@@ -461,7 +469,7 @@ async function chooseCandidate(item: any): Promise<MediaCandidate | null> {
   return unknown;
 }
 
-async function privateResolve(target: StoryTarget, env: Env): Promise<MediaCandidate[] | null> {
+async function privateResolve(target: StoryTarget, env: Env, upload = false): Promise<MediaCandidate[] | null> {
   if (!env.INSTAGRAM_SESSIONID?.trim()) throw new StoryError("session_missing");
   const jar = createJar(env); // One jar for the entire private resolver chain.
   if (!authParts(jar)) throw new StoryError("session_missing");
@@ -489,11 +497,24 @@ async function privateResolve(target: StoryTarget, env: Env): Promise<MediaCandi
 
   const media: MediaCandidate[] = [];
   for (const item of items) {
-    const candidate = await chooseCandidate(item);
-    if (candidate) media.push(candidate);
+    const candidate = await chooseCandidate(item, upload);
+    if (upload && !candidate) throw new StoryError("no_media");
+    if (candidate) media.push(upload ? { ...candidate, variants: itemCandidates(item),
+      storyId: String(item?.pk || item?.id || "").split("_")[0] } : candidate);
   }
   if (!media.length) throw new StoryError("no_media");
   return media;
+}
+
+export async function instagramProfileStories(username: string, env: Env): Promise<InstagramProfilePost[]> {
+  const media = await privateResolve({ kind: "story", username, storyId: null,
+    url: `https://www.instagram.com/stories/${username}/` }, env, true);
+  if (!media?.length) throw new StoryError("unavailable");
+  return media.map(item => {
+    if (!/^\d{1,24}$/.test(item.storyId || "")) throw new StoryError("unavailable");
+    return { shortcode: item.storyId!, storyId: item.storyId,
+      url: `https://www.instagram.com/stories/${username}/${item.storyId}/`, groups: [item.variants || [item]] };
+  });
 }
 
 // Live/replay resolution shares the working Story session and exact-ID parser.

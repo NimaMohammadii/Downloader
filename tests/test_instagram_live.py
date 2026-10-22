@@ -379,6 +379,42 @@ class FFmpegTests(unittest.TestCase):
 
 
 class PostUploadTests(unittest.TestCase):
+    def test_profile_story_uses_existing_complete_sender_with_story_callbacks(self):
+        data = payload('replay')
+        data['id'] += '-profile-1'
+        data['completionUrl'] += '-profile-1'
+        data['userId'] = 42
+        data['source'] = {'mode': 'replay', 'title': 'Instagram', 'instagramPost': {
+            'shortcode': '999', 'storyId': '999', 'media': [
+                {'kind': 'video', 'url': CDN + 'story.mp4', 'size': 4}]}}
+        job = app.InstagramCapture(data)
+        sent = []
+
+        async def upload(token, method, body, file):
+            sent.append(body)
+            return {'message_id': 10, 'video': {'file_id': 'story-file'}}
+
+        def download(item, path, deadline):
+            path.write_bytes(b'abcd')
+            return 4
+
+        try:
+            with patch.object(job, 'notify'), patch.object(job, 'safe_status'), \
+                 patch.object(job, 'download_post_item', side_effect=download), \
+                 patch.object(app, 'reuse_cached_file', return_value=False), \
+                 patch.object(app, 'upload_complete_file', side_effect=upload), \
+                 patch.object(app, 'store_uploaded_file'), patch.object(app, 'delete_status'), \
+                 patch.object(app.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0,
+                     json.dumps({'streams': [{'codec_type': 'video', 'width': 720, 'height': 1280}], 'format': {'duration': '1'}}), '')):
+                job.run()
+                self.assertEqual(job.state, 'ready')
+                self.assertTrue(job.send()['ok'])
+            markup = json.loads(sent[0]['reply_markup'])
+            self.assertEqual(markup['inline_keyboard'][0][0]['callback_data'], 'iga|s|999|0|42')
+            self.assertEqual(markup['inline_keyboard'][0][1]['callback_data'], 'igm|s|999|0|42')
+        finally:
+            job.cleanup()
+
     def setUp(self):
         data = payload('replay')
         data['userId'] = 42

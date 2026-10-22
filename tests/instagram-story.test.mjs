@@ -12,9 +12,19 @@ const { outputFiles } = await build({
       : 'export const recordUsage=async()=>true; export const recordMediaDelivery=async()=>{}; export const telegramCustomEmoji=(_method,payload)=>payload; export const telegramTextMotion=async()=>{}; export const telegramFileCache=async(...args)=>globalThis.storyFileCache ? globalThis.storyFileCache(...args) : null; export class AdminStatsStore {} export const ADMIN_USER_ID = 1; export async function recordDownload(_env,record) {(globalThis.downloadHistory ||= []).push(record);} export async function recordSuccessfulDelivery() {}' }));
   } }],
 });
-const { default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
+const { default: worker, parseInstagramProfileCommand } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
 const session = '12345%3Afictional-test-session';
 const media = { pk: '999', user: { pk: '77' }, video_versions: [{ url: 'https://cdn.instagram.com/test.mp4', width: 720, height: 1280 }] };
+
+test('Persian profile commands accept usernames with or without @ and reject other messages', () => {
+  assert.deepEqual(parseInstagramProfileCommand('اینستاگرام استوری @example.name'), {kind:'story',username:'example.name'});
+  assert.deepEqual(parseInstagramProfileCommand('اینستاگرام پست example_123'), {kind:'posts',username:'example_123'});
+  for (const value of ['example', 'استوری example', 'اینستاگرام استوری', 'اینستاگرام پست ../example',
+    'اینستاگرام پست user extra', 'اینستاگرام استوری @a..b', 'اینستاگرام پست '+ 'a'.repeat(31)]) {
+    assert.equal(parseInstagramProfileCommand(value), null, value);
+  }
+});
+
 async function run({ routes = {}, env = {}, link = 'https://www.instagram.com/stories/example/999/' } = {}) {
   const requests = [], telegram = [];
   globalThis.legacy = 0; globalThis.downloadHistory = [];

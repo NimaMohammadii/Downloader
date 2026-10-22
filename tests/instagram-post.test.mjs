@@ -15,7 +15,7 @@ const { outputFiles } = await build({
     ` }));
   } }],
 });
-const { default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
+const { default: worker, instagramProfilePage, instagramProfilePostMedia, instagramProfileErrorText } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
 
 const shortcode = 'DesNYugDyMp';
 const mediaId = '4011640241882342185';
@@ -27,6 +27,67 @@ const redirect = (location, headers = {}) => new Response(null, { status: 302, h
 const report = result => result.diagnostics.find(item => item.message === 'instagram download failed')?.info?.detail;
 const files = result => result.sent.filter(item => ['sendPhoto', 'sendVideo'].includes(item.method));
 const errorText = result => result.sent.findLast(item => item.method === 'editMessageText')?.payload.text;
+
+test('profile pagination uses the maintained authenticated web query and preserves carousel order', async () => {
+  const requests=[];
+  const photo={media_type:1,image_versions2:{candidates:[{url:'https://scontent.cdninstagram.com/photo.jpg',width:100,height:100}]}};
+  const movie={media_type:2,video_versions:video.video_versions};
+  globalThis.fetch=async(url,init)=>{
+    const query=new URLSearchParams(init.body);const variables=JSON.parse(query.get('variables'));
+    requests.push({url,variables,headers:new Headers(init.headers)});
+    assert.equal(query.get('doc_id'),'28975909992013618');
+    return Response.json({data:{xdt_api__v1__feed__user_timeline_graphql_connection:{
+      edges:variables.after ? [] : [{node:{code:shortcode,carousel_media:[photo,movie]}}],
+      page_info:{has_next_page:!variables.after,end_cursor:variables.after?null:'next-page'},
+    }}});
+  };
+  const env={BOT_TOKEN:'fake',INSTAGRAM_SESSIONID:'12345%3Afixture-session'};
+  const first=await instagramProfilePage('example',null,env);
+  assert.equal(first.next,'next-page');
+  assert.deepEqual(first.posts[0].groups.map(g=>g[0].kind),['photo','video']);
+  assert.equal(first.posts[0].shortcode,shortcode);
+  assert.ok(!JSON.stringify(first).includes('fixture-session'));
+  const second=await instagramProfilePage('example',first.next,env);
+  assert.equal(second.next,null);
+  assert.equal(requests[1].variables.after,'next-page');
+  assert.equal(requests[0].variables.username,'example');
+  assert.match(requests[0].headers.get('cookie'),/sessionid=/);
+});
+
+test('profile lookup stops on challenges and throttles without trying more account endpoints', async () => {
+  for (const [body,status,pattern] of [[{message:'challenge_required'},400,/تأیید امنیتی/],
+    [{message:'feedback_required'},400,/محدودیت فعالیت/],[{},429,/محدود/]]) {
+    let requests=0;
+    globalThis.fetch=async()=>{requests++;return Response.json(body,{status});};
+    await assert.rejects(()=>instagramProfilePage('example',null,{BOT_TOKEN:'fake',INSTAGRAM_SESSIONID:'session'}),error=>{
+      assert.match(instagramProfileErrorText(error),pattern);return true;
+    });
+    assert.equal(requests,1);
+  }
+});
+
+test('profile lookup rejects missing sessions, invalid pages and non-advancing pagination', async () => {
+  globalThis.fetch=async()=>{throw Error('must not request');};
+  await assert.rejects(()=>instagramProfilePage('example',null,{BOT_TOKEN:'fake'}),/LOGIN_REQUIRED/);
+  globalThis.fetch=async()=>Response.json({data:{xdt_api__v1__feed__user_timeline_graphql_connection:{edges:[],
+    page_info:{has_next_page:true,end_cursor:'same'}}}});
+  await assert.rejects(()=>instagramProfilePage('example','same',{BOT_TOKEN:'fake',INSTAGRAM_SESSIONID:'session'}),/PAGINATION/);
+  globalThis.fetch=async()=>Response.json({data:{}});
+  await assert.rejects(()=>instagramProfilePage('example',null,{BOT_TOKEN:'fake',INSTAGRAM_SESSIONID:'session'}),/UNAVAILABLE/);
+});
+
+test('profile media keeps large videos on the existing complete-file uploader and never treats covers as videos', async () => {
+  globalThis.fetch=async()=>new Response(null,{headers:{'content-length':'120000000'}});
+  const media=await instagramProfilePostMedia({shortcode,url:'https://instagram.com/p/'+shortcode+'/',
+    groups:[[{kind:'video',url:video.video_versions[0].url,width:1080,height:1920}]]},{BOT_TOKEN:'fake'});
+  assert.equal(media[0].size,120000000);
+  assert.equal(media[0].kind,'video');
+  globalThis.fetch=async()=>Response.json({data:{xdt_api__v1__feed__user_timeline_graphql_connection:{
+    edges:[{node:{code:shortcode,media_type:2,image_versions2:{candidates:[{url:'https://scontent.cdninstagram.com/cover.jpg'}]}}}],
+    page_info:{has_next_page:false,end_cursor:null}}}});
+  const page=await instagramProfilePage('example',null,{BOT_TOKEN:'fake',INSTAGRAM_SESSIONID:'session'});
+  assert.deepEqual(page.posts[0].groups,[]);
+});
 
 async function run({ session = '12345%3Afixture-session', env = {}, respond, cdnRespond, telegramRespond, nativeAllowsAuth = true,
   text = `https://www.instagram.com/reel/${shortcode}/?mdxt=test` } = {}) {

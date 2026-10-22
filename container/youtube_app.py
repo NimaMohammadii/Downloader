@@ -1727,7 +1727,7 @@ class InstagramCapture:
     def __init__(self, payload: dict[str, Any]):
         self.payload = payload
         self.id = str(payload.get("id") or "")
-        if not re.fullmatch(r"igdl--?\d+-\d+-\d+(?:-(?:audio|song|music-[A-Za-z0-9_-]{11}))?", self.id):
+        if not re.fullmatch(r"igdl--?\d+-\d+-\d+(?:-(?:audio|song|music-[A-Za-z0-9_-]{11}|profile-\d+))?", self.id):
             raise ValueError("Invalid Instagram job ID")
         self.source = payload.get("source") or {}
         self.live = self.source.get("mode") == "live"
@@ -1807,6 +1807,9 @@ class InstagramCapture:
         try:
             if self.source.get("instagramPost"):
                 post = self.source["instagramPost"]
+                if post.get("storyId") and (not re.fullmatch(r"\d{1,24}", str(post["storyId"]))
+                                             or post["storyId"] != post.get("shortcode") or len(post.get("media") or []) != 1):
+                    raise UserVisibleError("❌ اطلاعات استوری اینستاگرام معتبر نیست.")
                 items = post.get("media")
                 if (not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", str(post.get("shortcode") or ""))
                         or not isinstance(items, list) or not 1 <= len(items) <= 20):
@@ -2202,6 +2205,7 @@ class InstagramCapture:
 
     def send_instagram_post(self) -> dict[str, Any]:
         post = self.source["instagramPost"]
+        source_kind = "s" if post.get("storyId") else "p"
         items = post["media"]
         deadline = time.monotonic() + 25 * 60
         uploading = False
@@ -2220,8 +2224,8 @@ class InstagramCapture:
                     data["reply_parameters"] = json.dumps({"message_id": self.payload["requestMessageId"], "allow_sending_without_reply": True})
                 key = f"ig:{self.payload['userId']}:{post['shortcode']}:{index}:video" if video else None
                 markup = {"inline_keyboard": [[
-                    {"text": "🎵 فقط صدا", "callback_data": f"iga|p|{post['shortcode']}|{index}|{self.payload['userId']}"},
-                    {"text": "🔎 پیداکردن آهنگ", "callback_data": f"igm|p|{post['shortcode']}|{index}|{self.payload['userId']}"},
+                    {"text": "🎵 فقط صدا", "callback_data": f"iga|{source_kind}|{post['shortcode']}|{index}|{self.payload['userId']}"},
+                    {"text": "🔎 پیداکردن آهنگ", "callback_data": f"igm|{source_kind}|{post['shortcode']}|{index}|{self.payload['userId']}"},
                 ]]} if video else None
                 if key and reuse_cached_file(self.payload, key, caption, reply_markup=markup):
                     self.post_sent += 1

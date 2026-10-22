@@ -82,6 +82,15 @@ Tests cover provider routing, exact large IDs, hostile redirects/hosts, real pin
 
 ## Supported Instagram links
 
+Profile commands accept a username with or without `@`:
+
+```text
+اینستاگرام استوری username
+اینستاگرام پست username
+```
+
+The Story command sends all currently accessible stories. The post command reads the profile timeline page by page using the logged-in web query from Instaloader 4.15.4 (`doc_id=28975909992013618`). Both use the existing Workflow and complete-file Instagram sender, one story/post at a time; albums retain their item order, overlapping profile pages are deduplicated, and durable checkpoints avoid repeating confirmed deliveries on replay. There is no application-level post-count cap. Account access, active-story availability, existing per-file limits and platform restrictions still apply. A security/rate rejection or an incomplete item stops the batch and reports confirmed partial progress. No extra session, service, Container binding or polling loop is added. Existing link requests keep their current routes.
+
 - Instagram Reel
 - Instagram video post
 - Instagram carousel media

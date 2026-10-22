@@ -2,8 +2,10 @@ import { build } from 'esbuild';
 import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { createHmac } from 'node:crypto';
 const source = await readFile(new URL('../src/youtube-main.ts', import.meta.url), 'utf8');
 const story = await readFile(new URL('../src/story-main.ts', import.meta.url), 'utf8');
+const instagram = await readFile(new URL('../src/index.ts', import.meta.url), 'utf8');
 const { outputFiles } = await build({
   stdin: { contents: source + '\nexport {parseInstagramVideoTarget,parseInstagramAudioTarget,resolveInstagramVideo,instagramVideoErrorText,parsePlaylist,mediaCacheKey,parseSocialUrl,extractYouTubeUrl};', loader: 'ts' },
   bundle: true, format: 'esm', write: false,
@@ -11,6 +13,7 @@ const { outputFiles } = await build({
     build.onResolve({ filter: /.*/ }, a => ({ path: a.path, namespace: 'test' }));
     build.onLoad({ filter: /.*/, namespace: 'test' }, a => {
       if (a.path === './story-main') return { contents: story, loader: 'ts' };
+      if (a.path === './index') return { contents: instagram, loader: 'ts' };
       if (a.path === './main') return { contents: 'export default {fetch(){return Response.json({delegated:true})}};' };
       if (a.path === '@cloudflare/containers') return { contents: `
         export class Container {
@@ -39,6 +42,148 @@ const env = { BOT_TOKEN: 'fictional-bot-token', API_ID: '123', API_HASH: 'fictio
   DOWNLOAD_POOL: {getByName(){return {async acquire(){return {instance:0,token:'test-lease'};},async release(){},async lookup(){return {instance:0};}};}} };
 const liveUrl = 'https://scontent.cdninstagram.com/live.mpd';
 const job = { id: 'igdl-42-7-42', chatId: 42, requestMessageId: 7, userId: 42, url: '', instagram: {kind:'live',broadcastId:'17900000000000001'} };
+
+async function profileWorkflow({ failPost, rejectPage, repeatCursor = false, stories = false } = {}) {
+  const parent={...job,instagram:undefined,url:'https://www.instagram.com/example/',instagramProfile:{username:'example',kind:stories?'story':'posts'}};
+  const checkpoints=new Map(),events=new Map(),waiters=new Map(),children=[],tasks=[],order=[],messages=[],pages=[];
+  const created=new Set();
+  globalThis.downloadHistory=[];globalThis.delivered=0;globalThis.containerIds=[];globalThis.testFileCache=undefined;
+  const photo={kind:'photo',url:'https://scontent.cdninstagram.com/picture.jpg',width:1080,height:1080};
+  const node=code=>({code,media_type:1,image_versions2:{candidates:[photo]}});
+  globalThis.fetch=async(url,init={})=>{
+    if(String(url).includes('api.telegram.org')) {
+      messages.push(JSON.parse(init.body));return Response.json({ok:true,result:{message_id:100+messages.length}});
+    }
+    if(String(url).includes('cdninstagram.com')) return new Response(null,{headers:{'content-length':String(stories&&String(url).endsWith('.mp4')?120000000:1000000)}});
+    if(stories&&String(url).includes('/usernameinfo/'))return Response.json({user:{pk:'77'}});
+    if(stories&&String(url).includes('/feed/user/77/story/')) {
+      pages.push(null);return Response.json({reel:{items:[
+        {pk:'999',media_type:2,video_versions:[{url:'https://scontent.cdninstagram.com/story.mp4',width:1080,height:1920}]},
+        {pk:'1000',...node('B')},
+      ]}});
+    }
+    assert.equal(String(url),'https://www.instagram.com/graphql/query');
+    const variables=JSON.parse(new URLSearchParams(init.body).get('variables'));pages.push(variables.after||null);
+    if(rejectPage) return Response.json({message:'challenge_required'},{status:400});
+    return Response.json({data:{xdt_api__v1__feed__user_timeline_graphql_connection:{
+      edges:(variables.after?['B','C']:['A','B']).map(code=>({node:node(code)})),
+      page_info:{has_next_page:!variables.after||repeatCursor,end_cursor:!variables.after||repeatCursor?'page-2':null},
+    }}});
+  };
+  globalThis.container={
+    async startShared(){},async releaseInstagram(){},
+    async instagramRequest(action,payload){
+      if(action==='start')order.push('start:'+payload.id);
+      if(action==='send') {
+        order.push('send:'+payload.id);
+        if(payload.id.endsWith('-'+failPost))return {ok:false,parts:0,message:'❌ fixture failure'};
+        return {ok:true,parts:1};
+      }
+      if(action==='cleanup')order.push('cleanup:'+payload.id);
+      return {ok:true};
+    },
+  };
+  const stepFor=id=>({
+    async do(name,options,fn) {
+      if(typeof options==='function')fn=options;
+      const key=id+':'+name;if(checkpoints.has(key))return structuredClone(checkpoints.get(key));
+      const value=await fn();checkpoints.set(key,structuredClone(value));return value;
+    },
+    async waitForEvent(name,{type}) {
+      if(type==='instagram-ready')return {payload:{ok:true}};
+      const key=id+':'+name;if(checkpoints.has(key))return structuredClone(checkpoints.get(key));
+      const value=events.has(type)?events.get(type):await new Promise((resolve,reject)=>{
+        const timer=setTimeout(()=>reject(Error('missing parent event '+type)),2000);
+        waiters.set(type,value=>{clearTimeout(timer);resolve(value);});
+      });
+      const result={payload:value};checkpoints.set(key,structuredClone(result));return result;
+    },
+  });
+  const bindings={...env,YOUTUBE_DOWNLOAD_WORKFLOW:{
+    async create({id,params}) {
+      if(created.has(id))throw Error('already exists');created.add(id);children.push(params);
+      tasks.push(new mod.YoutubeDownloadWorkflow({},bindings).run({payload:params},stepFor(id)));
+      return {id};
+    },
+    async get(id){assert.equal(id,parent.id);return {async sendEvent({type,payload}) {
+      events.set(type,payload);waiters.get(type)?.(payload);
+    }};},
+  }};
+  const replay=()=>new mod.YoutubeDownloadWorkflow({},bindings).run({payload:parent},stepFor(parent.id));
+  await replay();await Promise.all(tasks);
+  return {children,order,pages,messages,replay};
+}
+
+test('profile posts paginate, deduplicate overlapping pages, send sequentially and survive replay',async()=>{
+  const result=await profileWorkflow();
+  assert.deepEqual(result.pages,[null,'page-2']);
+  assert.deepEqual(result.children.map(c=>c.instagramPost.shortcode),['A','B','C']);
+  assert.deepEqual(result.order.flatMap(x=>x.startsWith('send:')?[x.split('-').at(-1)]:[]),['1','2','3']);
+  for(let i=1;i<3;i++)assert.ok(result.order.indexOf(`cleanup:${job.id}-profile-${i}`)<result.order.indexOf(`start:${job.id}-profile-${i+1}`));
+  assert.ok(!JSON.stringify(result.children).includes(env.INSTAGRAM_SESSIONID));
+  const count=result.order.length,requests=result.pages.length,sent=result.messages.length;
+  await result.replay();
+  assert.equal(result.order.length,count);assert.equal(result.pages.length,requests);assert.equal(result.messages.length,sent);
+  const final=globalThis.downloadHistory.findLast(x=>x.source==='Instagram profile posts');
+  assert.equal(final.status,'success');assert.equal(final.delivered,3);
+});
+
+test('profile stops after a failed post and reports confirmed partial delivery',async()=>{
+  const result=await profileWorkflow({failPost:2});
+  assert.deepEqual(result.children.map(c=>c.instagramPost.shortcode),['A','B']);
+  assert.deepEqual(result.pages,[null]);
+  const final=globalThis.downloadHistory.findLast(x=>x.source==='Instagram profile posts');
+  assert.equal(final.status,'partial');assert.equal(final.delivered,1);
+});
+
+test('profile challenge stops before creating upload jobs',async()=>{
+  const result=await profileWorkflow({rejectPage:true});
+  assert.equal(result.children.length,0);assert.equal(result.pages.length,1);
+  assert.match(result.messages.at(-1).text,/تأیید امنیتی/);
+});
+
+test('profile rejects cyclic cursors instead of repeatedly requesting pages',async()=>{
+  const result=await profileWorkflow({repeatCursor:true});
+  assert.deepEqual(result.pages,[null,'page-2']);
+  assert.match(result.messages.at(-1).text,/فهرست پست/);
+});
+
+test('profile post command immediately creates one durable batch without source requests',async()=>{
+  const created=[];
+  globalThis.fetch=async()=>{throw Error('must not fetch Instagram or send files in webhook');};
+  const request=()=>new Request('https://worker/telegram/webhook',{method:'POST',headers:{
+    'content-type':'application/json','x-telegram-bot-api-secret-token':'profile-test'},body:JSON.stringify({update_id:9,
+      message:{message_id:7,chat:{id:42},from:{id:1},text:'اینستاگرام پست @example'}})});
+  const bindings={...env,WEBHOOK_SECRET:'profile-test',YOUTUBE_DOWNLOAD_WORKFLOW:{async create(value){
+    if(created.length)throw Error('already exists');created.push(value);
+  }}};
+  assert.equal((await mod.default.fetch(request(),bindings,{})).status,200);
+  assert.equal((await mod.default.fetch(request(),bindings,{})).status,200);
+  assert.equal(created.length,1);assert.equal(created[0].params.instagramProfile.username,'example');
+});
+
+test('story profile uses the same serial uploader for all stories including videos above Bot API URL limits',async()=>{
+  const result=await profileWorkflow({stories:true});
+  assert.equal(result.children.length,2);
+  assert.deepEqual(result.children.map(c=>c.instagramPost.storyId),['999','1000']);
+  assert.deepEqual(result.children.map(c=>c.instagramPost.media[0].kind),['video','photo']);
+  assert.equal(result.children[0].instagramPost.media[0].size,120000000);
+  const final=globalThis.downloadHistory.findLast(x=>x.source==='Instagram profile stories');
+  assert.equal(final.status,'success');assert.equal(final.delivered,2);
+});
+
+test('profile child completion callbacks retain the existing signature check and route to their own workflow',async()=>{
+  const id='igdl-42-7-42-profile-1',events=[];
+  const bindings={...env,YOUTUBE_DOWNLOAD_WORKFLOW:{async get(value){
+    assert.equal(value,id);return {async sendEvent(event){events.push(event);}};
+  }}};
+  const request=token=>new Request('https://worker/instagram/events/'+id,{method:'POST',headers:{
+    'content-type':'application/json','x-instagram-event-token':token},body:JSON.stringify({ok:true})});
+  assert.equal((await mod.default.fetch(request('invalid'),bindings,{})).status,403);
+  const token=createHmac('sha256',env.BOT_TOKEN).update('event:'+id).digest('hex');
+  assert.equal((await mod.default.fetch(request(token),bindings,{})).status,200);
+  assert.deepEqual(events,[{type:'instagram-ready',payload:{ok:true,message:undefined}}]);
+});
 
 test('Pinterest shared Pin links normalize before creating jobs while boards and internal API URLs stay rejected',()=>{
   for(const url of ['https://www.pinterest.com/pin/266556871689003952/sent/?sender=42',
