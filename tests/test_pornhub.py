@@ -343,6 +343,82 @@ class PornhubTests(unittest.TestCase):
             run.assert_called_once()
             send.assert_not_called()
 
+    def test_temporary_metadata_http_errors_retry_then_succeed(self):
+        for status in (502, 503, 504):
+            failure = subprocess.CalledProcessError(1, 'yt-dlp',
+                stderr=f'ERROR: Unable to download webpage: HTTP Error {status}: Service Unavailable')
+            success = subprocess.CompletedProcess([], 0, '{}')
+            with self.subTest(status=status), \
+                 patch.object(pipeline, '_run', side_effect=[failure, success]) as run, \
+                 patch.object(pornhub.time, 'sleep') as sleep:
+                self.assertIs(pornhub.run_source(['yt-dlp'], 90, 'metadata'), success)
+            self.assertEqual(run.call_count, 2)
+            sleep.assert_called_once_with(1)
+
+    def test_temporary_metadata_failure_is_bounded_and_preserves_safe_error(self):
+        failure = subprocess.CalledProcessError(1, 'yt-dlp',
+            stderr='response body must not be logged\nERROR: HTTP Error 503: Service Unavailable')
+        with patch.object(pipeline, '_run', side_effect=failure) as run, \
+             patch.object(pornhub.time, 'sleep') as sleep, \
+             self.assertRaises(pornhub.DownloadError) as caught:
+            pornhub.run_source(['yt-dlp'], 90, 'metadata')
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+        self.assertEqual(caught.exception.error_code, 'SOURCE_TEMPORARILY_UNAVAILABLE')
+        self.assertEqual(caught.exception.phase, 'metadata')
+        self.assertEqual(caught.exception.detail, 'ERROR: HTTP Error 503: Service Unavailable')
+
+    def test_recovered_metadata_failure_downloads_and_sends_only_once(self):
+        calls = []
+        def run(command, timeout):
+            calls.append(command)
+            if len(calls) == 1:
+                raise subprocess.CalledProcessError(1, 'yt-dlp', stderr='ERROR: HTTP Error 503: Service Unavailable')
+            if '--dump-single-json' in command:
+                return subprocess.CompletedProcess(command, 0, json.dumps({'title': 'Example', 'duration': 60}))
+            path = Path(command[command.index('--output') + 1].replace('%(ext)s', 'mp4'))
+            path.write_bytes(b'complete-fixture')
+            return subprocess.CompletedProcess(command, 0, str(path))
+        with patch.object(pipeline, '_run', side_effect=run), patch.object(pornhub.time, 'sleep'), \
+             patch.object(app, 'probe_duration', return_value=60), \
+             patch.object(pipeline, '_probe_geometry', return_value=(640, 360, 16/9)), \
+             patch.object(app, 'send_media_file') as send, patch.object(app, 'edit_status'), \
+             patch.object(app, 'delete_status'):
+            result = app.process_job(self.payload())
+        self.assertTrue(result['ok'])
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sum('--load-info-json' in command for command in calls), 1)
+        send.assert_called_once()
+
+    def test_metadata_retry_uses_remaining_budget_including_job_deadline(self):
+        failure = subprocess.CalledProcessError(1, 'yt-dlp', stderr='ERROR: HTTP Error 503: Service Unavailable')
+        success = subprocess.CompletedProcess([], 0, '{}')
+        with patch.object(app, 'job_timeout', return_value=8), \
+             patch.object(pornhub.time, 'monotonic', side_effect=[100, 100, 106, 107]), \
+             patch.object(pipeline, '_run', side_effect=[failure, success]) as run, \
+             patch.object(pornhub.time, 'sleep'):
+            self.assertIs(pornhub.run_source(['yt-dlp'], 90, 'metadata'), success)
+        self.assertEqual([call.args[1] for call in run.call_args_list], [8, 1])
+        with patch.object(pornhub.time, 'monotonic', side_effect=[100, 100, 189.5]), \
+             patch.object(pipeline, '_run', side_effect=failure) as run, \
+             patch.object(pornhub.time, 'sleep') as sleep, \
+             self.assertRaises(pornhub.DownloadError):
+            pornhub.run_source(['yt-dlp'], 90, 'metadata')
+        run.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_temporary_download_errors_and_unrelated_numbers_do_not_retry(self):
+        for phase, detail in [('download', 'HTTP Error 503: Service Unavailable'),
+                              ('metadata', 'ERROR: video 503 is unavailable'),
+                              ('metadata', 'ERROR: failed https://example.test/HTTP Error 503')]:
+            with self.subTest(phase=phase, detail=detail), \
+                 patch.object(pipeline, '_run', side_effect=subprocess.CalledProcessError(1, 'yt-dlp', stderr=detail)) as run, \
+                 patch.object(pornhub.time, 'sleep') as sleep, \
+                 self.assertRaises(pornhub.DownloadError):
+                pornhub.run_source(['yt-dlp'], 90, phase)
+            run.assert_called_once()
+            sleep.assert_not_called()
+
     def test_invalid_metadata_is_a_metadata_failure(self):
         for value in ['not json', '[]', 'null']:
             with self.subTest(value=value), \

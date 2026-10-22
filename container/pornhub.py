@@ -49,6 +49,8 @@ def source_error(detail: str) -> tuple[str, str]:
         return "TELEGRAM_FILE_TOO_LARGE", "❌ حجم این ویدیو از سقف ارسال ۲ گیگابایت تلگرام بیشتر است."
     if "429" in detail or "too many requests" in detail:
         return "SOURCE_RATE_LIMITED", "❌ Pornhub درخواست‌های این سرور را موقتاً محدود کرده؛ کمی بعد امتحان کن."
+    if re.search(r"\bhttp error (?:502|503|504)\b", detail):
+        return "SOURCE_TEMPORARILY_UNAVAILABLE", "❌ سرویس دریافت از Pornhub موقتاً پاسخ نمی‌دهد؛ کمی بعد امتحان کن."
     if "redirection detected" in detail:
         if "suppliedcookies=0;" in detail:
             return "SOURCE_SESSION_MISSING", "❌ سرور دانلود بدون کوکی نشست به Pornhub وصل شد؛ تنظیمات نشست باید روی همین سرور اعمال شود."
@@ -75,20 +77,31 @@ def source_error(detail: str) -> tuple[str, str]:
 
 
 def run_source(command: list[str], timeout: int, phase: str) -> subprocess.CompletedProcess[str]:
-    try:
-        # Shared runner bounds the entire process group, including FFmpeg children.
-        return pipeline._run(command, timeout)
-    except subprocess.TimeoutExpired as exc:
-        raise DownloadError("SOURCE_TIMEOUT", phase, "❌ دریافت ویدیو از Pornhub بیش از حد طول کشید؛ دوباره امتحان کن.") from exc
-    except subprocess.CalledProcessError as exc:
-        stderr = str(exc.stderr or "")
-        code, message = source_error(stderr)
-        # Keep one extractor error line for diagnosis, never its command or a
-        # provider response dump. The job boundary redacts secrets and URLs.
-        errors = [line.strip() for line in stderr.splitlines() if line.lstrip().startswith("ERROR:")]
-        error = DownloadError(code, phase, message, errors[-1] if errors else "")
-        error.source_diagnostics = source_diagnostics(stderr)
-        raise error from exc
+    # yt-dlp's download retries do not cover Pornhub's metadata webpage request.
+    # Retry only temporary HTTP failures there, within the original total budget.
+    deadline = time.monotonic() + app.job_timeout(timeout)
+    for attempt in range(3):
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            # Shared runner bounds the process group, including FFmpeg children.
+            return pipeline._run(command, remaining)
+        except subprocess.TimeoutExpired as exc:
+            raise DownloadError("SOURCE_TIMEOUT", phase, "❌ دریافت ویدیو از Pornhub بیش از حد طول کشید؛ دوباره امتحان کن.") from exc
+        except subprocess.CalledProcessError as exc:
+            stderr = str(exc.stderr or "")
+            code, message = source_error(stderr)
+            if phase == "metadata" and code == "SOURCE_TEMPORARILY_UNAVAILABLE" and attempt < 2:
+                delay = attempt + 1
+                if deadline - time.monotonic() > delay:
+                    time.sleep(delay)
+                    continue
+            # Keep one extractor error line; the job boundary redacts secrets.
+            errors = [line.strip() for line in stderr.splitlines() if line.lstrip().startswith("ERROR:")]
+            error = DownloadError(code, phase, message, errors[-1] if errors else "")
+            error.source_diagnostics = source_diagnostics(stderr)
+            raise error from exc
 
 
 def video_url(value: str) -> str:
