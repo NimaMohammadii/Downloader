@@ -154,6 +154,16 @@ class SocialBoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(app.UserVisibleError,'دسترسی'):
                 p.social_download_http('https://video.twimg.com/a.mp4',Path(d)/'source','x',1000,time.monotonic()+60)
 
+    def test_reported_pinterest_not_found_row_is_not_a_file_download_failure(self):
+        # Captured gallery-dl 1.32.17 output for pin.it/6CNqhwjOg: the Pin
+        # metadata API returns HTTP 404/code 50 before any media is downloaded.
+        data=[[-1,{'error':'NotFoundError','message':'Requested pin could not be found'}]]
+        command=[sys.executable,'-c',f'print({json.dumps(data)!r})']
+        with self.assertRaisesRegex(app.UserVisibleError,'پست Pinterest حذف شده، در دسترس نیست'):
+            p.social_json(command,'pinterest')
+        self.assertIn('دریافت فایل',str(p.social_error('pinterest','TimeoutExpired')))
+        self.assertIn('دسترسی',str(p.social_error('pinterest','NotFoundError: private pin, login required')))
+
     def test_metadata_output_error_rows_and_invalid_json_are_not_success(self):
         def command(data,code=0):return [sys.executable,'-c',f'import sys;print({data!r});sys.exit({code})']
         self.assertEqual(p.social_json(command('{"ok":true}'),'x'),{'ok':True})

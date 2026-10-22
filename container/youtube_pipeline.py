@@ -986,7 +986,8 @@ def social_error(platform: str, detail: str) -> app.UserVisibleError:
     s = detail.lower()
     if any(x in s for x in ("429", "rate limit", "ip address is blocked", "captcha", "challenge", "403", "sign in", "login", "log in", "authorization", "private")):
         return app.UserVisibleError(f"❌ {name} دسترسی این سرور به پست را نپذیرفت یا پست نیاز به ورود دارد؛ دانلود انجام نشد.")
-    if any(x in s for x in ("404", "not found", "deleted", "unavailable", "no video", "empty")):
+    if (any(x in s for x in ("404", "not found", "deleted", "unavailable", "no video", "empty"))
+            or (platform == "pinterest" and any(x in s for x in ("notfounderror", "requested pin could not be found")))):
         return app.UserVisibleError(f"❌ پست {name} حذف شده، در دسترس نیست یا رسانهٔ قابل دانلود ندارد.")
     return app.UserVisibleError(f"❌ دریافت فایل {name} کامل نشد؛ لینک عمومی پست یا آهنگ را دوباره بفرست.")
 
