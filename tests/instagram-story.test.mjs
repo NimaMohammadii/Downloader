@@ -16,11 +16,17 @@ const { default: worker, parseInstagramProfileCommand } = await import(`data:tex
 const session = '12345%3Afictional-test-session';
 const media = { pk: '999', user: { pk: '77' }, video_versions: [{ url: 'https://cdn.instagram.com/test.mp4', width: 720, height: 1280 }] };
 
-test('Persian profile commands accept usernames with or without @ and reject other messages', () => {
+test('Persian and English profile commands accept usernames with or without @ and reject other messages', () => {
   assert.deepEqual(parseInstagramProfileCommand('اینستاگرام استوری @example.name'), {kind:'story',username:'example.name'});
   assert.deepEqual(parseInstagramProfileCommand('اینستاگرام پست example_123'), {kind:'posts',username:'example_123'});
+  assert.deepEqual(parseInstagramProfileCommand('/instastory @example.name'), {kind:'story',username:'example.name'});
+  assert.deepEqual(parseInstagramProfileCommand('/instapost example_123'), {kind:'posts',username:'example_123'});
+  assert.deepEqual(parseInstagramProfileCommand('/INSTASTORY@ExampleBot example'), {kind:'story',username:'example'});
+  assert.deepEqual(parseInstagramProfileCommand('/instapost@ExampleBot @example'), {kind:'posts',username:'example'});
   for (const value of ['example', 'استوری example', 'اینستاگرام استوری', 'اینستاگرام پست ../example',
-    'اینستاگرام پست user extra', 'اینستاگرام استوری @a..b', 'اینستاگرام پست '+ 'a'.repeat(31)]) {
+    'اینستاگرام پست user extra', 'اینستاگرام استوری @a..b', 'اینستاگرام پست '+ 'a'.repeat(31),
+    '/instapost', '/instastory@ExampleBot', '/instapostextra example', '/instastory ../example',
+    '/instapost @a..b', '/instapost user extra', '/instastory '+ 'a'.repeat(31)]) {
     assert.equal(parseInstagramProfileCommand(value), null, value);
   }
 });

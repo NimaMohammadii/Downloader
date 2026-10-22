@@ -86,9 +86,9 @@ async function safeTelegramCall(token: string, method: string, payload: Record<s
 }
 
 export function parseInstagramProfileCommand(text: string): { kind: "story" | "posts"; username: string } | null {
-  const match = /^اینستاگرام\s+(استوری|پست)\s+@?([A-Za-z0-9_](?:[A-Za-z0-9_.]{0,28}[A-Za-z0-9_])?)$/i.exec(text.trim());
-  if (!match || match[2].includes("..")) return null;
-  return { kind: match[1] === "استوری" ? "story" : "posts", username: match[2] };
+  const match = /^(?:اینستاگرام\s+(استوری|پست)|\/(instastory|instapost)(?:@[A-Za-z0-9_]+)?)\s+@?([A-Za-z0-9_](?:[A-Za-z0-9_.]{0,28}[A-Za-z0-9_])?)$/i.exec(text.trim());
+  if (!match || match[3].includes("..")) return null;
+  return { kind: match[1] === "استوری" || match[2]?.toLowerCase() === "instastory" ? "story" : "posts", username: match[3] };
 }
 
 function parseStoryTarget(text: string): StoryTarget | null {

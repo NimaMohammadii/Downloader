@@ -1621,9 +1621,9 @@ export default {
           }
           return Response.json({ ok: true });
         }
-        if (!profileCommand && /^اینستاگرام\s+(?:استوری|پست)(?:\s|$)/.test(text)) {
+        if (!profileCommand && /^(?:اینستاگرام\s+(?:استوری|پست)|\/(?:instastory|instapost)(?:@[A-Za-z0-9_]+)?)(?:\s|$)/i.test(text)) {
           await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id,
-            text: "دستور را همراه یوزرنیم بفرست:\nاینستاگرام استوری username\nاینستاگرام پست username" });
+            text: "دستور را همراه یوزرنیم بفرست:\n/instastory username\n/instapost username\nاینستاگرام استوری username\nاینستاگرام پست username" });
           return Response.json({ ok: true });
         }
 

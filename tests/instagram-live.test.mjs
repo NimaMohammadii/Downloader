@@ -148,18 +148,23 @@ test('profile rejects cyclic cursors instead of repeatedly requesting pages',asy
   assert.match(result.messages.at(-1).text,/فهرست پست/);
 });
 
-test('profile post command immediately creates one durable batch without source requests',async()=>{
+test('Persian and English profile commands create the same durable batch without source requests',async()=>{
+  for(const [text,kind] of [['اینستاگرام پست @example','posts'],['اینستاگرام استوری example','story'],
+    ['/instapost @example','posts'],['/instastory example','story'],['/instapost@ExampleBot example','posts'],
+    ['/instastory@ExampleBot @example','story']]) {
   const created=[];
   globalThis.fetch=async()=>{throw Error('must not fetch Instagram or send files in webhook');};
   const request=()=>new Request('https://worker/telegram/webhook',{method:'POST',headers:{
     'content-type':'application/json','x-telegram-bot-api-secret-token':'profile-test'},body:JSON.stringify({update_id:9,
-      message:{message_id:7,chat:{id:42},from:{id:1},text:'اینستاگرام پست @example'}})});
+      message:{message_id:7,chat:{id:42},from:{id:1},text}})});
   const bindings={...env,WEBHOOK_SECRET:'profile-test',YOUTUBE_DOWNLOAD_WORKFLOW:{async create(value){
     if(created.length)throw Error('already exists');created.push(value);
   }}};
   assert.equal((await mod.default.fetch(request(),bindings,{})).status,200);
   assert.equal((await mod.default.fetch(request(),bindings,{})).status,200);
   assert.equal(created.length,1);assert.equal(created[0].params.instagramProfile.username,'example');
+  assert.equal(created[0].params.instagramProfile.kind,kind);
+  }
 });
 
 test('story profile uses the same serial uploader for all stories including videos above Bot API URL limits',async()=>{

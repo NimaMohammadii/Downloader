@@ -85,6 +85,8 @@ Tests cover provider routing, exact large IDs, hostile redirects/hosts, real pin
 Profile commands accept a username with or without `@`:
 
 ```text
+/instastory username
+/instapost username
 اینستاگرام استوری username
 اینستاگرام پست username
 ```
