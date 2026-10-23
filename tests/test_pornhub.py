@@ -92,13 +92,25 @@ class PornhubTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(app.UserVisibleError):
                 pornhub.video_url(value)
 
+    @staticmethod
+    def write_source_metadata(command, raw):
+        output = command[command.index('--output') + 1]
+        assert output.endswith('source.%(ext)s')
+        info = Path(output.replace('%(ext)s', 'info.json'))
+        info.write_text(raw, encoding='utf-8')
+        return info
+
     def download(self, directory, duration=60, metadata=None, metadata_stdout=None):
         path = Path(directory) / 'Pornhub.mp4'
         path.write_bytes(b'fictional-video')
-        results = [subprocess.CompletedProcess([], 0, metadata_stdout if metadata_stdout is not None
-                                               else json.dumps(metadata or {'title': 'Example', 'duration': 60})),
-                   subprocess.CompletedProcess([], 0, str(path))]
-        with patch.object(pipeline, '_run', side_effect=results) as run, \
+        def fake_run(command, timeout):
+            if '--write-info-json' in command:
+                self.write_source_metadata(
+                    command, json.dumps(metadata if metadata is not None
+                                        else {'title': 'Example', 'duration': 60}))
+                return subprocess.CompletedProcess(command, 0, metadata_stdout or '')
+            return subprocess.CompletedProcess(command, 0, str(path))
+        with patch.object(pipeline, '_run', side_effect=fake_run) as run, \
              patch.object(app, 'probe_duration', return_value=duration), \
              patch.object(pipeline, '_probe_geometry', return_value=(1280, 720, 16/9)):
             value = pornhub.download('https://pornhub.com/view_video.php?viewkey=ph123', Path(directory))
@@ -119,7 +131,13 @@ class PornhubTests(unittest.TestCase):
                 self.assertNotIn('--plugin-dirs', command)
                 self.assertEqual(command[command.index('--compat-options') + 1], 'no-certifi')
             self.assertEqual(calls[0].args[0][-2], '--')
+            self.assertIn('--write-info-json', calls[0].args[0])
+            self.assertNotIn('--dump-single-json', calls[0].args[0])
+            self.assertIn('--skip-download', calls[0].args[0])
             self.assertIn('--load-info-json', calls[1].args[0])
+            output = calls[0].args[0][calls[0].args[0].index('--output') + 1]
+            info = calls[1].args[0][calls[1].args[0].index('--load-info-json') + 1]
+            self.assertEqual(output.replace('%(ext)s', 'info.json'), info)
             self.assertNotIn('https://pornhub.com/view_video.php?viewkey=ph123', calls[1].args[0])
             self.assertIn('--abort-on-unavailable-fragments', calls[1].args[0])
             self.assertIn(str(app.DIRECT_TELEGRAM_LIMIT), calls[1].args[0])
@@ -215,6 +233,7 @@ class PornhubTests(unittest.TestCase):
         self.assertNotIn('--print-traffic', calls[1].args[0])
         self.assertEqual(calls[0].args[0][calls[0].args[0].index('--impersonate') + 1], 'chrome')
         self.assertNotIn('--impersonate', calls[1].args[0])
+        self.assertIn('--write-info-json', calls[0].args[0])
 
     def test_temporary_metadata_http_errors_retry_then_succeed(self):
         for status in (502, 503, 504):
@@ -247,8 +266,9 @@ class PornhubTests(unittest.TestCase):
             calls.append(command)
             if len(calls) == 1:
                 raise subprocess.CalledProcessError(1, 'yt-dlp', stderr='ERROR: HTTP Error 503: Service Unavailable')
-            if '--dump-single-json' in command:
-                return subprocess.CompletedProcess(command, 0, json.dumps({'title': 'Example', 'duration': 60}))
+            if '--write-info-json' in command:
+                self.write_source_metadata(command, json.dumps({'title': 'Example', 'duration': 60}))
+                return subprocess.CompletedProcess(command, 0, 'HTTP trace ignored')
             path = Path(command[command.index('--output') + 1].replace('%(ext)s', 'mp4'))
             path.write_bytes(b'complete-fixture')
             return subprocess.CompletedProcess(command, 0, str(path))
@@ -292,27 +312,40 @@ class PornhubTests(unittest.TestCase):
             run.assert_called_once()
             sleep.assert_not_called()
 
-    def test_metadata_traffic_prefix_does_not_corrupt_json(self):
-        trace = ("director: sending request via CurlCFFI\n"
-                 "send: GET https://www.pornhub.com/view_video.php?viewkey=ph123\n"
-                 "reply: HTTP/2 200 OK\n"
-                 + json.dumps({'title': 'Example', 'duration': 60}) + "\n")
+    def test_metadata_file_is_independent_of_http_traffic_stdout(self):
+        # The old last-line JSON parser rejected this successful extraction.
+        trace = ('{"title": "Example", "duration": 60}\n'
+                 'HTTP/2 200 OK\nLocation: https://www.pornhub.com/\n')
         with tempfile.TemporaryDirectory() as directory:
             (path, title), calls = self.download(directory, metadata_stdout=trace)
-        self.assertEqual(title, 'Example')
-        self.assertEqual(path.suffix, '.mp4')
+            self.assertEqual(title, 'Example')
+            self.assertEqual(path.suffix, '.mp4')
+            self.assertEqual((Path(directory) / 'source.info.json').stat().st_mode & 0o777, 0o600)
         self.assertEqual(len(calls), 2)
         self.assertIn('--print-traffic', calls[0].args[0])
 
-    def test_invalid_metadata_is_a_metadata_failure(self):
+    def test_invalid_metadata_file_is_a_metadata_failure(self):
         for value in ['', 'not json', '[]', 'null']:
+            def fake_run(command, timeout):
+                self.write_source_metadata(command, value)
+                return subprocess.CompletedProcess(command, 0, 'HTTP trace ignored')
             with self.subTest(value=value), \
-                 patch.object(pipeline, '_run', return_value=subprocess.CompletedProcess([], 0, value)), \
+                 patch.object(pipeline, '_run', side_effect=fake_run), \
                  patch.object(app, 'edit_status'), patch.object(app, 'send_media_file') as send:
                 result = app.process_job(self.payload())
             self.assertEqual(result['phase'], 'metadata')
             self.assertEqual(result['errorCode'], 'SOURCE_INVALID_METADATA')
             send.assert_not_called()
+
+    def test_missing_metadata_file_is_reported_without_fallback(self):
+        # Never fall back to guessing an object from stdout.
+        with patch.object(pipeline, '_run', return_value=subprocess.CompletedProcess(
+                 [], 0, '{"title": "misleading stdout"}')), \
+             patch.object(app, 'edit_status'), patch.object(app, 'send_media_file') as send:
+            result = app.process_job(self.payload())
+        self.assertEqual(result['phase'], 'metadata')
+        self.assertEqual(result['errorCode'], 'SOURCE_MISSING_METADATA')
+        send.assert_not_called()
 
     def test_unknown_extractor_error_keeps_a_redacted_error_line_for_diagnosis(self):
         detail = ('provider response must not be logged\n'
@@ -332,10 +365,11 @@ class PornhubTests(unittest.TestCase):
             calls = []
             def run(command, timeout):
                 calls.append(command)
-                if '--dump-single-json' in command:
+                if '--write-info-json' in command:
                     if len(calls) == 3:
                         self.assertFalse((folder / 'Pornhub.mp4.part').exists())
-                    return subprocess.CompletedProcess(command, 0, json.dumps({'duration': 60, 'title': 'Example'}))
+                    self.write_source_metadata(command, json.dumps({'duration': 60, 'title': 'Example'}))
+                    return subprocess.CompletedProcess(command, 0, 'HTTP trace ignored')
                 if len(calls) == 2:
                     (folder / 'Pornhub.mp4.part').write_bytes(b'incomplete')
                     raise subprocess.CalledProcessError(1, command, stderr='HTTP Error 403: Forbidden')
@@ -349,9 +383,12 @@ class PornhubTests(unittest.TestCase):
             self.assertEqual(len(calls), 4)
 
     def test_repeated_rejected_download_links_stop_after_one_refresh(self):
-        info = subprocess.CompletedProcess([], 0, json.dumps({'duration': 60}))
-        error = subprocess.CalledProcessError(1, 'yt-dlp', stderr='HTTP Error 410: Gone')
-        with patch.object(pipeline, '_run', side_effect=[info, error, info, error]) as run, \
+        def fake_run(command, timeout):
+            if '--write-info-json' in command:
+                self.write_source_metadata(command, json.dumps({'duration': 60}))
+                return subprocess.CompletedProcess(command, 0, 'HTTP trace ignored')
+            raise subprocess.CalledProcessError(1, command, stderr='HTTP Error 410: Gone')
+        with patch.object(pipeline, '_run', side_effect=fake_run) as run, \
              patch.object(app, 'edit_status'), patch.object(app, 'send_media_file') as send:
             result = app.process_job(self.payload())
         self.assertEqual(run.call_count, 4)
@@ -384,7 +421,8 @@ class PornhubTests(unittest.TestCase):
             sent = []
             def run(command, timeout, phase):
                 if phase == 'metadata':
-                    return subprocess.CompletedProcess(command, 0, json.dumps(metadata))
+                    self.write_source_metadata(command, json.dumps(metadata))
+                    return subprocess.CompletedProcess(command, 0, 'HTTP trace ignored')
                 return original_run(command, timeout, phase)
             def telegram(token, method, **kwargs):
                 self.assertEqual(method, 'sendVideo')
