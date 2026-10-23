@@ -65,7 +65,6 @@ type Env = AdminStatsEnv & {
   WEBHOOK_SECRET?: string;
   API_ID?: string;
   API_HASH?: string;
-  PORNHUB_COOKIES?: string;
   PINTEREST_COOKIES?: string;
   YOUTUBE_DOWNLOAD_WORKFLOW: Workflow<YoutubeDownloadJob>;
   YOUTUBE_DOWNLOADER_CONTAINER: DurableObjectNamespace<YoutubeDownloaderContainer>;
@@ -135,13 +134,6 @@ type ContainerResult = {
   rpcCode?: number;
   retryAfterSeconds?: number;
   retrySafe?: boolean;
-  sourceDiagnostics?: {
-    probeVersion: string;
-    redirectKind: string;
-    suppliedCookieCount: number;
-    matchingCookies: boolean;
-    httpOnlyCookieCount: number;
-  };
 };
 
 type YoutubeFileSize = { bytes: number; estimated: boolean };
@@ -222,7 +214,6 @@ export class YoutubeDownloaderContainer extends Container<Env> {
   enableInternet = true;
   envVars: Record<string, string> = {
     API_ID: this.env.API_ID || "", API_HASH: this.env.API_HASH || "",
-    PORNHUB_COOKIES: this.env.PORNHUB_COOKIES || "",
   };
   private starting?: Promise<void>;
   private idleShutdownRequested = false;
@@ -426,33 +417,13 @@ async function sendCachedMedia(env: Env, job: YoutubeDownloadJob, statusId?: num
 }
 
 function redactDiagnostic(detail: string, env: Env): string {
-  const cookieValues = (env.PORNHUB_COOKIES || "").split(/\r?\n/)
-    .map(line => line.split("\t")).filter(fields => fields.length === 7).map(fields => fields[6]);
-  try {
-    const exported = JSON.parse((env.PORNHUB_COOKIES || "").replace(/^[\uFEFF \t\r\n]+/, ""));
-    const entries = Array.isArray(exported) ? exported : exported?.cookies;
-    if (Array.isArray(entries)) {
-      for (const entry of entries) if (typeof entry?.value === "string") cookieValues.push(entry.value);
-    }
-  } catch { /* Invalid exports are reported without their contents by the Container. */ }
-  const secrets = [env.BOT_TOKEN, env.API_HASH, env.INSTAGRAM_SESSIONID, env.PORNHUB_COOKIES, ...cookieValues]
+  const secrets = [env.BOT_TOKEN, env.API_HASH, env.INSTAGRAM_SESSIONID]
     .filter((secret): secret is string => Boolean(secret)).sort((a, b) => b.length - a.length);
   for (const secret of secrets) {
     detail = detail.split(secret).join("[redacted]");
   }
   return detail.replace(/https?:\/\/[^\s"'<>]+/gi, "[url]")
     .replace(/\b(?:authorization|cookie|sessionid)\b["']?\s*[:=]\s*[^\r\n]+/gi, "[redacted]").slice(0, 2000);
-}
-
-function safeSourceDiagnostics(value: ContainerResult["sourceDiagnostics"]): ContainerResult["sourceDiagnostics"] {
-  if (!value || !["ph-session-v1", "ph-session-v2"].includes(value.probeVersion)
-      || !["login", "age_verification", "access_restricted", "homepage", "external", "other"].includes(value.redirectKind)
-      || typeof value.matchingCookies !== "boolean"
-      || ![value.suppliedCookieCount, value.httpOnlyCookieCount].every(n => Number.isSafeInteger(n) && n >= 0 && n <= 999999)) return undefined;
-  // Copy only fixed categories, booleans and counts; never trust arbitrary fields.
-  return { probeVersion: value.probeVersion, redirectKind: value.redirectKind,
-    suppliedCookieCount: value.suppliedCookieCount, matchingCookies: value.matchingCookies,
-    httpOnlyCookieCount: value.httpOnlyCookieCount };
 }
 
 function workflowFailureMessage(detail: string, phase: string): string {
@@ -775,8 +746,6 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
                 method: "POST",
                 headers: { "content-type": "application/json" },
                 body: JSON.stringify({ ...job, statusMessageId, botToken: this.env.BOT_TOKEN,
-                  ...(job.source === "pornhub" ? { pornhubSessionTag: await instagramSignature(this.env.BOT_TOKEN,
-                    `pornhub-session:${this.env.PORNHUB_COOKIES || ""}`) } : {}),
                   ...await mediaCacheContext(this.env, job) }),
               }),
             );
@@ -812,7 +781,6 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         console.error(`${source} download rejected`, { source, jobId: job.id, phase: result.phase || "transfer",
           code: result.errorCode || "SOURCE_REJECTED",
           type: result.errorType, rpcMethod: result.rpcMethod, rpcCode: result.rpcCode, retryAfterSeconds: result.retryAfterSeconds,
-          sourceDiagnostics: source === "pornhub" ? safeSourceDiagnostics(result.sourceDiagnostics) : undefined,
           detail: redactDiagnostic(result.diagnostic || result.message || "download failed", this.env) });
         await step.do("track youtube rejection", () => trackJob(this.env, job, "failed", { title: result.title, detail: result.message || "دریافت یا ارسال فایل ناموفق بود." }));
       }

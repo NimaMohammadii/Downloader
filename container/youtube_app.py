@@ -339,23 +339,6 @@ class UserVisibleError(Exception):
     pass
 
 
-def pornhub_cookie_secrets() -> list[str]:
-    raw = os.environ.get("PORNHUB_COOKIES", "")
-    # Include individual values: an extractor may quote one row, not the jar.
-    values = [raw, *(fields[6] for line in raw.splitlines()
-                     if len(fields := line.split("\t", 6)) == 7)]
-    try:
-        entries = json.loads(raw.lstrip("\ufeff \t\r\n"))
-        if isinstance(entries, dict):
-            entries = entries.get("cookies")
-        if isinstance(entries, list):
-            values.extend(entry["value"] for entry in entries
-                          if isinstance(entry, dict) and isinstance(entry.get("value"), str))
-    except ValueError:
-        pass
-    return values
-
-
 def upload_error_diagnostic(exc: BaseException, token: str) -> dict[str, Any]:
     if isinstance(exc, BaseExceptionGroup):
         children = [upload_error_diagnostic(child, token) for child in exc.exceptions[:3]]
@@ -365,8 +348,7 @@ def upload_error_diagnostic(exc: BaseException, token: str) -> dict[str, Any]:
     if isinstance(exc, subprocess.SubprocessError):
         detail = "subprocess failed"  # Commands can contain signed URLs and account headers.
     secrets_to_redact = (token, os.environ.get("API_HASH", ""), os.environ.get("INSTAGRAM_SESSIONID", ""),
-                        os.environ.get("TELEGRAM_BOT_SESSION", ""), os.environ.get("TELEGRAM_SESSION_TOKEN", ""),
-                        *pornhub_cookie_secrets())
+                        os.environ.get("TELEGRAM_BOT_SESSION", ""), os.environ.get("TELEGRAM_SESSION_TOKEN", ""))
     for secret in sorted(set(secrets_to_redact), key=len, reverse=True):
         if secret:
             detail = detail.replace(secret, "[redacted]")
