@@ -20,18 +20,56 @@ class DownloadError(app.UserVisibleError):
         self.error_code, self.phase, self.detail = code, phase, detail
 
 
+def redirect_category(stderr: str) -> str:
+    """Describe the HTTP landing page without exposing locations or request headers."""
+    # yt-dlp's built-in traffic trace captures Location even when the extractor
+    # rejects the final URL. Only an allowlisted category leaves this process.
+    locations = re.findall(r"\\blocation:\\s*([^\\s\\\\\\'\\\"<>]+)", stderr, re.I)
+    if not locations:
+        return ""
+    try:
+        target = urlparse(locations[-1])
+        if target.hostname and not re.fullmatch(
+                r"(?:[a-z0-9-]+\\.)*pornhub\\.(?:com|org|net)", target.hostname, re.I):
+            return "external"
+        path = target.path.lower()
+    except ValueError:
+        return "other"
+    if path in {"", "/"}:
+        return "homepage"
+    if any(word in path for word in ("login", "signin", "sign-in")):
+        return "login"
+    if any(word in path for word in ("age", "verify", "verification", "consent")):
+        return "verification"
+    if any(word in path for word in ("blocked", "unavailable", "country", "region")):
+        return "restricted"
+    if "404" in path or "removed" in path:
+        return "unavailable"
+    return "other"
+
+
+REDIRECT_MESSAGES = {
+    "homepage": "❌ Pornhub این سرور را به صفحهٔ اصلی منتقل کرد؛ ممکن است ویدیو حذف شده یا دسترسی IP سرور محدود باشد.",
+    "login": "❌ Pornhub این ویدیو را به صفحهٔ ورود هدایت کرد؛ دسترسی بدون ورود ممکن نیست.",
+    "verification": "❌ Pornhub درخواست تأیید دسترسی یا سن دارد؛ دریافت بدون انجام تأیید ممکن نیست.",
+    "restricted": "❌ Pornhub دسترسی این سرور یا منطقه به ویدیو را محدود کرده است.",
+    "unavailable": "❌ Pornhub ویدیو را به صفحهٔ محتوای حذف‌شده یا ناموجود هدایت کرد.",
+    "external": "❌ Pornhub درخواست را به سایت دیگری هدایت کرد؛ دانلود متوقف شد.",
+}
+
+
 def source_error(detail: str) -> tuple[str, str]:
     """Classify extractor output without returning signed URLs or credentials."""
     detail = re.sub(r"https?://[^\s\"'<>]+", "[url]", detail.lower())
     detail = re.sub(r"\b(?:authorization|cookie|sessionid)\b[\"']?\s*[:=]\s*[^\r\n]+", "[redacted]", detail)
+    if "redirection detected" in detail:
+        return "SOURCE_REDIRECTED", "❌ Pornhub درخواست را به صفحهٔ دیگری هدایت کرد؛ ممکن است تأیید سن یا ورود لازم باشد، یا ویدیو در دسترس نباشد."
     if "filesize" in detail or "max-filesize" in detail:
         return "TELEGRAM_FILE_TOO_LARGE", "❌ حجم این ویدیو از سقف ارسال ۲ گیگابایت تلگرام بیشتر است."
     if "429" in detail or "too many requests" in detail:
         return "SOURCE_RATE_LIMITED", "❌ Pornhub درخواست‌های این سرور را موقتاً محدود کرده؛ کمی بعد امتحان کن."
     if re.search(r"\bhttp error (?:502|503|504)\b", detail):
         return "SOURCE_TEMPORARILY_UNAVAILABLE", "❌ سرویس دریافت از Pornhub موقتاً پاسخ نمی‌دهد؛ کمی بعد امتحان کن."
-    if "redirection detected" in detail:
-        return "SOURCE_REDIRECTED", "❌ Pornhub درخواست را به صفحهٔ دیگری هدایت کرد؛ ممکن است تأیید سن یا ورود لازم باشد، یا ویدیو در دسترس نباشد."
     if any(word in detail for word in ("requested format is not available", "no video formats", "only images")):
         return "SOURCE_FORMAT_UNAVAILABLE", "❌ فرمت قابل دانلود این ویدیوی Pornhub دریافت نشد."
     if any(word in detail for word in ("private", "removed", "video unavailable", "404", "not available")):
@@ -66,10 +104,15 @@ def run_source(command: list[str], timeout: int, phase: str) -> subprocess.Compl
                 if deadline - time.monotonic() > delay:
                     time.sleep(delay)
                     continue
-            # Keep one extractor error line; the job boundary redacts secrets.
+            # Keep one extractor error line; never expose raw HTTP traffic.
             errors = [line.strip() for line in stderr.splitlines() if line.lstrip().startswith("ERROR:")]
-            error = DownloadError(code, phase, message, errors[-1] if errors else "")
-            raise error from exc
+            detail = errors[-1] if errors else ""
+            if phase == "metadata" and code == "SOURCE_REDIRECTED":
+                category = redirect_category(stderr)
+                message = REDIRECT_MESSAGES.get(category, message)
+                if category:
+                    detail = f"{detail} [redirectTarget={category}]"
+            raise DownloadError(code, phase, message, detail) from exc
 
 
 def video_url(value: str) -> str:
@@ -94,7 +137,7 @@ def download(url: str, workdir: Path) -> tuple[Path, str]:
             "--force-ipv4", "--socket-timeout", "15", "--retries", "2", "--fragment-retries", "2"]
     info_path = workdir / "source.info.json"
     for attempt in range(2):
-        info = run_source([*args, "--skip-download", "--dump-single-json", "--", url],
+        info = run_source([*args, "--skip-download", "--print-traffic", "--dump-single-json", "--", url],
                           app.METADATA_TIMEOUT_SECONDS, "metadata")
         try:
             metadata = json.loads(info.stdout)
