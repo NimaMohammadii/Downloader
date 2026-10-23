@@ -24,13 +24,13 @@ def redirect_category(stderr: str) -> str:
     """Describe the HTTP landing page without exposing locations or request headers."""
     # yt-dlp's built-in traffic trace captures Location even when the extractor
     # rejects the final URL. Only an allowlisted category leaves this process.
-    locations = re.findall(r"\\blocation:\\s*([^\\s\\\\\\'\\\"<>]+)", stderr, re.I)
+    locations = re.findall(r"\blocation:\s*([^\s\\'\"<>]+)", stderr, re.I)
     if not locations:
         return ""
     try:
         target = urlparse(locations[-1])
         if target.hostname and not re.fullmatch(
-                r"(?:[a-z0-9-]+\\.)*pornhub\\.(?:com|org|net)", target.hostname, re.I):
+                r"(?:[a-z0-9-]+\.)*pornhub\.(?:com|org|net)", target.hostname, re.I):
             return "external"
         path = target.path.lower()
     except ValueError:
