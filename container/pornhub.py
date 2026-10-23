@@ -139,7 +139,7 @@ def download(url: str, workdir: Path) -> tuple[Path, str]:
             "--force-ipv4", "--socket-timeout", "15", "--retries", "2", "--fragment-retries", "2"]
     info_path = workdir / "source.info.json"
     for attempt in range(2):
-        info = run_source([*args, "--skip-download", "--print-traffic", "--dump-single-json", "--", url],
+        info = run_source([*args, "--impersonate", "chrome", "--skip-download", "--print-traffic", "--dump-single-json", "--", url],
                           app.METADATA_TIMEOUT_SECONDS, "metadata")
         try:
             metadata = json.loads(info.stdout)
