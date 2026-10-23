@@ -174,6 +174,37 @@ class PornhubTests(unittest.TestCase):
             run.assert_called_once()
             send.assert_not_called()
 
+    def test_redirect_trace_safely_reports_destination_category(self):
+        cases = [
+            ("https://www.pornhub.com/", "homepage"),
+            ("https://www.pornhub.com/login?session=never-log-this", "login"),
+            ("/age-verification?token=never-log-this", "verification"),
+            ("/unavailable", "restricted"),
+            ("https://external.example/secret?token=never-log-this", "external"),
+        ]
+        for location, expected in cases:
+            trace = (
+                "reply: 'HTTP/2 302\\r\\nLocation: " + location
+                + "\\r\\nSet-Cookie: session=never-log-this\\r\\n'\n"
+                + "ERROR: [PornHub] 66c7283d71138: Redirection detected; the video may be deleted or require login"
+            )
+            with self.subTest(expected=expected), \
+                 patch.object(pipeline, '_run', side_effect=subprocess.CalledProcessError(
+                     1, 'yt-dlp', stderr=trace)) as run, \
+                 self.assertRaises(pornhub.DownloadError) as caught:
+                pornhub.run_source(['yt-dlp', '--print-traffic'], 90, 'metadata')
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(caught.exception.error_code, "SOURCE_REDIRECTED")
+            self.assertIn("redirectTarget=" + expected, caught.exception.detail)
+            self.assertNotIn("never-log-this", caught.exception.detail)
+            self.assertNotIn("never-log-this", str(caught.exception))
+
+    def test_metadata_traffic_trace_stays_out_of_download_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, calls = self.download(directory)
+        self.assertIn('--print-traffic', calls[0].args[0])
+        self.assertNotIn('--print-traffic', calls[1].args[0])
+
     def test_temporary_metadata_http_errors_retry_then_succeed(self):
         for status in (502, 503, 504):
             failure = subprocess.CalledProcessError(1, 'yt-dlp',
