@@ -92,10 +92,11 @@ class PornhubTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(app.UserVisibleError):
                 pornhub.video_url(value)
 
-    def download(self, directory, duration=60, metadata=None):
+    def download(self, directory, duration=60, metadata=None, metadata_stdout=None):
         path = Path(directory) / 'Pornhub.mp4'
         path.write_bytes(b'fictional-video')
-        results = [subprocess.CompletedProcess([], 0, json.dumps(metadata or {'title': 'Example', 'duration': 60})),
+        results = [subprocess.CompletedProcess([], 0, metadata_stdout if metadata_stdout is not None
+                                               else json.dumps(metadata or {'title': 'Example', 'duration': 60})),
                    subprocess.CompletedProcess([], 0, str(path))]
         with patch.object(pipeline, '_run', side_effect=results) as run, \
              patch.object(app, 'probe_duration', return_value=duration), \
@@ -291,8 +292,20 @@ class PornhubTests(unittest.TestCase):
             run.assert_called_once()
             sleep.assert_not_called()
 
+    def test_metadata_traffic_prefix_does_not_corrupt_json(self):
+        trace = ("director: sending request via CurlCFFI\n"
+                 "send: GET https://www.pornhub.com/view_video.php?viewkey=ph123\n"
+                 "reply: HTTP/2 200 OK\n"
+                 + json.dumps({'title': 'Example', 'duration': 60}) + "\n")
+        with tempfile.TemporaryDirectory() as directory:
+            (path, title), calls = self.download(directory, metadata_stdout=trace)
+        self.assertEqual(title, 'Example')
+        self.assertEqual(path.suffix, '.mp4')
+        self.assertEqual(len(calls), 2)
+        self.assertIn('--print-traffic', calls[0].args[0])
+
     def test_invalid_metadata_is_a_metadata_failure(self):
-        for value in ['not json', '[]', 'null']:
+        for value in ['', 'not json', '[]', 'null']:
             with self.subTest(value=value), \
                  patch.object(pipeline, '_run', return_value=subprocess.CompletedProcess([], 0, value)), \
                  patch.object(app, 'edit_status'), patch.object(app, 'send_media_file') as send:
