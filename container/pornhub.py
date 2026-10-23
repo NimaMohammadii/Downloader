@@ -60,10 +60,12 @@ REDIRECT_MESSAGES = {
 
 def source_error(detail: str) -> tuple[str, str]:
     """Classify extractor output without returning signed URLs or credentials."""
+    # Check the known extractor error before redacting captured HTTP headers.
+    # Escaped trace lines can otherwise make the Cookie pattern eat this error.
+    if "redirection detected" in detail.lower():
+        return "SOURCE_REDIRECTED", "❌ Pornhub درخواست را به صفحهٔ دیگری هدایت کرد؛ ممکن است تأیید سن یا ورود لازم باشد، یا ویدیو در دسترس نباشد."
     detail = re.sub(r"https?://[^\s\"'<>]+", "[url]", detail.lower())
     detail = re.sub(r"\b(?:authorization|cookie|sessionid)\b[\"']?\s*[:=]\s*[^\r\n]+", "[redacted]", detail)
-    if "redirection detected" in detail:
-        return "SOURCE_REDIRECTED", "❌ Pornhub درخواست را به صفحهٔ دیگری هدایت کرد؛ ممکن است تأیید سن یا ورود لازم باشد، یا ویدیو در دسترس نباشد."
     if "filesize" in detail or "max-filesize" in detail:
         return "TELEGRAM_FILE_TOO_LARGE", "❌ حجم این ویدیو از سقف ارسال ۲ گیگابایت تلگرام بیشتر است."
     if "429" in detail or "too many requests" in detail:
