@@ -142,7 +142,8 @@ def download(url: str, workdir: Path) -> tuple[Path, str]:
         info = run_source([*args, "--impersonate", "chrome", "--skip-download", "--print-traffic", "--dump-single-json", "--", url],
                           app.METADATA_TIMEOUT_SECONDS, "metadata")
         try:
-            metadata = json.loads(info.stdout)
+            # --print-traffic writes HTTP diagnostics to stdout before yt-dlp's final JSON line.
+            metadata = json.loads(info.stdout.strip().rsplit("\n", 1)[-1])
             if not isinstance(metadata, dict):
                 raise ValueError("metadata must be an object")
         except ValueError as exc:
