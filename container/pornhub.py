@@ -1,7 +1,6 @@
 """Anonymous Pornhub downloads through the official yt-dlp extractor."""
 import json
 import math
-import os
 import re
 import shutil
 import subprocess
@@ -139,19 +138,25 @@ def download(url: str, workdir: Path) -> tuple[Path, str]:
             "--force-ipv4", "--socket-timeout", "15", "--retries", "2", "--fragment-retries", "2"]
     info_path = workdir / "source.info.json"
     for attempt in range(2):
-        info = run_source([*args, "--impersonate", "chrome", "--skip-download", "--print-traffic", "--dump-single-json", "--", url],
-                          app.METADATA_TIMEOUT_SECONDS, "metadata")
+        # Let yt-dlp write the canonical .info.json consumed by --load-info-json.
+        # The --print-traffic output may contain arbitrary text before/after JSON.
+        run_source([
+            *args, "--impersonate", "chrome", "--skip-download", "--print-traffic",
+            "--write-info-json", "--output", str(workdir / "source.%(ext)s"), "--", url,
+        ], app.METADATA_TIMEOUT_SECONDS, "metadata")
+        if not info_path.is_file():
+            raise DownloadError("SOURCE_MISSING_METADATA", "metadata",
+                                "❌ Pornhub فایل اطلاعات ویدیو را ذخیره نکرد.")
         try:
-            # --print-traffic writes HTTP diagnostics to stdout before yt-dlp's final JSON line.
-            metadata = json.loads(info.stdout.strip().rsplit("\n", 1)[-1])
+            info_path.chmod(0o600)
+            with info_path.open("r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
             if not isinstance(metadata, dict):
                 raise ValueError("metadata must be an object")
-        except ValueError as exc:
-            raise DownloadError("SOURCE_INVALID_METADATA", "metadata", "❌ اطلاعات ویدیوی Pornhub کامل دریافت نشد.") from exc
+        except (OSError, ValueError) as exc:
+            raise DownloadError("SOURCE_INVALID_METADATA", "metadata",
+                                "❌ اطلاعات ویدیوی Pornhub کامل دریافت نشد.") from exc
         app.validate_video_metadata(metadata)
-        # Keep the exact catalog/headers just extracted; do not hit the webpage twice.
-        with open(info_path, "w", encoding="utf-8", opener=lambda name, flags: os.open(name, flags, 0o600)) as handle:
-            json.dump(metadata, handle)
         try:
             result = run_source([
                 *args, "--abort-on-unavailable-fragments", "--max-filesize", str(app.DIRECT_TELEGRAM_LIMIT),
