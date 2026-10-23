@@ -199,6 +199,14 @@ class PornhubTests(unittest.TestCase):
             self.assertNotIn("never-log-this", caught.exception.detail)
             self.assertNotIn("never-log-this", str(caught.exception))
 
+    def test_redirect_error_survives_escaped_cookie_trace(self):
+        trace = (
+            r"reply: HTTP/2 302\r\nLocation: /\r\nSet-Cookie: session=never-log-this"
+            r"\r\nERROR: [PornHub] 66c7283d71138: Redirection detected"
+        )
+        self.assertEqual(pornhub.source_error(trace)[0], "SOURCE_REDIRECTED")
+        self.assertEqual(pornhub.redirect_category(trace), "homepage")
+
     def test_metadata_traffic_trace_stays_out_of_download_request(self):
         with tempfile.TemporaryDirectory() as directory:
             _, calls = self.download(directory)
