@@ -324,6 +324,23 @@ class PornhubTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertIn('--print-traffic', calls[0].args[0])
 
+    def test_native_ytdlp_writes_the_expected_infojson_filename(self):
+        from yt_dlp import YoutubeDL
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'source.info.json'
+            metadata = {
+                'id': 'fixture', 'title': 'Example', 'duration': 3,
+                'extractor': 'PornHub', 'extractor_key': 'PornHub',
+                'webpage_url': self.payload()['url'],
+                'formats': [{'format_id': 'mp4', 'ext': 'mp4', 'vcodec': 'avc1',
+                             'acodec': 'mp4a', 'url': 'http://127.0.0.1:9/example.mp4'}],
+            }
+            with YoutubeDL({'quiet': True, 'skip_download': True, 'writeinfojson': True,
+                            'outtmpl': {'default': str(Path(directory) / 'source.%(ext)s')}}) as ydl:
+                ydl.process_ie_result(metadata, download=True)
+            self.assertTrue(path.is_file())
+            self.assertEqual(json.loads(path.read_text(encoding='utf-8'))['id'], 'fixture')
+
     def test_invalid_metadata_file_is_a_metadata_failure(self):
         for value in ['', 'not json', '[]', 'null']:
             def fake_run(command, timeout):
