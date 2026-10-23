@@ -212,6 +212,8 @@ class PornhubTests(unittest.TestCase):
             _, calls = self.download(directory)
         self.assertIn('--print-traffic', calls[0].args[0])
         self.assertNotIn('--print-traffic', calls[1].args[0])
+        self.assertEqual(calls[0].args[0][calls[0].args[0].index('--impersonate') + 1], 'chrome')
+        self.assertNotIn('--impersonate', calls[1].args[0])
 
     def test_temporary_metadata_http_errors_retry_then_succeed(self):
         for status in (502, 503, 504):
