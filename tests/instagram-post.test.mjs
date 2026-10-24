@@ -151,7 +151,7 @@ test('Bright Data Reel uses documented sync endpoint and never sends Instagram s
   assert.equal(request.url.searchParams.get('dataset_id'), 'gd_lyclm20il4r5helnj');
   assert.equal(request.headers.get('authorization'), 'Bearer private-brightdata-key');
   assert.equal(request.headers.get('cookie'), null);
-  assert.deepEqual(JSON.parse(request.body), {input: [{url: 'https://www.instagram.com/reel/' + shortcode + '/'}]});
+  assert.deepEqual(JSON.parse(request.body), [{url: 'https://www.instagram.com/reel/' + shortcode + '/'}]);
   assert.ok(!JSON.stringify(result.sent).includes('private-brightdata-key'));
   assert.ok(!JSON.stringify(result.diagnostics).includes('private-brightdata-key'));
 });
@@ -204,6 +204,20 @@ test('Bright Data 202 pending snapshot does not retry or silently switch to Inst
   assert.equal(result.calls.length, 1);
   assert.equal(files(result).length, 0);
   assert.match(report(result), /BRIGHTDATA_PENDING/);
+});
+
+test('Bright Data rejects upstream validation errors with safe HTTP diagnostics and no retry', async () => {
+  const result = await run({env: {BRIGHTDATA_API_KEY: 'sensitive-api-key'}, respond(call) {
+    if (call.hostname === 'api.brightdata.com') return Response.json({
+      code: 'validation_error', error: 'Private key sensitive-api-key must never appear in logs',
+    }, {status: 400});
+  }});
+  assert.equal(result.calls.length, 1);
+  assert.equal(files(result).length, 0);
+  assert.match(report(result), /BRIGHTDATA_INVALID_REQUEST/);
+  const diagnostic = result.diagnostics.find(x => x.message === 'instagram brightdata rejected')?.info;
+  assert.deepEqual(diagnostic, {status: 400, dataset: 'reels', code: 'validation_error'});
+  assert.ok(!JSON.stringify(result.diagnostics).includes('sensitive-api-key'));
 });
 
 test('Bright Data authentication failures are reported with no anonymous retry', async () => {
