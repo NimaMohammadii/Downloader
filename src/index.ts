@@ -9,6 +9,7 @@ type Env = Partial<AdminStatsEnv> & {
   INSTAGRAM_MID?: string;
   INSTAGRAM_IG_DID?: string;
   BRIGHTDATA_API_KEY?: string;
+  APIFY_API_TOKEN?: string;
   uploadInstagramPost?: (post: InstagramPostUpload) => Promise<void>;
 };
 
@@ -1157,10 +1158,104 @@ function mediaGroupsFromStoryReel(reel: any, exactStoryId: string | null): Media
   return groups;
 }
 
+// Bright Data has no verified off-the-shelf Stories dataset ID. Use the
+// documented Apify public Stories & Highlights actor only when its own token
+// is configured. The existing Instagram session route stays as the default.
+async function resolveStoryViaApify(
+  target: Extract<InstagramTarget, { kind: "story" | "highlight" }>,
+  apiToken: string,
+): Promise<MediaCandidate[][]> {
+  const isHighlight = target.kind === "highlight";
+  if (!isHighlight && !/^[A-Za-z0-9_.]{1,30}$/.test(target.username)) {
+    throw new Error("INSTAGRAM_STORY_USER_NOT_FOUND");
+  }
+  const canonical = isHighlight
+    ? "https://www.instagram.com/stories/highlights/" + target.highlightId + "/"
+    : "https://www.instagram.com/stories/" + target.username + "/"
+      + (target.storyId ? target.storyId + "/" : "");
+  const endpoint = "https://api.apify.com/v2/acts/rowfinch~instagram-stories-scraper/run-sync-get-dataset-items";
+  let response: Response;
+  try {
+    response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer " + apiToken,
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        usernames: [canonical],
+        stories: !isHighlight,
+        highlights: isHighlight,
+        ...(isHighlight ? { highlightsLimit: 1 } : {}),
+      }),
+      // If a provider run outlasts the webhook, never retry it automatically:
+      // the first run could still be processing and charging the account.
+      signal: AbortSignal.timeout(45_000),
+    });
+  } catch {
+    throw new Error("APIFY_STORY_REQUEST_FAILED");
+  }
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => undefined);
+    console.warn("instagram apify story rejected", { status: response.status });
+    if (response.status === 401 || response.status === 403) throw new Error("APIFY_STORY_AUTH_ERROR");
+    if (response.status === 402 || response.status === 429) throw new Error("APIFY_STORY_CREDITS_OR_LIMIT");
+    throw new Error("APIFY_STORY_REQUEST_FAILED");
+  }
+  const records: unknown = await response.json().catch(() => null);
+  if (!Array.isArray(records) || !records.length) throw new Error("APIFY_STORY_NO_MEDIA");
+  // Existing direct webhook sends at most 20 files. Never truncate silently.
+  if (records.length > 20) throw new Error("APIFY_STORY_TOO_MANY_MEDIA");
+  const output: MediaCandidate[][] = [];
+  for (const record of records) {
+    if (!record || typeof record !== "object" || Array.isArray(record)) throw new Error("APIFY_STORY_INVALID_MEDIA");
+    const row = record as Record<string, unknown>;
+    if (row.error || row.error_type) throw new Error("APIFY_STORY_UNAVAILABLE");
+
+    const type = typeof row.type === "string" ? row.type.toLowerCase() : "";
+    if (type !== (isHighlight ? "highlight" : "story")) throw new Error("APIFY_STORY_WRONG_TARGET");
+
+    const id = String(row.id ?? "");
+    if (!/^\d{1,24}$/.test(id)) throw new Error("APIFY_STORY_INVALID_MEDIA");
+    if (!isHighlight && target.storyId && id !== target.storyId) continue;
+
+    const returnedOwner = typeof row.ownerUsername === "string" ? row.ownerUsername.toLowerCase() : null;
+    if (!isHighlight && returnedOwner && returnedOwner !== target.username.toLowerCase()) {
+      throw new Error("APIFY_STORY_WRONG_TARGET");
+    }
+    if (isHighlight && String(row.highlightId ?? "") !== target.highlightId) {
+      throw new Error("APIFY_STORY_WRONG_TARGET");
+    }
+
+    const mediaType = typeof row.mediaType === "string" ? row.mediaType.toLowerCase() : "";
+    if (mediaType !== "video" && mediaType !== "image") throw new Error("APIFY_STORY_INVALID_MEDIA");
+    // For a video, a displayUrl is only the poster and must never be
+    // substituted when the actual videoUrl is absent.
+    const rawMediaUrl = mediaType === "video" ? row.videoUrl : row.displayUrl;
+    if (typeof rawMediaUrl !== "string") throw new Error("APIFY_STORY_NO_MEDIA");
+    let media: URL;
+    try { media = new URL(rawMediaUrl); }
+    catch { throw new Error("APIFY_STORY_INVALID_MEDIA"); }
+    if (media.protocol !== "https:" || media.username || media.password || media.port
+        || !allowedMediaHost(media.hostname)) throw new Error("APIFY_STORY_INVALID_MEDIA");
+
+    output.push([{ kind: mediaType === "video" ? "video" : "photo",
+      url: media.toString(), width: numberOrZero(row.width), height: numberOrZero(row.height) }]);
+  }
+  if (!output.length) throw new Error("APIFY_STORY_NO_MEDIA");
+  console.log("instagram story resolver success", {
+    resolver: "apify-public-story", kind: isHighlight ? "highlight" : "story",
+    count: output.length,
+  });
+  return output;
+}
+
 async function resolveStory(
   target: Extract<InstagramTarget, { kind: "story" | "highlight" }>,
   env: Env,
 ): Promise<MediaCandidate[][]> {
+  if (env.APIFY_API_TOKEN?.trim()) return resolveStoryViaApify(target, env.APIFY_API_TOKEN.trim());
   if (!env.INSTAGRAM_SESSIONID?.trim()) throw new Error("INSTAGRAM_STORY_SESSION_REQUIRED");
 
   const jar = secretCookies(env);
@@ -1361,6 +1456,14 @@ async function resolveTarget(target: InstagramTarget, env: Env): Promise<Resolve
 
 function friendlyError(detail: string, throttle?: InstagramThrottle): string {
   const value = detail.toLowerCase();
+  if (value.startsWith("apify_story_auth_error")) return "❌ توکن Apify نامعتبر است یا استخراج‌کننده استوری در دسترس نیست.";
+  if (value.startsWith("apify_story_credits_or_limit")) return "❌ اعتبار یا محدودیت اجرای Apify اجازه دریافت استوری را نمی‌دهد.";
+  if (value.startsWith("apify_story_request_failed")) return "❌ اجرای استخراج‌کننده Apify کامل نشد؛ پیش از تلاش مجدد، وضعیت اجرا را در داشبورد بررسی کن.";
+  if (value.startsWith("apify_story_wrong_target")) return "❌ خروجی استوری با لینک درخواست‌شده مطابقت نداشت؛ فایل اشتباه ارسال نشد.";
+  if (value.startsWith("apify_story_too_many_media")) return "❌ تعداد فایل‌ها بیش از سقف این درخواست است؛ ارسال ناقص انجام نشد.";
+  if (value.startsWith("apify_story_invalid_media")) return "❌ خروجی استخراج‌کننده استوری معتبر نبود.";
+  if (value.startsWith("apify_story_no_media")) return "❌ استخراج‌کننده Apify برای این استوری فایل قابل دانلود برنگرداند.";
+  if (value.startsWith("apify_story_unavailable")) return "❌ استوری یا هایلایت در Apify در دسترس نبود یا خصوصی است.";
   if (value.startsWith("brightdata_auth_error")) return "❌ کلید Bright Data معتبر نیست یا به استخراج‌کننده Instagram دسترسی ندارد.";
   if (value.startsWith("brightdata_credits_error")) return "❌ سهمیه یا اعتبار Bright Data تمام شده است.";
   if (value.startsWith("brightdata_rate_limit")) return "❌ Bright Data درخواست‌های API را موقتاً محدود کرده است.";
