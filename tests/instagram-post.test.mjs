@@ -134,6 +134,159 @@ async function run({ session = '12345%3Afixture-session', env = {}, respond, cdn
 }
 
 
+
+test('TopAPI becomes primary for Reels with one postUrls request, no session or Bright Data call', async () => {
+  const result = await run({env: {APIFY_API_TOKEN:'private-apify-token',BRIGHTDATA_API_KEY:'private-brightdata-key'},
+    respond(call) {
+      if (call.hostname === 'api.apify.com') return Response.json([{
+        url:'https://www.instagram.com/reel/'+shortcode+'/',shortCode:shortcode,type:'Video',
+        videoUrl:'https://scontent.cdninstagram.com/reel.mp4',
+        displayUrl:'https://scontent.cdninstagram.com/cover.jpg',
+        images:[{url:'https://scontent.cdninstagram.com/cover-small.jpg',width:360,height:640}],
+        dimensionsWidth:1080,dimensionsHeight:1920,
+      }]);
+      throw Error('Unexpected provider called: '+call.hostname);
+    }});
+  assert.deepEqual(files(result).map(x=>x.method),['sendVideo']);
+  assert.equal(result.calls.length,1);
+  const request = result.calls[0];
+  assert.equal(request.hostname,'api.apify.com');
+  assert.equal(request.path,'/v2/actors/topapi~instagram-scraper/run-sync-get-dataset-items');
+  assert.equal(request.headers.get('authorization'),'Bearer private-apify-token');
+  assert.equal(request.headers.get('cookie'),null);
+  assert.deepEqual(JSON.parse(request.body),{
+    postUrls:['https://www.instagram.com/reel/'+shortcode+'/'],postType:'all',
+    dataDetailLevel:'detailedData',maxItems:1,resultsLimit:1,
+    includeVideoViewCount:false,includeLatestComments:false,includeProfileSummary:false,compact:false,
+  });
+  assert.ok(!JSON.stringify(result.sent).includes('private-apify-token'));
+  assert.ok(!JSON.stringify(result.diagnostics).includes('private-apify-token'));
+  assert.ok(!JSON.stringify(result.diagnostics).includes('private-brightdata-key'));
+});
+
+test('TopAPI photo post treats images as resolutions, not separate slides', async () => {
+  const result = await run({text:'https://www.instagram.com/p/'+shortcode+'/',
+    env:{APIFY_API_TOKEN:'key',BRIGHTDATA_API_KEY:'fallback'},respond(call){
+      if(call.hostname==='api.apify.com')return Response.json([{
+        type:'Image',shortCode:shortcode,images:[
+          {url:'https://scontent.cdninstagram.com/high.jpg',width:1200,height:1200},
+          {url:'https://scontent.cdninstagram.com/low.jpg',width:300,height:300},
+        ],
+      }]);
+      throw Error('unexpected request');
+    }});
+  assert.deepEqual(files(result).map(x=>x.method),['sendPhoto']);
+  assert.equal(result.calls.length,1);
+});
+
+test('TopAPI ordered mixed childPosts carousel preserves every slide and never sends covers', async () => {
+  const result=await run({text:'https://www.instagram.com/p/'+shortcode+'/',
+    env:{APIFY_API_TOKEN:'key',BRIGHTDATA_API_KEY:'fallback'},respond(call){
+      if(call.hostname==='api.apify.com')return Response.json([{
+        type:'Sidecar',shortCode:shortcode,productType:'carousel_container',
+        displayUrl:'https://scontent.cdninstagram.com/carousel-cover.jpg',
+        childPosts:[
+          {type:'Image',displayUrl:'https://scontent.cdninstagram.com/first.jpg'},
+          {type:'Video',videoUrl:'https://scontent.cdninstagram.com/second.mp4',
+            displayUrl:'https://scontent.cdninstagram.com/video-cover.jpg'},
+          {type:'Image',images:[{url:'https://scontent.cdninstagram.com/third.jpg'}]},
+        ],
+      }]);
+      throw Error('unexpected request');
+    }});
+  assert.deepEqual(files(result).map(x=>x.method),['sendPhoto','sendVideo','sendPhoto']);
+  assert.equal(result.calls.length,1);
+});
+
+test('TopAPI metadata-only result invokes Bright Data once as the paid fallback', async () => {
+  const result=await run({env:{APIFY_API_TOKEN:'top-key',BRIGHTDATA_API_KEY:'bright-key'},
+    respond(call){
+      if(call.hostname==='api.apify.com')return Response.json([{
+        type:'Video',shortCode:shortcode,displayUrl:'https://scontent.cdninstagram.com/cover.jpg',
+      }]);
+      if(call.hostname==='api.brightdata.com')return Response.json([{
+        shortcode,video_url:'https://scontent.cdninstagram.com/recovered.mp4',
+      }]);
+      throw Error('unexpected request');
+    }});
+  assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com','api.brightdata.com']);
+  assert.deepEqual(files(result).map(x=>x.method),['sendVideo']);
+  const fallback=result.diagnostics.find(x=>x.message==='instagram topapi fallback')?.info;
+  assert.deepEqual(fallback,{reason:'TOPAPI_NO_MEDIA',next:'brightdata'});
+  assert.ok(result.calls.every(x=>!x.headers.get('cookie')?.includes('sessionid=')));
+});
+
+test('TopAPI empty dataset and 429 response fall back once to Bright Data', async () => {
+  for(const topResponse of [Response.json([]),Response.json({error:'rate limit'},{status:429})]){
+    const result=await run({env:{APIFY_API_TOKEN:'top-key',BRIGHTDATA_API_KEY:'bright-key'},
+      respond(call){
+        if(call.hostname==='api.apify.com')return topResponse.clone();
+        if(call.hostname==='api.brightdata.com')return Response.json([{
+          shortcode,video_url:'https://scontent.cdninstagram.com/recovered.mp4',
+        }]);
+      }});
+    assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com','api.brightdata.com']);
+    assert.deepEqual(files(result).map(x=>x.method),['sendVideo']);
+  }
+});
+
+test('TopAPI incomplete carousel falls back to complete Bright Data carousel instead of partial files', async () => {
+  const result=await run({text:'https://www.instagram.com/p/'+shortcode+'/',
+    env:{APIFY_API_TOKEN:'top-key',BRIGHTDATA_API_KEY:'bright-key'},
+    respond(call){
+      if(call.hostname==='api.apify.com')return Response.json([{shortCode:shortcode,type:'Sidecar',
+        childPosts:[{type:'Image',displayUrl:'https://scontent.cdninstagram.com/photo.jpg'},
+          {type:'Video',displayUrl:'https://scontent.cdninstagram.com/cover.jpg'}],
+      }]);
+      if(call.hostname==='api.brightdata.com')return Response.json([{shortcode,carousel_media:[
+        {image_url:'https://scontent.cdninstagram.com/photo.jpg'},
+        {video_url:'https://scontent.cdninstagram.com/real-video.mp4'},
+      ]}]);
+    }});
+  assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com','api.brightdata.com']);
+  assert.deepEqual(files(result).map(x=>x.method),['sendPhoto','sendVideo']);
+});
+
+test('TopAPI wrong-shortcode responses never trigger backup downloads', async () => {
+  const result=await run({env:{APIFY_API_TOKEN:'top-key',BRIGHTDATA_API_KEY:'bright-key'},
+    respond(call){
+      if(call.hostname==='api.apify.com')return Response.json([{
+        shortCode:'DIFFERENT',type:'Video',videoUrl:'https://scontent.cdninstagram.com/wrong.mp4',
+      }]);
+      throw Error('Backup must not be called');
+    }});
+  assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com']);
+  assert.equal(files(result).length,0);
+  assert.match(report(result),/TOPAPI_WRONG_POST/);
+});
+
+test('TopAPI ambiguous timeout or upstream 500 does not create a second paid extraction', async () => {
+  for(const mode of ['network','http500']){
+    const result=await run({env:{APIFY_API_TOKEN:'top-key',BRIGHTDATA_API_KEY:'bright-key'},
+      respond(call){
+        if(call.hostname==='api.apify.com'){
+          if(mode==='network')throw Error('aborted after unknown upstream run');
+          return Response.json({error:'unknown state'},{status:500});
+        }
+        throw Error('Backup must not be called');
+      }});
+    assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com']);
+    assert.equal(files(result).length,0);
+    assert.match(report(result),mode==='network'?/TOPAPI_NETWORK_OR_TIMEOUT/:/TOPAPI_AMBIGUOUS_PROVIDER_ERROR/);
+  }
+});
+
+test('without an Apify token, existing Bright Data route remains unchanged', async () => {
+  const result=await run({env:{BRIGHTDATA_API_KEY:'bright-key'},respond(call){
+    if(call.hostname==='api.brightdata.com')return Response.json([{
+      shortcode,video_url:'https://scontent.cdninstagram.com/unchanged.mp4',
+    }]);
+    throw Error('Apify must not run without a token');
+  }});
+  assert.deepEqual(result.calls.map(x=>x.hostname),['api.brightdata.com']);
+  assert.deepEqual(files(result).map(x=>x.method),['sendVideo']);
+});
+
 test('Bright Data Reel uses documented sync endpoint and never sends Instagram session credentials', async () => {
   const result = await run({env: {BRIGHTDATA_API_KEY: 'private-brightdata-key'}, respond(call) {
     if (call.hostname === 'api.brightdata.com') return Response.json([{
