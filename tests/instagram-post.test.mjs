@@ -471,28 +471,6 @@ test('non-JSON and network diagnostics never contain response bodies, cookies or
   }
 });
 
-function sessionResponse(cookies, mode, location = '/') {
-  const response = redirect(location);
-  // Match Workers' Set-Cookie API and runtimes that expose one combined field.
-  Object.defineProperty(response.headers, 'getSetCookie', { value: undefined });
-  if (mode === 'workers') {
-    Object.defineProperty(response.headers, 'getAll', { value: name => {
-      assert.equal(name.toLowerCase(), 'set-cookie');
-      return cookies;
-    } });
-    const originalGet = response.headers.get.bind(response.headers);
-    response.headers.get = name => name.toLowerCase() === 'set-cookie' ? cookies[0] : originalGet(name);
-  } else {
-    response.headers.set('set-cookie', cookies.join(', '));
-  }
-  return response;
-}
-
-
-
-
-
-
 test('anonymous web-info GraphQL resolves a metadata-free page without login', async () => {
   const result = await run({ session: '', respond(call) {
     if (call.path === apiPath) return redirect('https://i.instagram.com/accounts/login/');
