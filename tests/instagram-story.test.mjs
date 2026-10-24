@@ -156,6 +156,81 @@ test('public Story API authentication failure is terminal and never attempts Ins
   assert.ok(!JSON.stringify(r.telegram).includes('broken-token'));
 });
 
+test('public Story API exposes safe HTTP status and machine code for provider errors', async () => {
+  for (const [status, type, code] of [
+    [400, 'invalid-input', 'apify_invalid_input'],
+    [404, 'record-not-found', 'apify_actor_missing'],
+    [408, 'run-timeout-exceeded', 'apify_timeout'],
+    [500, 'internal-error', 'apify_server_error'],
+  ]) {
+    const logs=[];
+    const oldWarn=console.warn;
+    console.warn=(message, info)=>logs.push({message,info});
+    try {
+      const r=await run({env:{APIFY_API_TOKEN:'secret-apify-token',INSTAGRAM_SESSIONID:''},
+        routes:{[apifyPath]:()=>Response.json({error:{type,message:'private secret-apify-token'}},{status})}});
+      assert.equal(r.requests.length,1);
+      assert.equal(r.telegram.filter(x=>['sendPhoto','sendVideo'].includes(x.method)).length,0);
+      const reported=logs.find(x=>x.message==='instagram story resolution failed')?.info;
+      assert.equal(reported?.code,code);
+      assert.equal(reported?.provider?.status,status);
+      assert.equal(reported?.provider?.providerCode,type);
+      assert.equal(reported?.provider?.stage,'response');
+      assert.ok(!JSON.stringify(logs).includes('secret-apify-token'));
+      assert.ok(!JSON.stringify(r.telegram).includes('secret-apify-token'));
+    } finally {console.warn=oldWarn;}
+  }
+});
+
+test('public Story API distinguishes network disconnect and timeout without triggering another run', async () => {
+  for (const [error,expectedCode,reason] of [
+    [new TypeError('private-network-information'), 'apify_failed','network_or_redirect'],
+    [Object.assign(new Error('timed out'),{name:'TimeoutError'}), 'apify_timeout','timeout'],
+  ]) {
+    const oldFetch=globalThis.fetch,oldWarn=console.warn;
+    const logs=[],calls=[];
+    try {
+      globalThis.fetch=async(url,init={})=>{
+        calls.push(String(url));
+        if(String(url).includes('/v2/actors/rowfinch~instagram-stories-scraper/'))throw error;
+        if(String(url).includes('api.telegram.org'))return Response.json({ok:true,result:{message_id:10}});
+        throw Error('Unexpected network request');
+      };
+      console.warn=(message,info)=>logs.push({message,info});
+      const message={message_id:7,from:{id:1},chat:{id:1},
+        text:'https://www.instagram.com/stories/example/999/'};
+      const request=new Request('https://worker/telegram/webhook',{
+        method:'POST',
+        headers:{'x-telegram-bot-api-secret-token':'dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1','content-type':'application/json'},
+        body:JSON.stringify({update_id:123,message}),
+      });
+      const response=await worker.fetch(request,{BOT_TOKEN:'fictional-token',APIFY_API_TOKEN:'private-apify-token'}, {});
+      assert.equal(response.status,200);
+      assert.equal(calls.filter(x=>x.includes('api.apify.com')).length,1);
+      const logged=logs.find(x=>x.message==='instagram story resolution failed')?.info;
+      assert.equal(logged?.code,expectedCode);
+      assert.equal(logged?.provider?.stage,'request');
+      assert.equal(logged?.provider?.reason,reason);
+      assert.ok(!JSON.stringify(logs).includes('private-apify-token'));
+    } finally { globalThis.fetch=oldFetch; console.warn=oldWarn; }
+  }
+});
+
+test('public Story API detects a success response with invalid JSON rather than calling it no media', async () => {
+  const logs=[];
+  const oldWarn=console.warn;
+  console.warn=(message,info)=>logs.push({message,info});
+  try {
+    const r=await run({env:{APIFY_API_TOKEN:'private-token',INSTAGRAM_SESSIONID:''},
+      routes:{[apifyPath]:()=>new Response('NOT JSON',{status:200,headers:{'content-type':'text/plain'}})}});
+    assert.equal(r.requests.length,1);
+    assert.equal(r.telegram.filter(x=>['sendPhoto','sendVideo'].includes(x.method)).length,0);
+    assert.equal(logs.find(x=>x.message==='instagram story resolution failed')?.info?.code,'apify_invalid_response');
+    assert.equal(logs.find(x=>x.message==='instagram story invalid response')?.info?.reason,'unparseable_json');
+    assert.ok(!JSON.stringify(logs).includes('private-token'));
+  } finally {console.warn=oldWarn;}
+});
+
 test('public Story API profile command reuses the same resolved media with IDs and no session', async () => {
   const previous=globalThis.fetch;
   const calls=[];
