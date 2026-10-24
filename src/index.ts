@@ -1358,7 +1358,11 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
     if (acknowledgeKickedChat(error)) return Response.json({ ok: true });
     const detail = error instanceof Error ? error.message : String(error);
     const throttle = error instanceof InstagramThrottleError ? error.throttle : undefined;
-    console.error("instagram download failed", { target: target.kind, detail, ...(throttle ? { throttle } : {}) });
+    if (/^INSTAGRAM_PUBLIC_COOLDOWN_\d+$/.test(detail)) {
+      console.info("instagram public cooldown active", { target: target.kind, remainingSeconds: Number(detail.split("_").at(-1)) });
+    } else {
+      console.error("instagram download failed", { target: target.kind, detail, ...(throttle ? { throttle } : {}) });
+    }
     const friendly = friendlyError(detail, throttle);
     if (statusMessageId) {
       await safeTelegramCall(env.BOT_TOKEN, "editMessageText", {
