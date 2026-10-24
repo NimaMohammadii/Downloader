@@ -134,6 +134,127 @@ async function run({ session = '12345%3Afixture-session', env = {}, respond, cdn
 }
 
 
+
+test('Apify story link downloads its exact video without using Instagram session', async () => {
+  const result = await run({text: 'https://www.instagram.com/stories/example/999/',
+    env: {INSTAGRAM_SESSIONID: '', APIFY_API_TOKEN: 'private-apify-key'},
+    respond(call) {
+      if (call.hostname === 'api.apify.com') return Response.json([
+        {type:'story', id:'998', ownerUsername:'example', mediaType:'Image',
+          displayUrl:'https://scontent.cdninstagram.com/other.jpg'},
+        {type:'story', id:'999', ownerUsername:'example', mediaType:'Video',
+          displayUrl:'https://scontent.cdninstagram.com/poster.jpg',
+          videoUrl:'https://scontent.cdninstagram.com/story.mp4', width:1080, height:1920},
+      ]);
+    }});
+  assert.equal(files(result).length, 1);
+  assert.equal(files(result)[0].method, 'sendVideo');
+  assert.equal(result.calls.length, 1);
+  assert.equal(result.calls[0].hostname, 'api.apify.com');
+  assert.equal(result.calls[0].path, '/v2/acts/rowfinch~instagram-stories-scraper/run-sync-get-dataset-items');
+  assert.equal(result.calls[0].headers.get('authorization'), 'Bearer private-apify-key');
+  assert.equal(result.calls[0].headers.get('cookie'), null);
+  assert.deepEqual(JSON.parse(result.calls[0].body), {
+    usernames:['https://www.instagram.com/stories/example/999/'], stories:true, highlights:false,
+  });
+  assert.ok(!JSON.stringify(result.sent).includes('private-apify-key'));
+  assert.ok(!JSON.stringify(result.diagnostics).includes('private-apify-key'));
+});
+
+test('Apify username story tray delivers every ordered image and video', async () => {
+  const result = await run({text:'https://www.instagram.com/stories/example/',
+    env:{INSTAGRAM_SESSIONID:'',APIFY_API_TOKEN:'key'},
+    respond(call) {
+      if (call.hostname === 'api.apify.com') return Response.json([
+        {type:'story',id:'999',ownerUsername:'example',mediaType:'Image',
+          displayUrl:'https://scontent.cdninstagram.com/photo.jpg'},
+        {type:'story',id:'1000',ownerUsername:'example',mediaType:'Video',
+          videoUrl:'https://scontent.cdninstagram.com/movie.mp4',
+          displayUrl:'https://scontent.cdninstagram.com/cover.jpg'},
+      ]);
+    }});
+  assert.deepEqual(files(result).map(x=>x.method), ['sendPhoto','sendVideo']);
+  assert.equal(result.calls.length, 1);
+});
+
+test('Apify direct highlight retrieves only matching highlight items without Instagram login', async () => {
+  const id = '17950000000123456';
+  const result = await run({text:'https://www.instagram.com/stories/highlights/'+id+'/',
+    env:{INSTAGRAM_SESSIONID:'',APIFY_API_TOKEN:'key'},
+    respond(call) {
+      if (call.hostname === 'api.apify.com') return Response.json([
+        {type:'highlight', id:'999', highlightId:id, mediaType:'Video',
+          videoUrl:'https://scontent.cdninstagram.com/movie.mp4',
+          displayUrl:'https://scontent.cdninstagram.com/cover.jpg'},
+      ]);
+    }});
+  assert.deepEqual(files(result).map(x=>x.method), ['sendVideo']);
+  assert.deepEqual(JSON.parse(result.calls[0].body), {
+    usernames:['https://www.instagram.com/stories/highlights/'+id+'/'],
+    stories:false, highlights:true, highlightsLimit:1,
+  });
+  assert.equal(result.calls.length, 1);
+});
+
+test('Apify rejects foreign usernames and highlight IDs rather than sending wrong videos', async () => {
+  for (const [target,payload] of [
+    ['https://www.instagram.com/stories/example/999/',
+      {type:'story',id:'999',ownerUsername:'other',mediaType:'Video',
+        videoUrl:'https://scontent.cdninstagram.com/movie.mp4'}],
+    ['https://www.instagram.com/stories/highlights/17950000000123456/',
+      {type:'highlight',id:'999',highlightId:'17950000000999999',mediaType:'Video',
+        videoUrl:'https://scontent.cdninstagram.com/movie.mp4'}],
+  ]) {
+    const result = await run({text:target,env:{INSTAGRAM_SESSIONID:'',APIFY_API_TOKEN:'key'},
+      respond(call) { if(call.hostname==='api.apify.com')return Response.json([payload]); }});
+    assert.equal(files(result).length, 0);
+    assert.equal(result.calls.length, 1);
+    assert.match(report(result), /APIFY_STORY_WRONG_TARGET/);
+  }
+});
+
+test('Apify story without matching ID, or video URL only as a cover, never sends a wrong file', async () => {
+  for (const [payload,expected] of [
+    [[{type:'story',id:'998',ownerUsername:'example',mediaType:'Image',
+      displayUrl:'https://scontent.cdninstagram.com/other.jpg'}],/APIFY_STORY_NO_MEDIA/],
+    [[{type:'story',id:'999',ownerUsername:'example',mediaType:'Video',
+      displayUrl:'https://scontent.cdninstagram.com/poster.jpg'}],/APIFY_STORY_NO_MEDIA/],
+    [[{type:'story',id:'999',ownerUsername:'example',mediaType:'Video',
+      videoUrl:'https://evil.example/file.mp4'}],/APIFY_STORY_INVALID_MEDIA/],
+  ]) {
+    const result=await run({text:'https://www.instagram.com/stories/example/999/',
+      env:{INSTAGRAM_SESSIONID:'',APIFY_API_TOKEN:'key'},
+      respond(call){if(call.hostname==='api.apify.com')return Response.json(payload);}});
+    assert.equal(files(result).length,0);
+    assert.equal(result.calls.length,1);
+    assert.match(report(result),expected);
+  }
+});
+
+test('Apify authentication errors do not fall through to the Instagram session', async () => {
+  const result=await run({text:'https://www.instagram.com/stories/example/999/',
+    env:{INSTAGRAM_SESSIONID:'12345%3Asecret-session',APIFY_API_TOKEN:'bad-token'},
+    respond(call){if(call.hostname==='api.apify.com')return Response.json({error:{type:'unauthorized'}},{status:401});}});
+  assert.equal(result.calls.length,1);
+  assert.equal(files(result).length,0);
+  assert.match(report(result),/APIFY_STORY_AUTH_ERROR/);
+  assert.ok(!JSON.stringify(result.sent).includes('bad-token'));
+});
+
+test('Apify story oversized item sets fail instead of silently delivering the first twenty', async () => {
+  const result=await run({text:'https://www.instagram.com/stories/example/',
+    env:{INSTAGRAM_SESSIONID:'',APIFY_API_TOKEN:'key'},
+    respond(call){
+      if(call.hostname==='api.apify.com')return Response.json(Array.from({length:21},(_,i)=>({
+        type:'story',id:String(1000+i),ownerUsername:'example',mediaType:'Image',
+        displayUrl:'https://scontent.cdninstagram.com/picture.jpg',
+      })));
+    }});
+  assert.equal(result.calls.length,1);
+  assert.equal(files(result).length,0);
+  assert.match(report(result),/APIFY_STORY_TOO_MANY_MEDIA/);
+});
+
 test('Bright Data Reel uses documented sync endpoint and never sends Instagram session credentials', async () => {
   const result = await run({env: {BRIGHTDATA_API_KEY: 'private-brightdata-key'}, respond(call) {
     if (call.hostname === 'api.brightdata.com') return Response.json([{
