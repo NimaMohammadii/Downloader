@@ -249,6 +249,33 @@ test('Bright Data provider rejections are terminal; empty results use one free m
   }
 });
 
+test('Bright Data Reel containing poster images and alternate video renditions only sends the video once', async () => {
+  const result = await run({env: {BRIGHTDATA_API_KEY: 'brightdata-key'}, respond(call) {
+    if (call.hostname === 'api.brightdata.com') return Response.json([{
+      shortcode, content_type: 'reel',
+      video_url: 'https://scontent.cdninstagram.com/best.mp4',
+      videos: ['https://scontent.cdninstagram.com/low.mp4'],
+      photos: ['https://scontent.cdninstagram.com/poster.jpg'],
+    }]);
+  }});
+  assert.deepEqual(files(result).map(x => x.method), ['sendVideo']);
+  assert.equal(result.calls.length, 1);
+  assert.ok(!result.diagnostics.some(x => x.message === 'instagram brightdata no media'));
+});
+
+test('Bright Data explicitly single-video Post ignores cover instead of rejecting valid video', async () => {
+  const result = await run({text: 'https://www.instagram.com/p/' + shortcode + '/',
+    env: {BRIGHTDATA_API_KEY: 'brightdata-key'}, respond(call) {
+      if (call.hostname === 'api.brightdata.com') return Response.json([{
+        shortcode, content_type: 'video',
+        videos: ['https://scontent.cdninstagram.com/movie.mp4'],
+        photos: ['https://scontent.cdninstagram.com/poster.jpg'],
+      }]);
+    }});
+  assert.deepEqual(files(result).map(x => x.method), ['sendVideo']);
+  assert.equal(result.calls.length, 1);
+});
+
 test('Bright Data metadata-only Reel is recovered by the existing public webpage without another paid call', async () => {
   const result = await run({env: {BRIGHTDATA_API_KEY: 'brightdata-key',
       INSTAGRAM_SESSIONID: 'personal-session-not-for-public-reels'}, respond(call) {
