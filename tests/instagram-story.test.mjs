@@ -12,7 +12,7 @@ const { outputFiles } = await build({
       : 'export const recordUsage=async()=>true; export const recordMediaDelivery=async()=>{}; export const telegramCustomEmoji=(_method,payload)=>payload; export const telegramTextMotion=async()=>{}; export const telegramFileCache=async(...args)=>globalThis.storyFileCache ? globalThis.storyFileCache(...args) : null; export class AdminStatsStore {} export const ADMIN_USER_ID = 1; export async function recordDownload(_env,record) {(globalThis.downloadHistory ||= []).push(record);} export async function recordSuccessfulDelivery() {}' }));
   } }],
 });
-const { default: worker, parseInstagramProfileCommand } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
+const { default: worker, parseInstagramProfileCommand, instagramProfileStories } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
 const session = '12345%3Afictional-test-session';
 const media = { pk: '999', user: { pk: '77' }, video_versions: [{ url: 'https://cdn.instagram.com/test.mp4', width: 720, height: 1280 }] };
 
@@ -54,6 +54,126 @@ async function run({ routes = {}, env = {}, link = 'https://www.instagram.com/st
   assert.equal(response.status, 200);
   return { requests, telegram, legacy: globalThis.legacy };
 }
+
+
+const apifyPath = '/v2/actors/rowfinch~instagram-stories-scraper/run-sync-get-dataset-items';
+
+test('configured public Story API sends exact video and never uses personal Instagram session', async () => {
+  const r = await run({env:{APIFY_API_TOKEN:'private-apify-token', INSTAGRAM_SESSIONID:''},
+    routes:{[apifyPath]:() => Response.json([
+      {type:'story',id:'998',ownerUsername:'example',mediaType:'Image',
+        displayUrl:'https://cdn.instagram.com/old.jpg'},
+      {type:'story',id:'999',ownerUsername:'example',mediaType:'Video',
+        videoUrl:'https://cdn.instagram.com/video.mp4',displayUrl:'https://cdn.instagram.com/poster.jpg',
+        width:1080,height:1920},
+    ])}});
+  assert.deepEqual(r.requests.map(x=>x.url.hostname), ['api.apify.com']);
+  assert.equal(r.requests[0].headers.get('authorization'), 'Bearer private-apify-token');
+  assert.equal(r.requests[0].headers.get('cookie'), null);
+  assert.deepEqual(r.telegram.filter(x=>['sendPhoto','sendVideo'].includes(x.method)).map(x=>x.method), ['sendVideo']);
+  assert.ok(!JSON.stringify(r.telegram).includes('private-apify-token'));
+});
+
+test('public Story API handles a complete current-story tray with no Instagram session', async () => {
+  const r = await run({link:'https://www.instagram.com/stories/example/',
+    env:{APIFY_API_TOKEN:'private-token',INSTAGRAM_SESSIONID:''},
+    routes:{[apifyPath]:()=>Response.json([
+      {type:'story',id:'999',ownerUsername:'example',mediaType:'Image',
+        displayUrl:'https://cdn.instagram.com/photo.jpg'},
+      {type:'story',id:'1000',ownerUsername:'example',mediaType:'Video',
+        videoUrl:'https://cdn.instagram.com/movie.mp4'},
+    ])}});
+  assert.equal(r.requests.length,1);
+  assert.deepEqual(r.telegram.filter(x=>['sendPhoto','sendVideo'].includes(x.method)).map(x=>x.method),
+    ['sendPhoto','sendVideo']);
+});
+
+test('public Story API downloads a single matching Highlight from its public URL', async () => {
+  const id='17950000000123456';
+  const r = await run({link:'https://www.instagram.com/stories/highlights/'+id+'/',
+    env:{APIFY_API_TOKEN:'private-token',INSTAGRAM_SESSIONID:''},
+    routes:{[apifyPath]:()=>Response.json([
+      {type:'highlight',id:'999',highlightId:id,mediaType:'Video',
+        videoUrl:'https://cdn.instagram.com/video.mp4'},
+    ])}});
+  assert.equal(r.requests.length,1);
+  assert.deepEqual(r.telegram.filter(x=>['sendPhoto','sendVideo'].includes(x.method)).map(x=>x.method),
+    ['sendVideo']);
+});
+
+test('public Story API rejects wrong owners, highlights, and absent requested IDs', async () => {
+  for (const [link,rows,expected] of [
+    ['https://www.instagram.com/stories/example/999/',
+      [{type:'story',id:'999',ownerUsername:'different',mediaType:'Video',
+        videoUrl:'https://cdn.instagram.com/video.mp4'}], /مطابقت/],
+    ['https://www.instagram.com/stories/example/999/',
+      [{type:'story',id:'998',ownerUsername:'example',mediaType:'Image',
+        displayUrl:'https://cdn.instagram.com/other.jpg'}], /هیچ فایل قابل دانلودی/],
+    ['https://www.instagram.com/stories/highlights/17950000000123456/',
+      [{type:'highlight',id:'999',highlightId:'17950000000765432',mediaType:'Video',
+        videoUrl:'https://cdn.instagram.com/video.mp4'}], /مطابقت/],
+  ]) {
+    const r=await run({link,env:{APIFY_API_TOKEN:'token',INSTAGRAM_SESSIONID:''},
+      routes:{[apifyPath]:()=>Response.json(rows)}});
+    assert.equal(r.requests.length,1);
+    assert.equal(r.telegram.filter(x=>['sendPhoto','sendVideo'].includes(x.method)).length,0);
+    assert.match(r.telegram.find(x=>x.method==='sendMessage').body.text,expected);
+  }
+});
+
+test('public Story API never substitutes video poster or accepts an unrelated media host', async () => {
+  for (const row of [
+    {type:'story',id:'999',ownerUsername:'example',mediaType:'Video',
+      displayUrl:'https://cdn.instagram.com/poster.jpg'},
+    {type:'story',id:'999',ownerUsername:'example',mediaType:'Video',
+      videoUrl:'https://example.com/file.mp4'},
+  ]) {
+    const r=await run({env:{APIFY_API_TOKEN:'token',INSTAGRAM_SESSIONID:''},
+      routes:{[apifyPath]:()=>Response.json([row])}});
+    assert.equal(r.requests.length,1);
+    assert.equal(r.telegram.filter(x=>['sendPhoto','sendVideo'].includes(x.method)).length,0);
+  }
+});
+
+test('public Story API refuses more than twenty media results before any partial send', async () => {
+  const r=await run({link:'https://www.instagram.com/stories/example/',
+    env:{APIFY_API_TOKEN:'token',INSTAGRAM_SESSIONID:''},
+    routes:{[apifyPath]:()=>Response.json(Array.from({length:21},(_,i)=>({
+      type:'story',id:String(1000+i),ownerUsername:'example',mediaType:'Image',
+      displayUrl:'https://cdn.instagram.com/photo.jpg',
+    })))}});
+  assert.equal(r.requests.length,1);
+  assert.equal(r.telegram.filter(x=>['sendPhoto','sendVideo'].includes(x.method)).length,0);
+  assert.match(r.telegram.find(x=>x.method==='sendMessage').body.text,/سقف/);
+});
+
+test('public Story API authentication failure is terminal and never attempts Instagram session', async () => {
+  const r=await run({env:{APIFY_API_TOKEN:'broken-token',INSTAGRAM_SESSIONID:session},
+    routes:{[apifyPath]:()=>Response.json({error:{type:'Unauthorized'}},{status:401})}});
+  assert.equal(r.requests.length,1);
+  assert.equal(r.telegram.filter(x=>['sendPhoto','sendVideo'].includes(x.method)).length,0);
+  assert.match(r.telegram.find(x=>x.method==='sendMessage').body.text,/توکن Apify/);
+  assert.ok(!JSON.stringify(r.telegram).includes('broken-token'));
+});
+
+test('public Story API profile command reuses the same resolved media with IDs and no session', async () => {
+  const previous=globalThis.fetch;
+  const calls=[];
+  try {
+    globalThis.fetch=async (url,init={})=>{
+      calls.push({url:String(url),body:JSON.parse(init.body),authorization:new Headers(init.headers).get('authorization')});
+      return Response.json([{type:'story',id:'999',ownerUsername:'example',mediaType:'Video',
+        videoUrl:'https://cdn.instagram.com/video.mp4'}]);
+    };
+    const result=await instagramProfileStories('example',{APIFY_API_TOKEN:'private-token',INSTAGRAM_SESSIONID:''});
+    assert.equal(calls.length,1);
+    assert.equal(result.length,1);
+    assert.equal(result[0].storyId,'999');
+    assert.equal(result[0].groups[0][0].kind,'video');
+    assert.equal(calls[0].body.stories,true);
+    assert.equal(calls[0].body.highlights,false);
+  } finally {globalThis.fetch=previous;}
+});
 
 test('missing session fails explicitly without Instagram requests or legacy retries', async () => {
   const r = await run({ env: { INSTAGRAM_SESSIONID: '' } });
