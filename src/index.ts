@@ -10,7 +10,7 @@ type Env = Partial<AdminStatsEnv> & {
   INSTAGRAM_IG_DID?: string;
   BRIGHTDATA_API_KEY?: string;
   APIFY_API_TOKEN?: string;
-  queueInstagramPost?: (post: Omit<InstagramPostUpload, "media">) => Promise<void>;
+  queueInstagramPost?: (post: Omit<InstagramPostUpload, "media" | "statusMessageId">) => Promise<void>;
   uploadInstagramPost?: (post: InstagramPostUpload) => Promise<void>;
 };
 
@@ -1713,23 +1713,22 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
   await recordDownload(env, { ...history, status: "processing" });
   let statusMessageId: number | undefined;
   try {
+    // TopAPI runs inside the durable download Workflow, with an ID stable per
+    // message. The Workflow itself sends the status once so webhook redelivery
+    // cannot duplicate status messages or costly provider requests.
+    if (target.kind === "post" && env.APIFY_API_TOKEN?.trim() && env.queueInstagramPost) {
+      await env.queueInstagramPost({ shortcode: target.shortcode, url: target.url,
+        chatId: message.chat.id, requestMessageId: message.message_id,
+        userId: message.from?.id || message.chat.id });
+      return Response.json({ ok: true });
+    }
+
     const status = await telegramCall<TelegramMessage>(env.BOT_TOKEN, "sendMessage", {
       chat_id: message.chat.id,
       text: "⏳ لینک اینستاگرام رو گرفتم، دارم فایل رو آماده می‌کنم…",
       reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
     });
     statusMessageId = status.message_id;
-
-    // The TopAPI synchronous call can outlive Telegram's webhook connection.
-    // Queue it inside the already deployed durable download Workflow instead.
-    // Workflow IDs are stable per message, so a repeated webhook never starts
-    // a second billable TopAPI run.
-    if (target.kind === "post" && env.APIFY_API_TOKEN?.trim() && env.queueInstagramPost) {
-      await env.queueInstagramPost({ shortcode: target.shortcode, url: target.url,
-        chatId: message.chat.id, requestMessageId: message.message_id,
-        userId: message.from?.id || message.chat.id, statusMessageId });
-      return Response.json({ ok: true });
-    }
 
     const media = await resolveTarget(target, env);
     if (!media.length) throw new Error("INSTAGRAM_NO_MEDIA");
