@@ -10,6 +10,7 @@ type Env = Partial<AdminStatsEnv> & {
   INSTAGRAM_IG_DID?: string;
   BRIGHTDATA_API_KEY?: string;
   APIFY_API_TOKEN?: string;
+  queueInstagramPost?: (post: Omit<InstagramPostUpload, "media">) => Promise<void>;
   uploadInstagramPost?: (post: InstagramPostUpload) => Promise<void>;
 };
 
@@ -724,6 +725,10 @@ async function resolvePostWithTopApi(
   const isReel = route?.[1] === "reel" || route?.[1] === "reels";
   const canonicalUrl = "https://www.instagram.com/" + (isReel ? "reel" : "p") + "/" + target.shortcode + "/";
   const endpoint = "https://api.apify.com/v2/actors/topapi~instagram-scraper/run-sync-get-dataset-items";
+  // The Actor synchronous API can take up to 300 seconds. This runs inside
+  // the existing durable download Workflow, not the Telegram webhook request.
+  // Keep its single paid invocation inside one no-retry Workflow step.
+  const startedAt = Date.now();
   let response: Response;
   try {
     response = await fetch(endpoint, {
@@ -745,15 +750,24 @@ async function resolvePostWithTopApi(
         compact: false,
       }),
       redirect: "error",
-      // Do not restart a potentially billable run after an ambiguous timeout.
-      signal: AbortSignal.timeout(45_000),
+      // An interrupted paid request is ambiguous: do not retry automatically.
+      signal: AbortSignal.timeout(270_000),
     });
-  } catch {
-    throw new Error("TOPAPI_NETWORK_OR_TIMEOUT");
+  } catch (error) {
+    const timeout = error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
+    console.warn("instagram topapi request failed", {
+      stage: "fetch", kind: isReel ? "reels" : "posts",
+      reason: timeout ? "timeout" : "network_or_redirect",
+      durationMs: Math.max(0, Date.now() - startedAt),
+    });
+    throw new Error(timeout ? "TOPAPI_TIMEOUT" : "TOPAPI_NETWORK_ERROR");
   }
   if (!response.ok) {
     await response.body?.cancel().catch(() => undefined);
-    console.warn("instagram topapi rejected", { status: response.status });
+    console.warn("instagram topapi rejected", {
+      status: response.status, kind: isReel ? "reels" : "posts",
+      durationMs: Math.max(0, Date.now() - startedAt),
+    });
     if (response.status === 401 || response.status === 403) throw new Error("TOPAPI_AUTH_ERROR");
     if (response.status === 402 || response.status === 429) throw new Error("TOPAPI_QUOTA_OR_RATE_LIMIT");
     if ([400, 404, 422].includes(response.status)) throw new Error("TOPAPI_UNAVAILABLE");
@@ -1511,6 +1525,8 @@ async function resolveTarget(target: InstagramTarget, env: Env): Promise<Resolve
 
 function friendlyError(detail: string, throttle?: InstagramThrottle): string {
   const value = detail.toLowerCase();
+  if (value.startsWith("topapi_timeout")) return "❌ مهلت استخراج TopAPI تمام شد؛ اجرای قبلی ممکن است هنوز در Apify ادامه داشته باشد. از تکرار فوری لینک خودداری کن.";
+  if (value.startsWith("topapi_network_error")) return "❌ ارتباط با TopAPI قطع شد یا مسیر شبکه پاسخ نداد؛ برای جلوگیری از پرداخت تکراری، درخواست خودکار تکرار نشد.";
   if (value.startsWith("topapi_auth_error")) return "❌ توکن Apify معتبر نیست یا دسترسی TopAPI فعال نشده است.";
   if (value.startsWith("topapi_quota_or_rate_limit")) return "❌ سهمیه یا محدودیت اجرای TopAPI اجازه استخراج این پست را نمی‌دهد.";
   if (value.startsWith("topapi_no_media")) return "❌ TopAPI لینک فایل این پست یا ریلز را برنگرداند.";
@@ -1575,66 +1591,17 @@ function friendlyError(detail: string, throttle?: InstagramThrottle): string {
   return `❌ دانلود Instagram شکست خورد: ${detail.slice(0, 140)}`;
 }
 
-async function handleTelegramWebhook(request: Request, env: Env): Promise<Response> {
-  if (request.headers.get("x-telegram-bot-api-secret-token") !== (env.WEBHOOK_SECRET || WEBHOOK_SECRET)) {
-    return new Response("Forbidden", { status: 403 });
-  }
-
-  let update: TelegramUpdate;
-  try {
-    update = (await request.json()) as TelegramUpdate;
-  } catch {
-    return new Response("Bad Request", { status: 400 });
-  }
-
-  const message = update.message;
-  if (!message) return Response.json({ ok: true });
-  const text = (message.text || message.caption || "").trim();
-
-  if (text === "/start" || text.startsWith("/start ")) {
-    await telegramCall(env.BOT_TOKEN, "sendMessage", {
-      chat_id: message.chat.id,
-      text: "لینک Reel، پست ویدیویی یا Story اینستاگرام رو بفرست؛ فایلش رو همین‌جا می‌فرستم ⚡️",
-    });
-    return Response.json({ ok: true });
-  }
-
-  const target = parseInstagramTarget(text);
-  if (!target) {
-    await telegramCall(env.BOT_TOKEN, "sendMessage", {
-      chat_id: message.chat.id,
-      text: "یه لینک معتبر Instagram بفرست 👇",
-      reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
-    });
-    return Response.json({ ok: true });
-  }
-
-  const history = { key: `ig:${message.chat.id}:${message.message_id}:${message.from?.id || message.chat.id}`,
-    userId: message.from?.id || message.chat.id, source: `Instagram ${target.kind}`, request: target.url };
+// The existing Telegram delivery path is shared with durable Instagram
+// post resolution. Never duplicate its caching, media order, or usage logic.
+export async function sendInstagramPostDirect(
+  env: Env,
+  target: Extract<InstagramTarget, { kind: "post" }>,
+  message: Pick<TelegramMessage, "chat" | "message_id" | "from">,
+  media: ResolvedMedia[],
+  historyKey: string,
+): Promise<number> {
+  const history = { key: historyKey };
   let delivered = 0;
-  await recordDownload(env, { ...history, status: "processing" });
-  let statusMessageId: number | undefined;
-  try {
-    const status = await telegramCall<TelegramMessage>(env.BOT_TOKEN, "sendMessage", {
-      chat_id: message.chat.id,
-      text: "⏳ لینک اینستاگرام رو گرفتم، دارم فایل رو آماده می‌کنم…",
-      reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
-    });
-    statusMessageId = status.message_id;
-
-    const media = await resolveTarget(target, env);
-    if (!media.length) throw new Error("INSTAGRAM_NO_MEDIA");
-
-    // Hand off the entire ordered post before publishing any item. Small posts
-    // retain URL delivery; unknown video sizes need the bounded file uploader.
-    if (target.kind === "post" && env.uploadInstagramPost && media.some(item =>
-      item.kind === "video" && (item.size === null || item.size > TELEGRAM_VIDEO_URL_LIMIT))) {
-      await env.uploadInstagramPost({ shortcode: target.shortcode, url: target.url,
-        chatId: message.chat.id, requestMessageId: message.message_id,
-        userId: message.from?.id || message.chat.id, statusMessageId, media });
-      return Response.json({ ok: true });
-    }
-
     for (let index = 0; index < media.length; index++) {
       const item = media[index];
       const proxyUrl = await createMediaProxyUrl(env.BOT_TOKEN, item.url);
@@ -1682,6 +1649,103 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
       delivered++;
       if (env.ADMIN_STATS) await recordSuccessfulDelivery(env as AdminStatsEnv, `${history.key}:${index}`);
     }
+
+  return delivered;
+}
+
+export async function resolveInstagramPostForWorkflow(
+  url: string, shortcode: string, env: Env,
+): Promise<ResolvedMedia[]> {
+  const target = parseInstagramTarget(url);
+  if (!target || target.kind !== "post" || target.shortcode !== shortcode)
+    throw new Error("INSTAGRAM_WRONG_POST");
+  // Let the already existing large-file uploader choose media up to 2 GB.
+  // The hook is a capability flag during probing and is never called here.
+  const media = await resolveTarget(target, { ...env, uploadInstagramPost: async () => {
+    throw new Error("INSTAGRAM_UNEXPECTED_UPLOAD");
+  } });
+  if (!media.length) throw new Error("INSTAGRAM_NO_MEDIA");
+  return media;
+}
+
+export function instagramPostFriendlyError(error: unknown): string {
+  const detail = error instanceof Error ? error.message : "INSTAGRAM_UNKNOWN_FAILURE";
+  return friendlyError(detail);
+}
+
+async function handleTelegramWebhook(request: Request, env: Env): Promise<Response> {
+  if (request.headers.get("x-telegram-bot-api-secret-token") !== (env.WEBHOOK_SECRET || WEBHOOK_SECRET)) {
+    return new Response("Forbidden", { status: 403 });
+  }
+
+  let update: TelegramUpdate;
+  try {
+    update = (await request.json()) as TelegramUpdate;
+  } catch {
+    return new Response("Bad Request", { status: 400 });
+  }
+
+  const message = update.message;
+  if (!message) return Response.json({ ok: true });
+  const text = (message.text || message.caption || "").trim();
+
+  if (text === "/start" || text.startsWith("/start ")) {
+    await telegramCall(env.BOT_TOKEN, "sendMessage", {
+      chat_id: message.chat.id,
+      text: "لینک Reel، پست ویدیویی یا Story اینستاگرام رو بفرست؛ فایلش رو همین‌جا می‌فرستم ⚡️",
+    });
+    return Response.json({ ok: true });
+  }
+
+  const target = parseInstagramTarget(text);
+  if (!target) {
+    await telegramCall(env.BOT_TOKEN, "sendMessage", {
+      chat_id: message.chat.id,
+      text: "یه لینک معتبر Instagram بفرست 👇",
+      reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
+    });
+    return Response.json({ ok: true });
+  }
+
+  const history = { key: `ig:${message.chat.id}:${message.message_id}:${message.from?.id || message.chat.id}`,
+    userId: message.from?.id || message.chat.id, source: `Instagram ${target.kind}`, request: target.url };
+  let delivered = 0;
+  await recordDownload(env, { ...history, status: "processing" });
+  let statusMessageId: number | undefined;
+  try {
+    const status = await telegramCall<TelegramMessage>(env.BOT_TOKEN, "sendMessage", {
+      chat_id: message.chat.id,
+      text: "⏳ لینک اینستاگرام رو گرفتم، دارم فایل رو آماده می‌کنم…",
+      reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
+    });
+    statusMessageId = status.message_id;
+
+    // The TopAPI synchronous call can outlive Telegram's webhook connection.
+    // Queue it inside the already deployed durable download Workflow instead.
+    // Workflow IDs are stable per message, so a repeated webhook never starts
+    // a second billable TopAPI run.
+    if (target.kind === "post" && env.APIFY_API_TOKEN?.trim() && env.queueInstagramPost) {
+      await env.queueInstagramPost({ shortcode: target.shortcode, url: target.url,
+        chatId: message.chat.id, requestMessageId: message.message_id,
+        userId: message.from?.id || message.chat.id, statusMessageId });
+      return Response.json({ ok: true });
+    }
+
+    const media = await resolveTarget(target, env);
+    if (!media.length) throw new Error("INSTAGRAM_NO_MEDIA");
+
+    // Hand off the entire ordered post before publishing any item. Small posts
+    // retain URL delivery; unknown video sizes need the bounded file uploader.
+    if (target.kind === "post" && env.uploadInstagramPost && media.some(item =>
+      item.kind === "video" && (item.size === null || item.size > TELEGRAM_VIDEO_URL_LIMIT))) {
+      await env.uploadInstagramPost({ shortcode: target.shortcode, url: target.url,
+        chatId: message.chat.id, requestMessageId: message.message_id,
+        userId: message.from?.id || message.chat.id, statusMessageId, media });
+      return Response.json({ ok: true });
+    }
+
+    delivered = await sendInstagramPostDirect(env, target as Extract<InstagramTarget, { kind: "post" }>,
+      message, media, history.key);
     await recordDownload(env, { ...history, status: "success", delivered });
 
     if (statusMessageId) {
