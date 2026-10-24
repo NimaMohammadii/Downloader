@@ -289,6 +289,56 @@ async function workflow(ready = {ok:true}, input = job, sendResult = {ok:true}) 
   return {calls,steps,messages};
 }
 
+test('Cloudflare engine grace interruption does not fail, notify or clean up a waiting music workflow', async () => {
+  const calls = [], messages = [], checkpoints = new Map();
+  let interruption = true;
+  globalThis.downloadHistory = [];
+  globalThis.delivered = 0;
+  globalThis.containerIds = [];
+  globalThis.testFileCache = undefined;
+  globalThis.container = {
+    async startShared() { calls.push('start'); },
+    async instagramRequest(action) { calls.push(action); return action === 'send' ? {ok:true,parts:1,title:'Music'} : {ok:true}; },
+    async releaseInstagram() { calls.push('release'); },
+  };
+  globalThis.fetch = async (url, init) => {
+    assert.match(String(url), /^https:\/\/api\.telegram\.org\//);
+    messages.push(JSON.parse(init.body));
+    return Response.json({ok:true,result:{message_id:10}});
+  };
+  const binding = {...env, DOWNLOAD_POOL: {getByName() {return {
+    async acquire() { calls.push('reserve'); return {instance:0,token:'grace-test'}; },
+    async release() { calls.push('release-capacity'); },
+  };}}};
+  const step = {
+    async do(name, options, fn) {
+      const callback = typeof options === 'function' ? options : fn;
+      if (checkpoints.has(name)) return structuredClone(checkpoints.get(name));
+      const value = await callback();
+      checkpoints.set(name, structuredClone(value));
+      return value;
+    },
+    async waitForEvent(name, options) {
+      assert.equal(name, 'await instagram recording');
+      assert.equal(options.type, 'instagram-ready');
+      if (interruption) throw Error('Aborting engine: Grace period complete');
+      return {payload:{ok:true}};
+    },
+  };
+  const selected = {...job, id:'igdl-42-7-42-music-Y-6ktOohgYg', instagram:{kind:'music',musicVideoId:'Y-6ktOohgYg'}};
+  const run = () => new mod.YoutubeDownloadWorkflow({},binding).run({payload:selected},step);
+  await assert.rejects(run, /Aborting engine: Grace period complete/);
+  assert.deepEqual(calls, ['reserve','start','start']);
+  assert.equal(messages.length, 1, 'engine shutdown must not send a false failure message');
+  assert.equal(globalThis.downloadHistory.some(record => record.status === 'failed'), false);
+  assert.ok(!calls.includes('cleanup') && !calls.includes('release-capacity'));
+  interruption = false;
+  await run();
+  assert.deepEqual(calls, ['reserve','start','start','send','cleanup','release','release-capacity']);
+  assert.equal(globalThis.downloadHistory.at(-1).status, 'success');
+  assert.equal(messages.length, 1, 'durable replay must not resend the status message');
+});
+
 test('large Instagram posts reuse the existing upload lifecycle, status and resolved source without another login', async () => {
   const post = { shortcode: 'B', url: 'https://instagram.com/reel/B/', chatId: 42, requestMessageId: 7, userId: 42,
     statusMessageId: 88, media: [{ kind: 'video', url: 'https://scontent.cdninstagram.com/big.mp4', width: 1080, height: 1920, size: 120000000 }] };
