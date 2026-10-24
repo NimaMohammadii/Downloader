@@ -139,7 +139,7 @@ export async function instagramProfilePage(username: string, after: string | nul
 }
 
 export async function instagramProfilePostMedia(post: InstagramProfilePost, env: Env): Promise<ResolvedMedia[]> {
-  const groups = post.groups.length ? post.groups : await resolvePost({ kind: "post", url: post.url, shortcode: post.shortcode }, env);
+  const groups = post.groups.length ? post.groups : await resolvePost({ kind: "post", url: post.url, shortcode: post.shortcode });
   if (!groups.length || groups.length > 20) throw new Error("INSTAGRAM_NO_MEDIA");
   const media: ResolvedMedia[] = [];
   for (const group of groups) media.push(await chooseCandidate(group, true));
@@ -157,12 +157,9 @@ const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
 const BASE_URL = "https://downloader.vexaagent.workers.dev";
 const WEB_APP_ID = "936619743392459";
 const IOS_APP_ID = "124024574287414";
-const PRIVATE_APP_ID = "567067343352427";
-const WEB_ASBD_ID = "359341";
 const POST_WEB_INFO_DOC_ID = "27128499623469141";
 const STORY_GRAPHQL_DOC_ID = "25317500907894419";
 const IG_WWW_CLAIM_STATE_KEY = "__ig_www_claim";
-const PRIVATE_BLOKS_VERSION_ID = "7189b949425f9bf80ea8bd880cf5a3080b292d9b1c4b38a18d112f7c4b71e7a8";
 const MEDIA_LINK_TTL_SECONDS = 10 * 60;
 const TELEGRAM_VIDEO_URL_LIMIT = 19_000_000;
 const TELEGRAM_VIDEO_UPLOAD_LIMIT = 2_000_000_000;
@@ -174,8 +171,6 @@ const WEB_UA =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
 const IOS_UA =
   "Instagram 361.0.0.35.82 (iPad13,8; iOS 18_0; en_US; en-US; scale=2.00; 2048x2732; 674117118) AppleWebKit/420+";
-const PRIVATE_UA =
-  "Instagram 428.0.0.47.67 Android (34/14; 480dpi; 1344x2992; Google/google; Pixel 8 Pro; husky; husky; en_US; 961145276)";
 
 async function telegramCall<T = unknown>(
   token: string,
@@ -382,113 +377,6 @@ function mobileHeaders(jar: CookieJar): Headers {
   });
   const cookie = cookieHeader(jar);
   if (cookie) headers.set("cookie", cookie);
-  return headers;
-}
-
-function privateAuthParts(jar: CookieJar): { userId: string; sessionId: string } | null {
-  const sessionId = jar.get("sessionid")?.trim() || "";
-  let userId = jar.get("ds_user_id")?.trim() || "";
-  if (!userId && sessionId) {
-    try {
-      userId = decodeURIComponent(sessionId).match(/^\d+/)?.[0] || sessionId.match(/^\d+/)?.[0] || "";
-    } catch {
-      userId = sessionId.match(/^\d+/)?.[0] || "";
-    }
-  }
-  if (!sessionId || !/^\d+$/.test(userId)) return null;
-  return { userId, sessionId };
-}
-
-function privateAuthorization(jar: CookieJar): string | null {
-  const auth = privateAuthParts(jar);
-  if (!auth) return null;
-  const payload = JSON.stringify({
-    ds_user_id: auth.userId,
-    sessionid: auth.sessionId,
-    should_use_header_over_cookies: true,
-  });
-  return `Bearer IGT:2:${btoa(payload)}`;
-}
-
-function stableHex(seed: string, length: number): string {
-  let state = 0x811c9dc5;
-  let output = "";
-  for (let round = 0; output.length < length; round++) {
-    state ^= round + 0x9e3779b9;
-    for (let index = 0; index < seed.length; index++) {
-      state ^= seed.charCodeAt(index) + index;
-      state = Math.imul(state, 0x01000193);
-      state ^= state >>> 13;
-    }
-    output += (state >>> 0).toString(16).padStart(8, "0");
-  }
-  return output.slice(0, length);
-}
-
-function stableUuid(seed: string): string {
-  const chars = stableHex(seed, 32).split("");
-  chars[12] = "4";
-  chars[16] = ((parseInt(chars[16], 16) & 0x3) | 0x8).toString(16);
-  const hex = chars.join("");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
-
-function privateMobileHeaders(jar: CookieJar): Headers {
-  const auth = privateAuthParts(jar);
-  const userId = auth?.userId || "0";
-  const deviceUuid = stableUuid(`ig-device:${userId}`);
-  const familyUuid = stableUuid(`ig-family:${userId}`);
-  const androidId = `android-${stableHex(`ig-android:${userId}`, 16)}`;
-  const bandwidth = (2500 + Math.random() * 500).toFixed(3);
-  const totalBytes = String(Math.floor(5_000_000 + Math.random() * 85_000_000));
-  const totalTime = String(Math.floor(2_000 + Math.random() * 7_000));
-
-  const headers = new Headers({
-    accept: "*/*",
-    "accept-language": "en-US",
-    "user-agent": PRIVATE_UA,
-    "x-ig-app-locale": "en_US",
-    "x-ig-device-locale": "en_US",
-    "x-ig-mapped-locale": "en_US",
-    "x-pigeon-session-id": `UFS-${crypto.randomUUID()}-1`,
-    "x-pigeon-rawclienttime": (Date.now() / 1000).toFixed(3),
-    "x-ig-bandwidth-speed-kbps": bandwidth,
-    "x-ig-bandwidth-totalbytes-b": totalBytes,
-    "x-ig-bandwidth-totaltime-ms": totalTime,
-    "x-ig-app-startup-country": "US",
-    "x-bloks-version-id": PRIVATE_BLOKS_VERSION_ID,
-    "x-bloks-is-layout-rtl": "false",
-    "x-bloks-is-panorama-enabled": "true",
-    "x-ig-www-claim": jar.get(IG_WWW_CLAIM_STATE_KEY) || "0",
-    "x-ig-device-id": deviceUuid,
-    "x-ig-family-device-id": familyUuid,
-    "x-ig-android-id": androidId,
-    "x-ig-timezone-offset": "0",
-    "x-ig-connection-type": "WIFI",
-    "x-ig-capabilities": "3brTv10=",
-    "x-ig-app-id": PRIVATE_APP_ID,
-    priority: "u=3",
-    "x-fb-http-engine": "Tigon/MNS/TCP",
-    "x-tigon-is-retry": "False",
-    "x-zero-balance": "INIT",
-    "x-zero-state": "unknown",
-    "zero-http-network-interface": "wifi",
-    "x-fb-client-ip": "True",
-    "x-fb-server-cluster": "True",
-    "ig-intended-user-id": userId,
-    "ig-u-ds-user-id": userId,
-  });
-
-  const authorization = privateAuthorization(jar);
-  if (authorization) headers.set("authorization", authorization);
-  const cookie = cookieHeader(jar);
-  if (cookie) headers.set("cookie", cookie);
-  const csrf = jar.get("csrftoken");
-  if (csrf) headers.set("x-csrftoken", csrf);
-  const mid = jar.get("mid");
-  if (mid) headers.set("x-mid", mid);
-  const rur = jar.get("rur");
-  if (rur) headers.set("ig-u-rur", rur);
   return headers;
 }
 
@@ -740,7 +628,7 @@ async function resolveViaMobileMediaInfo(
 
   const media = await fetchJson(
     `https://i.instagram.com/api/v1/media/${mediaId}/info/`,
-    jar.has("sessionid") ? privateMobileHeaders(jar) : mobileHeaders(jar),
+    mobileHeaders(jar),
     jar,
   );
   const product = media.data?.items?.[0];
@@ -748,7 +636,7 @@ async function resolveViaMobileMediaInfo(
 
   const groups = candidatesFromProduct(product);
   if (groups.length) {
-    console.log("instagram resolver success", { resolver: "mobile-api", authenticated: jar.has("sessionid") });
+    console.log("instagram resolver success", { resolver: "public-mobile-api" });
     return groups;
   }
   return null;
@@ -777,10 +665,8 @@ async function resolveViaPostPage(
 ): Promise<MediaCandidate[][] | null> {
   // Reuse the requested page's state for web-info when Instagram sends only
   // its app shell. The media-info API can require login for a public post.
-  const authenticated = jar.has("sessionid");
   const page = await fetchHtml(`https://www.instagram.com/p/${target.shortcode}/`, browserHeaders(jar), jar);
-  // Use one jar for the whole session phase: tokens from this response must
-  // reach the media-info request instead of being discarded in a resolver copy.
+  // Reuse anonymous page cookies/CSRF for the exact-post web-info query.
   const csrf = extractCsrfFromHtml(page);
   if (csrf) jar.set("csrftoken", csrf);
   const groups = exactPostGroups(safeJsonScripts(page), target.shortcode, shortcodeToMediaId(target.shortcode));
@@ -788,7 +674,7 @@ async function resolveViaPostPage(
   const meta = page.match(/<meta\b[^>]*\bproperty=["']og:video(?::(?:url|secure_url))?["'][^>]*>/gi) || [];
   const fromMeta = candidatesFromHtmlMeta(meta.join("\n"));
   if (fromMeta.length) return fromMeta;
-  if (!jar.get("csrftoken") || (authenticated && !jar.has("sessionid"))) return null;
+  if (!jar.get("csrftoken")) return null;
 
   // The shortcode web-info query returns media omitted from the HTML app shell.
   // Reuse page tokens rather than requiring another homepage bootstrap.
@@ -812,7 +698,7 @@ async function resolveViaPostPage(
   const items = response.data?.data?.xdt_api__v1__media__shortcode__web_info?.items;
   const fromWebInfo = exactPostGroups(items, target.shortcode, shortcodeToMediaId(target.shortcode));
   if (fromWebInfo.length) {
-    console.log("instagram resolver success", { resolver: "graphql-web-info", authenticated });
+    console.log("instagram resolver success", { resolver: "public-graphql-web-info" });
     return fromWebInfo;
   }
   return null;
@@ -833,55 +719,26 @@ function safeJsonScripts(html: string): unknown[] {
   return values;
 }
 
-async function resolveAuthenticatedMediaInfo(
-  target: Extract<InstagramTarget, { kind: "post" }>,
-  mediaId: string,
-  jar: CookieJar,
-): Promise<MediaCandidate[][] | null> {
-  const headers = webHeaders(jar, target.url);
-  headers.set("origin", "https://www.instagram.com");
-  headers.set("x-asbd-id", WEB_ASBD_ID);
-  headers.set("x-ig-www-claim", jar.get(IG_WWW_CLAIM_STATE_KEY) || "0");
-
-  const response = await fetchJson(
-    `https://www.instagram.com/api/v1/media/${mediaId}/info/`,
-    headers,
-    jar,
-  );
-  const product = response.data?.items?.[0];
-  if (!product) return null;
-  const groups = candidatesFromProduct(product);
-  if (groups.length) {
-    console.log("instagram resolver success", { resolver: "authenticated-media-info" });
-    return groups;
+// Reject login cookies if a logged-out Instagram response unexpectedly sets them.
+class PublicPostCookieJar extends Map<string, string> {
+  override set(name: string, value: string): this {
+    if (/^(?:sessionid|ds_user_id)$/i.test(name)) return this;
+    return super.set(name, value);
   }
-  return null;
 }
 
+// Public posts and Reels never read or send configured Instagram account secrets.
 async function resolvePost(
-  target: Extract<InstagramTarget, { kind: "post" }>, env: Env,
+  target: Extract<InstagramTarget, { kind: "post" }>,
 ): Promise<MediaCandidate[][]> {
-  const anonymous: CookieJar = new Map();
-  const session = secretCookies(env);
-  const mediaId = shortcodeToMediaId(target.shortcode);
-  const attempts: Array<[string, () => Promise<MediaCandidate[][] | null>]> = [];
-  // These secrets contain browser cookies: use the existing web paths before
-  // asking the private mobile API to accept that session as an Android login.
-  // Keep all account paths before anonymous probes and stop on real restrictions.
-  if (session.get("sessionid")) attempts.push(
-    ["session/webpage", () => resolveViaPostPage(target, session)],
-    ["session/authenticated-media-info", () => resolveAuthenticatedMediaInfo(target, mediaId, session)],
-    ["session/mobile-api", () => resolveViaMobileMediaInfo(target, session)],
-  );
-  attempts.push(
-    ["public/mobile-api", () => resolveViaMobileMediaInfo(target, anonymous)],
+  const anonymous: CookieJar = new PublicPostCookieJar();
+  const attempts: Array<[string, () => Promise<MediaCandidate[][] | null>]> = [
     ["public/webpage", () => resolveViaPostPage(target, anonymous)],
-  );
+    ["public/mobile-api", () => resolveViaMobileMediaInfo(target, anonymous)],
+  ];
   const diagnostics: string[] = [];
-  let sessionRejected = false;
   const failure = (code: string) => new Error(`${code} [${diagnostics.join(",")}]`);
   for (const [name, run] of attempts) {
-    if (sessionRejected && name.startsWith("session/")) continue;
     let code = "EMPTY";
     let throttle: InstagramThrottle | undefined;
     try {
@@ -893,20 +750,14 @@ async function resolvePost(
       if (error instanceof InstagramThrottleError) throttle = error.throttle;
     }
     diagnostics.push(`${name}:${code}`);
-    if (["INSTAGRAM_RATE_LIMIT_429", "INSTAGRAM_FEEDBACK_REQUIRED"].includes(code)) {
+    // Stop on a restriction rather than trying another route or account.
+    if (["INSTAGRAM_RATE_LIMIT_429", "INSTAGRAM_FEEDBACK_REQUIRED",
+         "INSTAGRAM_CHALLENGE_REQUIRED", "INSTAGRAM_CONSENT_REQUIRED"].includes(code)) {
       const error = failure(code);
       throw throttle ? new InstagramThrottleError(throttle, error.message) : error;
     }
-    if (name.startsWith("session/") && ["INSTAGRAM_CHALLENGE_REQUIRED", "INSTAGRAM_CONSENT_REQUIRED"].includes(code)) {
-      throw failure(code.replace("INSTAGRAM_", "INSTAGRAM_SESSION_"));
-    }
-    // Stop using explicitly rejected credentials. Public posts may still be
-    // accessible anonymously, with a separate jar and no account retries.
-    if (name.startsWith("session/") && !session.get("sessionid")) sessionRejected = true;
-    if (name === "session/webpage" && code === "INSTAGRAM_LOGIN_REQUIRED") sessionRejected = true;
   }
-  const rejectedSession = sessionRejected || diagnostics.some(value => value.startsWith("session/") && value.endsWith(":INSTAGRAM_LOGIN_REQUIRED"));
-  throw failure(rejectedSession ? "INSTAGRAM_SESSION_LOGIN_REQUIRED" : "INSTAGRAM_POST_UNAVAILABLE");
+  throw failure("INSTAGRAM_POST_UNAVAILABLE");
 }
 
 function cobaltStoryHeaders(jar: CookieJar): Headers {
@@ -1299,7 +1150,7 @@ async function handleMediaProxy(request: Request, env: Env, url: URL): Promise<R
 }
 
 async function resolveTarget(target: InstagramTarget, env: Env): Promise<ResolvedMedia[]> {
-  const groups = target.kind === "post" ? await resolvePost(target, env) : await resolveStory(target, env);
+  const groups = target.kind === "post" ? await resolvePost(target) : await resolveStory(target, env);
   const resolved: ResolvedMedia[] = [];
   for (const group of groups) resolved.push(await chooseCandidate(group, target.kind === "post" && Boolean(env.uploadInstagramPost)));
   return resolved;
