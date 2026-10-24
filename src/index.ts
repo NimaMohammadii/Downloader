@@ -718,7 +718,7 @@ async function resolveViaPostPage(
 async function resolvePostWithBrightData(
   target: Extract<InstagramTarget, { kind: "post" }>, apiKey: string,
 ): Promise<MediaCandidate[][]> {
-  const route = /\\/(p|reels?|tv)\\/([A-Za-z0-9_-]+)(?:\\/|$)/.exec(new URL(target.url).pathname);
+  const route = /\/(p|reels?|tv)\/([A-Za-z0-9_-]+)(?:\/|$)/.exec(new URL(target.url).pathname);
   const isReel = route?.[1] === "reel" || route?.[1] === "reels";
   const datasetId = isReel ? BRIGHTDATA_REEL_DATASET : BRIGHTDATA_POST_DATASET;
   const canonicalUrl = `https://www.instagram.com/${isReel ? "reel" : "p"}/${target.shortcode}/`;
@@ -765,7 +765,7 @@ async function resolvePostWithBrightData(
   // An unrelated record must not become a download for the user's link.
   const returnedShortcode = String(item.shortcode || "").trim();
   const returnedUrl = typeof item.url === "string" ? item.url : "";
-  const urlShortcode = /\\/(?:p|reels?|tv)\\/([A-Za-z0-9_-]+)(?:\\/|$|\\?)/.exec(returnedUrl)?.[1];
+  const urlShortcode = /\/(?:p|reels?|tv)\/([A-Za-z0-9_-]+)(?:\/|$|\?)/.exec(returnedUrl)?.[1];
   if ((returnedShortcode && returnedShortcode !== target.shortcode)
       || (urlShortcode && urlShortcode !== target.shortcode)) throw new Error("BRIGHTDATA_WRONG_POST");
 
