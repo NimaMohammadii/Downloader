@@ -9,6 +9,7 @@ type Env = Partial<AdminStatsEnv> & {
   INSTAGRAM_MID?: string;
   INSTAGRAM_IG_DID?: string;
   BRIGHTDATA_API_KEY?: string;
+  APIFY_API_TOKEN?: string;
   uploadInstagramPost?: (post: InstagramPostUpload) => Promise<void>;
 };
 
@@ -712,6 +713,138 @@ async function resolveViaPostPage(
   return null;
 }
 
+// One TopAPI Actor run per public post/Reel. Its output has a different
+// structure from Bright Data: childPosts are ordered carousel slides, whereas
+// images are alternative sizes of a single photo. Never infer a video's file
+// from its displayUrl cover.
+async function resolvePostWithTopApi(
+  target: Extract<InstagramTarget, { kind: "post" }>, apiToken: string,
+): Promise<MediaCandidate[][]> {
+  const route = /\/(p|reels?|tv)\/([A-Za-z0-9_-]+)(?:\/|$)/.exec(new URL(target.url).pathname);
+  const isReel = route?.[1] === "reel" || route?.[1] === "reels";
+  const canonicalUrl = "https://www.instagram.com/" + (isReel ? "reel" : "p") + "/" + target.shortcode + "/";
+  const endpoint = "https://api.apify.com/v2/actors/topapi~instagram-scraper/run-sync-get-dataset-items";
+  let response: Response;
+  try {
+    response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer " + apiToken,
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify({
+        postUrls: [canonicalUrl],
+        postType: "all",
+        dataDetailLevel: "detailedData",
+        maxItems: 1,
+        resultsLimit: 1,
+        includeVideoViewCount: false,
+        includeLatestComments: false,
+        includeProfileSummary: false,
+        compact: false,
+      }),
+      redirect: "error",
+      // Do not restart a potentially billable run after an ambiguous timeout.
+      signal: AbortSignal.timeout(45_000),
+    });
+  } catch {
+    throw new Error("TOPAPI_NETWORK_OR_TIMEOUT");
+  }
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => undefined);
+    console.warn("instagram topapi rejected", { status: response.status });
+    if (response.status === 401 || response.status === 403) throw new Error("TOPAPI_AUTH_ERROR");
+    if (response.status === 402 || response.status === 429) throw new Error("TOPAPI_QUOTA_OR_RATE_LIMIT");
+    if ([400, 404, 422].includes(response.status)) throw new Error("TOPAPI_UNAVAILABLE");
+    // A gateway timeout/server error may follow a completed, billable run:
+    // do not automatically initiate an additional paid provider request.
+    throw new Error("TOPAPI_AMBIGUOUS_PROVIDER_ERROR");
+  }
+  const payload: unknown = await response.json().catch(() => null);
+  if (!Array.isArray(payload) || payload.length === 0) throw new Error("TOPAPI_NO_MEDIA");
+  if (payload.length !== 1 || !payload[0] || typeof payload[0] !== "object"
+      || Array.isArray(payload[0])) throw new Error("TOPAPI_INVALID_RESULT");
+  const item = payload[0] as Record<string, any>;
+  if (item.error || item.error_type || item.status === "fail") throw new Error("TOPAPI_UNAVAILABLE");
+
+  // Verify the returned result matches the exact URL requested. The uploader
+  // must never publish a different user's post on an incorrect Actor result.
+  for (const field of ["shortCode", "shortcode"]) {
+    if (typeof item[field] === "string" && item[field] !== target.shortcode)
+      throw new Error("TOPAPI_WRONG_POST");
+  }
+  for (const field of ["url", "inputUrl"]) {
+    if (typeof item[field] !== "string") continue;
+    const parsed = /\/(?:p|reels?|tv)\/([A-Za-z0-9_-]+)(?:\/|$|\?)/.exec(item[field]);
+    if (parsed && parsed[1] !== target.shortcode) throw new Error("TOPAPI_WRONG_POST");
+  }
+
+  function cdn(value: unknown): string | null {
+    if (typeof value !== "string") return null;
+    try {
+      const u = new URL(value);
+      return u.protocol === "https:" && !u.username && !u.password && !u.port
+        && allowedMediaHost(u.hostname) ? u.toString() : null;
+    } catch { return null; }
+  }
+  function photo(node: Record<string, any>): MediaCandidate[] | null {
+    // displayUrl is the preferred full-size image. 'images' are alternate
+    // resolutions, not individual carousel slides.
+    const alternatives = Array.isArray(node.images) ? node.images : [];
+    const u = cdn(node.displayUrl)
+      || alternatives.map((value: any) => cdn(value?.url || value)).find(Boolean);
+    if (!u) return null;
+    return [{kind:"photo", url:u,
+      width:numberOrZero(node.dimensionsWidth ?? node.width),
+      height:numberOrZero(node.dimensionsHeight ?? node.height)}];
+  }
+  function video(node: Record<string, any>): MediaCandidate[] | null {
+    const u = cdn(node.videoUrl);
+    if (!u) return null;
+    return [{kind:"video", url:u,
+      width:numberOrZero(node.dimensionsWidth ?? node.width),
+      height:numberOrZero(node.dimensionsHeight ?? node.height)}];
+  }
+  const type = String(item.type || "").toLowerCase();
+  const isCarousel = type === "sidecar" || type === "carousel"
+    || item.productType === "carousel_container"
+    || (Array.isArray(item.childPosts) && item.childPosts.length > 0);
+  if (isCarousel) {
+    const slides = item.childPosts;
+    if (!Array.isArray(slides) || !slides.length || slides.length > 20)
+      throw new Error("TOPAPI_INCOMPLETE_CAROUSEL");
+    const groups: MediaCandidate[][] = [];
+    for (const slide of slides) {
+      if (!slide || typeof slide !== "object" || Array.isArray(slide))
+        throw new Error("TOPAPI_INCOMPLETE_CAROUSEL");
+      const slideType = String(slide.type || "").toLowerCase();
+      const isVideo = slideType === "video" || slide.isVideo === true;
+      const isPhoto = slideType === "image" || slideType === "photo";
+      // Unknown slide types cannot safely be classified from cover images.
+      const group = isVideo ? video(slide) : isPhoto ? photo(slide) : null;
+      if (!group) throw new Error("TOPAPI_INCOMPLETE_CAROUSEL");
+      groups.push(group);
+    }
+    return groups;
+  }
+  if (isReel || type === "video" || item.isVideo === true) {
+    const found = video(item);
+    if (!found) throw new Error("TOPAPI_NO_MEDIA");
+    return [found];
+  }
+  if (type === "image" || type === "photo") {
+    const found = photo(item);
+    if (!found) throw new Error("TOPAPI_NO_MEDIA");
+    return [found];
+  }
+  // No declared type: accept an actual videoUrl, never a possible cover as a
+  // replacement for a missing video. Unknown image-only records are ambiguous.
+  const found = video(item);
+  if (found) return [found];
+  throw new Error("TOPAPI_NO_MEDIA");
+}
+
 // Bright Data returns metadata and signed CDN URLs, not a media file.
 // Use the documented synchronous Web Scraper API for one exact post/Reel;
 // never submit a second paid extraction as a fallback after an ambiguous run.
@@ -1325,32 +1458,49 @@ async function handleMediaProxy(request: Request, env: Env, url: URL): Promise<R
 }
 
 async function resolveTarget(target: InstagramTarget, env: Env): Promise<ResolvedMedia[]> {
-  let groups: MediaCandidate[][];
+  let groups: MediaCandidate[][] | null = null;
   if (target.kind !== "post") {
     groups = await resolveStory(target, env);
-  } else if (!env.BRIGHTDATA_API_KEY?.trim()) {
-    groups = await resolvePost(target);
   } else {
-    try {
-      groups = await resolvePostWithBrightData(target, env.BRIGHTDATA_API_KEY.trim());
-    } catch (error) {
-      const cause = error instanceof Error ? error.message : "";
-      // A provider result can contain valid metadata but omit CDN URLs or
-      // carousel ordering. Give the already-existing anonymous extractor one
-      // chance to complete it; never re-run the paid API or use login cookies.
-      // Other failures (authorization, rate limit, wrong post, provider error,
-      // pending snapshot) remain terminal and do not trigger retries.
-      if (cause !== "BRIGHTDATA_NO_MEDIA" && cause !== "BRIGHTDATA_INCOMPLETE_CAROUSEL") throw error;
+    // TopAPI is the primary post/Reel extractor when its Apify token exists.
+    // Without it, preserve the existing Bright Data / anonymous behavior.
+    if (env.APIFY_API_TOKEN?.trim()) {
       try {
-        groups = await resolvePost(target);
-        console.log("instagram brightdata media recovered", { source: "existing-public-resolver" });
-      } catch (publicError) {
-        const raw = publicError instanceof Error ? publicError.message : "";
-        const publicCode = /^INSTAGRAM_[A-Z0-9_]+/.exec(raw)?.[0] || "INSTAGRAM_UNAVAILABLE";
-        console.warn("instagram brightdata media fallback unavailable", {
-          cause, publicCode,
+        groups = await resolvePostWithTopApi(target, env.APIFY_API_TOKEN.trim());
+        console.log("instagram post resolver success", { resolver: "topapi" });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : "";
+        // Only deterministic failures may trigger another, potentially paid
+        // extraction. Never mask a wrong-post result or retry ambiguous runs.
+        if (!["TOPAPI_NO_MEDIA", "TOPAPI_INCOMPLETE_CAROUSEL", "TOPAPI_UNAVAILABLE",
+              "TOPAPI_AUTH_ERROR", "TOPAPI_QUOTA_OR_RATE_LIMIT"].includes(reason)) throw error;
+        console.warn("instagram topapi fallback", {
+          reason, next: env.BRIGHTDATA_API_KEY?.trim() ? "brightdata" : "public",
         });
-        throw error;
+      }
+    }
+    if (!groups) {
+      if (!env.BRIGHTDATA_API_KEY?.trim()) {
+        groups = await resolvePost(target);
+      } else {
+        try {
+          groups = await resolvePostWithBrightData(target, env.BRIGHTDATA_API_KEY.trim());
+          console.log("instagram post resolver success", { resolver: "brightdata" });
+        } catch (error) {
+          const cause = error instanceof Error ? error.message : "";
+          // Bright Data can return valid metadata without downloadable media.
+          // Keep the existing anonymous fallback, with no personal session.
+          if (cause !== "BRIGHTDATA_NO_MEDIA" && cause !== "BRIGHTDATA_INCOMPLETE_CAROUSEL") throw error;
+          try {
+            groups = await resolvePost(target);
+            console.log("instagram brightdata media recovered", { source: "existing-public-resolver" });
+          } catch (publicError) {
+            const raw = publicError instanceof Error ? publicError.message : "";
+            const publicCode = /^INSTAGRAM_[A-Z0-9_]+/.exec(raw)?.[0] || "INSTAGRAM_UNAVAILABLE";
+            console.warn("instagram brightdata media fallback unavailable", { cause, publicCode });
+            throw error;
+          }
+        }
       }
     }
   }
@@ -1361,6 +1511,12 @@ async function resolveTarget(target: InstagramTarget, env: Env): Promise<Resolve
 
 function friendlyError(detail: string, throttle?: InstagramThrottle): string {
   const value = detail.toLowerCase();
+  if (value.startsWith("topapi_auth_error")) return "❌ توکن Apify معتبر نیست یا دسترسی TopAPI فعال نشده است.";
+  if (value.startsWith("topapi_quota_or_rate_limit")) return "❌ سهمیه یا محدودیت اجرای TopAPI اجازه استخراج این پست را نمی‌دهد.";
+  if (value.startsWith("topapi_no_media")) return "❌ TopAPI لینک فایل این پست یا ریلز را برنگرداند.";
+  if (value.startsWith("topapi_incomplete_carousel")) return "❌ TopAPI همه اسلایدهای پست چندرسانه‌ای را برنگرداند؛ ارسال ناقص انجام نشد.";
+  if (value.startsWith("topapi_wrong_post")) return "❌ TopAPI اطلاعات پست دیگری را برگرداند؛ فایل اشتباه ارسال نشد.";
+  if (value.startsWith("topapi_")) return "❌ استخراج TopAPI کامل نشد؛ برای جلوگیری از مصرف دوباره اعتبار، وضعیت اجرا را بررسی کن.";
   if (value.startsWith("brightdata_auth_error")) return "❌ کلید Bright Data معتبر نیست یا به استخراج‌کننده Instagram دسترسی ندارد.";
   if (value.startsWith("brightdata_credits_error")) return "❌ سهمیه یا اعتبار Bright Data تمام شده است.";
   if (value.startsWith("brightdata_rate_limit")) return "❌ Bright Data درخواست‌های API را موقتاً محدود کرده است.";
