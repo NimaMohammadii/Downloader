@@ -412,31 +412,6 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
     const url = new URL(request.url);
     if (url.pathname === "/broadcast") return this.broadcasts.fetch(request);
 
-    // One shared cooldown for anonymous Instagram Post/Reel resolution across
-    // stateless Workers. Reuse the existing counters table and Durable Object.
-    if (url.pathname === "/instagram-public-cooldown") {
-      const sql = this.ctx.storage.sql;
-      const now = Date.now();
-      if (request.method === "GET") {
-        const row = sql.exec("SELECT value FROM counters WHERE key = 'instagram_public_cooldown_until'").toArray()[0];
-        const until = Number(row?.value) || 0;
-        return Response.json({ remainingSeconds: Math.max(0, Math.ceil((until - now) / 1000)) });
-      }
-      if (request.method === "POST") {
-        const payload = await request.json().catch(() => null) as { seconds?: number } | null;
-        const seconds = payload?.seconds;
-        if (!Number.isSafeInteger(seconds) || seconds! < 1 || seconds! > 86400) {
-          return new Response("Invalid cooldown", { status: 400 });
-        }
-        const until = now + seconds! * 1000;
-        sql.exec(`INSERT INTO counters(key,value) VALUES ('instagram_public_cooldown_until', ?)
-          ON CONFLICT(key) DO UPDATE SET value = MAX(counters.value, excluded.value)`, until);
-        const row = sql.exec("SELECT value FROM counters WHERE key = 'instagram_public_cooldown_until'").one();
-        return Response.json({ remainingSeconds: Math.max(0, Math.ceil((Number(row.value) - now) / 1000)) });
-      }
-      return new Response("Method not allowed", { status: 405 });
-    }
-
     if (request.method === "POST" && url.pathname === "/usage") {
       const body = await request.json() as { samples?: UsageSample[]; deliveries?: MediaUsage[]; runs?: ContainerRun[] };
       const runs = body.runs ?? [];
