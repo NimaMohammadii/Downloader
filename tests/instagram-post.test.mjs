@@ -589,67 +589,44 @@ test('feedback_required stops requests without claiming an HTTP 429 or an IP res
   assert.ok(!errorText(result).includes('429'));
 });
 
-test('upstream GraphQL HTTP 401 rate response triggers shared cooldown without retrying Instagram', async () => {
-  let until = 0;
-  const stored = [];
-  const store = { ADMIN_STATS: { getByName(name) {
-    assert.equal(name, 'global');
-    return { async fetch(request) {
-      const now = Date.now();
-      assert.equal(new URL(request.url).pathname, '/instagram-public-cooldown');
-      if (request.method === 'POST') {
-        const { seconds } = await request.json();
-        stored.push(seconds);
-        until = Math.max(until, now + seconds * 1000);
-      }
-      return Response.json({ remainingSeconds: Math.max(0, Math.ceil((until - now) / 1000)) });
-    } };
+test('upstream HTTP 401 GraphQL rate rejection does not activate a local cooldown', async () => {
+  let storeCalls = 0;
+  const env = { ADMIN_STATS: { getByName() {
+    storeCalls++;
+    throw Error('No cooldown store requests allowed');
   } } };
-  const first = await run({ env: store, respond(call) {
+  const upstream = call => {
     if (call.path === pagePath) return new Response('<script>{"csrf_token":"public-csrf"}</script>');
     if (call.path === '/graphql/query') {
       assert.ok(!call.headers.get('cookie')?.includes('sessionid='));
       return Response.json({ message: 'Please wait a few minutes before you try again.' }, { status: 401 });
     }
-  } });
+  };
+  const first = await run({ env, respond: upstream });
   assert.equal(first.calls.length, 2);
-  assert.equal(files(first).length, 0);
-  assert.match(report(first), /^INSTAGRAM_RATE_LIMIT_429 \[public\/webpage:INSTAGRAM_RATE_LIMIT_429\]/);
+  assert.match(report(first), /^INSTAGRAM_RATE_LIMIT_429 \\[public\\/webpage:INSTAGRAM_RATE_LIMIT_429\\]/);
   assert.deepEqual(first.diagnostics.find(x => x.message === 'instagram download failed').info.throttle, {
     source: 'api', endpoint: '/graphql/query', httpStatus: 401,
   });
-  assert.deepEqual(stored, [900]);
-  const second = await run({ env: store, respond() { throw Error('Instagram must not be called during cooldown'); } });
-  assert.equal(second.calls.length, 0, 'the next Worker request must not contact Instagram');
-  assert.ok(second.diagnostics.some(x => x.message === 'instagram public cooldown active' &&
-    x.info.remainingSeconds > 0));
-  assert.ok(!second.diagnostics.some(x => x.message === 'instagram download failed'),
-    'expected local pauses are not upstream download errors');
-  assert.match(errorText(second), /درخواست جدید نمی‌فرستد/);
-  until = Date.now() - 1;
-  const recovered = await run({ env: store, respond(call) {
-    if (call.path === pagePath) return new Response(html(video));
-  } });
-  assert.equal(recovered.calls.length, 1);
-  assert.equal(files(recovered).length, 1);
+  const second = await run({ env, respond: upstream });
+  assert.equal(second.calls.length, 2, 'later requests must not be blocked by an internal timer');
+  assert.match(report(second), /^INSTAGRAM_RATE_LIMIT_429/);
+  assert.equal(storeCalls, 0, 'rate-limit handling must not access a shared cooldown store');
 });
 
-test('anonymous Instagram HTTP 429 cooldown honors explicit Retry-After', async () => {
-  const recorded = [];
-  const env = { ADMIN_STATS: { getByName() {
-    return { async fetch(request) {
-      if (request.method === 'POST') {
-        recorded.push((await request.json()).seconds);
-        return Response.json({ remainingSeconds: recorded.at(-1) });
-      }
-      return Response.json({ remainingSeconds: 0 });
-    } };
-  } } };
-  const result = await run({ env, respond() {
-    return new Response(null, { status: 429, headers: { 'retry-after': '1158' } });
+test('upstream HTTP 429 is reported but does not block a later fresh download', async () => {
+  const first = await run({ respond(call) {
+    if (call.path === pagePath) return new Response(null, { status: 429, headers: { 'retry-after': '1158' } });
   } });
-  assert.equal(result.calls.length, 1);
-  assert.deepEqual(recorded, [1158]);
+  assert.equal(first.calls.length, 1);
+  assert.equal(files(first).length, 0);
+  assert.match(report(first), /^INSTAGRAM_RATE_LIMIT_429/);
+  assert.equal(first.diagnostics.find(x => x.message === 'instagram download failed').info.throttle.retryAfterSeconds, 1158);
+  const second = await run({ respond(call) {
+    if (call.path === pagePath) return new Response(html(video));
+  } });
+  assert.equal(second.calls.length, 1);
+  assert.equal(files(second).length, 1, 'no local cooldown should block the next request');
 });
 
 test('anonymous HTML and GraphQL may never accept server-provided account cookies', async () => {
