@@ -1327,3 +1327,38 @@ test('queued TopAPI Reel uses its captured slot for the run and dataset instead 
   await replay();assert.equal(requests.length,2);assert.equal(globalThis.downloadHistory.at(-1).status,'success');
   assert.ok(!JSON.stringify(messages).includes('numbered-two'));
 });
+
+test('post Workflow reports the original Apify cause and pinned account after a failed backup provider',async()=>{
+  const requests=[],messages=[],logs=[],previousWarn=console.warn;
+  const selected={...job,instagram:undefined,apifyAccount:2,instagramPostRequest:{shortcode:'Abc123'},url:'https://www.instagram.com/reel/Abc123/'};
+  globalThis.downloadHistory=[];globalThis.testFileCache=undefined;
+  console.warn=(message,info)=>logs.push({message,info});
+  globalThis.fetch=async(input,init={})=>{
+    const url=new URL(input);requests.push(url.hostname);
+    if(url.hostname==='api.apify.com')return Response.json({error:{type:'invalid-token'}},{status:401});
+    if(url.hostname==='api.brightdata.com')return Response.json([{error:'provider failure'}]);
+    if(url.hostname==='api.telegram.org'){
+      messages.push({method:url.pathname.split('/').at(-1),body:JSON.parse(init.body)});
+      return Response.json({ok:true,result:{message_id:33}});
+    }
+    throw Error('Unexpected provider');
+  };
+  const checkpoints=new Map();const step={async do(name,opts,fn){if(typeof opts==='function')fn=opts;
+    if(checkpoints.has(name))return structuredClone(checkpoints.get(name));
+    // Serialize an exhausted step failure as the Workflow engine does.
+    try{const result=await fn();checkpoints.set(name,structuredClone(result));return result;}
+    catch(error){throw new Error(error.message);}
+  }};
+  try{
+    await new mod.YoutubeDownloadWorkflow({}, {...env,APIFY_API_TOKEN_2:'private-two',BRIGHTDATA_API_KEY:'private-backup'})
+      .run({payload:selected},step);
+    assert.equal(requests.filter(x=>x==='api.apify.com').length,1);
+    assert.equal(requests.filter(x=>x==='api.brightdata.com').length,1);
+    const diagnostic=logs.find(x=>x.message==='instagram post workflow failed').info;
+    assert.deepEqual(diagnostic,{code:'INSTAGRAM_PROVIDER_CHAIN_FAILED',primaryCode:'TOPAPI_AUTH_ERROR',
+      fallbackCode:'BRIGHTDATA_PROVIDER_ERROR',apifyAccount:2,jobId:selected.id});
+    assert.match(messages.at(-1).body.text,/توکن Apify/);assert.match(messages.at(-1).body.text,/خود Bright Data/);
+    assert.equal(globalThis.downloadHistory.at(-1).status,'failed');
+    assert.ok(!JSON.stringify(logs).includes('private-two'));assert.ok(!JSON.stringify(messages).includes('private-backup'));
+  }finally{console.warn=previousWarn;}
+});

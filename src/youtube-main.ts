@@ -582,8 +582,12 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       }));
     } catch (error) {
       const cause = error instanceof Error ? error.message : "UNKNOWN";
+      const chain = /^INSTAGRAM_PROVIDER_CHAIN_FAILED\|(TOPAPI_[A-Z_]+)\|(BRIGHTDATA_[A-Z0-9_]+)$/.exec(cause);
       console.warn("instagram post workflow failed", {
-        code: /^TOPAPI_[A-Z_]+$/.test(cause) || /^BRIGHTDATA_[A-Z_]+$/.test(cause) ? cause : "INSTAGRAM_RESOLUTION_OR_DELIVERY_ERROR",
+        code: chain ? "INSTAGRAM_PROVIDER_CHAIN_FAILED"
+          : /^TOPAPI_[A-Z_]+$/.test(cause) || /^BRIGHTDATA_[A-Z0-9_]+$/.test(cause) ? cause : "INSTAGRAM_RESOLUTION_OR_DELIVERY_ERROR",
+        ...(chain ? { primaryCode: chain[1], fallbackCode: chain[2] } : {}),
+        apifyAccount: job.apifyAccount ?? 1,
         jobId: job.id,
       });
       // Never restart a paid provider call after an ambiguous timeout.

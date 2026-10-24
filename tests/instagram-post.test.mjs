@@ -1173,3 +1173,42 @@ test('temporary Telegram failures and invalid bot credentials are not silently a
 
 
 
+
+test('failed Bright Data fallback retains the original Apify cause instead of masking it',async()=>{
+  for(const [scenario,primaryCode,expectedText] of [
+    ['auth','TOPAPI_AUTH_ERROR',/توکن Apify/],
+    ['quota','TOPAPI_QUOTA_OR_RATE_LIMIT',/سهمیه یا محدودیت/],
+    ['missing_video','TOPAPI_NO_MEDIA',/TopAPI لینک فایل/],
+    ['failed_run','TOPAPI_UNAVAILABLE',/استخراج TopAPI کامل نشد/],
+  ]) {
+    const result=await run({env:{APIFY_API_TOKEN:'private-primary-token',BRIGHTDATA_API_KEY:'private-backup-key'},respond(call){
+      if(call.hostname==='api.brightdata.com')return Response.json([{error:'provider failure including private-backup-key'}]);
+      if(call.hostname==='api.apify.com'){
+        if(scenario==='auth')return Response.json({error:{type:'invalid-token'}},{status:401});
+        if(scenario==='quota')return Response.json({error:{type:'limit-exceeded'}},{status:429});
+        if(call.path.endsWith('/runs'))return Response.json({data:{id:'chainRun00001',status:scenario==='failed_run'?'FAILED':'SUCCEEDED',defaultDatasetId:'chainDataset00001'}});
+        return Response.json([{type:'Video',shortCode:shortcode,displayUrl:'https://scontent.cdninstagram.com/cover.jpg'}]);
+      }
+      throw Error('Unexpected provider');
+    }});
+    assert.equal(report(result),`INSTAGRAM_PROVIDER_CHAIN_FAILED|${primaryCode}|BRIGHTDATA_PROVIDER_ERROR`);
+    assert.match(errorText(result),expectedText);assert.match(errorText(result),/خود Bright Data/);
+    assert.equal(result.calls.filter(x=>x.hostname==='api.brightdata.com').length,1);
+    assert.equal(files(result).length,0);
+    assert.deepEqual(result.diagnostics.find(x=>x.message==='instagram post provider chain failed').info,
+      {primaryCode,fallbackCode:'BRIGHTDATA_PROVIDER_ERROR'});
+    assert.ok(!JSON.stringify(result.diagnostics).includes('private-primary-token'));
+    assert.ok(!JSON.stringify(result.diagnostics).includes('private-backup-key'));
+    assert.ok(!JSON.stringify(result.sent).includes('private-backup-key'));
+  }
+});
+
+test('Bright Data-only failures are not falsely reported as failures of Apify',async()=>{
+  const result=await run({env:{BRIGHTDATA_API_KEY:'backup-key'},respond(call){
+    if(call.hostname==='api.brightdata.com')return Response.json([{error:'provider failure'}]);
+    throw Error('No Apify configured');
+  }});
+  assert.equal(report(result),'BRIGHTDATA_PROVIDER_ERROR');
+  assert.ok(!errorText(result).includes('علت مسیر اصلی Apify'));
+  assert.ok(!result.diagnostics.some(x=>x.message==='instagram post provider chain failed'));
+});

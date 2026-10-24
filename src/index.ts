@@ -1572,6 +1572,15 @@ async function handleMediaProxy(request: Request, env: Env, url: URL): Promise<R
 
 async function resolveTarget(target: InstagramTarget, env: Env): Promise<ResolvedMedia[]> {
   let groups: MediaCandidate[][] | null = null;
+  let primaryFailure: string | undefined;
+  const providerFailure = (error: unknown): unknown => {
+    const fallbackCode = error instanceof Error ? error.message : "";
+    if (!primaryFailure || !/^BRIGHTDATA_[A-Z0-9_]+$/.test(fallbackCode)) return error;
+    // A serializable machine-code chain survives Workflow step errors. Never
+    // replace the primary Apify cause with the final backup provider's error.
+    console.warn("instagram post provider chain failed", { primaryCode: primaryFailure, fallbackCode });
+    return new Error(`INSTAGRAM_PROVIDER_CHAIN_FAILED|${primaryFailure}|${fallbackCode}`);
+  };
   if (target.kind !== "post") {
     groups = await resolveStory(target, env);
   } else {
@@ -1587,6 +1596,7 @@ async function resolveTarget(target: InstagramTarget, env: Env): Promise<Resolve
         // extraction. Never mask a wrong-post result or retry ambiguous runs.
         if (!["TOPAPI_NO_MEDIA", "TOPAPI_INCOMPLETE_CAROUSEL", "TOPAPI_UNAVAILABLE",
               "TOPAPI_AUTH_ERROR", "TOPAPI_QUOTA_OR_RATE_LIMIT"].includes(reason)) throw error;
+        primaryFailure = reason;
         console.warn("instagram topapi fallback", {
           reason, next: env.BRIGHTDATA_API_KEY?.trim() ? "brightdata" : "public",
         });
@@ -1603,7 +1613,7 @@ async function resolveTarget(target: InstagramTarget, env: Env): Promise<Resolve
           const cause = error instanceof Error ? error.message : "";
           // Bright Data can return valid metadata without downloadable media.
           // Keep the existing anonymous fallback, with no personal session.
-          if (cause !== "BRIGHTDATA_NO_MEDIA" && cause !== "BRIGHTDATA_INCOMPLETE_CAROUSEL") throw error;
+          if (cause !== "BRIGHTDATA_NO_MEDIA" && cause !== "BRIGHTDATA_INCOMPLETE_CAROUSEL") throw providerFailure(error);
           try {
             groups = await resolvePost(target);
             console.log("instagram brightdata media recovered", { source: "existing-public-resolver" });
@@ -1611,7 +1621,7 @@ async function resolveTarget(target: InstagramTarget, env: Env): Promise<Resolve
             const raw = publicError instanceof Error ? publicError.message : "";
             const publicCode = /^INSTAGRAM_[A-Z0-9_]+/.exec(raw)?.[0] || "INSTAGRAM_UNAVAILABLE";
             console.warn("instagram brightdata media fallback unavailable", { cause, publicCode });
-            throw error;
+            throw providerFailure(error);
           }
         }
       }
@@ -1623,6 +1633,8 @@ async function resolveTarget(target: InstagramTarget, env: Env): Promise<Resolve
 }
 
 function friendlyError(detail: string, throttle?: InstagramThrottle): string {
+  const chain = /^INSTAGRAM_PROVIDER_CHAIN_FAILED\|(TOPAPI_[A-Z_]+)\|(BRIGHTDATA_[A-Z0-9_]+)$/.exec(detail);
+  if (chain) return `علت مسیر اصلی Apify:\n${friendlyError(chain[1])}\n\nنتیجهٔ مسیر جایگزین:\n${friendlyError(chain[2])}`;
   const value = detail.toLowerCase();
   if (value.startsWith("topapi_still_running")) return "❌ استخراج TopAPI هنوز در Apify در حال اجراست. برای جلوگیری از هزینه تکراری، اجرای جدیدی شروع نشد.";
   if (value.startsWith("topapi_status_unavailable")) return "❌ اجرای TopAPI شروع شد اما دریافت وضعیت یا فایل خروجی ناموفق بود. در Runs حساب Apify وضعیت همین اجرا را بررسی کن.";
