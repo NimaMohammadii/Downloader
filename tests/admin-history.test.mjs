@@ -691,3 +691,77 @@ test('a Bright Data extraction is counted once for the pinned account across Wor
   assert.equal(paid,1);assert.deepEqual(usage.accounts.map(x=>x.used),[0,1,0,0]);
  }finally{globalThis.fetch=previous;f.close();}
 });
+
+test('download statistics count content rather than carousel files, exclude search/failures and deduplicate replays',async()=>{
+ const f=fixture();const write=(key,source,request,delivered,status='success',extra={})=>f.request('/download',{key,userId:42,source,request,delivered,status,...extra});
+ try{
+  await write('carousel','Instagram post','https://instagram.com/p/Abc/',6);
+  await write('reel','Instagram post','https://instagram.com/reel/Abc/',1);
+  await write('stories','Instagram story','https://instagram.com/stories/example/',3,'partial');
+  await write('stories','Instagram story','https://instagram.com/stories/example/',5);
+  await write('stories','Instagram story','https://instagram.com/stories/example/',5);
+  await write('group','Instagram profile stories','https://instagram.com/example/',10);
+  await write('parent','Instagram story','https://instagram.com/stories/example/123/',1,'success',{excludeFromStats:true});
+  await write('child','Instagram story','https://instagram.com/stories/example/123/',1);
+  await write('tiktok','TikTok','https://tiktok.com/x',8);
+  await write('x','X','https://x.com/x/status/1',2);
+  await write('yt','YouTube','https://youtube.com/watch?v=1',1);
+  await write('mp3','YouTube','https://youtube.com/watch?v=2',1,'success',{category:'music'});
+  await write('playlist','YouTube Playlist','https://youtube.com/playlist?list=1',4,'partial');
+  await write('results','جست‌وجو و دانلود آهنگ','music query',0,'results');
+  await write('failed','Instagram post','https://instagram.com/p/Fail/',1,'partial');
+  const stats=await admin.getDownloadStatistics(f.env);
+  assert.deepEqual(stats.periods.all,{ig_story:6,ig_post:1,ig_reel:1,ig_other:0,tiktok:1,x:1,youtube:1,music:5,other:0});
+  assert.deepEqual(stats.periods.day,stats.periods.all);f.restart();
+  assert.deepEqual((await admin.getDownloadStatistics(f.env)).periods.all,stats.periods.all);
+  const html=admin.formatDownloadStatistics(stats);assert.match(html,/<b>اینستاگرام — مجموع: 8<\/b>/);
+  assert.match(html,/<b>مجموع همه: 16<\/b>/);assert.ok(html.length<4096);
+ }finally{f.close();}
+});
+
+test('rolling download windows use delivery events and do not move old stories forward when a partial job finishes',async()=>{
+ const f=fixture();let now=Date.parse('2026-10-25T12:00:00Z');Date.now=()=>now;
+ const write=(key,source,delivered,status='success')=>f.request('/download',{key,userId:42,source,request:'fixture',delivered,status});
+ try{
+  await write('old','YouTube',1);now+=8*86400_000;
+  await write('week','X',1);now+=2*86400_000;
+  await write('stories','Instagram story',2,'partial');now+=86400_000;
+  let stats=await admin.getDownloadStatistics(f.env);assert.equal(stats.periods.day.ig_story,2,'inclusive 24-hour boundary');
+  now++;await write('stories','Instagram story',3);
+  stats=await admin.getDownloadStatistics(f.env);
+  assert.equal(stats.periods.day.ig_story,1);assert.equal(stats.periods.week.ig_story,3);
+  assert.equal(stats.periods.day.x,0);assert.equal(stats.periods.week.x,1);
+  assert.equal(stats.periods.week.youtube,0);assert.equal(stats.periods.all.youtube,1);
+  await write('old','YouTube',1);assert.equal((await admin.getDownloadStatistics(f.env)).periods.day.youtube,0);
+ }finally{f.close();}
+});
+
+test('one-time history import preserves known types and excludes grouped parents including large Story parents',async()=>{
+ const f=fixture();
+ try{
+  f.db.exec("DELETE FROM counters WHERE key='download_stats_since'; DELETE FROM download_stat_events;");
+  const add=(key,source,request,delivered,detail=null)=>f.db.prepare('INSERT INTO download_history VALUES (?,?,?,?,?,?,?,?,?,?)').run(key,'42',source,request,'success',null,detail,delivered,Date.now(),Date.now());
+  add('old-reel','Instagram post','https://instagram.com/reel/A/',2);
+  add('old-audio','YouTube','https://youtube.com/watch?v=A',1,'🎧 Audio HQ');
+  add('old-group','Instagram profile posts','https://instagram.com/user/',10);
+  add('ig:42:7:42','Instagram story','https://instagram.com/stories/user/1/',1);
+  add('igdl-42-7-42-profile-1','Instagram story','https://instagram.com/stories/user/1/',1);
+  f.restart();let stats=await admin.getDownloadStatistics(f.env);
+  assert.equal(stats.periods.all.ig_reel,1);assert.equal(stats.periods.all.ig_story,1);
+  assert.equal(stats.periods.all.music,1);assert.equal(stats.periods.all.ig_post,0);
+  f.restart();assert.deepEqual((await admin.getDownloadStatistics(f.env)).periods,stats.periods);
+ }finally{f.close();}
+});
+
+test('download statistics panel is admin-only and uses HTML bold with refresh and back controls',async()=>{
+ const f=fixture(),previous=globalThis.fetch,calls=[];
+ const visit=id=>admin.worker.fetch(webhook({callback_query:{id:'download-stats',from:{id},data:'admin:downloads',message:{message_id:20,chat:{id}}}}),f.env,{});
+ globalThis.fetch=async(input,init)=>{calls.push({url:String(input),body:JSON.parse(init.body)});return Response.json({ok:true,result:{message_id:20}});};
+ try{
+  await visit(99);assert.equal(calls.length,0);await visit(admin.ADMIN_USER_ID);
+  const panel=calls.find(x=>x.url.endsWith('/editMessageText')).body;
+  assert.equal(panel.parse_mode,'HTML');assert.match(panel.text,/<b>📥 آمار/);
+  assert.ok(panel.reply_markup.inline_keyboard.flat().some(x=>x.callback_data==='admin:downloads'));
+  assert.ok(admin.adminDashboardKeyboard().inline_keyboard.flat().some(x=>x.callback_data==='admin:downloads'));
+ }finally{globalThis.fetch=previous;f.close();}
+});

@@ -887,7 +887,7 @@ test('persistent Telegram cache sanitizes context, expires entries, bounds stora
   const result=await build({stdin:{contents:adminSource,loader:'ts',resolveDir:new URL('../src',import.meta.url).pathname},bundle:true,format:'esm',write:false,
     plugins:[{name:'durable-object',setup(b){b.onResolve({filter:/cloudflare:workers/},a=>({path:a.path,namespace:'stub'}));b.onLoad({filter:/.*/,namespace:'stub'},()=>({contents:'export class DurableObject {constructor(ctx,env){this.ctx=ctx;this.env=env;}}'}));}}]});
   const admin=await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString('base64')}`);
-  const instance=new admin.AdminStatsStore({storage:{sql}},{});
+  const instance=new admin.AdminStatsStore({storage:{sql,transactionSync(fn){db.exec('BEGIN');try{const result=fn();db.exec('COMMIT');return result;}catch(error){db.exec('ROLLBACK');throw error;}}}},{});
   const req=body=>instance.fetch(new Request('https://store/file-cache',{method:'POST',body:JSON.stringify(body)}));
   const key='yt:abcdefghijk:mp3';
   try {

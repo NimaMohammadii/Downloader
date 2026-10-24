@@ -146,6 +146,43 @@ export const ADMIN_USERS_PAGE_SIZE = 8;
 export const ADMIN_DOWNLOADS_PAGE_SIZE = 5;
 export const VISIT_IDLE_MS = 30 * 60_000;
 
+export const DOWNLOAD_CATEGORIES = ["ig_story", "ig_post", "ig_reel", "ig_other", "tiktok", "x", "youtube", "music", "other"] as const;
+export type DownloadCategory = typeof DOWNLOAD_CATEGORIES[number];
+// Aggregate profile rows repeat their children's deliveries and must be skipped.
+export function downloadCategory(source: string, request: string, detail = ""): DownloadCategory | null {
+  if (["Instagram profile stories", "Instagram profile posts"].includes(source)) return null;
+  if (["SoundCloud", "YouTube Playlist", "تشخیص آهنگ", "جست‌وجو و دانلود آهنگ", "Instagram audio", "Instagram music"].includes(source)
+      || (source === "YouTube" && /Audio (Low|HQ)/.test(detail))) return "music";
+  if (["Instagram story", "Instagram highlight"].includes(source)) return "ig_story";
+  if (source === "Instagram post") return /\/reels?\//i.test(request) ? "ig_reel" : "ig_post";
+  if (source.startsWith("Instagram ")) return "ig_other";
+  return source === "TikTok" ? "tiktok" : source === "X" ? "x" : source === "YouTube" ? "youtube" : "other";
+}
+
+type DownloadStatistics = { since: number; periods: Record<"day" | "week" | "all", Record<DownloadCategory, number>> };
+export async function getDownloadStatistics(env: AdminStatsEnv): Promise<DownloadStatistics> {
+  const response = await statsStub(env).fetch("https://admin-stats/download-statistics");
+  if (!response.ok) throw new Error("DOWNLOAD_STATISTICS_UNAVAILABLE");
+  return response.json();
+}
+export function formatDownloadStatistics(stats: DownloadStatistics): string {
+  const blocks = (["day", "week", "all"] as const).map(period => {
+    const counts = stats.periods[period];
+    const instagram = counts.ig_story + counts.ig_post + counts.ig_reel + counts.ig_other;
+    const total = DOWNLOAD_CATEGORIES.reduce((sum, key) => sum + counts[key], 0);
+    return [ `<b>${period === "day" ? "🕐 ۲۴ ساعت گذشته" : period === "week" ? "📅 ۷ روز گذشته" : "📚 کل سوابق ثبت‌شده"}</b>`,
+      `<b>اینستاگرام — مجموع: ${instagram}</b>`,
+      `استوری و هایلایت: <b>${counts.ig_story}</b>  |  پست: <b>${counts.ig_post}</b>  |  ریلز: <b>${counts.ig_reel}</b>`,
+      ...(counts.ig_other ? [`لایو و بازپخش اینستاگرام: <b>${counts.ig_other}</b>`] : []),
+      `تیک‌تاک: <b>${counts.tiktok}</b>  |  ایکس: <b>${counts.x}</b>`,
+      `یوتیوب: <b>${counts.youtube}</b>  |  موزیک و صوت: <b>${counts.music}</b>`,
+      ...(counts.other ? [`سایر سرویس‌ها: <b>${counts.other}</b>`] : []),
+      `<b>مجموع همه: ${total}</b>`,
+    ].join("\n");
+  });
+  return `<b>📥 آمار دانلودهای ارسال‌شده</b>\n\n${blocks.join("\n\n")}\n\nهر محتوای کامل یک مورد؛ پست چنداسلایدی یک مورد و هر استوری/آهنگ یک مورد است. استوری‌ها و آهنگ‌های ارسال‌شده از درخواست ناقص هم حساب می‌شوند.\nثبت زمان هر مورد از ${dateLabel(stats.since)}؛ سوابق قدیمی بر اساس زمان ثبت نهایی و نوع قابل شناسایی هستند. سوابق پیش از تاریخچه قابل تفکیک نیستند. موزیک از یوتیوب جداست.`;
+}
+
 export type DownloadStatus = "pending" | "awaiting_selection" | "processing" | "success" | "failed" | "partial" | "results";
 export type DownloadRecord = {
   key: string;
@@ -156,6 +193,8 @@ export type DownloadRecord = {
   title?: string;
   detail?: string;
   delivered?: number;
+  category?: DownloadCategory;
+  excludeFromStats?: boolean;
 };
 export type AdminDownload = DownloadRecord & { createdAt: number; updatedAt: number; stale: boolean };
 export type AdminUserDetail = {
@@ -469,6 +508,11 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_download_history_user ON download_history(user_id, created_at DESC, key);
+      CREATE TABLE IF NOT EXISTS download_stat_events (
+        download_key TEXT NOT NULL, item_index INTEGER NOT NULL, category TEXT NOT NULL, delivered_at INTEGER NOT NULL,
+        PRIMARY KEY(download_key, item_index)
+      );
+      CREATE INDEX IF NOT EXISTS idx_download_stat_events_time ON download_stat_events(delivered_at, category);
 
       CREATE TABLE IF NOT EXISTS membership_access (
         user_id TEXT PRIMARY KEY, first_download_at INTEGER NOT NULL
@@ -508,6 +552,32 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       CREATE INDEX IF NOT EXISTS idx_media_usage_time ON media_usage(recorded_at);
     `);
     this.ctx.storage.sql.exec("INSERT OR IGNORE INTO counters(key,value) VALUES ('usage_tracking_since',?)", Date.now());
+    // One-time, set-based import. No timer or polling and no repeated full scan.
+    if (!this.ctx.storage.sql.exec("SELECT value FROM counters WHERE key = 'download_stats_since'").toArray().length) {
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec(`
+          INSERT OR IGNORE INTO download_stat_events(download_key,item_index,category,delivered_at)
+          WITH RECURSIVE items(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM items WHERE n < 99),
+          history AS (SELECT *, CASE
+            WHEN source IN ('SoundCloud','YouTube Playlist','تشخیص آهنگ','جست‌وجو و دانلود آهنگ','Instagram audio','Instagram music')
+              OR (source='YouTube' AND (detail LIKE '%Audio Low%' OR detail LIKE '%Audio HQ%')) THEN 'music'
+            WHEN source IN ('Instagram story','Instagram highlight') THEN 'ig_story'
+            WHEN source='Instagram post' AND (request LIKE '%/reel/%' OR request LIKE '%/reels/%') THEN 'ig_reel'
+            WHEN source='Instagram post' THEN 'ig_post'
+            WHEN source LIKE 'Instagram %' THEN 'ig_other'
+            WHEN source='TikTok' THEN 'tiktok' WHEN source='X' THEN 'x'
+            WHEN source='YouTube' THEN 'youtube' ELSE 'other' END AS category
+            FROM download_history AS parent WHERE source NOT IN ('Instagram profile stories','Instagram profile posts')
+              AND NOT (parent.key LIKE 'ig:%' AND EXISTS (SELECT 1 FROM download_history AS child
+                WHERE child.key LIKE 'igdl-' || replace(substr(parent.key,4),':','-') || '-profile-%'))
+              AND delivered > 0 AND status IN ('success','partial'))
+          SELECT key,n,category,updated_at FROM history JOIN items
+            ON n < CASE WHEN category IN ('ig_story','music') THEN MIN(delivered,100)
+                       WHEN status='success' THEN 1 ELSE 0 END
+        `);
+        this.ctx.storage.sql.exec("INSERT INTO counters(key,value) VALUES ('download_stats_since',?)", Date.now());
+      });
+    }
   }
 
   private usageTotals(since: number, until: number, userId?: string): UsageTotals {
@@ -712,6 +782,18 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       return Response.json({ ok: true });
     }
 
+    if (request.method === "GET" && url.pathname === "/download-statistics") {
+      const now = Date.now();
+      const rows = this.ctx.storage.sql.exec(`SELECT category, COUNT(*) AS all_count,
+        SUM(delivered_at >= ?) AS day_count, SUM(delivered_at >= ?) AS week_count
+        FROM download_stat_events WHERE delivered_at <= ? GROUP BY category`, now - 86400_000, now - 7 * 86400_000, now).toArray();
+      const periods = Object.fromEntries((["day", "week", "all"] as const).map(period => [period,
+        Object.fromEntries(DOWNLOAD_CATEGORIES.map(category => [category,
+          asNumber(rows.find(row => row.category === category)?.[`${period}_count`] || 0)])),
+      ])) as DownloadStatistics["periods"];
+      return Response.json({ periods, since: asNumber(this.ctx.storage.sql.exec("SELECT value FROM counters WHERE key = 'download_stats_since'").one().value) });
+    }
+
     if (request.method === "POST" && url.pathname === "/download") {
       const payload = await request.json() as DownloadRecord;
       const statuses: DownloadStatus[] = ["pending", "awaiting_selection", "processing", "success", "failed", "partial", "results"];
@@ -719,6 +801,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
           || payload.userId <= 0 || !statuses.includes(payload.status)) return new Response("Invalid download", { status: 400 });
       const now = Date.now();
       const terminal = ["success", "failed", "partial", "results"].includes(payload.status);
+      this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec(
         `INSERT INTO download_history(key,user_id,source,request,status,title,detail,delivered,created_at,updated_at)
          VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET
@@ -734,6 +817,17 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         terminal ? displayText(payload.detail, 240) : null,
         Math.max(0, Math.min(100, Math.floor(Number(payload.delivered) || 0))), now, now,
       );
+      const saved = this.ctx.storage.sql.exec("SELECT * FROM download_history WHERE key = ? AND user_id = ?", payload.key, String(payload.userId)).toArray()[0];
+      if (!payload.excludeFromStats && saved && ["success", "partial"].includes(String(saved.status))) {
+        const inferred = downloadCategory(String(saved.source), String(saved.request), String(saved.detail || ""));
+        const category = inferred === null ? null : DOWNLOAD_CATEGORIES.includes(payload.category!) ? payload.category! : inferred;
+        const count = category === null ? 0 : ["ig_story", "music"].includes(category)
+          ? asNumber(saved.delivered) : saved.status === "success" && asNumber(saved.delivered) > 0 ? 1 : 0;
+        for (let index = 0; index < Math.min(100, count); index++) this.ctx.storage.sql.exec(
+          "INSERT OR IGNORE INTO download_stat_events(download_key,item_index,category,delivered_at) VALUES (?,?,?,?)",
+          payload.key, index, category!, now);
+      }
+      });
       let firstDownload = false;
       if ((payload.status === "success" || payload.status === "partial") && Number(payload.delivered) > 0) {
         const access = this.ctx.storage.sql.exec(
@@ -1015,6 +1109,7 @@ export function adminDashboardKeyboard(): Record<string, unknown> {
     inline_keyboard: [
       [{ text: "📤 پیام همگانی", callback_data: "admin:broadcast" }],
       [{ text: "📊 مصرف، ترافیک و هزینه", callback_data: "admin:usage" }],
+      [{ text: "📥 آمار دانلود سرویس‌ها", callback_data: "admin:downloads" }],
       [{ text: "👥 لیست کاربران", callback_data: "admin:users:0" }],
       [{ text: "کاربران استفاده‌کننده", callback_data: "admin:used:0" }],
       [{ text: "فعال‌های ۲۴ ساعت", callback_data: "admin:users:0:day" },

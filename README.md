@@ -257,6 +257,35 @@ Financial read errors do not prevent showing local counters or other accounts.
 A failed statistics write logs a credential-free warning and does not retry the
 paid extractor or interrupt delivery.
 
+### Downloads by service and time window
+
+Open `/admin` → **📥 آمار دانلود سرویس‌ها**. The admin-only report uses HTML bold
+headings and displays rolling 24-hour, rolling 7-day and all available history totals.
+Instagram Stories/Highlights, Posts and Reels are separate and also summed; Live/replay
+is shown separately when present. TikTok, X, YouTube video and music/audio are separate,
+with an additional total for other services. Music/audio is not counted again as YouTube.
+
+The unit is a complete delivered content item: a carousel/post is one item, while each
+Story or playlist song is one item. Confirmed Stories/songs from a partially completed
+request still count; incomplete posts do not count as complete downloads. Search result
+messages and failed requests do not count. Cached files delivered to users do count.
+Profile group totals are excluded because the individual child deliveries already count;
+small Story URL sends retain their own direct delivery history. New jobs explicitly
+identify audio selections so YouTube MP3 and social audio are classified as music.
+
+The existing admin SQLite store keeps timestamped, idempotent item events keyed by
+history key and item index. Updating or replaying a completed request cannot move old
+items into today's count; increases in a partial Story/song batch add only the new items.
+History changes and their item events are stored in one transaction. No polling is added.
+
+At first initialization, existing identifiable download history is imported once with
+its last recorded timestamp. Group parents, including large Story parents with child
+rows, are excluded. Old records can only be categorized using their saved source, URL
+and selection details; historical reporting therefore follows that recorded information,
+not reconstructed exact per-file delivery times. Records from before download-history
+tracking cannot be broken down. This limitation is shown in the report. The existing
+all-time file counter remains independent because it counts files rather than content.
+
 ## Optional Instagram secrets
 
 For Story/Highlight/Live/replay support and content that Instagram gates behind login, add these as Cloudflare Worker secrets/environment variables:

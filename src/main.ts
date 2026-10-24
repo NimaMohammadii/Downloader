@@ -21,6 +21,8 @@ import {
   formatAdminDashboard,
   formatAdminUsers,
   getAdminUsage,
+  getDownloadStatistics,
+  formatDownloadStatistics,
   formatAdminUsage,
   getAdminSummary,
   getAdminUsersPage,
@@ -148,6 +150,21 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
   await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: query.id });
 
   try {
+    if (data === "admin:downloads") {
+      const stats = await getDownloadStatistics(env);
+      await telegramCall(env.BOT_TOKEN, "editMessageText", {
+        chat_id: message.chat.id, message_id: message.message_id,
+        text: formatDownloadStatistics(stats), parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [
+          [{ text: "🔄 بروزرسانی آمار دانلود", callback_data: "admin:downloads" }],
+          [{ text: "بازگشت به پنل", callback_data: "admin:stats" }],
+        ] },
+      }).catch(error => {
+        if (!(error instanceof Error) || !/message is not modified/i.test(error.message)) throw error;
+      });
+      return Response.json({ ok: true });
+    }
+
     if (data === "admin:igbudget") {
       const text = await instagramAccountBudget(env);
       await telegramCall(env.BOT_TOKEN, "editMessageText", {

@@ -492,7 +492,11 @@ function jobHistory(job: YoutubeDownloadJob): Omit<DownloadRecord, "status"> {
 }
 
 async function trackJob(env: Env, job: YoutubeDownloadJob, status: DownloadStatus, extra: Partial<DownloadRecord> = {}): Promise<void> {
-  await recordDownload(env, { ...jobHistory(job), ...extra, status });
+  await recordDownload(env, { ...jobHistory(job),
+    ...(job.instagramProfile ? { excludeFromStats: true } : {}),
+    ...(job.audioMode || job.playlist || job.recognition || job.social?.audioOnly || job.social?.platform === "soundcloud"
+      || job.instagram?.kind === "audio" || job.instagram?.kind === "music" ? { category: "music" as const } : {}),
+    ...extra, status });
 }
 
 export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDownloadJob> {
