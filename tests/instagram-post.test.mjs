@@ -168,35 +168,42 @@ test('Bright Data post returns every photo in a simple ordered photo post', asyn
   assert.deepEqual(files(result).map(x => x.method), ['sendPhoto', 'sendPhoto']);
 });
 
-test('Bright Data mixed carousel without slide ordering must fail rather than shuffle media', async () => {
+test('Bright Data unordered mixed carousel uses one existing public fallback and never sends partial media', async () => {
   const result = await run({text: 'https://www.instagram.com/p/' + shortcode + '/',
     env: {BRIGHTDATA_API_KEY: 'key'}, respond(call) {
       if (call.hostname === 'api.brightdata.com') return Response.json([{
         photos: ['https://scontent.cdninstagram.com/cover.jpg'],
         videos: ['https://scontent.cdninstagram.com/movie.mp4'],
       }]);
+      if (call.hostname === 'www.instagram.com') return redirect('/accounts/login/');
+      if (call.hostname === 'i.instagram.com') return Response.json({message: 'login_required'}, {status: 401});
     }});
-  assert.equal(result.calls.length, 1);
+  assert.equal(result.calls.filter(call => call.hostname === 'api.brightdata.com').length, 1);
+  assert.equal(result.calls.length, 3);
   assert.equal(files(result).length, 0);
   assert.match(report(result), /BRIGHTDATA_INCOMPLETE_CAROUSEL/);
+  assert.ok(!result.calls.slice(1).some(call => call.headers.get('cookie')?.includes('sessionid=')));
 });
 
-test('Bright Data refuses another post, unsafe media URLs and missing Reel video', async () => {
-  for (const [payload, expected] of [
-    [[{shortcode: 'another', video_url: 'https://scontent.cdninstagram.com/video.mp4'}], /BRIGHTDATA_WRONG_POST/],
-    [[{shortcode, video_url: 'https://example.com/private.mp4'}], /BRIGHTDATA_NO_MEDIA/],
-    [[{shortcode, thumbnail: 'https://scontent.cdninstagram.com/cover.jpg'}], /BRIGHTDATA_NO_MEDIA/],
+test('Bright Data refuses wrong shortcode; unusable media only falls back anonymously', async () => {
+  for (const [payload, expected, requestCount] of [
+    [[{shortcode: 'another', video_url: 'https://scontent.cdninstagram.com/video.mp4'}], /BRIGHTDATA_WRONG_POST/, 1],
+    [[{shortcode, video_url: 'https://example.com/private.mp4'}], /BRIGHTDATA_NO_MEDIA/, 3],
+    [[{shortcode, thumbnail: 'https://scontent.cdninstagram.com/cover.jpg'}], /BRIGHTDATA_NO_MEDIA/, 3],
   ]) {
     const result = await run({env: {BRIGHTDATA_API_KEY: 'key'}, respond(call) {
       if (call.hostname === 'api.brightdata.com') return Response.json(payload);
+      if (call.hostname === 'www.instagram.com') return redirect('/accounts/login/');
+      if (call.hostname === 'i.instagram.com') return Response.json({message: 'login_required'}, {status: 401});
     }});
     assert.equal(files(result).length, 0);
-    assert.equal(result.calls.length, 1);
+    assert.equal(result.calls.length, requestCount);
+    assert.equal(result.calls.filter(call => call.hostname === 'api.brightdata.com').length, 1);
     assert.match(report(result), expected);
   }
 });
 
-test('Bright Data reports whether a successful Reel record contains a usable video link', async () => {
+test('Bright Data missing video URLs are diagnosed and then attempted by existing anonymous path', async () => {
   for (const [payload, state] of [
     [{url: 'https://www.instagram.com/reel/' + shortcode + '/', description: 'metadata only'}, 'missing'],
     [{url: 'https://www.instagram.com/reel/' + shortcode + '/', video_url: 'https://example.com/file.mp4'}, 'unsupported_host'],
@@ -204,9 +211,11 @@ test('Bright Data reports whether a successful Reel record contains a usable vid
   ]) {
     const result = await run({env: {BRIGHTDATA_API_KEY: 'sensitive-api-key'}, respond(call) {
       if (call.hostname === 'api.brightdata.com') return Response.json([payload]);
+      if (call.hostname === 'www.instagram.com') return redirect('/accounts/login/');
+      if (call.hostname === 'i.instagram.com') return Response.json({message: 'login_required'}, {status: 401});
     }});
     assert.equal(files(result).length, 0);
-    assert.equal(result.calls.length, 1);
+    assert.equal(result.calls.length, 3);
     assert.match(report(result), /BRIGHTDATA_NO_MEDIA/);
     const diagnostic = result.diagnostics.find(x => x.message === 'instagram brightdata no media')?.info;
     assert.equal(diagnostic?.reason, 'video_link_missing_or_unusable');
@@ -216,23 +225,71 @@ test('Bright Data reports whether a successful Reel record contains a usable vid
     assert.ok(!JSON.stringify(diagnostic).includes('metadata only'));
     assert.ok(!JSON.stringify(diagnostic).includes('example.com'));
     assert.ok(!JSON.stringify(result.diagnostics).includes('sensitive-api-key'));
+    assert.ok(!result.calls.slice(1).some(call => call.headers.get('cookie')?.includes('sessionid=')));
   }
 });
 
-test('Bright Data reports provider error records and empty results without sending media', async () => {
-  for (const [payload, reason] of [
-    [[{error: 'upstream denied private account', status: 'fail'}], 'provider_error_record'],
-    [[], 'invalid_record_count'],
+test('Bright Data provider rejections are terminal; empty results use one free media recovery', async () => {
+  for (const [payload, reason, expectedCode, requestCount] of [
+    [[{error: 'upstream denied private account', status: 'fail'}],
+      'provider_error_record', /BRIGHTDATA_PROVIDER_ERROR/, 1],
+    [[], 'invalid_record_count', /BRIGHTDATA_NO_MEDIA/, 3],
   ]) {
     const result = await run({env: {BRIGHTDATA_API_KEY: 'sensitive-api-key'}, respond(call) {
       if (call.hostname === 'api.brightdata.com') return Response.json(payload);
+      if (call.hostname === 'www.instagram.com') return redirect('/accounts/login/');
+      if (call.hostname === 'i.instagram.com') return Response.json({message: 'login_required'}, {status: 401});
     }});
-    assert.equal(result.calls.length, 1);
+    assert.equal(result.calls.length, requestCount);
     assert.equal(files(result).length, 0);
+    assert.match(report(result), expectedCode);
     const diagnostic = result.diagnostics.find(x => x.message === 'instagram brightdata no media')?.info;
     assert.equal(diagnostic?.reason, reason);
     assert.ok(!JSON.stringify(result.diagnostics).includes('upstream denied'));
   }
+});
+
+test('Bright Data metadata-only Reel is recovered by the existing public webpage without another paid call', async () => {
+  const result = await run({env: {BRIGHTDATA_API_KEY: 'brightdata-key',
+      INSTAGRAM_SESSIONID: 'personal-session-not-for-public-reels'}, respond(call) {
+    if (call.hostname === 'api.brightdata.com') return Response.json([{
+      url: 'https://www.instagram.com/reel/' + shortcode + '/',
+      description: 'The video URL is not included in this provider record',
+    }]);
+    if (call.path === pagePath) return new Response(html(video));
+  }});
+  assert.equal(files(result).length, 1);
+  assert.deepEqual(result.calls.map(call => call.hostname), ['api.brightdata.com', 'www.instagram.com']);
+  assert.equal(result.calls.filter(call => call.hostname === 'api.brightdata.com').length, 1);
+  assert.ok(result.calls.slice(1).every(call => !call.headers.get('cookie')?.includes('sessionid=')));
+  assert.ok(result.diagnostics.some(x => x.message === 'instagram brightdata media recovered'));
+});
+
+test('Bright Data posts can use a documented single-photo alternate without sending multiple copies', async () => {
+  const result = await run({text: 'https://www.instagram.com/p/' + shortcode + '/',
+    env: {BRIGHTDATA_API_KEY: 'brightdata-key'}, respond(call) {
+      if (call.hostname === 'api.brightdata.com') return Response.json([{
+        shortcode, content_type: 'photo', photos_number: 1,
+        images: ['https://scontent.cdninstagram.com/high.jpg', 'https://scontent.cdninstagram.com/low.jpg'],
+      }]);
+    }});
+  assert.deepEqual(files(result).map(item => item.method), ['sendPhoto']);
+  assert.equal(result.calls.length, 1);
+});
+
+test('Bright Data carousel photo count mismatch never sends a partial post', async () => {
+  const result = await run({text: 'https://www.instagram.com/p/' + shortcode + '/',
+    env: {BRIGHTDATA_API_KEY: 'brightdata-key'}, respond(call) {
+      if (call.hostname === 'api.brightdata.com') return Response.json([{
+        shortcode, content_type: 'carousel', photos_number: 3,
+        photos: ['https://scontent.cdninstagram.com/one.jpg'],
+      }]);
+      if (call.hostname === 'www.instagram.com') return redirect('/accounts/login/');
+      if (call.hostname === 'i.instagram.com') return Response.json({message: 'login_required'}, {status: 401});
+    }});
+  assert.equal(files(result).length, 0);
+  assert.equal(result.calls.filter(call => call.hostname === 'api.brightdata.com').length, 1);
+  assert.match(report(result), /BRIGHTDATA_INCOMPLETE_CAROUSEL/);
 });
 
 test('Bright Data 202 pending snapshot does not retry or silently switch to Instagram', async () => {
