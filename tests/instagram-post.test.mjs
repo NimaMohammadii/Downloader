@@ -594,7 +594,10 @@ test('upstream GraphQL HTTP 401 rate response triggers shared cooldown without r
   assert.deepEqual(stored, [900]);
   const second = await run({ env: store, respond() { throw Error('Instagram must not be called during cooldown'); } });
   assert.equal(second.calls.length, 0, 'the next Worker request must not contact Instagram');
-  assert.match(report(second), /^INSTAGRAM_PUBLIC_COOLDOWN_\d+/);
+  assert.ok(second.diagnostics.some(x => x.message === 'instagram public cooldown active' &&
+    x.info.remainingSeconds > 0));
+  assert.ok(!second.diagnostics.some(x => x.message === 'instagram download failed'),
+    'expected local pauses are not upstream download errors');
   assert.match(errorText(second), /درخواست جدید نمی‌فرستد/);
   until = Date.now() - 1;
   const recovered = await run({ env: store, respond(call) {
