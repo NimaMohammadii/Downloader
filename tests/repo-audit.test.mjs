@@ -64,6 +64,7 @@ test('the production entrypoint downloads an Instagram reel without depending on
     }
     if (target.hostname === 'scontent.cdninstagram.com') return new Response(null, { headers: { 'content-length': '1000000' } });
     instagram.push(target.pathname);
+    if (target.pathname === '/p/B/') return new Response('<html></html>');
     if (target.pathname === '/api/v1/oembed/') return new Response(null, { status: 403 });
     if (target.pathname === '/api/v1/media/1/info/') return Response.json({ items: [{
       code: 'B', video_versions: [{ url: 'https://scontent.cdninstagram.com/fixture.mp4', width: 720, height: 1280 }],
@@ -76,7 +77,7 @@ test('the production entrypoint downloads an Instagram reel without depending on
       text: 'https://www.instagram.com/reel/B/' } }),
   }), { BOT_TOKEN: 'fixture', WEBHOOK_SECRET: secret }, {});
   assert.equal(response.status, 200);
-  assert.deepEqual(instagram, ['/api/v1/media/1/info/']);
+  assert.deepEqual(instagram, ['/p/B/', '/api/v1/media/1/info/']);
   assert.equal(sent.filter(item => item.method === 'sendVideo').length, 1);
   assert.equal(sent.find(item => item.method === 'sendVideo').body.width, 720);
 });
