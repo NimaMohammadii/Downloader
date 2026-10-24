@@ -8,6 +8,7 @@ type Env = Partial<AdminStatsEnv> & {
   INSTAGRAM_DS_USER_ID?: string;
   INSTAGRAM_MID?: string;
   INSTAGRAM_IG_DID?: string;
+  BRIGHTDATA_API_KEY?: string;
   uploadInstagramPost?: (post: InstagramPostUpload) => Promise<void>;
 };
 
@@ -158,6 +159,8 @@ const BASE_URL = "https://downloader.vexaagent.workers.dev";
 const WEB_APP_ID = "936619743392459";
 const IOS_APP_ID = "124024574287414";
 const POST_WEB_INFO_DOC_ID = "27128499623469141";
+const BRIGHTDATA_POST_DATASET = "gd_lk5ns7kz21pck8jpis";
+const BRIGHTDATA_REEL_DATASET = "gd_lyclm20il4r5helnj";
 const STORY_GRAPHQL_DOC_ID = "25317500907894419";
 const IG_WWW_CLAIM_STATE_KEY = "__ig_www_claim";
 const MEDIA_LINK_TTL_SECONDS = 10 * 60;
@@ -709,6 +712,113 @@ async function resolveViaPostPage(
   return null;
 }
 
+// Bright Data returns metadata and signed CDN URLs, not a media file.
+// Use the documented synchronous Web Scraper API for one exact post/Reel;
+// never submit a second paid extraction as a fallback after an ambiguous run.
+async function resolvePostWithBrightData(
+  target: Extract<InstagramTarget, { kind: "post" }>, apiKey: string,
+): Promise<MediaCandidate[][]> {
+  const route = /\\/(p|reels?|tv)\\/([A-Za-z0-9_-]+)(?:\\/|$)/.exec(new URL(target.url).pathname);
+  const isReel = route?.[1] === "reel" || route?.[1] === "reels";
+  const datasetId = isReel ? BRIGHTDATA_REEL_DATASET : BRIGHTDATA_POST_DATASET;
+  const canonicalUrl = `https://www.instagram.com/${isReel ? "reel" : "p"}/${target.shortcode}/`;
+  const endpoint = `https://api.brightdata.com/datasets/v3/scrape?dataset_id=${datasetId}&format=json&include_errors=true`;
+  let response: Response;
+  try {
+    response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${apiKey}`,
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify({ input: [{ url: canonicalUrl }] }),
+      signal: AbortSignal.timeout(65_000),
+    });
+  } catch {
+    throw new Error("BRIGHTDATA_NETWORK_ERROR");
+  }
+  // An accepted snapshot is still running. Retrying a scrape here would
+  // launch a second potentially billable job, so report it without polling.
+  if (response.status === 202) {
+    const accepted = await response.json().catch(() => null) as { snapshot_id?: unknown } | null;
+    console.warn("instagram brightdata pending", {
+      snapshot: typeof accepted?.snapshot_id === "string" ? accepted.snapshot_id : undefined,
+    });
+    throw new Error("BRIGHTDATA_PENDING");
+  }
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => undefined);
+    console.warn("instagram brightdata rejected", { status: response.status, dataset: isReel ? "reels" : "posts" });
+    if (response.status === 401 || response.status === 403) throw new Error("BRIGHTDATA_AUTH_ERROR");
+    if (response.status === 402 || response.status === 429) throw new Error("BRIGHTDATA_CREDITS_ERROR");
+    throw new Error("BRIGHTDATA_SERVICE_ERROR");
+  }
+  const payload: unknown = await response.json().catch(() => null);
+  const rows: unknown[] = Array.isArray(payload) ? payload
+    : payload && typeof payload === "object" && Array.isArray((payload as any).data) ? (payload as any).data
+    : payload ? [payload] : [];
+  if (rows.length !== 1 || !rows[0] || typeof rows[0] !== "object") throw new Error("BRIGHTDATA_NO_MEDIA");
+  const item = rows[0] as Record<string, any>;
+  if (item.error || item.error_type || item.status === "fail") throw new Error("BRIGHTDATA_NO_MEDIA");
+
+  // An unrelated record must not become a download for the user's link.
+  const returnedShortcode = String(item.shortcode || "").trim();
+  const returnedUrl = typeof item.url === "string" ? item.url : "";
+  const urlShortcode = /\\/(?:p|reels?|tv)\\/([A-Za-z0-9_-]+)(?:\\/|$|\\?)/.exec(returnedUrl)?.[1];
+  if ((returnedShortcode && returnedShortcode !== target.shortcode)
+      || (urlShortcode && urlShortcode !== target.shortcode)) throw new Error("BRIGHTDATA_WRONG_POST");
+
+  function mediaUrl(value: unknown): string | null {
+    if (typeof value !== "string") return null;
+    try {
+      const url = new URL(value);
+      // Media proxy already restricts these hosts; apply the same restriction
+      // before probing source URLs returned by a third-party provider.
+      return url.protocol === "https:" && !url.username && !url.password && !url.port
+        && allowedMediaHost(url.hostname) ? url.toString() : null;
+    } catch { return null; }
+  }
+  function urls(value: unknown): string[] {
+    return Array.isArray(value) ? value.map(mediaUrl).filter((url): url is string => Boolean(url))
+      : [];
+  }
+  function candidate(kind: MediaKind, url: string): MediaCandidate[] {
+    return [{ kind, url, width: 0, height: 0 }];
+  }
+
+  // Preserve slide order when an ordered carousel is explicitly provided.
+  const carousel = Array.isArray(item.carousel_media) ? item.carousel_media : null;
+  if (carousel?.length) {
+    const groups: MediaCandidate[][] = [];
+    for (const slide of carousel) {
+      const video = mediaUrl(slide?.video_url) || urls(slide?.videos)[0];
+      const photo = mediaUrl(slide?.image_url) || mediaUrl(slide?.display_url)
+        || urls(slide?.photos)[0];
+      if (video) groups.push(candidate("video", video));
+      else if (photo && !slide?.is_video && slide?.media_type !== 2) groups.push(candidate("photo", photo));
+      else throw new Error("BRIGHTDATA_INCOMPLETE_CAROUSEL");
+    }
+    if (groups.length > 20) throw new Error("BRIGHTDATA_INCOMPLETE_CAROUSEL");
+    return groups;
+  }
+
+  const videos = [...new Set([
+    ...urls(item.videos), ...(mediaUrl(item.video_url) ? [mediaUrl(item.video_url)!] : []),
+  ])];
+  const photos = urls(item.photos);
+  // Flat videos/photos arrays have no shared ordering for a mixed carousel.
+  // Never silently deliver slides out of order or pass a video's cover as media.
+  if (videos.length && photos.length) throw new Error("BRIGHTDATA_INCOMPLETE_CAROUSEL");
+  if (videos.length) return videos.slice(0, 20).map(url => candidate("video", url));
+  const hasVideo = isReel || /video|reel/i.test(String(item.content_type || item.product_type || ""));
+  if (hasVideo) throw new Error("BRIGHTDATA_NO_MEDIA");
+  if (photos.length) return photos.slice(0, 20).map(url => candidate("photo", url));
+  const image = mediaUrl(item.image_url) || mediaUrl(item.display_url);
+  if (image) return [candidate("photo", image)];
+  throw new Error("BRIGHTDATA_NO_MEDIA");
+}
+
 function safeJsonScripts(html: string): unknown[] {
   const values: unknown[] = [];
   const pattern = /<script\b[^>]*\bdata-sjs(?:=["'][^"']*["'])?[^>]*>([\s\S]*?)<\/script>/gi;
@@ -1159,7 +1269,11 @@ async function handleMediaProxy(request: Request, env: Env, url: URL): Promise<R
 }
 
 async function resolveTarget(target: InstagramTarget, env: Env): Promise<ResolvedMedia[]> {
-  const groups = target.kind === "post" ? await resolvePost(target) : await resolveStory(target, env);
+  const groups = target.kind === "post"
+    ? env.BRIGHTDATA_API_KEY?.trim()
+      ? await resolvePostWithBrightData(target, env.BRIGHTDATA_API_KEY.trim())
+      : await resolvePost(target)
+    : await resolveStory(target, env);
   const resolved: ResolvedMedia[] = [];
   for (const group of groups) resolved.push(await chooseCandidate(group, target.kind === "post" && Boolean(env.uploadInstagramPost)));
   return resolved;
@@ -1167,6 +1281,13 @@ async function resolveTarget(target: InstagramTarget, env: Env): Promise<Resolve
 
 function friendlyError(detail: string, throttle?: InstagramThrottle): string {
   const value = detail.toLowerCase();
+  if (value.startsWith("brightdata_auth_error")) return "❌ کلید Bright Data معتبر نیست یا به استخراج‌کننده Instagram دسترسی ندارد.";
+  if (value.startsWith("brightdata_credits_error")) return "❌ سهمیه یا اعتبار Bright Data تمام شده یا سرویس موقتاً محدود است.";
+  if (value.startsWith("brightdata_pending")) return "❌ استخراج Bright Data هنوز تمام نشده؛ برای جلوگیری از مصرف دوباره سهمیه، درخواست را فوراً تکرار نکن.";
+  if (value.startsWith("brightdata_incomplete_carousel")) return "❌ Bright Data ترتیب یا همه فایل‌های پست چندرسانه‌ای را برنگرداند؛ دانلود ناقص ارسال نشد.";
+  if (value.startsWith("brightdata_wrong_post")) return "❌ Bright Data اطلاعات لینک دیگری را برگرداند؛ برای جلوگیری از ارسال فایل اشتباه، دانلود متوقف شد.";
+  if (value.startsWith("brightdata_no_media")) return "❌ Bright Data فایل قابل دانلود این پست را برنگرداند.";
+  if (value.startsWith("brightdata_")) return "❌ ارتباط با سرویس Bright Data یا دریافت نتیجه کامل نشد.";
   if (value.startsWith("instagram_session_challenge_required")) {
     return "❌ حساب اینستاگرام متصل نیاز به تأیید امنیتی دارد؛ ابتدا در خود اینستاگرام تأیید شود.";
   }
