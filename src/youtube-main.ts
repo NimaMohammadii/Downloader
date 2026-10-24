@@ -517,6 +517,19 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
   // Telegram re-delivers an update or the Worker is restarted.
   private async runInstagramPostRequest(job: YoutubeDownloadJob, step: WorkflowStep): Promise<void> {
     try {
+      // Creating the Telegram status in a checkpointed step prevents duplicate
+      // progress messages if Telegram retries the same incoming webhook.
+      const statusId = await step.do("show public Instagram post status once", {
+        retries: { limit: 0, delay: "1 second" }, timeout: "30 seconds",
+      }, async () => {
+        const status = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
+          chat_id: job.chatId,
+          text: "⏳ لینک اینستاگرام رو گرفتم، دارم فایل رو آماده می‌کنم…",
+          reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
+        });
+        return status.message_id;
+      });
+      job.statusMessageId = statusId;
       const media = await step.do("resolve public Instagram post once", {
         retries: { limit: 0, delay: "1 second" }, timeout: "5 minutes",
       }, () => resolveInstagramPostForWorkflow(job.url, job.instagramPostRequest!.shortcode, this.env));
@@ -1761,11 +1774,11 @@ export default {
     }
 
     return storyWorker.fetch(request, { ...env,
-      queueInstagramPost: async (post: Omit<InstagramPostUpload, "media">) => {
+      queueInstagramPost: async (post: Omit<InstagramPostUpload, "media" | "statusMessageId">) => {
         const id = `igdl-${post.chatId}-${post.requestMessageId}-${post.userId}`;
         const job: YoutubeDownloadJob = {
           id, chatId: post.chatId, requestMessageId: post.requestMessageId,
-          userId: post.userId, statusMessageId: post.statusMessageId, url: post.url,
+          userId: post.userId, url: post.url,
           instagramPostRequest: { shortcode: post.shortcode },
         };
         try { await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id, params: job }); }
