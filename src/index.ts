@@ -810,10 +810,11 @@ async function resolvePostWithBrightData(
   // Flat videos/photos arrays have no shared ordering for a mixed carousel.
   // Never silently deliver slides out of order or pass a video's cover as media.
   if (videos.length && photos.length) throw new Error("BRIGHTDATA_INCOMPLETE_CAROUSEL");
-  if (videos.length) return videos.slice(0, 20).map(url => candidate("video", url));
+  if (videos.length > 20 || photos.length > 20) throw new Error("BRIGHTDATA_INCOMPLETE_CAROUSEL");
+  if (videos.length) return videos.map(url => candidate("video", url));
   const hasVideo = isReel || /video|reel/i.test(String(item.content_type || item.product_type || ""));
   if (hasVideo) throw new Error("BRIGHTDATA_NO_MEDIA");
-  if (photos.length) return photos.slice(0, 20).map(url => candidate("photo", url));
+  if (photos.length) return photos.map(url => candidate("photo", url));
   const image = mediaUrl(item.image_url) || mediaUrl(item.display_url);
   if (image) return [candidate("photo", image)];
   throw new Error("BRIGHTDATA_NO_MEDIA");
