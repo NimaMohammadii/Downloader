@@ -2,7 +2,7 @@ import { BroadcastManager } from "./broadcast";
 import { DurableObject } from "cloudflare:workers";
 
 // Error visibility is enforced before both drafts and final Telegram messages.
-export const PUBLIC_ERROR_MESSAGE = "❌ خطایی رخ داده است؛ در حال بررسی و پیگیری هستیم و به‌زودی رفع می‌شود.";
+export const PUBLIC_ERROR_MESSAGE = "مثل اینکه خطایی پیش اومده، در حال بررسی و پیگیری است، به زودی رفع می‌شود.";
 export function isErrorNotice(text: string): boolean {
   return text !== PUBLIC_ERROR_MESSAGE && /(?:^|\n)\s*(?:❌|⚠)|ناموفق|ممکن نیست|نامعتبر|دکمه برای|تأیید نشد|ارسال نشد|کامل نشد|معتبر نیست|معتبر نیستند|منقضی|برای شما نیست|درخواست‌کننده|محدود کرده|موقتاً.*(?:متوقف|محدود)|قابل دسترسی.*ندارد|قبلاً.*(?:شروع|تمام)|آمادهٔ ارسال نیست|صف متوقف شد/.test(text);
 }
@@ -23,23 +23,9 @@ export function privateErrorPayload(method: string, payload: Record<string, unkn
   for (const key of ["entities", "parse_mode", "reply_markup", "link_preview_options"]) delete result[key];
   return result;
 }
-async function prepareErrorNotice(token: string, method: string, payload: Record<string, unknown>): Promise<void> {
+function prepareErrorNotice(method: string, payload: Record<string, unknown>): void {
   const actor = payload._errorUserId;
   const safe = privateErrorPayload(method, payload);
-  if ((safe.text === PUBLIC_ERROR_MESSAGE && safe.text !== payload.text) ||
-      (method === "answerCallbackQuery" && payload._errorDetail && Number(actor) === ADMIN_USER_ID)) {
-    const original = String(payload._errorDetail || payload.text).replaceAll(token, "[TOKEN]")
-      .replace(/https?:\/\/\S+/gi, "[URL]")
-      .replace(/(?:sessionid|cookie|authorization|api_hash|bot_token)\s*[:=]\s*[^\s]+/gi, "[REDACTED]");
-    try {
-      await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ chat_id: ADMIN_USER_ID,
-          text: `گزارش خطا | chat=${payload.chat_id ?? "callback"} | message=${payload.message_id ?? payload.callback_query_id ?? "-"}\n${original}`.slice(0, 4000) }),
-        signal: AbortSignal.timeout(5000),
-      });
-    } catch { /* Admin notification failure must never reveal details to the user. */ }
-  }
   for (const key of Object.keys(payload)) delete payload[key];
   Object.assign(payload, safe);
   if (method === "answerCallbackQuery" && actor !== undefined) payload._errorUserId = actor;
@@ -102,7 +88,7 @@ const textMotionChats = new Map<string, number>();
 export async function telegramTextMotion(
   token: string, method: string, payload: Record<string, unknown>, options: { animateEdits?: boolean } = {},
 ): Promise<void> {
-  await prepareErrorNotice(token, method, payload);
+  prepareErrorNotice(method, payload);
   const editing = method === "editMessageText" && options.animateEdits && Number.isSafeInteger(payload.message_id);
   if ((method !== "sendMessage" && !editing) || typeof payload.text !== "string" || payload.parse_mode ||
       payload.text.length < 2 || payload.inline_message_id || payload.business_connection_id) return;

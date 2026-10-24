@@ -93,7 +93,7 @@ async function run({ session = '12345%3Afixture-session', env = {}, respond, cdn
   text = `https://www.instagram.com/reel/${shortcode}/?mdxt=test` } = {}) {
   const calls = [], sent = [], diagnostics = [];
   globalThis.history = [];
-  const previous = { error: console.error, warn: console.warn, log: console.log };
+  const previous = { error: console.error, warn: console.warn, log: console.log, info: console.info };
   for (const level of Object.keys(previous)) console[level] = (message, info) => diagnostics.push({ message, info });
   try {
     globalThis.fetch = async (url, init = {}) => {

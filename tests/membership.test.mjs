@@ -157,7 +157,7 @@ test('verification failures block work without falsely claiming the user is not 
     await api.worker.fetch(f.webhook('https://youtube.com/watch?v=abcdefghijk'), f.env, {});
     assert.equal(f.jobs.length, 0);
     assert.match(f.calls.at(-1).body.text, /در حال بررسی و پیگیری/);
-    assert.ok(f.calls.some(c => c.body.chat_id === 7138547731 && c.body.text.includes("گزارش خطا")));
+    assert.ok(!f.calls.some(c => c.body.chat_id === 7138547731), "user errors must not notify the admin");
     assert.equal(f.calls.at(-1).body.reply_markup, undefined);
     f.calls.length = 0;
     assert.equal((await api.worker.fetch(f.webhook('/start', 42, undefined, 'forged'), f.env, {})).status, 403);

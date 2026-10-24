@@ -232,7 +232,6 @@ def process_job(payload: dict) -> dict:
             diagnostic["errorCode"] = exc.error_code
             if exc.detail:
                 diagnostic["diagnostic"] = app.upload_error_diagnostic(RuntimeError(exc.detail), token)["diagnostic"]
-        app.report_error_diagnostic(token, chat_id, diagnostic)
         print(json.dumps({"message": "pornhub job failed", "jobId": payload.get("id"),
                           "phase": phase, **diagnostic}, ensure_ascii=False), flush=True)
         message = (str(exc) if isinstance(exc, app.UserVisibleError) else app.telegram_flood_message(diagnostic)

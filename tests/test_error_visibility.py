@@ -14,15 +14,8 @@ class ErrorVisibilityTests(unittest.TestCase):
             self.assertEqual(safe['text'], body['text'] if str(chat) == str(app.ADMIN_USER_ID) else app.PUBLIC_ERROR_MESSAGE)
             self.assertEqual(body['text'], '❌ نشست منقضی شده')
 
-    def test_report_failure_does_not_leak_and_report_is_redacted(self):
-        with patch.object(app.requests, 'post', side_effect=RuntimeError('offline')) as post:
-            safe = app.prepare_error_notice('private-token', 'editMessageText',
-                {'chat_id': 42, 'text': '❌ private-token https://signed.example/private'})
-            report = post.call_args.kwargs['json']
-            self.assertEqual(report['chat_id'], app.ADMIN_USER_ID)
-            self.assertNotIn('private-token', report['text'])
-            self.assertNotIn('signed.example', report['text'])
-            self.assertEqual(safe['text'], app.PUBLIC_ERROR_MESSAGE)
+    def test_public_message_matches_requested_text(self):
+        self.assertEqual(app.PUBLIC_ERROR_MESSAGE, 'مثل اینکه خطایی پیش اومده، در حال بررسی و پیگیری است، به زودی رفع می‌شود.')
 
     def test_partial_and_retry_errors_but_not_media_captions(self):
         for text in ('🎵 list\n❌ دریافت نشد: 2', '⏳ تلگرام موقتاً ارسال را متوقف کرده'):
@@ -38,4 +31,15 @@ class ErrorVisibilityTests(unittest.TestCase):
             app.telegram_call('token', 'editMessageText', json_payload={'chat_id': 42, 'text': '❌ login required'})
             self.assertEqual(motion.call_args.args[2]['text'], app.PUBLIC_ERROR_MESSAGE)
             self.assertEqual(post.call_args.kwargs['json']['text'], app.PUBLIC_ERROR_MESSAGE)
-            self.assertEqual(post.call_args_list[0].kwargs['json']['chat_id'], app.ADMIN_USER_ID)
+            self.assertEqual(post.call_count, 1)
+            self.assertEqual(post.call_args.kwargs['json']['chat_id'], 42)
+
+    def test_admin_own_request_keeps_original_error_without_extra_messages(self):
+        class Response:
+            ok = True
+            def json(self): return {'ok': True, 'result': {}}
+        with patch.object(app.requests, 'post', return_value=Response()) as post, patch.object(app, 'telegram_text_motion'):
+            app.telegram_call('token', 'editMessageText', json_payload={'chat_id': app.ADMIN_USER_ID, 'text': '❌ login required'})
+            self.assertEqual(post.call_count, 1)
+            self.assertEqual(post.call_args.kwargs['json']['text'], '❌ login required')
+            self.assertEqual(post.call_args.kwargs['json']['chat_id'], app.ADMIN_USER_ID)
