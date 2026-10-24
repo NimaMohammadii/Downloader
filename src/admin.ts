@@ -2,7 +2,7 @@ import { BroadcastManager } from "./broadcast";
 import { DurableObject } from "cloudflare:workers";
 
 // Error visibility is enforced before both drafts and final Telegram messages.
-export const PUBLIC_ERROR_MESSAGE = "مثل اینکه خطایی پیش اومده، در حال بررسی و پیگیری است، به زودی رفع می‌شود.";
+export const PUBLIC_ERROR_MESSAGE = "⚠️ مثل اینکه خطایی پیش اومده، در حال بررسی و پیگیری است، به زودی رفع می‌شود.";
 export function isErrorNotice(text: string): boolean {
   return text !== PUBLIC_ERROR_MESSAGE && /(?:^|\n)\s*(?:❌|⚠)|ناموفق|ممکن نیست|نامعتبر|دکمه برای|تأیید نشد|ارسال نشد|کامل نشد|معتبر نیست|معتبر نیستند|منقضی|برای شما نیست|درخواست‌کننده|محدود کرده|موقتاً.*(?:متوقف|محدود)|قابل دسترسی.*ندارد|قبلاً.*(?:شروع|تمام)|آمادهٔ ارسال نیست|صف متوقف شد/.test(text);
 }
@@ -10,17 +10,26 @@ export function privateErrorPayload(method: string, payload: Record<string, unkn
   const result = { ...payload };
   delete result._errorUserId;
   delete result._errorDetail;
+  delete result._publicErrorFrame;
+  if (payload._publicErrorFrame === true && /^(sendMessageDraft|editMessageText)$/.test(method) &&
+      typeof payload.text === "string" && PUBLIC_ERROR_MESSAGE.startsWith(payload.text)) return result;
   if (!/^(sendMessage|sendMessageDraft|editMessageText|answerCallbackQuery)$/.test(method) ||
-      typeof payload.text !== "string" || !isErrorNotice(payload.text) && !payload._errorDetail) return result;
+      typeof payload.text !== "string" || (payload.text !== PUBLIC_ERROR_MESSAGE && !isErrorNotice(payload.text) && !payload._errorDetail)) return result;
   // A group is never an admin-only destination, even when the requester is admin.
   const admin = method === "answerCallbackQuery" ? Number(payload._errorUserId) === ADMIN_USER_ID
     : Number(payload.chat_id) === ADMIN_USER_ID;
-  if (admin) {
+  if (admin && payload.text !== PUBLIC_ERROR_MESSAGE) {
     if (payload._errorDetail && method !== "answerCallbackQuery") result.text = `${payload.text}\n${payload._errorDetail}`;
     return result;
   }
   result.text = PUBLIC_ERROR_MESSAGE;
   for (const key of ["entities", "parse_mode", "reply_markup", "link_preview_options"]) delete result[key];
+  if (method !== "answerCallbackQuery") result.entities = [
+    { type: "custom_emoji", offset: 0, length: 2, custom_emoji_id: "5447644880824181073" },
+    ...["خطایی پیش اومده", "در حال بررسی و پیگیری", "به زودی رفع می‌شود"].map(text => ({
+      type: "bold", offset: PUBLIC_ERROR_MESSAGE.indexOf(text), length: text.length,
+    })),
+  ];
   return result;
 }
 function prepareErrorNotice(method: string, payload: Record<string, unknown>): void {
@@ -83,13 +92,13 @@ export function telegramCustomEmoji(method: string, payload: Record<string, unkn
 
 const textMotionChats = new Map<string, number>();
 
-// Drafts use Telegram’s native append animation. Panel edits opt into a bounded
-// reveal on the existing message; other edit callers keep their current behavior.
+// Drafts use Telegram’s native append animation. Public errors and panel edits
+// reveal text on the existing message; other edits keep their current behavior.
 export async function telegramTextMotion(
   token: string, method: string, payload: Record<string, unknown>, options: { animateEdits?: boolean } = {},
 ): Promise<void> {
   prepareErrorNotice(method, payload);
-  const editing = method === "editMessageText" && options.animateEdits && Number.isSafeInteger(payload.message_id);
+  const editing = method === "editMessageText" && (options.animateEdits || payload.text === PUBLIC_ERROR_MESSAGE) && Number.isSafeInteger(payload.message_id);
   if ((method !== "sendMessage" && !editing) || typeof payload.text !== "string" || payload.parse_mode ||
       payload.text.length < 2 || payload.inline_message_id || payload.business_connection_id) return;
   const chat = Number(payload.chat_id);
@@ -122,8 +131,8 @@ export async function telegramTextMotion(
         .filter(e => Number(e.offset) < text.length && (e.type !== "custom_emoji" || Number(e.offset) + Number(e.length) <= text.length))
         .map(e => ({ ...e, length: Math.min(Number(e.length), text.length - Number(e.offset)) })) : undefined;
       await post(editing ? "editMessageText" : "sendMessageDraft", editing
-        ? { chat_id: chat, message_id: payload.message_id, text, entities, reply_markup: payload.reply_markup }
-        : { chat_id: chat, message_thread_id: payload.message_thread_id, draft_id, text, entities });
+        ? { chat_id: chat, message_id: payload.message_id, text, entities, reply_markup: payload.reply_markup, _publicErrorFrame: payload.text === PUBLIC_ERROR_MESSAGE }
+        : { chat_id: chat, message_thread_id: payload.message_thread_id, draft_id, text, entities, _publicErrorFrame: payload.text === PUBLIC_ERROR_MESSAGE });
       // Wait after acknowledgement: network time must not consume the reveal time.
       // Persisting immediately would replace the draft before its animation finishes.
       const pause = editing ? 450 : frame === 0 ? 120 : Math.min(1000, Math.max(500, chars.length * 12));

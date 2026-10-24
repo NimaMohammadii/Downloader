@@ -401,20 +401,31 @@ def job_timeout(seconds: float) -> float:
 
 
 ADMIN_USER_ID = 7138547731
-PUBLIC_ERROR_MESSAGE = "مثل اینکه خطایی پیش اومده، در حال بررسی و پیگیری است، به زودی رفع می‌شود."
+PUBLIC_ERROR_MESSAGE = "⚠️ مثل اینکه خطایی پیش اومده، در حال بررسی و پیگیری است، به زودی رفع می‌شود."
 ERROR_NOTICE_PATTERN = re.compile(r"(?:^|\n)\s*(?:❌|⚠)|ناموفق|ممکن نیست|نامعتبر|دکمه برای|تأیید نشد|ارسال نشد|کامل نشد|معتبر نیست|منقضی|برای شما نیست|درخواست‌کننده|محدود کرده|موقتاً.*(?:متوقف|محدود)|قابل دسترسی.*ندارد|قبلاً.*(?:شروع|تمام)|آمادهٔ ارسال نیست|صف متوقف شد")
 
 
 def private_error_payload(method: str, payload: dict[str, Any]) -> dict[str, Any]:
     result = dict(payload)
+    result.pop("_publicErrorFrame", None)
+    text = payload.get("text")
+    if (payload.get("_publicErrorFrame") is True and method in {"sendMessageDraft", "editMessageText"}
+            and isinstance(text, str) and PUBLIC_ERROR_MESSAGE.startswith(text)):
+        return result
     if (method in {"sendMessage", "sendMessageDraft", "editMessageText", "answerCallbackQuery"}
-            and str(payload.get("chat_id")) != str(ADMIN_USER_ID)
-            and isinstance(payload.get("text"), str)
-            and payload["text"] != PUBLIC_ERROR_MESSAGE
-            and ERROR_NOTICE_PATTERN.search(payload["text"])):
+            and isinstance(text, str)
+            and (text == PUBLIC_ERROR_MESSAGE or
+                 (str(payload.get("chat_id")) != str(ADMIN_USER_ID) and ERROR_NOTICE_PATTERN.search(text)))):
         result["text"] = PUBLIC_ERROR_MESSAGE
         for key in ("entities", "parse_mode", "reply_markup", "link_preview_options"):
             result.pop(key, None)
+        if method != "answerCallbackQuery":
+            result["entities"] = [{"type": "custom_emoji", "offset": 0, "length": 2,
+                                   "custom_emoji_id": "5447644880824181073"}]
+            for phrase in ("خطایی پیش اومده", "در حال بررسی و پیگیری", "به زودی رفع می‌شود"):
+                offset = PUBLIC_ERROR_MESSAGE.index(phrase)
+                result["entities"].append({"type": "bold", "offset": len(PUBLIC_ERROR_MESSAGE[:offset].encode("utf-16-le")) // 2,
+                                           "length": len(phrase.encode("utf-16-le")) // 2})
     return result
 
 
@@ -489,7 +500,8 @@ def telegram_custom_emoji(method: str, payload: dict[str, Any], *, form: bool = 
 def telegram_text_motion(token: str, method: str, payload: dict[str, Any]) -> None:
     payload = private_error_payload(method, payload)
     text = payload.get("text")
-    if method != "sendMessage" or not isinstance(text, str) or len(text) < 2 or payload.get("parse_mode"):
+    editing = method == "editMessageText" and text == PUBLIC_ERROR_MESSAGE and bool(payload.get("message_id"))
+    if (method != "sendMessage" and not editing) or not isinstance(text, str) or len(text) < 2 or payload.get("parse_mode"):
         return
     if payload.get("inline_message_id") or payload.get("business_connection_id"):
         return
@@ -497,13 +509,13 @@ def telegram_text_motion(token: str, method: str, payload: dict[str, Any]) -> No
         chat = int(payload["chat_id"])
         if chat <= 0:
             return
-        key, now = (token.split(":")[0], chat), time.monotonic()
+        key, now = (token.split(":")[0] + (":edit" if editing else ""), chat), time.monotonic()
         with TEXT_MOTION_LOCK:
             if now < TEXT_MOTION_CHATS.get(key, -10):
                 return
             if len(TEXT_MOTION_CHATS) >= 512:
                 TEXT_MOTION_CHATS.pop(next(iter(TEXT_MOTION_CHATS)))
-            TEXT_MOTION_CHATS[key] = now + 10
+            TEXT_MOTION_CHATS[key] = now + (1.5 if editing else 10)
         # Keep Persian combining marks, joiners and animated emoji together.
         chars: list[str] = []
         for char in text:
@@ -517,15 +529,19 @@ def telegram_text_motion(token: str, method: str, payload: dict[str, Any]) -> No
             return
         draft_id, deadline = secrets.randbelow(2147483646) + 1, now + 4.5
         # Seed once, then let Telegram animate the full append without restarts.
-        for frame in range(2):
+        for frame in range(3 if editing else 2):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            end = 1 if frame == 0 else len(chars)
+            end = max(1, len(chars) * (frame + 1) // 4) if editing else 1 if frame == 0 else len(chars)
             prefix = "".join(chars[:end])
             if not prefix.strip():
                 continue
-            body = {"chat_id": chat, "draft_id": draft_id, "text": prefix}
+            body = {"chat_id": chat, "text": prefix, "_publicErrorFrame": text == PUBLIC_ERROR_MESSAGE}
+            if editing:
+                body["message_id"] = payload["message_id"]
+            else:
+                body["draft_id"] = draft_id
             if "message_thread_id" in payload:
                 body["message_thread_id"] = payload["message_thread_id"]
             length = len(prefix.encode("utf-16-le")) // 2
@@ -534,8 +550,9 @@ def telegram_text_motion(token: str, method: str, payload: dict[str, Any]) -> No
             body["entities"] = [{**e, "length": min(e["length"], length - e["offset"])} for e in entities
                                 if e["offset"] < length and (e.get("type") != "custom_emoji" or e["offset"] + e["length"] <= length)]
             request_timeout = min(0.4, remaining / 2, job_timeout(0.4))
-            response = requests.post(f"https://api.telegram.org/bot{token}/sendMessageDraft",
-                                     json=telegram_custom_emoji("sendMessageDraft", body), timeout=(request_timeout, request_timeout))
+            action = "editMessageText" if editing else "sendMessageDraft"
+            response = requests.post(f"https://api.telegram.org/bot{token}/{action}",
+                                     json=telegram_custom_emoji(action, body), timeout=(request_timeout, request_timeout))
             result = response.json()
             if response.status_code == 429:
                 retry = max(3, min(3600, float(result.get("parameters", {}).get("retry_after") or 30)))
@@ -544,7 +561,7 @@ def telegram_text_motion(token: str, method: str, payload: dict[str, Any]) -> No
             if not response.ok or not result.get("ok"):
                 break
             # Give the client time after acknowledgement before final persistence.
-            pause = 0.12 if frame == 0 else min(1.0, max(0.5, len(chars) * 0.012))
+            pause = 0.45 if editing else 0.12 if frame == 0 else min(1.0, max(0.5, len(chars) * 0.012))
             time.sleep(max(0, min(pause, deadline - time.monotonic(), job_timeout(pause))))
     except Exception:
         pass  # Optional effect must never prevent the complete message.

@@ -15,7 +15,7 @@ class ErrorVisibilityTests(unittest.TestCase):
             self.assertEqual(body['text'], '❌ نشست منقضی شده')
 
     def test_public_message_matches_requested_text(self):
-        self.assertEqual(app.PUBLIC_ERROR_MESSAGE, 'مثل اینکه خطایی پیش اومده، در حال بررسی و پیگیری است، به زودی رفع می‌شود.')
+        self.assertEqual(app.PUBLIC_ERROR_MESSAGE, '⚠️ مثل اینکه خطایی پیش اومده، در حال بررسی و پیگیری است، به زودی رفع می‌شود.')
 
     def test_partial_and_retry_errors_but_not_media_captions(self):
         for text in ('🎵 list\n❌ دریافت نشد: 2', '⏳ تلگرام موقتاً ارسال را متوقف کرده'):
@@ -43,3 +43,26 @@ class ErrorVisibilityTests(unittest.TestCase):
             self.assertEqual(post.call_count, 1)
             self.assertEqual(post.call_args.kwargs['json']['text'], '❌ login required')
             self.assertEqual(post.call_args.kwargs['json']['chat_id'], app.ADMIN_USER_ID)
+
+    def test_style_and_animation_keep_partial_frames_and_final_message(self):
+        import json
+        body = app.telegram_custom_emoji('editMessageText', {'chat_id': 8484, 'message_id': 77, 'text': '❌ source failed'})
+        self.assertEqual(body['text'], app.PUBLIC_ERROR_MESSAGE)
+        self.assertEqual([e['custom_emoji_id'] for e in body['entities'] if e['type'] == 'custom_emoji'], ['5447644880824181073'])
+        self.assertEqual([body['text'][e['offset']:e['offset']+e['length']] for e in body['entities'] if e['type'] == 'bold'],
+                         ['خطایی پیش اومده', 'در حال بررسی و پیگیری', 'به زودی رفع می‌شود'])
+        self.assertEqual(app.telegram_custom_emoji('editMessageText', body), body)
+        class Response:
+            ok = True
+            status_code = 200
+            def json(self): return {'ok': True, 'result': {}}
+        with patch.object(app.requests, 'post', return_value=Response()) as post, patch.object(app.time, 'sleep'):
+            app.telegram_call('motion-test-token', 'editMessageText', json_payload=body)
+            messages = [c.kwargs['json'] for c in post.call_args_list]
+            self.assertEqual(len(messages), 4)
+            self.assertTrue(all(m['chat_id'] == 8484 for m in messages))
+            self.assertTrue(all(app.PUBLIC_ERROR_MESSAGE.startswith(m['text']) and len(m['text']) < len(app.PUBLIC_ERROR_MESSAGE) for m in messages[:-1]))
+            self.assertEqual(messages[-1]['text'], app.PUBLIC_ERROR_MESSAGE)
+            self.assertTrue(all('_publicErrorFrame' not in m for m in messages))
+        form = app.telegram_custom_emoji('editMessageText', body, form=True)
+        self.assertEqual(json.loads(form['entities']), body['entities'])

@@ -19,7 +19,9 @@ test('details reach only the private admin chat, including admin requests in gro
     assert.equal(outgoing.text,chat===ADMIN_USER_ID?'❌ INSTAGRAM_LOGIN_REQUIRED':PUBLIC_ERROR_MESSAGE);
     if(chat!==ADMIN_USER_ID) assert.equal(outgoing.reply_markup,undefined);
   }
-  assert.equal(calls.length,0, 'preparing errors must never notify the admin');
+  assert.ok(calls.length > 0);
+  assert.ok(calls.every(c=>c.body.chat_id!==ADMIN_USER_ID && PUBLIC_ERROR_MESSAGE.startsWith(c.body.text)), 'animation must stay in the user chat');
+  assert.ok(calls.every(c=>c.body.text.length<PUBLIC_ERROR_MESSAGE.length), 'edit frames must reveal partial text');
 });
 
 test('user drafts stay generic and never notify the admin',async()=>{
@@ -57,5 +59,19 @@ test('partial failure and retry notices are hidden; successful media captions re
 
 
 test('public error message matches the requested text exactly',()=>{
-  assert.equal(PUBLIC_ERROR_MESSAGE,'مثل اینکه خطایی پیش اومده، در حال بررسی و پیگیری است، به زودی رفع می‌شود.');
+  assert.equal(PUBLIC_ERROR_MESSAGE,'⚠️ مثل اینکه خطایی پیش اومده، در حال بررسی و پیگیری است، به زودی رفع می‌شود.');
+});
+
+
+test('public error entities use the requested custom emoji and bold phrases',()=>{
+  const body=telegramCustomEmoji('editMessageText',{chat_id:42,text:'❌ source failed'});
+  assert.equal(body.text,PUBLIC_ERROR_MESSAGE);
+  assert.deepEqual(body.entities.filter(e=>e.type==='custom_emoji'),[
+    {type:'custom_emoji',offset:0,length:2,custom_emoji_id:'5447644880824181073'},
+  ]);
+  assert.deepEqual(body.entities.filter(e=>e.type==='bold').map(e=>body.text.slice(e.offset,e.offset+e.length)),
+    ['خطایی پیش اومده','در حال بررسی و پیگیری','به زودی رفع می‌شود']);
+  assert.deepEqual(telegramCustomEmoji('editMessageText',body),body,'repeated decoration must be stable');
+  const callback=privateErrorPayload('answerCallbackQuery',{text:'❌ error'});
+  assert.equal(callback.entities,undefined,'Telegram callback alerts support plain text only');
 });
