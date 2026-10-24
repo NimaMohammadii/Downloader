@@ -139,7 +139,7 @@ export async function instagramProfilePage(username: string, after: string | nul
 }
 
 export async function instagramProfilePostMedia(post: InstagramProfilePost, env: Env): Promise<ResolvedMedia[]> {
-  const groups = post.groups.length ? post.groups : await resolvePost({ kind: "post", url: post.url, shortcode: post.shortcode }, env.ADMIN_STATS);
+  const groups = post.groups.length ? post.groups : await resolvePost({ kind: "post", url: post.url, shortcode: post.shortcode });
   if (!groups.length || groups.length > 20) throw new Error("INSTAGRAM_NO_MEDIA");
   const media: ResolvedMedia[] = [];
   for (const group of groups) media.push(await chooseCandidate(group, true));
@@ -732,36 +732,10 @@ class PublicPostCookieJar extends Map<string, string> {
   }
 }
 
-// The existing AdminStats Durable Object stores one global backoff across
-// stateless Worker instances. A store outage cannot break ordinary downloads.
-async function publicInstagramCooldown(
-  store: AdminStatsEnv["ADMIN_STATS"] | undefined,
-  seconds?: number,
-): Promise<number> {
-  if (!store) return 0;
-  try {
-    const request = new Request("https://admin-stats/instagram-public-cooldown", seconds === undefined
-      ? { method: "GET", signal: AbortSignal.timeout(1500) }
-      : { method: "POST", headers: { "content-type": "application/json" },
-          body: JSON.stringify({ seconds }), signal: AbortSignal.timeout(1500) });
-    const response = await store.getByName("global").fetch(request);
-    if (!response.ok) return 0;
-    const result = await response.json() as { remainingSeconds?: number };
-    const remaining = result.remainingSeconds;
-    return Number.isSafeInteger(remaining) && remaining! >= 0 && remaining! <= 86400 ? remaining! : 0;
-  } catch {
-    console.warn("instagram public cooldown storage unavailable");
-    return 0;
-  }
-}
-
 // Public posts and Reels never read or send configured Instagram account secrets.
 async function resolvePost(
   target: Extract<InstagramTarget, { kind: "post" }>,
-  store?: AdminStatsEnv["ADMIN_STATS"],
 ): Promise<MediaCandidate[][]> {
-  const remaining = await publicInstagramCooldown(store);
-  if (remaining) throw new Error(`INSTAGRAM_PUBLIC_COOLDOWN_${remaining}`);
   const anonymous: CookieJar = new PublicPostCookieJar();
   const attempts: Array<[string, () => Promise<MediaCandidate[][] | null>]> = [
     ["public/webpage", () => resolveViaPostPage(target, anonymous)],
@@ -784,14 +758,6 @@ async function resolvePost(
     // Stop on a restriction rather than trying another route or account.
     if (["INSTAGRAM_RATE_LIMIT_429", "INSTAGRAM_FEEDBACK_REQUIRED",
          "INSTAGRAM_CHALLENGE_REQUIRED", "INSTAGRAM_CONSENT_REQUIRED"].includes(code)) {
-      if (code === "INSTAGRAM_RATE_LIMIT_429" || code === "INSTAGRAM_FEEDBACK_REQUIRED") {
-        // This is OUR conservative pause, not Instagram's promised unblock time.
-        // Respect an explicit Retry-After; otherwise avoid repeat traffic for 15 min.
-        const wait = throttle?.retryAfterSeconds;
-        const seconds = Number.isSafeInteger(wait) && wait! > 0
-          ? Math.min(wait!, 86400) : 15 * 60;
-        await publicInstagramCooldown(store, seconds);
-      }
       const error = failure(code);
       throw throttle ? new InstagramThrottleError(throttle, error.message) : error;
     }
@@ -1193,7 +1159,7 @@ async function handleMediaProxy(request: Request, env: Env, url: URL): Promise<R
 }
 
 async function resolveTarget(target: InstagramTarget, env: Env): Promise<ResolvedMedia[]> {
-  const groups = target.kind === "post" ? await resolvePost(target, env.ADMIN_STATS) : await resolveStory(target, env);
+  const groups = target.kind === "post" ? await resolvePost(target) : await resolveStory(target, env);
   const resolved: ResolvedMedia[] = [];
   for (const group of groups) resolved.push(await chooseCandidate(group, target.kind === "post" && Boolean(env.uploadInstagramPost)));
   return resolved;
@@ -1201,8 +1167,6 @@ async function resolveTarget(target: InstagramTarget, env: Env): Promise<Resolve
 
 function friendlyError(detail: string, throttle?: InstagramThrottle): string {
   const value = detail.toLowerCase();
-  const cooldown = /^instagram_public_cooldown_(\d+)$/.exec(value);
-  if (cooldown) return `❌ اینستاگرام درخواست‌های عمومی را محدود کرده؛ ربات برای جلوگیری از تشدید محدودیت، ${cooldown[1]} ثانیه دیگر درخواست جدید نمی‌فرستد.`;
   if (value.startsWith("instagram_session_challenge_required")) {
     return "❌ حساب اینستاگرام متصل نیاز به تأیید امنیتی دارد؛ ابتدا در خود اینستاگرام تأیید شود.";
   }
@@ -1370,11 +1334,7 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
     if (acknowledgeKickedChat(error)) return Response.json({ ok: true });
     const detail = error instanceof Error ? error.message : String(error);
     const throttle = error instanceof InstagramThrottleError ? error.throttle : undefined;
-    if (/^INSTAGRAM_PUBLIC_COOLDOWN_\d+$/.test(detail)) {
-      console.info("instagram public cooldown active", { target: target.kind, remainingSeconds: Number(detail.split("_").at(-1)) });
-    } else {
-      console.error("instagram download failed", { target: target.kind, detail, ...(throttle ? { throttle } : {}) });
-    }
+    console.error("instagram download failed", { target: target.kind, detail, ...(throttle ? { throttle } : {}) });
     const friendly = friendlyError(detail, throttle);
     if (statusMessageId) {
       await safeTelegramCall(env.BOT_TOKEN, "editMessageText", {
