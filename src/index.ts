@@ -845,13 +845,19 @@ async function resolvePostWithBrightData(
     return groups;
   }
 
-  const videos = [...new Set([
-    ...urls(item.videos), ...(mediaUrl(item.video_url) ? [mediaUrl(item.video_url)!] : []),
-  ])];
+  const directVideo = mediaUrl(item.video_url);
+  const videos = [...new Set([...(directVideo ? [directVideo] : []), ...urls(item.videos)])];
   const photos = urls(item.photos);
   const imageAlternates = urls(item.images);
-  // 'images' is documented as alternate resolutions, not a carousel.
-  // Only use one image when the record identifies a single-photo post.
+  const declaredVideo = isReel || item.is_video === true
+    || /^(video|reel|clips)$/i.test(String(item.content_type || item.product_type || ""));
+  // A Reel or explicitly single-video post can include photo covers and
+  // multiple rendition links. Neither should produce extra Telegram files.
+  if (declaredVideo) {
+    if (videos.length) return [candidate("video", videos[0])];
+    noMedia("video_link_missing_or_unusable", item);
+  }
+  // 'images' is documented as alternate photo resolutions, not slides.
   const photoCount = Number(item.photos_number);
   const hasKnownPhotoCount = Number.isSafeInteger(photoCount) && photoCount > 0;
   if (hasKnownPhotoCount && photos.length && photos.length < photoCount) {
@@ -862,9 +868,6 @@ async function resolvePostWithBrightData(
   if (videos.length && photos.length) throw new Error("BRIGHTDATA_INCOMPLETE_CAROUSEL");
   if (videos.length > 20 || photos.length > 20) throw new Error("BRIGHTDATA_INCOMPLETE_CAROUSEL");
   if (videos.length) return videos.map(url => candidate("video", url));
-  const hasVideo = isReel || item.is_video === true
-    || /video|reel|clips/i.test(String(item.content_type || item.product_type || ""));
-  if (hasVideo) noMedia("video_link_missing_or_unusable", item);
   if (photos.length) return photos.map(url => candidate("photo", url));
   if (hasKnownPhotoCount && photoCount > 1) noMedia("incomplete_photo_carousel", item);
   const image = mediaUrl(item.image_url) || imageAlternates[0] || mediaUrl(item.display_url);
