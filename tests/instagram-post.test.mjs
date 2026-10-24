@@ -315,6 +315,80 @@ test('TopAPI ambiguous timeout or upstream 500 does not create a second paid ext
   }
 });
 
+test('TopAPI async run waits for its original ID, reads dataset, and starts only one paid run', async () => {
+  let reads=0;
+  const id='topapiRun000001',datasetId='topapiDataset000001';
+  const result=await run({env:{APIFY_API_TOKEN:'private-apify-token',BRIGHTDATA_API_KEY:'bright-key'},
+    respond(call){
+      if(call.hostname!=='api.apify.com')throw Error('unexpected paid fallback');
+      if(call.path==='/v2/actors/topapi~instagram-scraper/runs')
+        return Response.json({data:{id,status:'RUNNING',defaultDatasetId:datasetId}},{status:201});
+      if(call.path==='/v2/actor-runs/'+id) {
+        assert.equal(call.url.searchParams.get('waitForFinish'),'20');
+        reads++;
+        return Response.json({data:{id,status:reads===1?'RUNNING':'SUCCEEDED',
+          defaultDatasetId:datasetId}});
+      }
+      if(call.path==='/v2/datasets/'+datasetId+'/items')
+        return Response.json([{shortCode:shortcode,type:'Video',
+          videoUrl:'https://scontent.cdninstagram.com/video.mp4'}]);
+      throw Error('unexpected path '+call.path);
+    }});
+  assert.equal(result.calls.filter(x=>x.method==='POST').length,1);
+  assert.deepEqual(result.calls.map(x=>x.path),[
+    '/v2/actors/topapi~instagram-scraper/runs',
+    '/v2/actor-runs/'+id,'/v2/actor-runs/'+id,
+    '/v2/datasets/'+datasetId+'/items',
+  ]);
+  assert.equal(result.calls[0].url.searchParams.get('waitForFinish'),'0');
+  assert.equal(result.calls[0].url.searchParams.get('restartOnError'),'false');
+  assert.deepEqual(files(result).map(x=>x.method),['sendVideo']);
+  assert.ok(!JSON.stringify(result.diagnostics).includes('private-apify-token'));
+});
+
+test('TopAPI known failed run uses existing Bright Data once without rerunning the Actor', async () => {
+  const id='topapiRun000002';
+  const result=await run({env:{APIFY_API_TOKEN:'top-key',BRIGHTDATA_API_KEY:'bright-key'},
+    respond(call){
+      if(call.path==='/v2/actors/topapi~instagram-scraper/runs')
+        return Response.json({data:{id,status:'FAILED',defaultDatasetId:'dataset000002'}},{status:201});
+      if(call.hostname==='api.brightdata.com')return Response.json([{
+        shortcode,video_url:'https://scontent.cdninstagram.com/recovered.mp4',
+      }]);
+      throw Error('unexpected paid action '+call.path);
+    }});
+  assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com','api.brightdata.com']);
+  assert.equal(result.calls.filter(x=>x.method==='POST'&&x.hostname==='api.apify.com').length,1);
+  assert.deepEqual(files(result).map(x=>x.method),['sendVideo']);
+});
+
+test('TopAPI missing run ID does not start a new paid run or Bright Data', async () => {
+  const result=await run({env:{APIFY_API_TOKEN:'top-key',BRIGHTDATA_API_KEY:'bright-key'},
+    respond(call){
+      if(call.path==='/v2/actors/topapi~instagram-scraper/runs')
+        return Response.json({data:{status:'RUNNING'}},{status:201});
+      throw Error('no more provider requests allowed');
+    }});
+  assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com']);
+  assert.equal(files(result).length,0);
+  assert.match(report(result),/TOPAPI_AMBIGUOUS_PROVIDER_ERROR/);
+});
+
+test('TopAPI status network failures only retry free GET, never a paid POST or Bright Data', async () => {
+  const id='topapiRun000003';
+  const result=await run({env:{APIFY_API_TOKEN:'top-key',BRIGHTDATA_API_KEY:'bright-key'},
+    respond(call){
+      if(call.path==='/v2/actors/topapi~instagram-scraper/runs')
+        return Response.json({data:{id,status:'RUNNING',defaultDatasetId:'dataset000003'}},{status:201});
+      if(call.path==='/v2/actor-runs/'+id)throw Error('transient read-only status failure');
+      throw Error('unwanted paid second run');
+    }});
+  assert.equal(result.calls.filter(x=>x.method==='POST').length,1);
+  assert.equal(result.calls.filter(x=>x.method==='GET').length,12);
+  assert.deepEqual(files(result),[]);
+  assert.match(report(result),/TOPAPI_STATUS_UNAVAILABLE/);
+});
+
 test('without an Apify token, existing Bright Data route remains unchanged', async () => {
   const result=await run({env:{BRIGHTDATA_API_KEY:'bright-key'},respond(call){
     if(call.hostname==='api.brightdata.com')return Response.json([{
