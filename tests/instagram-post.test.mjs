@@ -92,6 +92,7 @@ test('profile media keeps large videos on the existing complete-file uploader an
 async function run({ session = '12345%3Afixture-session', env = {}, respond, cdnRespond, telegramRespond,
   text = `https://www.instagram.com/reel/${shortcode}/?mdxt=test` } = {}) {
   const calls = [], sent = [], diagnostics = [];
+  let topapiFixtureDataset = null;
   globalThis.history = [];
   const previous = { error: console.error, warn: console.warn, log: console.log, info: console.info };
   for (const level of Object.keys(previous)) console[level] = (message, info) => diagnostics.push({ message, info });
@@ -111,7 +112,26 @@ async function run({ session = '12345%3Afixture-session', env = {}, respond, cdn
       const call = { path: target.pathname, url: target, hostname: target.hostname, headers, signal: init.signal,
         method: init.method || 'GET', body: init.body };
       calls.push(call);
+      // Existing tests provide a mocked synchronous Actor dataset. Translate
+      // it into the real asynchronous POST-run + GET-dataset API, without
+      // triggering a second paid POST or contacting a live provider.
+      if (target.hostname === 'api.apify.com' &&
+          target.pathname === '/v2/datasets/mockDataset123/items') {
+        if (!topapiFixtureDataset) throw Error('Missing TopAPI test dataset');
+        return topapiFixtureDataset.clone();
+      }
       const custom = respond?.(call);
+      if (target.hostname === 'api.apify.com' &&
+          target.pathname === '/v2/actors/topapi~instagram-scraper/runs' &&
+          custom instanceof Response && custom.ok) {
+        const output = await custom.clone().json().catch(() => null);
+        if (Array.isArray(output)) {
+          topapiFixtureDataset = custom.clone();
+          return Response.json({ data: {
+            id: 'mockRun123456', status: 'SUCCEEDED', defaultDatasetId: 'mockDataset123',
+          } }, { status: 201 });
+        }
+      }
       if (custom) return custom;
       if (target.pathname === apiPath) {
         if (target.hostname === 'i.instagram.com') return Response.json({ items: [video] });
@@ -165,10 +185,10 @@ test('TopAPI becomes primary for Reels with one postUrls request, no session or 
       throw Error('Unexpected provider called: '+call.hostname);
     }});
   assert.deepEqual(files(result).map(x=>x.method),['sendVideo']);
-  assert.equal(result.calls.length,1);
+  assert.equal(result.calls.length,2);
   const request = result.calls[0];
   assert.equal(request.hostname,'api.apify.com');
-  assert.equal(request.path,'/v2/actors/topapi~instagram-scraper/run-sync-get-dataset-items');
+  assert.equal(request.path,'/v2/actors/topapi~instagram-scraper/runs');
   assert.equal(request.headers.get('authorization'),'Bearer private-apify-token');
   assert.equal(request.headers.get('cookie'),null);
   assert.deepEqual(JSON.parse(request.body),{
@@ -193,7 +213,7 @@ test('TopAPI photo post treats images as resolutions, not separate slides', asyn
       throw Error('unexpected request');
     }});
   assert.deepEqual(files(result).map(x=>x.method),['sendPhoto']);
-  assert.equal(result.calls.length,1);
+  assert.equal(result.calls.length,2);
 });
 
 test('TopAPI ordered mixed childPosts carousel preserves every slide and never sends covers', async () => {
@@ -212,7 +232,7 @@ test('TopAPI ordered mixed childPosts carousel preserves every slide and never s
       throw Error('unexpected request');
     }});
   assert.deepEqual(files(result).map(x=>x.method),['sendPhoto','sendVideo','sendPhoto']);
-  assert.equal(result.calls.length,1);
+  assert.equal(result.calls.length,2);
 });
 
 test('TopAPI metadata-only result invokes Bright Data once as the paid fallback', async () => {
@@ -226,7 +246,7 @@ test('TopAPI metadata-only result invokes Bright Data once as the paid fallback'
       }]);
       throw Error('unexpected request');
     }});
-  assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com','api.brightdata.com']);
+  assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com','api.apify.com','api.brightdata.com']);
   assert.deepEqual(files(result).map(x=>x.method),['sendVideo']);
   const fallback=result.diagnostics.find(x=>x.message==='instagram topapi fallback')?.info;
   assert.deepEqual(fallback,{reason:'TOPAPI_NO_MEDIA',next:'brightdata'});
@@ -242,7 +262,9 @@ test('TopAPI empty dataset and 429 response fall back once to Bright Data', asyn
           shortcode,video_url:'https://scontent.cdninstagram.com/recovered.mp4',
         }]);
       }});
-    assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com','api.brightdata.com']);
+    assert.deepEqual(result.calls.map(x=>x.hostname),
+      topResponse.status===429 ? ['api.apify.com','api.brightdata.com']
+        : ['api.apify.com','api.apify.com','api.brightdata.com']);
     assert.deepEqual(files(result).map(x=>x.method),['sendVideo']);
   }
 });
@@ -260,7 +282,7 @@ test('TopAPI incomplete carousel falls back to complete Bright Data carousel ins
         {video_url:'https://scontent.cdninstagram.com/real-video.mp4'},
       ]}]);
     }});
-  assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com','api.brightdata.com']);
+  assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com','api.apify.com','api.brightdata.com']);
   assert.deepEqual(files(result).map(x=>x.method),['sendPhoto','sendVideo']);
 });
 
@@ -272,7 +294,7 @@ test('TopAPI wrong-shortcode responses never trigger backup downloads', async ()
       }]);
       throw Error('Backup must not be called');
     }});
-  assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com']);
+  assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com','api.apify.com']);
   assert.equal(files(result).length,0);
   assert.match(report(result),/TOPAPI_WRONG_POST/);
 });
