@@ -339,6 +339,78 @@ test('Cloudflare engine grace interruption does not fail, notify or clean up a w
   assert.equal(messages.length, 1, 'durable replay must not resend the status message');
 });
 
+test('TopAPI posts resolve in durable Workflow once with no webhook wait, repeat paid calls or polling',async()=>{
+  const messages=[],apiRequests=[],steps=[],checkpoints=new Map();
+  globalThis.downloadHistory=[];globalThis.delivered=0;globalThis.testFileCache=undefined;
+  const selected={...job,id:'igdl-42-7-42',instagram:undefined,instagramPostRequest:{shortcode:'Abc123'},
+    statusMessageId:undefined,url:'https://www.instagram.com/reel/Abc123/'};
+  globalThis.fetch=async (url,init={})=>{
+    const raw=String(url);
+    if(raw.includes('api.telegram.org')) {
+      messages.push({method:raw.split('/').at(-1),body:JSON.parse(init.body)});
+      return Response.json({ok:true,result:{message_id:33,video:{file_id:'delivered-video'}}});
+    }
+    if(raw.includes('api.apify.com')) {
+      apiRequests.push({url:raw,body:JSON.parse(init.body),auth:new Headers(init.headers).get('authorization')});
+      return Response.json([{type:'Video',shortCode:'Abc123',
+        videoUrl:'https://scontent.cdninstagram.com/video.mp4',
+        displayUrl:'https://scontent.cdninstagram.com/cover.jpg'}]);
+    }
+    if(raw.includes('cdninstagram.com')) return new Response(null,{headers:{'content-length':'1000000'}});
+    throw Error('Unexpected source '+raw);
+  };
+  const step={async do(name,options,fn) {
+    if(typeof options==='function')fn=options;
+    steps.push({name,options});
+    if(checkpoints.has(name))return structuredClone(checkpoints.get(name));
+    const value=await fn();checkpoints.set(name,structuredClone(value));return value;
+  }};
+  const bindings={...env,APIFY_API_TOKEN:'private-topapi-key',BRIGHTDATA_API_KEY:'private-bright-key'};
+  const replay=()=>new mod.YoutubeDownloadWorkflow({},bindings).run({payload:selected},step);
+  await replay();
+  assert.equal(apiRequests.length,1);
+  assert.equal(apiRequests[0].auth,'Bearer private-topapi-key');
+  assert.deepEqual(apiRequests[0].body.postUrls,['https://www.instagram.com/reel/Abc123/']);
+  assert.deepEqual(messages.map(x=>x.method),['sendMessage','sendVideo','deleteMessage']);
+  assert.ok(steps.some(x=>x.name==='resolve public Instagram post once'&&x.options.retries.limit===0));
+  assert.ok(steps.some(x=>x.name==='deliver public Instagram post once'&&x.options.retries.limit===0));
+  assert.equal(globalThis.downloadHistory.at(-1).status,'success');
+  const sent=messages.length;
+  await replay();
+  assert.equal(apiRequests.length,1,'checkpoint must never restart the paid Actor');
+  assert.equal(messages.length,sent,'checkpoint must not resend Telegram messages');
+  assert.ok(!JSON.stringify(messages).includes('private-topapi-key'));
+  assert.ok(!JSON.stringify(messages).includes('private-bright-key'));
+});
+
+test('TopAPI network failure in Workflow reports once and does not automatically charge Bright Data',async()=>{
+  const messages=[],apiRequests=[],steps=[];
+  globalThis.downloadHistory=[];globalThis.delivered=0;
+  const selected={...job,id:'igdl-42-8-42',instagram:undefined,instagramPostRequest:{shortcode:'Abc123'},
+    url:'https://www.instagram.com/reel/Abc123/'};
+  globalThis.fetch=async(url,init={})=>{
+    const raw=String(url);
+    if(raw.includes('api.telegram.org')){
+      messages.push({method:raw.split('/').at(-1),body:JSON.parse(init.body)});
+      return Response.json({ok:true,result:{message_id:33}});
+    }
+    if(raw.includes('api.apify.com')){apiRequests.push(raw);throw new TypeError('temporary failure');}
+    throw Error('No fallback or polling after ambiguous provider connection');
+  };
+  const step={async do(name,options,fn){
+    if(typeof options==='function')fn=options;
+    steps.push({name,options});
+    return fn();
+  }};
+  await new mod.YoutubeDownloadWorkflow({}, {...env,APIFY_API_TOKEN:'private-topapi',BRIGHTDATA_API_KEY:'private-bright'})
+    .run({payload:selected},step);
+  assert.equal(apiRequests.length,1);
+  assert.deepEqual(messages.map(x=>x.method),['sendMessage','editMessageText']);
+  assert.match(messages[1].body.text,/TopAPI/);
+  assert.equal(globalThis.downloadHistory.at(-1).status,'failed');
+  assert.ok(steps.find(x=>x.name==='resolve public Instagram post once').options.retries.limit===0);
+});
+
 test('large Instagram posts reuse the existing upload lifecycle, status and resolved source without another login', async () => {
   const post = { shortcode: 'B', url: 'https://instagram.com/reel/B/', chatId: 42, requestMessageId: 7, userId: 42,
     statusMessageId: 88, media: [{ kind: 'video', url: 'https://scontent.cdninstagram.com/big.mp4', width: 1080, height: 1920, size: 120000000 }] };
