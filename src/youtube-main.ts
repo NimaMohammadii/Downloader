@@ -531,7 +531,9 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       });
       job.statusMessageId = statusId;
       const media = await step.do("resolve public Instagram post once", {
-        retries: { limit: 0, delay: "1 second" }, timeout: "5 minutes",
+        // A TopAPI run can take nearly five minutes, and a deterministic
+        // metadata-only result can still use the existing Bright Data fallback.
+        retries: { limit: 0, delay: "1 second" }, timeout: "8 minutes",
       }, () => resolveInstagramPostForWorkflow(job.url, job.instagramPostRequest!.shortcode, this.env));
       if (!media.length) throw new Error("INSTAGRAM_NO_MEDIA");
 
