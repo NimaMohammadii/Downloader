@@ -263,10 +263,20 @@ function privateHeaders(jar: CookieJar): Headers | null {
 }
 
 type StoryFailure = "session_missing" | "login_required" | "challenge_required" | "rate_limited" | "network" | "user_lookup" | "unavailable" | "no_media"
-  | "apify_auth" | "apify_quota" | "apify_failed" | "apify_wrong_target" | "apify_invalid_media" | "apify_no_media" | "apify_too_many" | "apify_unavailable";
+  | "apify_auth" | "apify_quota" | "apify_failed" | "apify_timeout" | "apify_invalid_input"
+  | "apify_actor_missing" | "apify_server_error" | "apify_invalid_response"
+  | "apify_wrong_target" | "apify_invalid_media" | "apify_no_media" | "apify_too_many" | "apify_unavailable";
+
+type StoryProviderDiagnostic = {
+  stage: "request" | "response" | "decode";
+  status?: number;
+  reason?: "timeout" | "network_or_redirect" | "unparseable_json" | "unexpected_response";
+  providerCode?: string;
+  durationMs: number;
+};
 
 class StoryError extends Error {
-  constructor(readonly code: StoryFailure) {
+  constructor(readonly code: StoryFailure, readonly diagnostic?: StoryProviderDiagnostic) {
     super(code);
   }
 }
@@ -275,6 +285,11 @@ function storyErrorText(error: unknown): string {
   const code = error instanceof StoryError ? error.code : "network";
   if (code === "apify_auth") return "❌ توکن Apify برای دریافت استوری معتبر نیست یا دسترسی استخراج‌کننده فعال نشده است.";
   if (code === "apify_quota") return "❌ اعتبار یا محدودیت حساب Apify اجازه دریافت استوری را نمی‌دهد.";
+  if (code === "apify_invalid_input") return "❌ Apify ورودی استخراج‌کننده استوری را نپذیرفت (HTTP 400/422). وضعیت اجرای Rowfinch را بررسی کن.";
+  if (code === "apify_actor_missing") return "❌ استخراج‌کننده Rowfinch در Apify پیدا نشد یا برای حساب قابل دسترسی نیست (HTTP 404).";
+  if (code === "apify_timeout") return "❌ پاسخ استخراج استوری در مهلت مقرر نرسید؛ اجرا ممکن است در Apify ادامه داشته باشد. قبل از تکرار، اجرای قبلی را بررسی کن.";
+  if (code === "apify_server_error") return "❌ خود سرویس Apify پاسخ سرور ناموفق برگرداند. وضعیت اجرا را در داشبورد بررسی کن.";
+  if (code === "apify_invalid_response") return "❌ Apify پاسخ قابل‌خواندن به‌صورت JSON برنگرداند.";
   if (code === "apify_failed") return "❌ اجرای استخراج‌کننده Apify کامل نشد؛ قبل از تلاش دوباره، وضعیت اجرا را در داشبورد بررسی کن.";
   if (code === "apify_wrong_target") return "❌ نتیجه استخراج با لینک استوری/هایلایت مطابقت نداشت؛ فایل اشتباه ارسال نشد.";
   if (code === "apify_invalid_media") return "❌ استخراج‌کننده Apify لینک معتبر برای فایل استوری برنگرداند.";
@@ -493,6 +508,8 @@ async function apifyPublicStory(target: StoryTarget, env: Env, upload: boolean):
   // This is an established Apify Actor ID and documented synchronous endpoint;
   // do not invent a Bright Data Stories dataset ID.
   const endpoint = "https://api.apify.com/v2/actors/rowfinch~instagram-stories-scraper/run-sync-get-dataset-items";
+  const startedAt = Date.now();
+  const durationMs = () => Math.max(0, Date.now() - startedAt);
   let response: Response;
   try {
     response = await fetch(endpoint, {
@@ -509,17 +526,49 @@ async function apifyPublicStory(target: StoryTarget, env: Env, upload: boolean):
       // Never retry an ambiguous billable run. It could still finish upstream.
       signal: AbortSignal.timeout(45_000),
     });
-  } catch { throw new StoryError("apify_failed"); }
+  } catch (error) {
+    const reason = error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")
+      ? "timeout" : "network_or_redirect";
+    const diagnostic: StoryProviderDiagnostic = { stage: "request", reason, durationMs: durationMs() };
+    console.warn("instagram apify story request failed", { kind: target.kind, ...diagnostic });
+    throw new StoryError(reason === "timeout" ? "apify_timeout" : "apify_failed", diagnostic);
+  }
   if (!response.ok) {
-    await response.body?.cancel().catch(() => undefined);
-    console.warn("instagram apify story rejected", { status: response.status });
-    if (response.status === 401 || response.status === 403) throw new StoryError("apify_auth");
-    if (response.status === 402 || response.status === 429) throw new StoryError("apify_quota");
-    throw new StoryError("apify_failed");
+    // API error.type is a machine-readable identifier. Preserve only safe,
+    // short tokens; never log arbitrary provider messages, links or secrets.
+    const payload = await response.json().catch(() => null) as Record<string, any> | null;
+    const rawType = typeof payload?.error?.type === "string" ? payload.error.type : "";
+    const providerCode = /^[a-zA-Z0-9_-]{1,64}$/.test(rawType) ? rawType : undefined;
+    const diagnostic: StoryProviderDiagnostic = {
+      stage: "response", status: response.status, durationMs: durationMs(),
+      ...(providerCode ? { providerCode } : {}),
+    };
+    console.warn("instagram apify story rejected", { kind: target.kind, ...diagnostic });
+    if (response.status === 401 || response.status === 403) throw new StoryError("apify_auth", diagnostic);
+    if (response.status === 402 || response.status === 429) throw new StoryError("apify_quota", diagnostic);
+    if (response.status === 400 || response.status === 422) throw new StoryError("apify_invalid_input", diagnostic);
+    if (response.status === 404) throw new StoryError("apify_actor_missing", diagnostic);
+    if (response.status === 408 || response.status === 504) throw new StoryError("apify_timeout", diagnostic);
+    if (response.status >= 500) throw new StoryError("apify_server_error", diagnostic);
+    throw new StoryError("apify_failed", diagnostic);
   }
 
   const rows: unknown = await response.json().catch(() => null);
-  if (!Array.isArray(rows) || !rows.length) throw new StoryError("apify_no_media");
+  if (rows === null) {
+    const diagnostic: StoryProviderDiagnostic = {
+      stage: "decode", reason: "unparseable_json", status: response.status, durationMs: durationMs(),
+    };
+    console.warn("instagram apify story invalid response", { kind: target.kind, ...diagnostic });
+    throw new StoryError("apify_invalid_response", diagnostic);
+  }
+  if (!Array.isArray(rows)) {
+    const diagnostic: StoryProviderDiagnostic = {
+      stage: "decode", reason: "unexpected_response", status: response.status, durationMs: durationMs(),
+    };
+    console.warn("instagram apify story invalid response", { kind: target.kind, ...diagnostic });
+    throw new StoryError("apify_invalid_response", diagnostic);
+  }
+  if (!rows.length) throw new StoryError("apify_no_media");
   if (rows.some((row: any) => row?.error || row?.error_type)) throw new StoryError("apify_unavailable");
 
   // An exact story link selects only its own ID, even if the provider returns
@@ -918,6 +967,7 @@ export default {
           await recordDownload(env, { ...history, status: "failed", detail: "دریافت محتوای استوری ناموفق بود." });
           console.warn("instagram story resolution failed", {
             target: target.kind, code: error instanceof StoryError ? error.code : "network",
+            ...(error instanceof StoryError && error.diagnostic ? { provider: error.diagnostic } : {}),
           });
           await safeTelegramCall(env.BOT_TOKEN, "sendMessage", {
             chat_id: message.chat.id,
