@@ -4,6 +4,11 @@ import {
   telegramTextMotion,
   telegramCustomEmoji,
   ADMIN_USER_ID,
+  APIFY_ACCOUNTS,
+  apifyAccountToken,
+  setActiveApifyAccount,
+  type ApifyAccount,
+  type ApifyAccountSecrets,
   AdminStatsStore,
   adminDashboardKeyboard,
   adminUsersKeyboard,
@@ -25,7 +30,7 @@ import {
 
 export { AdminStatsStore };
 
-type Env = AdminStatsEnv & {
+type Env = AdminStatsEnv & ApifyAccountSecrets & {
   BOT_TOKEN: string;
   WEBHOOK_SECRET?: string;
   INSTAGRAM_SESSIONID?: string;
@@ -140,6 +145,35 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
   await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: query.id });
 
   try {
+    const apifyMatch = /^admin:apify(?::([1-4]))?$/.exec(data);
+    if (apifyMatch) {
+      const requested = apifyMatch[1] ? Number(apifyMatch[1]) as ApifyAccount : undefined;
+      let notice = "";
+      if (requested) {
+        if (apifyAccountToken(env, requested)) await setActiveApifyAccount(env, requested);
+        else notice = `توکن اکانت ${requested} هنوز در Secret تنظیم نشده است.\n\n`;
+      }
+      // Read the persisted selection even when its Secret has subsequently been
+      // removed, so the administrator can repair it by selecting another slot.
+      const response = await env.ADMIN_STATS.getByName("global").fetch("https://admin-stats/apify-account");
+      if (!response.ok) throw new Error("APIFY_ACCOUNT_SETTING_UNAVAILABLE");
+      const { account } = await response.json() as { account: ApifyAccount };
+      await telegramCall(env.BOT_TOKEN, "editMessageText", {
+        chat_id: message.chat.id, message_id: message.message_id,
+        text: `${notice}🔑 اکانت Apify\n\nاکانت انتخاب‌شده: ${account}\nبرای پست، ریلز، استوری و هایلایت.\n\nانتخاب شما برای دانلودهای جدید اعمال می‌شود؛ دانلودهای در حال اجرا با اکانت قبلی ادامه دارند.`,
+        reply_markup: { inline_keyboard: [
+          ...APIFY_ACCOUNTS.map(slot => [{
+            text: `${slot === account ? "✅ " : ""}اکانت ${slot} — ${apifyAccountToken(env, slot) ? "تنظیم شده" : "تنظیم نشده"}`,
+            callback_data: `admin:apify:${slot}`,
+          }]),
+          [{ text: "بازگشت به پنل", callback_data: "admin:stats" }],
+        ] },
+      }).catch(error => {
+        if (!(error instanceof Error) || !/message is not modified/i.test(error.message)) throw error;
+      });
+      return Response.json({ ok: true });
+    }
+
     const membershipMatch = /^admin:membership(?::(enable|disable))?$/.exec(data);
     if (membershipMatch) {
       if (membershipMatch[1]) await setMembershipEnabled(env, membershipMatch[1] === "enable");

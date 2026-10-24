@@ -13,6 +13,10 @@ import {
   telegramTextMotion,
   telegramCustomEmoji,
   ADMIN_USER_ID,
+  activeApifyAccount,
+  apifyAccountToken,
+  type ApifyAccount,
+  type ApifyAccountSecrets,
   recordSuccessfulDelivery,
   recordUserActivity,
   recordDownload,
@@ -56,6 +60,7 @@ type YoutubeDownloadJob = {
   instagram?: InstagramVideoTarget;
   instagramPost?: InstagramPostUpload;
   instagramPostRequest?: { shortcode: string };
+  apifyAccount?: ApifyAccount;
   instagramProfile?: { username: string; kind?: "posts" | "story"; target?: StoryTarget };
   instagramProfileParent?: { id: string; eventType: string };
   recognition?: RecognitionInput;
@@ -63,7 +68,7 @@ type YoutubeDownloadJob = {
   social?: SocialInput;
 };
 
-type Env = AdminStatsEnv & {
+type Env = AdminStatsEnv & ApifyAccountSecrets & {
   BOT_TOKEN: string;
   WEBHOOK_SECRET?: string;
   API_ID?: string;
@@ -488,6 +493,13 @@ async function trackJob(env: Env, job: YoutubeDownloadJob, status: DownloadStatu
 }
 
 export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDownloadJob> {
+  private apifyEnvironment(job: YoutubeDownloadJob): Env {
+    // Jobs retain the selected slot, never its credential. Old jobs preserve
+    // their original unnumbered Secret; a switch cannot move an existing run.
+    return job.apifyAccount === undefined ? this.env
+      : { ...this.env, APIFY_API_TOKEN: apifyAccountToken(this.env, job.apifyAccount) };
+  }
+
   async run(event: WorkflowEvent<YoutubeDownloadJob>, step: WorkflowStep) {
     const job: YoutubeDownloadJob = { ...event.payload };
     const inspect = !job.instagramProfile && !job.instagram && !job.instagramPost &&
@@ -519,6 +531,8 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
   // Telegram re-delivers an update or the Worker is restarted.
   private async runInstagramPostRequest(job: YoutubeDownloadJob, step: WorkflowStep): Promise<void> {
     try {
+      const providerEnv = this.apifyEnvironment(job);
+      if (job.apifyAccount !== undefined && !providerEnv.APIFY_API_TOKEN) throw new Error("TOPAPI_AUTH_ERROR");
       // Creating the Telegram status in a checkpointed step prevents duplicate
       // progress messages if Telegram retries the same incoming webhook.
       const statusId = await step.do("show public Instagram post status once", {
@@ -536,7 +550,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         // A TopAPI run can take nearly five minutes, and a deterministic
         // metadata-only result can still use the existing Bright Data fallback.
         retries: { limit: 0, delay: "1 second" }, timeout: "8 minutes",
-      }, () => resolveInstagramPostForWorkflow(job.url, job.instagramPostRequest!.shortcode, this.env));
+      }, () => resolveInstagramPostForWorkflow(job.url, job.instagramPostRequest!.shortcode, providerEnv));
       if (!media.length) throw new Error("INSTAGRAM_NO_MEDIA");
 
       if (media.some(item => item.kind === "video" && (item.size === null || item.size > 19_000_000))) {
@@ -584,13 +598,15 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
   }
 
   private async resolvePublicStory(job: YoutubeDownloadJob, target: StoryTarget, step: WorkflowStep) {
+    const providerEnv = this.apifyEnvironment(job);
+    if (!providerEnv.APIFY_API_TOKEN?.trim()) throw new Error("apify_auth");
     const token = await instagramSignature(this.env.BOT_TOKEN, `apify-story:${job.id}`);
     // Checkpoint the run ID immediately, independently of waiting and reading.
     // An ambiguous start is never automatically re-POSTed.
     const started = await step.do("start public Instagram story once", {
       retries: { limit: 0, delay: "1 second" }, timeout: "40 seconds",
     }, async () => {
-      try { return { run: await startInstagramStoryRun(target, this.env, {
+      try { return { run: await startInstagramStoryRun(target, providerEnv, {
         url: `https://downloader.vexaagent.workers.dev/instagram/apify-events/${job.id}`, token,
       }) }; }
       catch (error) { return { error: instagramVideoErrorText(error) }; }
@@ -613,7 +629,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
     const result = await step.do("read completed public Instagram story", {
       retries: { limit: 2, delay: "3 seconds", backoff: "exponential" }, timeout: "2 minutes",
     }, async () => {
-      try { return { media: await readInstagramStoryRun(run.id, target, this.env) }; }
+      try { return { media: await readInstagramStoryRun(run.id, target, providerEnv) }; }
       catch (error) {
         // Retry only transient reads of this run, never its paid start.
         if (error instanceof Error && ["apify_pending", "apify_timeout", "apify_server_error"].includes(error.message)) throw error;
@@ -627,6 +643,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
   private async runInstagramProfile(job: YoutubeDownloadJob, step: WorkflowStep): Promise<void> {
     let statusId: number | undefined;
     const stories = job.instagramProfile!.kind === "story";
+    const providerEnv = this.apifyEnvironment(job);
     const target = job.instagramProfile!.target;
     const label = target?.kind === "highlight" ? "هایلایت" : stories ? "استوری" : "پست";
     let delivered = 0;
@@ -642,7 +659,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         });
         return status.message_id;
       });
-      const publicMedia = stories && this.env.APIFY_API_TOKEN?.trim()
+      const publicMedia = stories && (job.apifyAccount !== undefined || providerEnv.APIFY_API_TOKEN?.trim())
         ? await this.resolvePublicStory(job, target || { kind: "story", username: job.instagramProfile!.username,
           storyId: null, url: job.url }, step) : undefined;
       for (let pageNumber = 0; ; pageNumber++) {
@@ -655,7 +672,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
               url: target.url, groups: [item.variants || [item]],
             })), next: null } };
             return { value: stories
-            ? { posts: await instagramProfileStories(job.instagramProfile!.username, { ...this.env,
+            ? { posts: await instagramProfileStories(job.instagramProfile!.username, { ...providerEnv,
                 resolvePublicStory: async () => publicMedia!,
               }), next: null }
             : await instagramProfilePage(job.instagramProfile!.username, after, this.env) }; }
@@ -733,7 +750,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
     } catch (error) {
       if (error instanceof Error && error.message === "Aborting engine: Grace period complete") throw error;
       const text = error instanceof Error && error.message.startsWith("❌") ? error.message
-        : stories && this.env.APIFY_API_TOKEN?.trim() ? instagramVideoErrorText(error)
+        : stories && (job.apifyAccount !== undefined || providerEnv.APIFY_API_TOKEN?.trim()) ? instagramVideoErrorText(error)
         : `❌ دریافت ${label}‌های حساب کامل نشد؛ دسترسی حساب و وضعیت ارسال را بررسی کن.`;
       await step.do("fail instagram profile", async () => {
         await trackJob(this.env, job, delivered ? "partial" : "failed", { delivered, detail: text });
@@ -1636,6 +1653,7 @@ async function socialAudioCallback(env: Env, update: TelegramUpdate, callback: T
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const requestUrl = new URL(request.url);
+    let apifySelection: Awaited<ReturnType<typeof activeApifyAccount>> | undefined;
 
     const usageRequest = /^\/container-usage\/(\d+)$/.exec(requestUrl.pathname);
     if (request.method === "POST" && usageRequest) {
@@ -1771,11 +1789,16 @@ export default {
         const text = (message.text || message.caption || "").trim();
 
         const profileCommand = parseInstagramProfileCommand(text);
+        if (profileCommand?.kind === "story" || (isInstagramDownloadLink(text)
+            && !parseInstagramVideoTarget(text) && !/^\/audio(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text))) {
+          apifySelection = await activeApifyAccount(env);
+        }
         if (profileCommand) {
           const id = `igdl-${message.chat.id}-${message.message_id}-${message.from?.id || message.chat.id}`;
           const job: YoutubeDownloadJob = { id, chatId: message.chat.id, requestMessageId: message.message_id,
             userId: message.from?.id || message.chat.id, url: `https://www.instagram.com/${profileCommand.username}/`,
-            instagramProfile: { username: profileCommand.username, kind: profileCommand.kind } };
+            instagramProfile: { username: profileCommand.username, kind: profileCommand.kind },
+            ...(apifySelection?.token ? { apifyAccount: apifySelection.account } : {}) };
           try { await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id, params: job }); }
           catch (error) {
             if (!/already|exists|duplicate|conflict/i.test(error instanceof Error ? error.message : String(error))) throw error;
@@ -1872,11 +1895,13 @@ export default {
     }
 
     return storyWorker.fetch(request, { ...env,
+      ...(apifySelection ? { APIFY_API_TOKEN: apifySelection.token } : {}),
       queueInstagramStory: async (target: StoryTarget, message: TelegramMessage) => {
         const userId = message.from?.id || message.chat.id;
         const id = `igdl-${message.chat.id}-${message.message_id}-${userId}`;
         const job: YoutubeDownloadJob = { id, chatId: message.chat.id, userId,
           requestMessageId: message.message_id, url: target.url,
+          ...(apifySelection?.token ? { apifyAccount: apifySelection.account } : {}),
           instagramProfile: { username: target.kind === "story" ? target.username : "highlight", kind: "story", target } };
         try { await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id, params: job }); }
         catch (error) {
@@ -1889,6 +1914,7 @@ export default {
           id, chatId: post.chatId, requestMessageId: post.requestMessageId,
           userId: post.userId, url: post.url,
           instagramPostRequest: { shortcode: post.shortcode },
+          ...(apifySelection?.token ? { apifyAccount: apifySelection.account } : {}),
         };
         try { await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id, params: job }); }
         catch (error) {

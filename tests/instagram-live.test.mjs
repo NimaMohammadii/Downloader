@@ -29,6 +29,9 @@ const { outputFiles } = await build({
         export const recordDownload = async(_env,record)=>{(globalThis.downloadHistory ||= []).push(record);};
         export const isInstagramDownloadLink = text=>/instagram.com\\//.test(text);
         export const telegramTextMotion=async()=>{};
+        export const apifyAccountToken=(env,account)=>env['APIFY_API_TOKEN_'+account]?.trim()||(account===1?env.APIFY_API_TOKEN?.trim():undefined);
+        export const activeApifyAccount=async(env)=>({account:1,token:apifyAccountToken(env,1)});
+
         export const recordUsage=async()=>true; export const recordMediaDelivery=async()=>{}; export const telegramCustomEmoji=(_method,payload)=>payload;
         export const telegramFileCache=async(...args)=>globalThis.testFileCache ? globalThis.testFileCache(...args) : null; export class AdminStatsStore{} export const ADMIN_USER_ID=1;
         export const recordUserActivity=async()=>{};
@@ -1134,18 +1137,18 @@ test('Instagram rejects ambiguous and unconfirmed floods without any automatic r
 });
 
 async function publicStoryWorkflow({large=false,initialStatus='RUNNING',startError=false,readFailures=0,waitError,
-  checkpoints=new Map(),events=new Map(),interruptOnce=false,finalStatus,datasetFailures=0}={}) {
+  checkpoints=new Map(),events=new Map(),interruptOnce=false,finalStatus,datasetFailures=0,selectedAccount}={}) {
   const calls=[],messages=[],children=[],options=[];
   globalThis.downloadHistory=[];globalThis.testFileCache=undefined;globalThis.delivered=0;
   const target={kind:'story',username:'example',storyId:'999',url:'https://www.instagram.com/stories/example/999/'};
-  const selected={...job,url:target.url,instagram:undefined,instagramProfile:{kind:'story',username:'example',target}};
+  const selected={...job,url:target.url,instagram:undefined,instagramProfile:{kind:'story',username:'example',target},...(selectedAccount?{apifyAccount:selectedAccount}:{})};
   const runId='storyRun00001',datasetId='storyDataset00001';
-  const bindings={...env,APIFY_API_TOKEN:'private-story-token',YOUTUBE_DOWNLOAD_WORKFLOW:{
+  const bindings={...env,APIFY_API_TOKEN:'private-story-token',APIFY_API_TOKEN_1:'numbered-account-one',APIFY_API_TOKEN_2:'numbered-account-two',YOUTUBE_DOWNLOAD_WORKFLOW:{
     async get(id){return {async sendEvent(event){events.set(event.type,event.payload);}};},
     async create(value){children.push(value.params);},
   }};
   globalThis.fetch=async(url,init={})=>{
-    url=new URL(url);calls.push({url,method:init.method||'GET',body:init.body});
+    url=new URL(url);calls.push({url,method:init.method||'GET',body:init.body,authorization:new Headers(init.headers).get('authorization')});
     if(url.hostname==='api.telegram.org'){
       messages.push({method:url.pathname.split('/').at(-1),body:JSON.parse(init.body)});
       return Response.json({ok:true,result:{message_id:33,video:{file_id:'story-file'}}});
@@ -1288,4 +1291,39 @@ test('public Story dataset connection failure retries only reads of the checkpoi
   assert.equal(result.calls.filter(x=>x.url.hostname==='api.apify.com'&&x.method==='POST').length,1);
   assert.equal(result.calls.filter(x=>x.url.pathname.includes('/datasets/')).length,2);
   assert.equal(result.messages.filter(x=>x.method==='sendVideo').length,1);
+});
+
+test('queued Story start, status and dataset use the pinned numbered account across Workflow replay',async()=>{
+  const result=await publicStoryWorkflow({selectedAccount:2,interruptOnce:true});
+  await result.replay();
+  const provider=result.calls.filter(x=>x.url.hostname==='api.apify.com');
+  assert.equal(provider.length,3);assert.ok(provider.every(x=>x.authorization==='Bearer numbered-account-two'));
+  assert.equal(provider.filter(x=>x.method==='POST').length,1);
+  assert.equal(result.messages.filter(x=>x.method==='sendVideo').length,1);
+  assert.ok(!JSON.stringify(result.messages).includes('numbered-account-two'));
+});
+
+test('queued TopAPI Reel uses its captured slot for the run and dataset instead of the default token',async()=>{
+  const requests=[],messages=[];globalThis.testFileCache=undefined;globalThis.downloadHistory=[];
+  const selected={...job,instagram:undefined,apifyAccount:2,instagramPostRequest:{shortcode:'Abc123'},url:'https://www.instagram.com/reel/Abc123/'};
+  globalThis.fetch=async(input,init={})=>{
+    const url=new URL(input);
+    if(url.hostname==='api.apify.com') {
+      requests.push({path:url.pathname,authorization:new Headers(init.headers).get('authorization')});
+      if(url.pathname.endsWith('/runs'))return Response.json({data:{id:'postRun00001',status:'SUCCEEDED',defaultDatasetId:'postDataset00001'}});
+      return Response.json([{type:'Video',shortCode:'Abc123',videoUrl:'https://cdn.instagram.com/reel.mp4'}]);
+    }
+    if(url.hostname==='cdn.instagram.com')return new Response(null,{headers:{'content-length':'1000000'}});
+    if(url.hostname==='api.telegram.org'){
+      messages.push(JSON.parse(init.body));return Response.json({ok:true,result:{message_id:33,video:{file_id:'post-file'}}});
+    }
+    throw Error('Unexpected request '+url.hostname);
+  };
+  const checkpoints=new Map();const step={async do(name,opts,fn){if(typeof opts==='function')fn=opts;
+    if(checkpoints.has(name))return structuredClone(checkpoints.get(name));const value=await fn();checkpoints.set(name,structuredClone(value));return value;}};
+  const bindings={...env,APIFY_API_TOKEN:'legacy-default-token',APIFY_API_TOKEN_1:'numbered-one',APIFY_API_TOKEN_2:'numbered-two'};
+  const replay=()=>new mod.YoutubeDownloadWorkflow({},bindings).run({payload:selected},step);
+  await replay();assert.equal(requests.length,2);assert.ok(requests.every(x=>x.authorization==='Bearer numbered-two'));
+  await replay();assert.equal(requests.length,2);assert.equal(globalThis.downloadHistory.at(-1).status,'success');
+  assert.ok(!JSON.stringify(messages).includes('numbered-two'));
 });

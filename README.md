@@ -183,6 +183,20 @@ The existing users, link totals and global success counter are preserved. New ta
 
 Never commit the bot token to the repository.
 
+## Apify account selection
+
+Configure up to four owned Apify accounts with Worker Secrets `APIFY_API_TOKEN_1`,
+`APIFY_API_TOKEN_2`, `APIFY_API_TOKEN_3`, and `APIFY_API_TOKEN_4`. The existing
+`APIFY_API_TOKEN` is still supported as account 1 when `_1` is absent.
+
+Open `/admin` → **🔑 انتخاب اکانت Apify** to select a configured account manually.
+The selection is stored in the existing admin Durable Object and applies to new
+post/Reel, Story/Highlight and profile-Story requests. Existing jobs retain their
+original account number, including across Workflow replay. Tokens stay in Worker
+Secrets; neither Telegram nor Workflow state stores them. Missing slots cannot be
+selected. There is no automatic account rotation, and Bright Data's existing key
+is independent of this setting.
+
 ## Optional Instagram secrets
 
 For Story/Highlight/Live/replay support and content that Instagram gates behind login, add these as Cloudflare Worker secrets/environment variables:

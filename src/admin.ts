@@ -192,6 +192,46 @@ export type AdminStatsEnv = {
   ADMIN_STATS: DurableObjectNamespace<AdminStatsStore>;
 };
 
+export type ApifyAccount = 1 | 2 | 3 | 4;
+export type ApifyAccountSecrets = {
+  APIFY_API_TOKEN?: string;
+  APIFY_API_TOKEN_1?: string;
+  APIFY_API_TOKEN_2?: string;
+  APIFY_API_TOKEN_3?: string;
+  APIFY_API_TOKEN_4?: string;
+};
+export const APIFY_ACCOUNTS: readonly ApifyAccount[] = [1, 2, 3, 4];
+
+export function apifyAccountToken(env: ApifyAccountSecrets, account: ApifyAccount): string | undefined {
+  // Preserve the existing Secret as account 1; numbered Secrets take priority.
+  return env[`APIFY_API_TOKEN_${account}`]?.trim() || (account === 1 ? env.APIFY_API_TOKEN?.trim() : undefined) || undefined;
+}
+
+export async function activeApifyAccount(env: Partial<AdminStatsEnv> & ApifyAccountSecrets): Promise<{
+  account: ApifyAccount; token?: string;
+}> {
+  let account: ApifyAccount = 1;
+  if (env.ADMIN_STATS) {
+    const response = await env.ADMIN_STATS.getByName("global").fetch("https://admin-stats/apify-account");
+    if (!response.ok) throw new Error("APIFY_ACCOUNT_SETTING_UNAVAILABLE");
+    const value = await response.json() as { account?: ApifyAccount };
+    if (!APIFY_ACCOUNTS.includes(value.account!)) throw new Error("APIFY_ACCOUNT_SETTING_INVALID");
+    account = value.account!;
+  }
+  const token = apifyAccountToken(env, account);
+  if (!token && (account !== 1 || APIFY_ACCOUNTS.some(slot => apifyAccountToken(env, slot))))
+    throw new Error("APIFY_ACCOUNT_SECRET_MISSING");
+  return { account, token };
+}
+
+export async function setActiveApifyAccount(env: AdminStatsEnv & ApifyAccountSecrets, account: ApifyAccount): Promise<void> {
+  if (!APIFY_ACCOUNTS.includes(account) || !apifyAccountToken(env, account)) throw new Error("APIFY_ACCOUNT_SECRET_MISSING");
+  const response = await env.ADMIN_STATS.getByName("global").fetch("https://admin-stats/apify-account", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ account }),
+  });
+  if (!response.ok) throw new Error("APIFY_ACCOUNT_SETTING_UNAVAILABLE");
+}
+
 export type TrackedUser = {
   id: number;
   username?: string;
@@ -355,6 +395,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       INSERT OR IGNORE INTO membership_access(user_id, first_download_at)
         SELECT user_id, MIN(created_at) FROM download_history WHERE delivered > 0 GROUP BY user_id;
       INSERT OR IGNORE INTO counters(key, value) VALUES ('membership_enabled', 1);
+      INSERT OR IGNORE INTO counters(key, value) VALUES ('apify_account', 1);
 
       CREATE TABLE IF NOT EXISTS telegram_file_cache (
         key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at INTEGER NOT NULL
@@ -455,6 +496,17 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         all: this.usageTotals(0, now, id), day: this.usageTotals(now - 86400_000, now, id),
         week: this.usageTotals(now - 7 * 86400_000, now, id),
       } satisfies AdminUsage);
+    }
+
+    if (url.pathname === "/apify-account") {
+      const sql = this.ctx.storage.sql;
+      if (request.method === "POST") {
+        const payload = await request.json().catch(() => null) as { account?: ApifyAccount } | null;
+        if (!payload || !APIFY_ACCOUNTS.includes(payload.account!)) return new Response("Invalid account", { status: 400 });
+        sql.exec("UPDATE counters SET value = ? WHERE key = 'apify_account'", payload.account);
+      } else if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
+      const row = sql.exec("SELECT value FROM counters WHERE key = 'apify_account'").one();
+      return Response.json({ account: asNumber(row.value) });
     }
 
     if (url.pathname === "/membership") {
@@ -843,6 +895,7 @@ export function adminDashboardKeyboard(): Record<string, unknown> {
         { text: "فعال‌های ۷ روز", callback_data: "admin:users:0:week" }],
       [{ text: "لینک‌فرستاده‌های ۲۴ ساعت", callback_data: "admin:used:0:day" },
         { text: "لینک‌فرستاده‌های ۷ روز", callback_data: "admin:used:0:week" }],
+      [{ text: "🔑 انتخاب اکانت Apify", callback_data: "admin:apify" }],
       [{ text: "عضویت اجباری چنل", callback_data: "admin:membership" }],
       [{ text: "🔄 بروزرسانی آمار", callback_data: "admin:stats" }],
     ],
