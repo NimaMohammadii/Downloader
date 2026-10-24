@@ -20,6 +20,7 @@ type Env = AdminStatsEnv & {
   INSTAGRAM_DS_USER_ID?: string;
   INSTAGRAM_MID?: string;
   INSTAGRAM_IG_DID?: string;
+  APIFY_API_TOKEN?: string;
 };
 
 type TelegramUser = { id: number; first_name?: string; last_name?: string; username?: string };
@@ -261,7 +262,8 @@ function privateHeaders(jar: CookieJar): Headers | null {
   return headers;
 }
 
-type StoryFailure = "session_missing" | "login_required" | "challenge_required" | "rate_limited" | "network" | "user_lookup" | "unavailable" | "no_media";
+type StoryFailure = "session_missing" | "login_required" | "challenge_required" | "rate_limited" | "network" | "user_lookup" | "unavailable" | "no_media"
+  | "apify_auth" | "apify_quota" | "apify_failed" | "apify_wrong_target" | "apify_invalid_media" | "apify_no_media" | "apify_too_many" | "apify_unavailable";
 
 class StoryError extends Error {
   constructor(readonly code: StoryFailure) {
@@ -271,6 +273,14 @@ class StoryError extends Error {
 
 function storyErrorText(error: unknown): string {
   const code = error instanceof StoryError ? error.code : "network";
+  if (code === "apify_auth") return "❌ توکن Apify برای دریافت استوری معتبر نیست یا دسترسی استخراج‌کننده فعال نشده است.";
+  if (code === "apify_quota") return "❌ اعتبار یا محدودیت حساب Apify اجازه دریافت استوری را نمی‌دهد.";
+  if (code === "apify_failed") return "❌ اجرای استخراج‌کننده Apify کامل نشد؛ قبل از تلاش دوباره، وضعیت اجرا را در داشبورد بررسی کن.";
+  if (code === "apify_wrong_target") return "❌ نتیجه استخراج با لینک استوری/هایلایت مطابقت نداشت؛ فایل اشتباه ارسال نشد.";
+  if (code === "apify_invalid_media") return "❌ استخراج‌کننده Apify لینک معتبر برای فایل استوری برنگرداند.";
+  if (code === "apify_no_media") return "❌ استخراج‌کننده Apify هیچ فایل قابل دانلودی برای این استوری پیدا نکرد.";
+  if (code === "apify_too_many") return "❌ تعداد فایل‌های استوری/هایلایت بیشتر از سقف یک درخواست است؛ ارسال ناقص انجام نشد.";
+  if (code === "apify_unavailable") return "❌ این استوری در Apify قابل دسترسی نبود، خصوصی یا منقضی شده است.";
   if (code === "session_missing") return "❌ سشن اینستاگرام تنظیم نشده یا معتبر نیست؛ INSTAGRAM_SESSIONID باید در Secretهای همین Worker تنظیم شود.";
   if (code === "login_required") return "❌ اینستاگرام سشن ذخیره‌شده را قبول نکرد؛ سشن نیاز به ورود دوباره دارد.";
   if (code === "challenge_required") return "❌ اکانت اینستاگرام نیاز به تأیید امنیتی دارد؛ ابتدا داخل خود اینستاگرام تأییدش کن.";
@@ -469,7 +479,109 @@ async function chooseCandidate(item: any, upload = false): Promise<MediaCandidat
   return unknown;
 }
 
+// A verified public Story & Highlight actor can be used when explicitly
+// configured. Keep all Story traffic in this existing resolver so the direct
+// link handler and profile-story workflow share one source of truth.
+async function apifyPublicStory(target: StoryTarget, env: Env, upload: boolean): Promise<MediaCandidate[]> {
+  const apiToken = env.APIFY_API_TOKEN!.trim();
+  const isHighlight = target.kind === "highlight";
+  if (!isHighlight && !/^[A-Za-z0-9_.]{1,30}$/.test(target.username)) throw new StoryError("user_lookup");
+  const canonical = isHighlight
+    ? "https://www.instagram.com/stories/highlights/" + target.highlightId + "/"
+    : "https://www.instagram.com/stories/" + target.username + "/"
+      + (target.storyId ? target.storyId + "/" : "");
+  // This is an established Apify Actor ID and documented synchronous endpoint;
+  // do not invent a Bright Data Stories dataset ID.
+  const endpoint = "https://api.apify.com/v2/actors/rowfinch~instagram-stories-scraper/run-sync-get-dataset-items";
+  let response: Response;
+  try {
+    response = await fetch(endpoint, {
+      method: "POST",
+      headers: { authorization: "Bearer " + apiToken,
+        "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({
+        usernames: [canonical],
+        stories: !isHighlight,
+        highlights: isHighlight,
+        ...(isHighlight ? { highlightsLimit: 1 } : {}),
+      }),
+      redirect: "error",
+      // Never retry an ambiguous billable run. It could still finish upstream.
+      signal: AbortSignal.timeout(45_000),
+    });
+  } catch { throw new StoryError("apify_failed"); }
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => undefined);
+    console.warn("instagram apify story rejected", { status: response.status });
+    if (response.status === 401 || response.status === 403) throw new StoryError("apify_auth");
+    if (response.status === 402 || response.status === 429) throw new StoryError("apify_quota");
+    throw new StoryError("apify_failed");
+  }
+
+  const rows: unknown = await response.json().catch(() => null);
+  if (!Array.isArray(rows) || !rows.length) throw new StoryError("apify_no_media");
+  if (rows.some((row: any) => row?.error || row?.error_type)) throw new StoryError("apify_unavailable");
+
+  // An exact story link selects only its own ID, even if the provider returns
+  // the whole tray. Do not send a neighboring story by accident.
+  const selected = !isHighlight && target.storyId
+    ? rows.filter((row: any) => String(row?.id ?? "") === target.storyId)
+    : rows;
+  if (!selected.length) throw new StoryError("apify_no_media");
+  if (selected.length > 20) throw new StoryError("apify_too_many");
+
+  const resolved: MediaCandidate[] = [];
+  for (const item of selected) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw new StoryError("apify_invalid_media");
+    const row = item as Record<string, any>;
+    const type = typeof row.type === "string" ? row.type.toLowerCase() : "";
+    if (type !== (isHighlight ? "highlight" : "story")) throw new StoryError("apify_wrong_target");
+    const storyId = String(row.id ?? "");
+    if (!/^\d{1,24}$/.test(storyId)) throw new StoryError("apify_invalid_media");
+    if (isHighlight) {
+      if (String(row.highlightId ?? "") !== target.highlightId) throw new StoryError("apify_wrong_target");
+    } else {
+      const owner = String(row.ownerUsername || "").toLowerCase();
+      if (owner && owner !== target.username.toLowerCase()) throw new StoryError("apify_wrong_target");
+      if (typeof row.url === "string") {
+        const match = /\/stories\/([A-Za-z0-9_.]+)\//.exec(row.url);
+        if (match && match[1].toLowerCase() !== target.username.toLowerCase()) throw new StoryError("apify_wrong_target");
+      }
+    }
+    const mediaType = typeof row.mediaType === "string" ? row.mediaType.toLowerCase() : "";
+    if (mediaType !== "image" && mediaType !== "video") throw new StoryError("apify_invalid_media");
+    // Video previews must never be substituted for a missing video file.
+    const value = mediaType === "video" ? row.videoUrl : row.displayUrl;
+    if (typeof value !== "string") throw new StoryError("apify_no_media");
+    let media: URL;
+    try { media = new URL(value); }
+    catch { throw new StoryError("apify_invalid_media"); }
+    const host = media.hostname.toLowerCase();
+    if (media.protocol !== "https:" || media.username || media.password || media.port
+        || !["cdninstagram.com", "fbcdn.net", "instagram.com"].some(suffix =>
+          host === suffix || host.endsWith("." + suffix))) throw new StoryError("apify_invalid_media");
+
+    const candidate: MediaCandidate = {
+      kind: mediaType === "video" ? "video" : "photo",
+      url: media.toString(), width: Number(row.width) || 0, height: Number(row.height) || 0,
+      storyId,
+    };
+    if (!upload) {
+      const size = await probeSize(candidate.url);
+      const limit = candidate.kind === "video" ? VIDEO_LIMIT : PHOTO_LIMIT;
+      if (size !== null && size > limit) throw new StoryError("no_media");
+    }
+    resolved.push(upload ? { ...candidate, variants: [candidate] } : candidate);
+  }
+  console.log("instagram story resolver success", {
+    resolver: "apify-public-stories", kind: isHighlight ? "highlight" : "story",
+    count: resolved.length,
+  });
+  return resolved;
+}
+
 async function privateResolve(target: StoryTarget, env: Env, upload = false): Promise<MediaCandidate[] | null> {
+  if (env.APIFY_API_TOKEN?.trim()) return apifyPublicStory(target, env, upload);
   if (!env.INSTAGRAM_SESSIONID?.trim()) throw new StoryError("session_missing");
   const jar = createJar(env); // One jar for the entire private resolver chain.
   if (!authParts(jar)) throw new StoryError("session_missing");
