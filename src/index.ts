@@ -839,6 +839,13 @@ async function resolvePostWithTopApi(
     }
     run = statusBody.data;
   }
+  if (["FAILED", "ABORTED", "TIMED-OUT"].includes(String(run?.status))) {
+    console.warn("instagram topapi actor failed", {
+      runId, status: run.status, kind: isReel ? "reels" : "posts",
+      durationMs: elapsed(),
+    });
+    throw new Error("TOPAPI_UNAVAILABLE");
+  }
   if (run?.status !== "SUCCEEDED") {
     console.warn("instagram topapi still running", {
       runId, status: typeof run?.status === "string" ? run.status.slice(0, 24) : "unknown",
