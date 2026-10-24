@@ -196,6 +196,45 @@ test('Bright Data refuses another post, unsafe media URLs and missing Reel video
   }
 });
 
+test('Bright Data reports whether a successful Reel record contains a usable video link', async () => {
+  for (const [payload, state] of [
+    [{url: 'https://www.instagram.com/reel/' + shortcode + '/', description: 'metadata only'}, 'missing'],
+    [{url: 'https://www.instagram.com/reel/' + shortcode + '/', video_url: 'https://example.com/file.mp4'}, 'unsupported_host'],
+    [{url: 'https://www.instagram.com/reel/' + shortcode + '/', video_url: {url: 'https://scontent.cdninstagram.com/movie.mp4'}}, 'non_string'],
+  ]) {
+    const result = await run({env: {BRIGHTDATA_API_KEY: 'sensitive-api-key'}, respond(call) {
+      if (call.hostname === 'api.brightdata.com') return Response.json([payload]);
+    }});
+    assert.equal(files(result).length, 0);
+    assert.equal(result.calls.length, 1);
+    assert.match(report(result), /BRIGHTDATA_NO_MEDIA/);
+    const diagnostic = result.diagnostics.find(x => x.message === 'instagram brightdata no media')?.info;
+    assert.equal(diagnostic?.reason, 'video_link_missing_or_unusable');
+    assert.equal(diagnostic?.videoUrlState, state);
+    assert.equal(diagnostic?.dataset, 'reels');
+    assert.equal(diagnostic?.records, 1);
+    assert.ok(!JSON.stringify(diagnostic).includes('metadata only'));
+    assert.ok(!JSON.stringify(diagnostic).includes('example.com'));
+    assert.ok(!JSON.stringify(result.diagnostics).includes('sensitive-api-key'));
+  }
+});
+
+test('Bright Data reports provider error records and empty results without sending media', async () => {
+  for (const [payload, reason] of [
+    [[{error: 'upstream denied private account', status: 'fail'}], 'provider_error_record'],
+    [[], 'invalid_record_count'],
+  ]) {
+    const result = await run({env: {BRIGHTDATA_API_KEY: 'sensitive-api-key'}, respond(call) {
+      if (call.hostname === 'api.brightdata.com') return Response.json(payload);
+    }});
+    assert.equal(result.calls.length, 1);
+    assert.equal(files(result).length, 0);
+    const diagnostic = result.diagnostics.find(x => x.message === 'instagram brightdata no media')?.info;
+    assert.equal(diagnostic?.reason, reason);
+    assert.ok(!JSON.stringify(result.diagnostics).includes('upstream denied'));
+  }
+});
+
 test('Bright Data 202 pending snapshot does not retry or silently switch to Instagram', async () => {
   const result = await run({env: {BRIGHTDATA_API_KEY: 'key'}, respond(call) {
     if (call.hostname === 'api.brightdata.com') return Response.json({snapshot_id: 's_fixture'},
