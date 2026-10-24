@@ -6,7 +6,9 @@ import {
   type WorkflowStep,
 } from "cloudflare:workers";
 import storyWorker, { instagramProfileStories, parseInstagramProfileCommand, parseInstagramVideoTarget, parseInstagramAudioTarget, resolveInstagramVideo, instagramVideoErrorText, type InstagramVideoTarget, type InstagramVideoSource } from "./story-main";
-import { instagramProfilePage, instagramProfilePostMedia, instagramProfileErrorText, type InstagramPostUpload } from "./index";
+import { instagramProfilePage, instagramProfilePostMedia, instagramProfileErrorText,
+  resolveInstagramPostForWorkflow, sendInstagramPostDirect, instagramPostFriendlyError,
+  type InstagramPostUpload } from "./index";
 import {
   telegramTextMotion,
   telegramCustomEmoji,
@@ -53,6 +55,7 @@ type YoutubeDownloadJob = {
   statusMessageId?: number;
   instagram?: InstagramVideoTarget;
   instagramPost?: InstagramPostUpload;
+  instagramPostRequest?: { shortcode: string };
   instagramProfile?: { username: string; kind?: "posts" | "story" };
   instagramProfileParent?: { id: string; eventType: string };
   recognition?: RecognitionInput;
@@ -74,6 +77,8 @@ type Env = AdminStatsEnv & {
   INSTAGRAM_DS_USER_ID?: string;
   INSTAGRAM_MID?: string;
   INSTAGRAM_IG_DID?: string;
+  BRIGHTDATA_API_KEY?: string;
+  APIFY_API_TOKEN?: string;
 };
 
 type TelegramUser = {
@@ -458,6 +463,8 @@ async function containerResult<T>(env: Env, job: YoutubeDownloadJob, request: Re
 }
 
 function jobHistory(job: YoutubeDownloadJob): Omit<DownloadRecord, "status"> {
+  if (job.instagramPostRequest) return { key: `ig:${job.chatId}:${job.requestMessageId}:${job.userId}`,
+    userId: job.userId, source: "Instagram post", request: job.url };
   if (job.instagramProfile) return { key: job.id, userId: job.userId, source: job.instagramProfile.kind === "story" ? "Instagram profile stories" : "Instagram profile posts", request: job.url };
   if (job.instagramProfileParent) return { key: job.id, userId: job.userId, source: job.instagramPost?.storyId ? "Instagram story" : "Instagram post", request: job.url };
   if (job.instagramPost) return { key: `ig:${job.chatId}:${job.requestMessageId}:${job.userId}`,
@@ -481,9 +488,11 @@ async function trackJob(env: Env, job: YoutubeDownloadJob, status: DownloadStatu
 export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDownloadJob> {
   async run(event: WorkflowEvent<YoutubeDownloadJob>, step: WorkflowStep) {
     const job: YoutubeDownloadJob = { ...event.payload };
-    const inspect = !job.instagramProfile && !job.instagram && !job.instagramPost && !job.recognition && !job.playlist && !job.social && !job.quality && !job.audioMode && job.source !== "pornhub";
+    const inspect = !job.instagramProfile && !job.instagram && !job.instagramPost &&
+      !job.instagramPostRequest && !job.recognition && !job.playlist && !job.social && !job.quality && !job.audioMode && job.source !== "pornhub";
     await step.do("track download request", () => trackJob(this.env, job, inspect ? "pending" : "processing"));
     if (job.instagramProfile) return this.runInstagramProfile(job, step);
+    if (job.instagramPostRequest) return this.runInstagramPostRequest(job, step);
     if (job.instagram || job.instagramPost || job.recognition || job.playlist || job.social) {
       const result = await this.runInstagram(job, step).catch(error => {
         if (!job.instagramProfileParent) throw error;
@@ -500,6 +509,61 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       return;
     }
     return this.runYoutube(job, step);
+  }
+
+  // Resolve public posts inside the durable Workflow. The Telegram webhook
+  // already returned, so Apify can finish without depending on that socket.
+  // A no-retry paid step and a stable Workflow ID prevent double billing when
+  // Telegram re-delivers an update or the Worker is restarted.
+  private async runInstagramPostRequest(job: YoutubeDownloadJob, step: WorkflowStep): Promise<void> {
+    try {
+      const media = await step.do("resolve public Instagram post once", {
+        retries: { limit: 0, delay: "1 second" }, timeout: "5 minutes",
+      }, () => resolveInstagramPostForWorkflow(job.url, job.instagramPostRequest!.shortcode, this.env));
+      if (!media.length) throw new Error("INSTAGRAM_NO_MEDIA");
+
+      if (media.some(item => item.kind === "video" && (item.size === null || item.size > 19_000_000))) {
+        // The same complete-file uploader is used only when Telegram's direct
+        // video URL limit cannot accommodate the resolved media.
+        const upload: InstagramPostUpload = {
+          shortcode: job.instagramPostRequest!.shortcode, url: job.url,
+          chatId: job.chatId, userId: job.userId,
+          requestMessageId: job.requestMessageId,
+          statusMessageId: job.statusMessageId!, media,
+        };
+        await this.runInstagram({ ...job, instagramPost: upload, instagramPostRequest: undefined }, step);
+        return;
+      }
+
+      const delivered = await step.do("deliver public Instagram post once", {
+        retries: { limit: 0, delay: "1 second" }, timeout: "5 minutes",
+      }, () => sendInstagramPostDirect(
+        this.env, { kind: "post", url: job.url, shortcode: job.instagramPostRequest!.shortcode },
+        { chat: { id: job.chatId }, message_id: job.requestMessageId, from: { id: job.userId } },
+        media, `ig:${job.chatId}:${job.requestMessageId}:${job.userId}`,
+      ));
+      await step.do("record public Instagram post delivery", () =>
+        trackJob(this.env, job, "success", { delivered }));
+      if (job.statusMessageId) await step.do("clear public Instagram post status", {
+        retries: { limit: 0, delay: "1 second" }, timeout: "30 seconds",
+      }, () => safeTelegramCall(this.env.BOT_TOKEN, "deleteMessage", {
+        chat_id: job.chatId, message_id: job.statusMessageId,
+      }));
+    } catch (error) {
+      const cause = error instanceof Error ? error.message : "UNKNOWN";
+      console.warn("instagram post workflow failed", {
+        code: /^TOPAPI_[A-Z_]+$/.test(cause) || /^BRIGHTDATA_[A-Z_]+$/.test(cause) ? cause : "INSTAGRAM_RESOLUTION_OR_DELIVERY_ERROR",
+        jobId: job.id,
+      });
+      // Never restart a paid provider call after an ambiguous timeout.
+      await step.do("track public Instagram post failure", { retries: { limit: 0, delay: "1 second" } }, () =>
+        trackJob(this.env, job, "failed", { detail: "دریافت یا ارسال پست اینستاگرام کامل نشد." }));
+      await step.do("report public Instagram post failure", { retries: { limit: 0, delay: "1 second" } }, () =>
+        safeTelegramCall(this.env.BOT_TOKEN, job.statusMessageId ? "editMessageText" : "sendMessage", {
+          chat_id: job.chatId, ...(job.statusMessageId ? { message_id: job.statusMessageId } : {}),
+          text: instagramPostFriendlyError(error),
+        }));
+    }
   }
 
   private async runInstagramProfile(job: YoutubeDownloadJob, step: WorkflowStep): Promise<void> {
@@ -1697,6 +1761,18 @@ export default {
     }
 
     return storyWorker.fetch(request, { ...env,
+      queueInstagramPost: async (post: Omit<InstagramPostUpload, "media">) => {
+        const id = `igdl-${post.chatId}-${post.requestMessageId}-${post.userId}`;
+        const job: YoutubeDownloadJob = {
+          id, chatId: post.chatId, requestMessageId: post.requestMessageId,
+          userId: post.userId, statusMessageId: post.statusMessageId, url: post.url,
+          instagramPostRequest: { shortcode: post.shortcode },
+        };
+        try { await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id, params: job }); }
+        catch (error) {
+          if (!/already|exists|duplicate|conflict/i.test(error instanceof Error ? error.message : String(error))) throw error;
+        }
+      },
       uploadInstagramPost: async (post: InstagramPostUpload) => {
         const id = `igdl-${post.chatId}-${post.requestMessageId}-${post.userId}`;
         const job: YoutubeDownloadJob = { id, chatId: post.chatId, requestMessageId: post.requestMessageId,
