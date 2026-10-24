@@ -12,7 +12,7 @@ const { outputFiles } = await build({
       : 'export const recordUsage=async()=>true; export const recordMediaDelivery=async()=>{}; export const telegramCustomEmoji=(_method,payload)=>payload; export const telegramTextMotion=async()=>{}; export const telegramFileCache=async(...args)=>globalThis.storyFileCache ? globalThis.storyFileCache(...args) : null; export class AdminStatsStore {} export const ADMIN_USER_ID = 1; export async function recordDownload(_env,record) {(globalThis.downloadHistory ||= []).push(record);} export async function recordSuccessfulDelivery() {}' }));
   } }],
 });
-const { default: worker, parseInstagramProfileCommand, instagramProfileStories } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
+const { default: worker, parseInstagramProfileCommand, instagramProfileStories, startInstagramStoryRun, readInstagramStoryRun, instagramStoryItems, instagramVideoErrorText } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
 const session = '12345%3Afictional-test-session';
 const media = { pk: '999', user: { pk: '77' }, video_versions: [{ url: 'https://cdn.instagram.com/test.mp4', width: 720, height: 1280 }] };
 
@@ -56,198 +56,110 @@ async function run({ routes = {}, env = {}, link = 'https://www.instagram.com/st
 }
 
 
-const apifyPath = '/v2/actors/rowfinch~instagram-stories-scraper/run-sync-get-dataset-items';
+const target = {kind:'story',username:'example',storyId:'999',url:'https://www.instagram.com/stories/example/999/'};
+const publicEnv = {BOT_TOKEN:'fictional-token', APIFY_API_TOKEN:'private-apify-token',INSTAGRAM_SESSIONID:''};
+const publicVideo = {type:'story',id:'999',ownerUsername:'example',mediaType:'Video',
+  videoUrl:'https://cdn.instagram.com/video.mp4',displayUrl:'https://cdn.instagram.com/poster.jpg',width:1080,height:1920};
+const runId='storyRun00001',datasetId='storyDataset00001';
 
-test('configured public Story API sends exact video and never uses personal Instagram session', async () => {
-  const r = await run({env:{APIFY_API_TOKEN:'private-apify-token', INSTAGRAM_SESSIONID:''},
-    routes:{[apifyPath]:() => Response.json([
-      {type:'story',id:'998',ownerUsername:'example',mediaType:'Image',
-        displayUrl:'https://cdn.instagram.com/old.jpg'},
-      {type:'story',id:'999',ownerUsername:'example',mediaType:'Video',
-        videoUrl:'https://cdn.instagram.com/video.mp4',displayUrl:'https://cdn.instagram.com/poster.jpg',
-        width:1080,height:1920},
-    ])}});
-  assert.deepEqual(r.requests.map(x=>x.url.hostname), ['api.apify.com']);
-  assert.equal(r.requests[0].headers.get('authorization'), 'Bearer private-apify-token');
-  assert.equal(r.requests[0].headers.get('cookie'), null);
-  assert.deepEqual(r.telegram.filter(x=>['sendPhoto','sendVideo'].includes(x.method)).map(x=>x.method), ['sendVideo']);
-  assert.ok(!JSON.stringify(r.telegram).includes('private-apify-token'));
+test('public Story webhook queues work before provider requests or Telegram sends',async()=>{
+  const queued=[];
+  const result=await run({env:{...publicEnv,queueInstagramStory:async(t,m)=>queued.push({t,m})}});
+  assert.equal(result.requests.length,0);assert.equal(result.telegram.length,0);
+  assert.equal(queued.length,1);assert.deepEqual(queued[0].t,target);
 });
 
-test('public Story API handles a complete current-story tray with no Instagram session', async () => {
-  const r = await run({link:'https://www.instagram.com/stories/example/',
-    env:{APIFY_API_TOKEN:'private-token',INSTAGRAM_SESSIONID:''},
-    routes:{[apifyPath]:()=>Response.json([
-      {type:'story',id:'999',ownerUsername:'example',mediaType:'Image',
-        displayUrl:'https://cdn.instagram.com/photo.jpg'},
-      {type:'story',id:'1000',ownerUsername:'example',mediaType:'Video',
-        videoUrl:'https://cdn.instagram.com/movie.mp4'},
-    ])}});
-  assert.equal(r.requests.length,1);
-  assert.deepEqual(r.telegram.filter(x=>['sendPhoto','sendVideo'].includes(x.method)).map(x=>x.method),
-    ['sendPhoto','sendVideo']);
+test('public Story without the Workflow capability never starts an untracked paid run or personal-session fallback',async()=>{
+  const result=await run({env:publicEnv});
+  assert.equal(result.requests.length,0);assert.match(result.telegram[0].body.text,/Workflow/);
 });
 
-test('public Story API downloads a single matching Highlight from its public URL', async () => {
-  const id='17950000000123456';
-  const r = await run({link:'https://www.instagram.com/stories/highlights/'+id+'/',
-    env:{APIFY_API_TOKEN:'private-token',INSTAGRAM_SESSIONID:''},
-    routes:{[apifyPath]:()=>Response.json([
-      {type:'highlight',id:'999',highlightId:id,mediaType:'Video',
-        videoUrl:'https://cdn.instagram.com/video.mp4'},
-    ])}});
-  assert.equal(r.requests.length,1);
-  assert.deepEqual(r.telegram.filter(x=>['sendPhoto','sendVideo'].includes(x.method)).map(x=>x.method),
-    ['sendVideo']);
-});
-
-test('public Story API rejects wrong owners, highlights, and absent requested IDs', async () => {
-  for (const [link,rows,expected] of [
-    ['https://www.instagram.com/stories/example/999/',
-      [{type:'story',id:'999',ownerUsername:'different',mediaType:'Video',
-        videoUrl:'https://cdn.instagram.com/video.mp4'}], /مطابقت/],
-    ['https://www.instagram.com/stories/example/999/',
-      [{type:'story',id:'998',ownerUsername:'example',mediaType:'Image',
-        displayUrl:'https://cdn.instagram.com/other.jpg'}], /هیچ فایل قابل دانلودی/],
-    ['https://www.instagram.com/stories/highlights/17950000000123456/',
-      [{type:'highlight',id:'999',highlightId:'17950000000765432',mediaType:'Video',
-        videoUrl:'https://cdn.instagram.com/video.mp4'}], /مطابقت/],
-  ]) {
-    const r=await run({link,env:{APIFY_API_TOKEN:'token',INSTAGRAM_SESSIONID:''},
-      routes:{[apifyPath]:()=>Response.json(rows)}});
-    assert.equal(r.requests.length,1);
-    assert.equal(r.telegram.filter(x=>['sendPhoto','sendVideo'].includes(x.method)).length,0);
-    assert.match(r.telegram.find(x=>x.method==='sendMessage').body.text,expected);
-  }
-});
-
-test('public Story API never substitutes video poster or accepts an unrelated media host', async () => {
-  for (const row of [
-    {type:'story',id:'999',ownerUsername:'example',mediaType:'Video',
-      displayUrl:'https://cdn.instagram.com/poster.jpg'},
-    {type:'story',id:'999',ownerUsername:'example',mediaType:'Video',
-      videoUrl:'https://example.com/file.mp4'},
-  ]) {
-    const r=await run({env:{APIFY_API_TOKEN:'token',INSTAGRAM_SESSIONID:''},
-      routes:{[apifyPath]:()=>Response.json([row])}});
-    assert.equal(r.requests.length,1);
-    assert.equal(r.telegram.filter(x=>['sendPhoto','sendVideo'].includes(x.method)).length,0);
-  }
-});
-
-test('public Story API refuses more than twenty media results before any partial send', async () => {
-  const r=await run({link:'https://www.instagram.com/stories/example/',
-    env:{APIFY_API_TOKEN:'token',INSTAGRAM_SESSIONID:''},
-    routes:{[apifyPath]:()=>Response.json(Array.from({length:21},(_,i)=>({
-      type:'story',id:String(1000+i),ownerUsername:'example',mediaType:'Image',
-      displayUrl:'https://cdn.instagram.com/photo.jpg',
-    })))}});
-  assert.equal(r.requests.length,1);
-  assert.equal(r.telegram.filter(x=>['sendPhoto','sendVideo'].includes(x.method)).length,0);
-  assert.match(r.telegram.find(x=>x.method==='sendMessage').body.text,/سقف/);
-});
-
-test('public Story API authentication failure is terminal and never attempts Instagram session', async () => {
-  const r=await run({env:{APIFY_API_TOKEN:'broken-token',INSTAGRAM_SESSIONID:session},
-    routes:{[apifyPath]:()=>Response.json({error:{type:'Unauthorized'}},{status:401})}});
-  assert.equal(r.requests.length,1);
-  assert.equal(r.telegram.filter(x=>['sendPhoto','sendVideo'].includes(x.method)).length,0);
-  assert.match(r.telegram.find(x=>x.method==='sendMessage').body.text,/توکن Apify/);
-  assert.ok(!JSON.stringify(r.telegram).includes('broken-token'));
-});
-
-test('public Story API exposes safe HTTP status and machine code for provider errors', async () => {
-  for (const [status, type, code] of [
-    [400, 'invalid-input', 'apify_invalid_input'],
-    [404, 'record-not-found', 'apify_actor_missing'],
-    [408, 'run-timeout-exceeded', 'apify_timeout'],
-    [500, 'internal-error', 'apify_server_error'],
-  ]) {
-    const logs=[];
-    const oldWarn=console.warn;
-    console.warn=(message, info)=>logs.push({message,info});
-    try {
-      const r=await run({env:{APIFY_API_TOKEN:'secret-apify-token',INSTAGRAM_SESSIONID:''},
-        routes:{[apifyPath]:()=>Response.json({error:{type,message:'private secret-apify-token'}},{status})}});
-      assert.equal(r.requests.length,1);
-      assert.equal(r.telegram.filter(x=>['sendPhoto','sendVideo'].includes(x.method)).length,0);
-      const reported=logs.find(x=>x.message==='instagram story resolution failed')?.info;
-      assert.equal(reported?.code,code);
-      assert.equal(reported?.provider?.status,status);
-      assert.equal(reported?.provider?.providerCode,type);
-      assert.equal(reported?.provider?.stage,'response');
-      assert.ok(!JSON.stringify(logs).includes('secret-apify-token'));
-      assert.ok(!JSON.stringify(r.telegram).includes('secret-apify-token'));
-    } finally {console.warn=oldWarn;}
-  }
-});
-
-test('public Story API distinguishes network disconnect and timeout without triggering another run', async () => {
-  for (const [error,expectedCode,reason] of [
-    [new TypeError('private-network-information'), 'apify_failed','network_or_redirect'],
-    [Object.assign(new Error('timed out'),{name:'TimeoutError'}), 'apify_timeout','timeout'],
-  ]) {
-    const oldFetch=globalThis.fetch,oldWarn=console.warn;
-    const logs=[],calls=[];
-    try {
-      globalThis.fetch=async(url,init={})=>{
-        calls.push(String(url));
-        if(String(url).includes('/v2/actors/rowfinch~instagram-stories-scraper/'))throw error;
-        if(String(url).includes('api.telegram.org'))return Response.json({ok:true,result:{message_id:10}});
-        throw Error('Unexpected network request');
-      };
-      console.warn=(message,info)=>logs.push({message,info});
-      const message={message_id:7,from:{id:1},chat:{id:1},
-        text:'https://www.instagram.com/stories/example/999/'};
-      const request=new Request('https://worker/telegram/webhook',{
-        method:'POST',
-        headers:{'x-telegram-bot-api-secret-token':'dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1','content-type':'application/json'},
-        body:JSON.stringify({update_id:123,message}),
-      });
-      const response=await worker.fetch(request,{BOT_TOKEN:'fictional-token',APIFY_API_TOKEN:'private-apify-token'}, {});
-      assert.equal(response.status,200);
-      assert.equal(calls.filter(x=>x.includes('api.apify.com')).length,1);
-      const logged=logs.find(x=>x.message==='instagram story resolution failed')?.info;
-      assert.equal(logged?.code,expectedCode);
-      assert.equal(logged?.provider?.stage,'request');
-      assert.equal(logged?.provider?.reason,reason);
-      assert.ok(!JSON.stringify(logs).includes('private-apify-token'));
-    } finally { globalThis.fetch=oldFetch; console.warn=oldWarn; }
-  }
-});
-
-test('public Story API detects a success response with invalid JSON rather than calling it no media', async () => {
-  const logs=[];
-  const oldWarn=console.warn;
-  console.warn=(message,info)=>logs.push({message,info});
+test('Story starts once asynchronously with authenticated terminal webhooks and no session',async()=>{
+  const calls=[];const previous=globalThis.fetch;
+  globalThis.fetch=async(url,init)=>{calls.push({url:new URL(url),init});return Response.json({data:{id:runId,status:'RUNNING'}});};
   try {
-    const r=await run({env:{APIFY_API_TOKEN:'private-token',INSTAGRAM_SESSIONID:''},
-      routes:{[apifyPath]:()=>new Response('NOT JSON',{status:200,headers:{'content-type':'text/plain'}})}});
-    assert.equal(r.requests.length,1);
-    assert.equal(r.telegram.filter(x=>['sendPhoto','sendVideo'].includes(x.method)).length,0);
-    assert.equal(logs.find(x=>x.message==='instagram story resolution failed')?.info?.code,'apify_invalid_response');
-    assert.equal(logs.find(x=>x.message==='instagram story invalid response')?.info?.reason,'unparseable_json');
-    assert.ok(!JSON.stringify(logs).includes('private-token'));
-  } finally {console.warn=oldWarn;}
-});
-
-test('public Story API profile command reuses the same resolved media with IDs and no session', async () => {
-  const previous=globalThis.fetch;
-  const calls=[];
-  try {
-    globalThis.fetch=async (url,init={})=>{
-      calls.push({url:String(url),body:JSON.parse(init.body),authorization:new Headers(init.headers).get('authorization')});
-      return Response.json([{type:'story',id:'999',ownerUsername:'example',mediaType:'Video',
-        videoUrl:'https://cdn.instagram.com/video.mp4'}]);
-    };
-    const result=await instagramProfileStories('example',{APIFY_API_TOKEN:'private-token',INSTAGRAM_SESSIONID:''});
-    assert.equal(calls.length,1);
-    assert.equal(result.length,1);
-    assert.equal(result[0].storyId,'999');
-    assert.equal(result[0].groups[0][0].kind,'video');
-    assert.equal(calls[0].body.stories,true);
-    assert.equal(calls[0].body.highlights,false);
+    const result=await startInstagramStoryRun(target,publicEnv,{url:'https://worker/instagram/apify-events/igdl-1-7-1',token:'signed-callback'});
+    assert.deepEqual(result,{id:runId,status:'RUNNING'});assert.equal(calls.length,1);
+    const {url,init}=calls[0];assert.equal(init.method,'POST');
+    assert.equal(url.pathname,'/v2/actors/rowfinch~instagram-stories-scraper/runs');
+    assert.equal(url.searchParams.get('waitForFinish'),'0');assert.equal(url.searchParams.get('restartOnError'),'false');
+    assert.equal(url.searchParams.get('timeout'),'600');
+    assert.equal(init.headers.authorization,'Bearer private-apify-token');assert.equal(init.headers.cookie,undefined);
+    assert.deepEqual(JSON.parse(init.body),{usernames:[target.url],stories:true,highlights:false});
+    const hooks=JSON.parse(atob(url.searchParams.get('webhooks')));
+    assert.deepEqual(hooks[0].eventTypes,['ACTOR.RUN.SUCCEEDED','ACTOR.RUN.FAILED','ACTOR.RUN.ABORTED','ACTOR.RUN.TIMED_OUT']);
+    assert.equal(JSON.parse(hooks[0].headersTemplate)['x-instagram-event-token'],'signed-callback');
+    assert.equal(hooks[0].payloadTemplate,'{"runId":{{resource.id}},"status":{{resource.status}}}');
   } finally {globalThis.fetch=previous;}
+});
+
+test('ambiguous Story network failure or timeout never repeats the paid start',async()=>{
+  const previous=globalThis.fetch;
+  try {for(const [failure,code] of [[new TypeError('secret-network-detail'),'apify_failed'],
+    [Object.assign(new Error('deadline'),{name:'TimeoutError'}),'apify_timeout']]) {
+    let calls=0;globalThis.fetch=async()=>{calls++;throw failure;};
+    await assert.rejects(()=>startInstagramStoryRun(target,publicEnv,{url:'https://worker/event',token:'signed'}),e=>e.code===code);
+    assert.equal(calls,1);
+  }} finally {globalThis.fetch=previous;}
+});
+
+test('Story start classifies HTTP failures and logs only safe machine diagnostics',async()=>{
+  const previous=globalThis.fetch,oldWarn=console.warn;const logs=[];console.warn=(message,info)=>logs.push({message,info});
+  try {for(const [status,code] of [[401,'apify_auth'],[403,'apify_auth'],[402,'apify_quota'],[429,'apify_quota'],
+    [400,'apify_invalid_input'],[422,'apify_invalid_input'],[404,'apify_actor_missing'],[408,'apify_timeout'],[500,'apify_server_error']]) {
+    globalThis.fetch=async()=>Response.json({error:{type:'safe-code',message:'private-apify-token'}},{status});
+    await assert.rejects(()=>startInstagramStoryRun(target,publicEnv,{url:'https://worker/event',token:'signed'}),e=>e.code===code&&e.diagnostic.status===status);
+  }assert.ok(!JSON.stringify(logs).includes('private-apify-token'));} finally {globalThis.fetch=previous;console.warn=oldWarn;}
+});
+
+test('Story start refuses an unparseable response or missing run ID without retrying',async()=>{
+  const previous=globalThis.fetch;
+  try {for(const fixture of [new Response('NOT JSON'),Response.json({data:{status:'RUNNING'}})]) {
+    let calls=0;globalThis.fetch=async()=>{calls++;return fixture;};
+    await assert.rejects(()=>startInstagramStoryRun(target,publicEnv,{url:'https://worker/event',token:'signed'}),e=>e.code==='apify_invalid_response');
+    assert.equal(calls,1);
+  }}finally{globalThis.fetch=previous;}
+});
+
+test('Story completion reads only the saved run and its verified dataset, selecting the exact ID',async()=>{
+  const previous=globalThis.fetch,calls=[];
+  globalThis.fetch=async(url,init)=>{calls.push({url:String(url),init});return String(url).includes('/actor-runs/')
+    ?Response.json({data:{id:runId,status:'SUCCEEDED',defaultDatasetId:datasetId}})
+    :Response.json([{...publicVideo,id:'998'},publicVideo]);};
+  try {
+    const items=await readInstagramStoryRun(runId,target,publicEnv);
+    assert.equal(items.length,1);assert.equal(items[0].storyId,'999');assert.equal(items[0].kind,'video');
+    assert.deepEqual(calls.map(x=>new URL(x.url).pathname),['/v2/actor-runs/'+runId,'/v2/datasets/'+datasetId+'/items']);
+    assert.ok(calls.every(x=>!x.init.method&&!new URL(x.url).searchParams.has('waitForFinish')));
+  }finally{globalThis.fetch=previous;}
+});
+
+test('failed, still-running and mismatched runs never read dataset or launch a replacement',async()=>{
+  const previous=globalThis.fetch;
+  try {for(const [record,code] of [[{id:runId,status:'FAILED'},'apify_run_failed'],[{id:runId,status:'RUNNING'},'apify_still_running'],
+    [{id:'wrongRun00001',status:'SUCCEEDED',defaultDatasetId:datasetId},'apify_invalid_response']]) {
+    let calls=0;globalThis.fetch=async()=>{calls++;return Response.json({data:record});};
+    await assert.rejects(()=>readInstagramStoryRun(runId,target,publicEnv),e=>e.code===code);assert.equal(calls,1);
+  }}finally{globalThis.fetch=previous;}
+});
+
+test('Story media validation retains exact IDs, owners, highlight IDs, full video files and the twenty-item limit',()=>{
+  assert.equal(instagramStoryItems([publicVideo],target)[0].url,publicVideo.videoUrl);
+  for(const rows of [[{...publicVideo,ownerUsername:'different'}],[{...publicVideo,videoUrl:'https://example.com/file.mp4'}],
+    [{...publicVideo,videoUrl:null}],[{...publicVideo,id:'998'}],[],{},[{error:'private profile'}]]) {
+    assert.throws(()=>instagramStoryItems(rows,target));
+  }
+  const highlight={kind:'highlight',highlightId:'17950000000123456',url:'https://www.instagram.com/stories/highlights/17950000000123456/'};
+  assert.equal(instagramStoryItems([{...publicVideo,type:'highlight',highlightId:highlight.highlightId}],highlight).length,1);
+  assert.throws(()=>instagramStoryItems([{...publicVideo,type:'highlight',highlightId:'17950000000999999'}],highlight));
+  assert.throws(()=>instagramStoryItems(Array.from({length:21},(_,i)=>({...publicVideo,id:String(i+1000)})),{...target,storyId:null}),e=>e.code==='apify_too_many');
+});
+
+test('profile Story grouping shares the Workflow result without another extraction',async()=>{
+  const items=instagramStoryItems([publicVideo],target);let calls=0;
+  const posts=await instagramProfileStories('example',{...publicEnv,resolvePublicStory:async()=>{calls++;return items;}});
+  assert.equal(calls,1);assert.equal(posts[0].storyId,'999');assert.equal(posts[0].groups[0][0].kind,'video');
+  assert.match(instagramVideoErrorText(new Error('apify_pending')),/اجرای جدیدی شروع نشد/);
 });
 
 test('missing session fails explicitly without Instagram requests or legacy retries', async () => {

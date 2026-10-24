@@ -1132,3 +1132,160 @@ test('Instagram rejects ambiguous and unconfirmed floods without any automatic r
     console.error = previous;
   }
 });
+
+async function publicStoryWorkflow({large=false,initialStatus='RUNNING',startError=false,readFailures=0,waitError,
+  checkpoints=new Map(),events=new Map(),interruptOnce=false,finalStatus,datasetFailures=0}={}) {
+  const calls=[],messages=[],children=[],options=[];
+  globalThis.downloadHistory=[];globalThis.testFileCache=undefined;globalThis.delivered=0;
+  const target={kind:'story',username:'example',storyId:'999',url:'https://www.instagram.com/stories/example/999/'};
+  const selected={...job,url:target.url,instagram:undefined,instagramProfile:{kind:'story',username:'example',target}};
+  const runId='storyRun00001',datasetId='storyDataset00001';
+  const bindings={...env,APIFY_API_TOKEN:'private-story-token',YOUTUBE_DOWNLOAD_WORKFLOW:{
+    async get(id){return {async sendEvent(event){events.set(event.type,event.payload);}};},
+    async create(value){children.push(value.params);},
+  }};
+  globalThis.fetch=async(url,init={})=>{
+    url=new URL(url);calls.push({url,method:init.method||'GET',body:init.body});
+    if(url.hostname==='api.telegram.org'){
+      messages.push({method:url.pathname.split('/').at(-1),body:JSON.parse(init.body)});
+      return Response.json({ok:true,result:{message_id:33,video:{file_id:'story-file'}}});
+    }
+    if(url.pathname==='/v2/actors/rowfinch~instagram-stories-scraper/runs') {
+      if(startError)throw new TypeError('connection closed');
+      // A callback can be received before the start step has been persisted.
+      const hook=JSON.parse(atob(url.searchParams.get('webhooks')))[0];
+      const callback=await mod.default.fetch(new Request(hook.requestUrl,{method:'POST',
+        headers:JSON.parse(hook.headersTemplate),body:JSON.stringify({runId,status:'SUCCEEDED'})}),bindings,{});
+      assert.equal(callback.status,200);
+      return Response.json({data:{id:runId,status:initialStatus}});
+    }
+    if(url.pathname==='/v2/actor-runs/'+runId){
+      if(readFailures-->0)throw new TypeError('temporary read failure');
+      return Response.json({data:{id:runId,status:finalStatus||(initialStatus==='FAILED'?'FAILED':'SUCCEEDED'),defaultDatasetId:datasetId}});
+    }
+    if(url.pathname==='/v2/datasets/'+datasetId+'/items') {
+      if(datasetFailures-->0)throw new TypeError('temporary dataset failure');
+      return Response.json([
+      {type:'story',id:'998',ownerUsername:'example',mediaType:'Image',displayUrl:'https://cdn.instagram.com/neighbor.jpg'},
+      {type:'story',id:'999',ownerUsername:'example',mediaType:'Video',videoUrl:'https://cdn.instagram.com/story.mp4'},
+    ]);
+    }
+    if(url.hostname==='cdn.instagram.com')return new Response(null,{headers:{'content-length':large?'21000000':'1000000'}});
+    throw Error('Unexpected request '+url);
+  };
+  const step={async do(name,opts,fn){
+    if(typeof opts==='function'){fn=opts;opts={};}options.push({name,opts});
+    if(checkpoints.has(name))return structuredClone(checkpoints.get(name));
+    for(let attempt=0;;attempt++){
+      try{const result=await fn();checkpoints.set(name,structuredClone(result));return result;}
+      catch(error){if(attempt >= (opts.retries?.limit||0))throw error;}
+    }
+  },async waitForEvent(name,opts){
+    options.push({name,opts});
+    if(checkpoints.has(name))return structuredClone(checkpoints.get(name));
+    if(interruptOnce){interruptOnce=false;throw Error('Aborting engine: Grace period complete');}
+    if(waitError)throw waitError;
+    const payload=opts.type.startsWith('profile-post-')?{ok:true,parts:1}:events.get(opts.type);
+    assert.ok(payload,'completion must be buffered for the exact run');
+    const event={payload};checkpoints.set(name,structuredClone(event));return event;
+  }};
+  const replay=()=>new mod.YoutubeDownloadWorkflow({},bindings).run({payload:selected},step);
+  if(interruptOnce)await assert.rejects(replay,/Grace period complete/);else await replay();
+  return {calls,messages,children,options,replay,checkpoints,events};
+}
+
+test('public Story survives early completion callback and replay without repeated extraction or sends',async()=>{
+  const result=await publicStoryWorkflow();
+  const paid=()=>result.calls.filter(x=>x.url.hostname==='api.apify.com'&&x.method==='POST');
+  assert.equal(paid().length,1);assert.deepEqual(JSON.parse(paid()[0].body).usernames,['https://www.instagram.com/stories/example/999/']);
+  assert.deepEqual(result.messages.map(x=>x.method),['sendMessage','sendVideo','deleteMessage']);
+  assert.ok(result.messages[1].body.video.includes('story.mp4'));
+  assert.equal(result.messages[1].body.reply_markup.inline_keyboard[0][0].callback_data,'iga|s|999|0|42');
+  assert.equal(result.children.length,0,'small videos must not start Containers');
+  assert.equal(globalThis.downloadHistory.at(-1).status,'success');
+  assert.ok(result.options.some(x=>x.name==='start public Instagram story once'&&x.opts.retries.limit===0));
+  const total=result.calls.length;await result.replay();assert.equal(result.calls.length,total);
+});
+
+test('public Story resumes the saved run after Workflow interruption without another paid start',async()=>{
+  const result=await publicStoryWorkflow({interruptOnce:true});
+  assert.equal(globalThis.downloadHistory.some(x=>x.status==='failed'),false);
+  await result.replay();
+  assert.equal(result.calls.filter(x=>x.url.hostname==='api.apify.com'&&x.method==='POST').length,1);
+  assert.equal(result.messages.filter(x=>x.method==='sendVideo').length,1);
+});
+
+test('public Story recovers a lost callback and a temporary read failure using the original run only',async()=>{
+  const result=await publicStoryWorkflow({waitError:Error('Event timeout'),readFailures:1});
+  assert.equal(result.calls.filter(x=>x.url.hostname==='api.apify.com'&&x.method==='POST').length,1);
+  assert.equal(result.calls.filter(x=>x.url.pathname.includes('/actor-runs/')).length,2);
+  assert.ok(result.calls.filter(x=>x.url.pathname.includes('/actor-runs/')).every(x=>!x.url.searchParams.has('waitForFinish')));
+  assert.equal(result.messages.filter(x=>x.method==='sendVideo').length,1);
+});
+
+test('public Story ambiguous start failure is persisted and never restarts on replay',async()=>{
+  const result=await publicStoryWorkflow({startError:true});const total=result.calls.length;
+  assert.equal(globalThis.downloadHistory.at(-1).status,'failed');
+  assert.equal(result.messages.filter(x=>x.method==='sendVideo').length,0);
+  await result.replay();assert.equal(result.calls.length,total);
+  assert.equal(result.calls.filter(x=>x.url.hostname==='api.apify.com').length,1);
+});
+
+test('public Story terminal failure is reported without dataset reads or another provider',async()=>{
+  const result=await publicStoryWorkflow({initialStatus:'FAILED'});
+  assert.equal(result.calls.filter(x=>x.url.pathname.includes('/datasets/')).length,0);
+  assert.equal(result.messages.filter(x=>x.method==='sendVideo').length,0);
+  assert.match(result.messages.at(-1).body.text,/ناموفق تمام شد/);
+  assert.equal(globalThis.downloadHistory.at(-1).status,'failed');
+});
+
+test('public Story video above URL limit reaches the existing complete-file uploader',async()=>{
+  const result=await publicStoryWorkflow({large:true});
+  assert.equal(result.children.length,1);
+  assert.equal(result.children[0].instagramPost.storyId,'999');
+  assert.equal(result.children[0].instagramPost.media[0].size,21000000);
+  assert.equal(result.messages.filter(x=>x.method==='sendVideo').length,0);
+  assert.equal(globalThis.downloadHistory.at(-1).status,'success');
+});
+
+test('duplicate Story Telegram updates create one Workflow and never run extraction inside the webhook',async()=>{
+  const created=[];globalThis.fetch=async()=>{throw Error('No provider or Telegram requests in webhook');};
+  const bindings={...env,APIFY_API_TOKEN:'private-story-token',WEBHOOK_SECRET:'story-test',YOUTUBE_DOWNLOAD_WORKFLOW:{
+    async create(value){if(created.length)throw Error('already exists');created.push(value);},
+  }};
+  const request=()=>new Request('https://worker/telegram/webhook',{method:'POST',headers:{
+    'x-telegram-bot-api-secret-token':'story-test','content-type':'application/json'},body:JSON.stringify({update_id:2,
+      message:{message_id:7,chat:{id:42},from:{id:1},text:'https://www.instagram.com/stories/example/999/'}})});
+  assert.equal((await mod.default.fetch(request(),bindings,{})).status,200);
+  assert.equal((await mod.default.fetch(request(),bindings,{})).status,200);
+  assert.equal(created.length,1);assert.equal(created[0].params.instagramProfile.target.storyId,'999');
+});
+
+test('Apify Story callback requires a per-job signature and a terminal run before dispatching any event',async()=>{
+  const events=[];const id='igdl-42-7-42',runId='storyRun00001';
+  const token=createHmac('sha256',env.BOT_TOKEN).update('apify-story:'+id).digest('hex');
+  const bindings={...env,YOUTUBE_DOWNLOAD_WORKFLOW:{async get(){return {async sendEvent(e){events.push(e);}};}}};
+  const request=(signature,payload)=>new Request('https://worker/instagram/apify-events/'+id,{method:'POST',
+    headers:{'x-instagram-event-token':signature},body:JSON.stringify(payload)});
+  assert.equal((await mod.default.fetch(request('wrong',{runId,status:'SUCCEEDED'}),bindings,{})).status,403);
+  assert.equal((await mod.default.fetch(request(token,{runId,status:'RUNNING'}),bindings,{})).status,400);
+  assert.equal(events.length,0);
+  assert.equal((await mod.default.fetch(request(token,{runId,status:'SUCCEEDED'}),bindings,{})).status,200);
+  assert.deepEqual(events,[{type:'apify-story-'+runId,payload:{runId,status:'SUCCEEDED'}}]);
+});
+
+test('public Story still running after a lost callback is read once without status polling or a new extraction',async()=>{
+  const result=await publicStoryWorkflow({waitError:Error('Event timeout'),finalStatus:'RUNNING'});
+  assert.equal(result.calls.filter(x=>x.url.pathname.includes('/actor-runs/')).length,1);
+  assert.equal(result.calls.filter(x=>x.url.hostname==='api.apify.com'&&x.method==='POST').length,1);
+  assert.equal(result.calls.filter(x=>x.url.pathname.includes('/datasets/')).length,0);
+  assert.equal(result.messages.filter(x=>x.method==='sendVideo').length,0);
+  assert.match(result.messages.at(-1).body.text,/هنوز در Apify ادامه دارد/);
+});
+
+test('public Story dataset connection failure retries only reads of the checkpointed run',async()=>{
+  const result=await publicStoryWorkflow({datasetFailures:1});
+  assert.equal(result.calls.filter(x=>x.url.hostname==='api.apify.com'&&x.method==='POST').length,1);
+  assert.equal(result.calls.filter(x=>x.url.pathname.includes('/datasets/')).length,2);
+  assert.equal(result.messages.filter(x=>x.method==='sendVideo').length,1);
+});

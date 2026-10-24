@@ -5,7 +5,7 @@ import {
   type WorkflowEvent,
   type WorkflowStep,
 } from "cloudflare:workers";
-import storyWorker, { instagramProfileStories, parseInstagramProfileCommand, parseInstagramVideoTarget, parseInstagramAudioTarget, resolveInstagramVideo, instagramVideoErrorText, type InstagramVideoTarget, type InstagramVideoSource } from "./story-main";
+import storyWorker, { startInstagramStoryRun, readInstagramStoryRun, sendResolvedStory, type StoryTarget, instagramProfileStories, parseInstagramProfileCommand, parseInstagramVideoTarget, parseInstagramAudioTarget, resolveInstagramVideo, instagramVideoErrorText, type InstagramVideoTarget, type InstagramVideoSource } from "./story-main";
 import { instagramProfilePage, instagramProfilePostMedia, instagramProfileErrorText,
   resolveInstagramPostForWorkflow, sendInstagramPostDirect, instagramPostFriendlyError,
   type InstagramPostUpload } from "./index";
@@ -56,7 +56,7 @@ type YoutubeDownloadJob = {
   instagram?: InstagramVideoTarget;
   instagramPost?: InstagramPostUpload;
   instagramPostRequest?: { shortcode: string };
-  instagramProfile?: { username: string; kind?: "posts" | "story" };
+  instagramProfile?: { username: string; kind?: "posts" | "story"; target?: StoryTarget };
   instagramProfileParent?: { id: string; eventType: string };
   recognition?: RecognitionInput;
   playlist?: PlaylistInput;
@@ -465,6 +465,8 @@ async function containerResult<T>(env: Env, job: YoutubeDownloadJob, request: Re
 function jobHistory(job: YoutubeDownloadJob): Omit<DownloadRecord, "status"> {
   if (job.instagramPostRequest) return { key: `ig:${job.chatId}:${job.requestMessageId}:${job.userId}`,
     userId: job.userId, source: "Instagram post", request: job.url };
+  if (job.instagramProfile?.target) return { key: `ig:${job.chatId}:${job.requestMessageId}:${job.userId}`,
+    userId: job.userId, source: `Instagram ${job.instagramProfile.target.kind}`, request: job.url };
   if (job.instagramProfile) return { key: job.id, userId: job.userId, source: job.instagramProfile.kind === "story" ? "Instagram profile stories" : "Instagram profile posts", request: job.url };
   if (job.instagramProfileParent) return { key: job.id, userId: job.userId, source: job.instagramPost?.storyId ? "Instagram story" : "Instagram post", request: job.url };
   if (job.instagramPost) return { key: `ig:${job.chatId}:${job.requestMessageId}:${job.userId}`,
@@ -581,10 +583,52 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
     }
   }
 
+  private async resolvePublicStory(job: YoutubeDownloadJob, target: StoryTarget, step: WorkflowStep) {
+    const token = await instagramSignature(this.env.BOT_TOKEN, `apify-story:${job.id}`);
+    // Checkpoint the run ID immediately, independently of waiting and reading.
+    // An ambiguous start is never automatically re-POSTed.
+    const started = await step.do("start public Instagram story once", {
+      retries: { limit: 0, delay: "1 second" }, timeout: "40 seconds",
+    }, async () => {
+      try { return { run: await startInstagramStoryRun(target, this.env, {
+        url: `https://downloader.vexaagent.workers.dev/instagram/apify-events/${job.id}`, token,
+      }) }; }
+      catch (error) { return { error: instagramVideoErrorText(error) }; }
+    });
+    if (!started.run) throw new Error(started.error);
+    const run = started.run;
+    if (!["SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"].includes(run.status)) {
+      try {
+        const event = await step.waitForEvent<{ runId: string; status: string }>("await public Instagram story", {
+          type: `apify-story-${run.id}`, timeout: "12 minutes",
+        });
+        if (event.payload.runId !== run.id) throw new Error("Unexpected Apify story run");
+      } catch (error) {
+        if (error instanceof Error && error.message === "Aborting engine: Grace period complete") throw error;
+        // Recover a completed run if its callback was lost. One read of the
+        // known run is safe; it never creates a replacement extraction.
+        console.warn("instagram apify story completion unavailable", { jobId: job.id, runId: run.id });
+      }
+    }
+    const result = await step.do("read completed public Instagram story", {
+      retries: { limit: 2, delay: "3 seconds", backoff: "exponential" }, timeout: "2 minutes",
+    }, async () => {
+      try { return { media: await readInstagramStoryRun(run.id, target, this.env) }; }
+      catch (error) {
+        // Retry only transient reads of this run, never its paid start.
+        if (error instanceof Error && ["apify_pending", "apify_timeout", "apify_server_error"].includes(error.message)) throw error;
+        return { error: instagramVideoErrorText(error) };
+      }
+    });
+    if (!result.media) throw new Error(result.error);
+    return result.media;
+  }
+
   private async runInstagramProfile(job: YoutubeDownloadJob, step: WorkflowStep): Promise<void> {
     let statusId: number | undefined;
     const stories = job.instagramProfile!.kind === "story";
-    const label = stories ? "استوری" : "پست";
+    const target = job.instagramProfile!.target;
+    const label = target?.kind === "highlight" ? "هایلایت" : stories ? "استوری" : "پست";
     let delivered = 0;
     let count = 0;
     let after: string | null = null;
@@ -593,21 +637,52 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
     try {
       statusId = await step.do("show instagram profile status", async () => {
         const status = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
-          chat_id: job.chatId, text: `⏳ دارم ${label}‌های @${job.instagramProfile!.username} را دریافت می‌کنم…`,
+          chat_id: job.chatId, text: target ? `⏳ دارم ${label} را آماده می‌کنم…` : `⏳ دارم ${label}‌های @${job.instagramProfile!.username} را دریافت می‌کنم…`,
           reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
         });
         return status.message_id;
       });
+      const publicMedia = stories && this.env.APIFY_API_TOKEN?.trim()
+        ? await this.resolvePublicStory(job, target || { kind: "story", username: job.instagramProfile!.username,
+          storyId: null, url: job.url }, step) : undefined;
       for (let pageNumber = 0; ; pageNumber++) {
         // Persist precise failures as well as pages: replay must not re-probe a
         // rejected account or create another batch of already delivered posts.
         const page = await step.do(`read instagram profile page ${pageNumber}`, { retries: { limit: 0, delay: "1 second" }, timeout: "5 minutes" }, async () => {
-          try { return { value: stories
-            ? { posts: await instagramProfileStories(job.instagramProfile!.username, this.env), next: null }
+          try {
+            if (target && publicMedia) return { value: { posts: publicMedia.map(item => ({
+              shortcode: item.storyId!, storyId: item.storyId,
+              url: target.url, groups: [item.variants || [item]],
+            })), next: null } };
+            return { value: stories
+            ? { posts: await instagramProfileStories(job.instagramProfile!.username, { ...this.env,
+                resolvePublicStory: async () => publicMedia!,
+              }), next: null }
             : await instagramProfilePage(job.instagramProfile!.username, after, this.env) }; }
           catch (error) { return { error: stories ? instagramVideoErrorText(error) : instagramProfileErrorText(error) }; }
         });
         if (!page.value) throw new Error(page.error);
+        // Keep small Story files on the existing URL sender. Only large or
+        // unknown-size videos require the complete-file Container uploader.
+        if (target) {
+          const media = await step.do("prepare public Instagram story files", {
+            retries: { limit: 0, delay: "1 second" }, timeout: "2 minutes",
+          }, async () => {
+            const items = [];
+            for (const post of page.value!.posts) items.push(...await instagramProfilePostMedia(post, this.env));
+            return items;
+          });
+          if (!media.some(item => item.kind === "video" && (item.size === null || item.size > 19_000_000))) {
+            const sent = await step.do("deliver public Instagram story once", {
+              retries: { limit: 0, delay: "1 second" }, timeout: "5 minutes",
+            }, async () => (await sendResolvedStory(this.env, target, { update_id: 0, message: {
+              message_id: job.requestMessageId, chat: { id: job.chatId }, from: { id: job.userId },
+            } }, media, statusId)).json() as Promise<{ ok: boolean; delivered: number }>);
+            await step.do("record public Instagram story delivery", () => trackJob(this.env, job,
+              sent.ok ? "success" : sent.delivered ? "partial" : "failed", { delivered: sent.delivered }));
+            return;
+          }
+        }
         for (const post of page.value.posts) {
           if (seen.has(post.shortcode)) continue;
           seen.add(post.shortcode);
@@ -656,7 +731,9 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         return true;
       });
     } catch (error) {
+      if (error instanceof Error && error.message === "Aborting engine: Grace period complete") throw error;
       const text = error instanceof Error && error.message.startsWith("❌") ? error.message
+        : stories && this.env.APIFY_API_TOKEN?.trim() ? instagramVideoErrorText(error)
         : `❌ دریافت ${label}‌های حساب کامل نشد؛ دسترسی حساب و وضعیت ارسال را بررسی کن.`;
       await step.do("fail instagram profile", async () => {
         await trackJob(this.env, job, delivered ? "partial" : "failed", { delivered, detail: text });
@@ -1619,6 +1696,25 @@ export default {
       } catch { return new Response("Invalid cache request", { status: 400 }); }
     }
 
+    const apifyStory = /^\/instagram\/apify-events\/(igdl--?\d+-\d+-\d+)$/.exec(requestUrl.pathname);
+    if (request.method === "POST" && apifyStory) {
+      const expected = await instagramSignature(env.BOT_TOKEN, `apify-story:${apifyStory[1]}`);
+      if (!equalSignature(request.headers.get("x-instagram-event-token") || "", expected))
+        return new Response("Forbidden", { status: 403 });
+      const body = await request.text();
+      if (body.length > 4096) return new Response("Too large", { status: 413 });
+      let payload: { runId: string; status: string };
+      try { payload = JSON.parse(body); } catch { return new Response("Invalid event", { status: 400 }); }
+      if (!payload || !/^[A-Za-z0-9]{6,40}$/.test(payload.runId)
+          || !["SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"].includes(payload.status))
+        return new Response("Invalid event", { status: 400 });
+      try {
+        const instance = await env.YOUTUBE_DOWNLOAD_WORKFLOW.get(apifyStory[1]);
+        await instance.sendEvent({ type: `apify-story-${payload.runId}`, payload: { runId: payload.runId, status: payload.status } });
+        return Response.json({ ok: true });
+      } catch { return new Response("Event delivery failed", { status: 503 }); }
+    }
+
     const completion = /^\/instagram\/events\/(igdl--?\d+-\d+-\d+(?:-(?:audio|song|music-[A-Za-z0-9_-]{11}|profile-\d+))?)$/.exec(requestUrl.pathname);
     if (request.method === "POST" && completion) {
       const expected = await instagramSignature(env.BOT_TOKEN, `event:${completion[1]}`);
@@ -1776,6 +1872,17 @@ export default {
     }
 
     return storyWorker.fetch(request, { ...env,
+      queueInstagramStory: async (target: StoryTarget, message: TelegramMessage) => {
+        const userId = message.from?.id || message.chat.id;
+        const id = `igdl-${message.chat.id}-${message.message_id}-${userId}`;
+        const job: YoutubeDownloadJob = { id, chatId: message.chat.id, userId,
+          requestMessageId: message.message_id, url: target.url,
+          instagramProfile: { username: target.kind === "story" ? target.username : "highlight", kind: "story", target } };
+        try { await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id, params: job }); }
+        catch (error) {
+          if (!/already|exists|duplicate|conflict/i.test(error instanceof Error ? error.message : String(error))) throw error;
+        }
+      },
       queueInstagramPost: async (post: Omit<InstagramPostUpload, "media" | "statusMessageId">) => {
         const id = `igdl-${post.chatId}-${post.requestMessageId}-${post.userId}`;
         const job: YoutubeDownloadJob = {
