@@ -19,7 +19,7 @@ const { default: worker, instagramProfilePage, instagramProfilePostMedia, instag
 
 const shortcode = 'DesNYugDyMp';
 const mediaId = '4011640241882342185';
-const pagePath = `/p/${shortcode}/`;
+const pagePath = `/reel/${shortcode}/`;
 const apiPath = `/api/v1/media/${mediaId}/info/`;
 const video = { code: shortcode, video_versions: [{ url: 'https://scontent.cdninstagram.com/video.mp4', width: 1080, height: 1920 }] };
 const html = product => `<script data-sjs>${JSON.stringify(product)}</script>`;
@@ -317,20 +317,46 @@ test('anonymous mobile fallback sends without authentication or oEmbed', async (
 
 });
 
+test('direct Instagram post paths retain original media type with no extra anonymous probes', async () => {
+  for (const [route, expected] of [['p', 'p'], ['tv', 'tv'], ['reels', 'reel']]) {
+    const result = await run({ text: `https://www.instagram.com/${route}/${shortcode}/?igsh=test`,
+      respond(call) {
+        if (call.path === `/${expected}/${shortcode}/`) return new Response(html(video));
+      },
+    });
+    assert.equal(files(result).length, 1, route);
+    assert.deepEqual(result.calls.map(call => call.path), [`/${expected}/${shortcode}/`], route);
+    assert.ok(result.calls.every(call => !call.headers.get('cookie')?.includes('sessionid=')));
+  }
+});
+
+test('two upstream anonymous login walls explain the failure without using a personal session', async () => {
+  const result = await run({ respond(call) {
+    if (call.path === pagePath) return redirect('/accounts/login/');
+    if (call.path === apiPath) return Response.json({ message: 'login_required' }, { status: 401 });
+  } });
+  assert.equal(result.calls.length, 2);
+  assert.equal(files(result).length, 0);
+  assert.equal(report(result), 'INSTAGRAM_PUBLIC_LOGIN_REQUIRED [public/webpage:INSTAGRAM_LOGIN_REQUIRED,public/mobile-api:INSTAGRAM_LOGIN_REQUIRED]');
+  assert.match(errorText(result), /بدون ورود/);
+  assert.ok(result.calls.every(call => !call.headers.get('authorization') &&
+    !call.headers.get('cookie')?.includes('sessionid=')));
+});
+
 test('canonical redirects follow only the same requested reel', async () => {
   const result = await run({ session: '', respond(call) {
-    if (call.path === pagePath) return redirect(`/reel/${shortcode}/`);
-    if (call.path === `/reel/${shortcode}/`) return new Response(html(video));
+    if (call.path === pagePath) return redirect(`/p/${shortcode}/`);
+    if (call.path === `/p/${shortcode}/`) return new Response(html(video));
   } });
   assert.equal(files(result).length, 1);
-  assert.equal(result.calls.at(-1).path, `/reel/${shortcode}/`);
+  assert.equal(result.calls.at(-1).path, `/p/${shortcode}/`);
   noObsoleteRequests(result);
 });
 
 test('a canonical redirect retains response cookies and updates the following request', async () => {
   const result = await run({ session: '', respond(call) {
-    if (call.path === pagePath) return redirect(`https://instagram.com/reel/${shortcode}/`, { 'set-cookie': 'mid=fresh-mid; Path=/' });
-    if (call.path === `/reel/${shortcode}/`) {
+    if (call.path === pagePath) return redirect(`https://instagram.com/p/${shortcode}/`, { 'set-cookie': 'mid=fresh-mid; Path=/' });
+    if (call.path === `/p/${shortcode}/`) {
       assert.match(call.headers.get('cookie'), /mid=fresh-mid/);
       return new Response(html(video));
     }
@@ -363,7 +389,8 @@ test('login-form webpages do not force an account session', async () => {
     if (call.path === pagePath) return new Response('<form id="loginForm" action="/accounts/login/"></form>');
     if (call.path === apiPath) return Response.json({ message: 'login_required' }, { status: 401 });
   } });
-  assert.match(report(rejected), /^INSTAGRAM_POST_UNAVAILABLE/);
+  assert.match(report(rejected), /^INSTAGRAM_PUBLIC_LOGIN_REQUIRED/);
+  assert.match(errorText(rejected), /بدون ورود/);
   assert.equal(rejected.calls.length, 2);
   const accessible = await run({ respond(call) {
     if (call.path === pagePath) return new Response('<a href="/accounts/login/">Log in</a>' + html(video));
