@@ -135,6 +135,23 @@ async function run({ session = '12345%3Afixture-session', env = {}, respond, cdn
 
 
 
+test('TopAPI webhook queues the existing durable Workflow without opening any paid API request', async () => {
+  const queued=[];
+  const result=await run({env:{
+    APIFY_API_TOKEN:'private-apify-key',BRIGHTDATA_API_KEY:'private-bright-key',
+    queueInstagramPost:async request=>queued.push(request),
+  },respond(call){throw Error('Webhook must not request provider '+call.hostname);}});
+  assert.equal(result.calls.length,0);
+  assert.equal(files(result).length,0);
+  assert.equal(result.sent.filter(x=>x.method==='sendMessage').length,0,
+    'The Workflow owns the progress message and must not create duplicates in the webhook');
+  assert.deepEqual(queued,[{
+    shortcode,url:'https://www.instagram.com/reel/'+shortcode+'/?mdxt=test',
+    chatId:42,requestMessageId:8,userId:42,
+  }]);
+  assert.ok(!JSON.stringify(queued).includes('private-apify-key'));
+});
+
 test('TopAPI becomes primary for Reels with one postUrls request, no session or Bright Data call', async () => {
   const result = await run({env: {APIFY_API_TOKEN:'private-apify-token',BRIGHTDATA_API_KEY:'private-brightdata-key'},
     respond(call) {
@@ -272,7 +289,7 @@ test('TopAPI ambiguous timeout or upstream 500 does not create a second paid ext
       }});
     assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com']);
     assert.equal(files(result).length,0);
-    assert.match(report(result),mode==='network'?/TOPAPI_NETWORK_OR_TIMEOUT/:/TOPAPI_AMBIGUOUS_PROVIDER_ERROR/);
+    assert.match(report(result),mode==='network'?/TOPAPI_NETWORK_ERROR/:/TOPAPI_AMBIGUOUS_PROVIDER_ERROR/);
   }
 });
 
