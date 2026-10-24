@@ -732,7 +732,7 @@ async function resolvePostWithBrightData(
         "content-type": "application/json",
         accept: "application/json",
       },
-      body: JSON.stringify({ input: [{ url: canonicalUrl }] }),
+      body: JSON.stringify([{ url: canonicalUrl }]),
       signal: AbortSignal.timeout(65_000),
     });
   } catch {
@@ -748,11 +748,20 @@ async function resolvePostWithBrightData(
     throw new Error("BRIGHTDATA_PENDING");
   }
   if (!response.ok) {
-    await response.body?.cancel().catch(() => undefined);
-    console.warn("instagram brightdata rejected", { status: response.status, dataset: isReel ? "reels" : "posts" });
+    // Keep the upstream HTTP status and machine-readable error code for
+    // troubleshooting. Never log freeform provider messages or credentials.
+    const failure: any = await response.json().catch(() => null);
+    const rawCode = typeof failure?.code === "string" ? failure.code : "";
+    const code = /^[a-zA-Z0-9_-]{1,64}$/.test(rawCode) ? rawCode : undefined;
+    console.warn("instagram brightdata rejected", {
+      status: response.status, dataset: isReel ? "reels" : "posts", ...(code ? { code } : {}),
+    });
     if (response.status === 401 || response.status === 403) throw new Error("BRIGHTDATA_AUTH_ERROR");
-    if (response.status === 402 || response.status === 429) throw new Error("BRIGHTDATA_CREDITS_ERROR");
-    throw new Error("BRIGHTDATA_SERVICE_ERROR");
+    if (response.status === 402) throw new Error("BRIGHTDATA_CREDITS_ERROR");
+    if (response.status === 429) throw new Error("BRIGHTDATA_RATE_LIMIT");
+    if (response.status === 400 || response.status === 422) throw new Error("BRIGHTDATA_INVALID_REQUEST");
+    if (response.status === 404) throw new Error("BRIGHTDATA_DATASET_UNAVAILABLE");
+    throw new Error(`BRIGHTDATA_SERVICE_HTTP_${response.status}`);
   }
   const payload: unknown = await response.json().catch(() => null);
   const rows: unknown[] = Array.isArray(payload) ? payload
@@ -1283,7 +1292,10 @@ async function resolveTarget(target: InstagramTarget, env: Env): Promise<Resolve
 function friendlyError(detail: string, throttle?: InstagramThrottle): string {
   const value = detail.toLowerCase();
   if (value.startsWith("brightdata_auth_error")) return "❌ کلید Bright Data معتبر نیست یا به استخراج‌کننده Instagram دسترسی ندارد.";
-  if (value.startsWith("brightdata_credits_error")) return "❌ سهمیه یا اعتبار Bright Data تمام شده یا سرویس موقتاً محدود است.";
+  if (value.startsWith("brightdata_credits_error")) return "❌ سهمیه یا اعتبار Bright Data تمام شده است.";
+  if (value.startsWith("brightdata_rate_limit")) return "❌ Bright Data درخواست‌های API را موقتاً محدود کرده است.";
+  if (value.startsWith("brightdata_invalid_request")) return "❌ Bright Data قالب درخواست Instagram را نپذیرفت؛ کد HTTP و code را در لاگ بررسی کن.";
+  if (value.startsWith("brightdata_dataset_unavailable")) return "❌ شناسه یا دسترسی Dataset اینستاگرام در Bright Data معتبر نیست.";
   if (value.startsWith("brightdata_pending")) return "❌ استخراج Bright Data هنوز تمام نشده؛ برای جلوگیری از مصرف دوباره سهمیه، درخواست را فوراً تکرار نکن.";
   if (value.startsWith("brightdata_incomplete_carousel")) return "❌ Bright Data ترتیب یا همه فایل‌های پست چندرسانه‌ای را برنگرداند؛ دانلود ناقص ارسال نشد.";
   if (value.startsWith("brightdata_wrong_post")) return "❌ Bright Data اطلاعات لینک دیگری را برگرداند؛ برای جلوگیری از ارسال فایل اشتباه، دانلود متوقف شد.";
