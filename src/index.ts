@@ -767,9 +767,42 @@ async function resolvePostWithBrightData(
   const rows: unknown[] = Array.isArray(payload) ? payload
     : payload && typeof payload === "object" && Array.isArray((payload as any).data) ? (payload as any).data
     : payload ? [payload] : [];
-  if (rows.length !== 1 || !rows[0] || typeof rows[0] !== "object") throw new Error("BRIGHTDATA_NO_MEDIA");
+
+  // A successful HTTP response may contain only metadata, an error record,
+  // or media links on a different host. Distinguish these without logging
+  // post content, media URLs, account data, or credentials.
+  function noMedia(reason: string, value?: unknown): never {
+    const row = value && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown> : {};
+    const candidate = row.video_url;
+    let videoUrlState = "missing";
+    if (typeof candidate === "string" && candidate.length) {
+      try {
+        const url = new URL(candidate);
+        videoUrlState = url.protocol === "https:" && !url.username && !url.password && !url.port
+          && allowedMediaHost(url.hostname) ? "accepted" : "unsupported_host";
+      } catch { videoUrlState = "invalid"; }
+    } else if (candidate !== undefined && candidate !== null) videoUrlState = "non_string";
+
+    // Log only a fixed set of known field names, never arbitrary upstream values.
+    const knownFields = ["video_url", "videos", "photos", "carousel_media", "image_url", "display_url",
+      "thumbnail", "error", "error_type", "status", "code", "url", "shortcode", "content_type",
+      "product_type", "post_content", "media", "images"];
+    console.warn("instagram brightdata no media", {
+      dataset: isReel ? "reels" : "posts", status: response.status, reason,
+      records: rows.length,
+      fields: knownFields.filter(key => Object.prototype.hasOwnProperty.call(row, key)),
+      videoUrlState,
+      videoCount: Array.isArray(row.videos) ? row.videos.length : null,
+      photoCount: Array.isArray(row.photos) ? row.photos.length : null,
+      carouselCount: Array.isArray(row.carousel_media) ? row.carousel_media.length : null,
+    });
+    throw new Error("BRIGHTDATA_NO_MEDIA");
+  }
+
+  if (rows.length !== 1 || !rows[0] || typeof rows[0] !== "object") noMedia("invalid_record_count");
   const item = rows[0] as Record<string, any>;
-  if (item.error || item.error_type || item.status === "fail") throw new Error("BRIGHTDATA_NO_MEDIA");
+  if (item.error || item.error_type || item.status === "fail") noMedia("provider_error_record", item);
 
   // An unrelated record must not become a download for the user's link.
   const returnedShortcode = String(item.shortcode || "").trim();
@@ -822,11 +855,11 @@ async function resolvePostWithBrightData(
   if (videos.length > 20 || photos.length > 20) throw new Error("BRIGHTDATA_INCOMPLETE_CAROUSEL");
   if (videos.length) return videos.map(url => candidate("video", url));
   const hasVideo = isReel || /video|reel/i.test(String(item.content_type || item.product_type || ""));
-  if (hasVideo) throw new Error("BRIGHTDATA_NO_MEDIA");
+  if (hasVideo) noMedia("video_link_missing_or_unusable", item);
   if (photos.length) return photos.map(url => candidate("photo", url));
   const image = mediaUrl(item.image_url) || mediaUrl(item.display_url);
   if (image) return [candidate("photo", image)];
-  throw new Error("BRIGHTDATA_NO_MEDIA");
+  noMedia("media_links_missing_or_unusable", item);
 }
 
 function safeJsonScripts(html: string): unknown[] {
