@@ -665,7 +665,12 @@ async function resolveViaPostPage(
 ): Promise<MediaCandidate[][] | null> {
   // Reuse the requested page's state for web-info when Instagram sends only
   // its app shell. The media-info API can require login for a public post.
-  const page = await fetchHtml(`https://www.instagram.com/p/${target.shortcode}/`, browserHeaders(jar), jar);
+  // Keep the media route from the supplied link: a Reel should not silently
+  // become /p/. The shortcode was already validated by parseInstagramTarget.
+  const route = /\/(p|reels?|tv)\/([A-Za-z0-9_-]+)(?:\/|$)/.exec(new URL(target.url).pathname);
+  const kind = route?.[2] === target.shortcode
+    ? route[1] === "reels" ? "reel" : route[1] : "p";
+  const page = await fetchHtml(`https://www.instagram.com/${kind}/${target.shortcode}/`, browserHeaders(jar), jar);
   // Reuse anonymous page cookies/CSRF for the exact-post web-info query.
   const csrf = extractCsrfFromHtml(page);
   if (csrf) jar.set("csrftoken", csrf);
@@ -791,7 +796,11 @@ async function resolvePost(
       throw throttle ? new InstagramThrottleError(throttle, error.message) : error;
     }
   }
-  throw failure("INSTAGRAM_POST_UNAVAILABLE");
+  // Two explicit login walls are not a malformed post, and do not justify
+  // retrying with a personal session or more anonymous endpoints.
+  const loginGated = diagnostics.length === attempts.length &&
+    diagnostics.every(item => item.endsWith(":INSTAGRAM_LOGIN_REQUIRED"));
+  throw failure(loginGated ? "INSTAGRAM_PUBLIC_LOGIN_REQUIRED" : "INSTAGRAM_POST_UNAVAILABLE");
 }
 
 function cobaltStoryHeaders(jar: CookieJar): Headers {
@@ -1202,6 +1211,9 @@ function friendlyError(detail: string, throttle?: InstagramThrottle): string {
   }
   if (value.startsWith("instagram_session_login_required")) {
     return "❌ اینستاگرام نشست حساب متصل را برای دریافت این پست نپذیرفت؛ ورود حساب و دسترسی آن به پست باید بررسی شود.";
+  }
+  if (value.startsWith("instagram_public_login_required")) {
+    return "❌ اینستاگرام اطلاعات این پست یا ریلز را بدون ورود در اختیار دانلودر قرار نداد؛ ممکن است دسترسی ناشناس از سرور محدود باشد. از سشن شخصی استفاده نشده.";
   }
   if (value.startsWith("instagram_post_unavailable")) {
     return "❌ اطلاعات قابل دانلود این پست از اینستاگرام دریافت نشد؛ دوباره امتحان کن.";
