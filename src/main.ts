@@ -4,11 +4,13 @@ import {
   telegramTextMotion,
   telegramCustomEmoji,
   ADMIN_USER_ID,
-  APIFY_ACCOUNTS,
-  apifyAccountToken,
-  setActiveApifyAccount,
+  INSTAGRAM_API_ACCOUNTS,
+  instagramApiToken,
+  instagramApiSettings,
+  setInstagramApi,
+  type InstagramProvider,
   type ApifyAccount,
-  type ApifyAccountSecrets,
+  type InstagramApiSecrets,
   AdminStatsStore,
   adminDashboardKeyboard,
   adminUsersKeyboard,
@@ -30,7 +32,7 @@ import {
 
 export { AdminStatsStore };
 
-type Env = AdminStatsEnv & ApifyAccountSecrets & {
+type Env = AdminStatsEnv & InstagramApiSecrets & {
   BOT_TOKEN: string;
   WEBHOOK_SECRET?: string;
   INSTAGRAM_SESSIONID?: string;
@@ -145,29 +147,42 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
   await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: query.id });
 
   try {
-    const apifyMatch = /^admin:apify(?::([1-4]))?$/.exec(data);
-    if (apifyMatch) {
-      const requested = apifyMatch[1] ? Number(apifyMatch[1]) as ApifyAccount : undefined;
+    const apiMatch = /^admin:igapi(?::(posts|stories|both)(?::(apify|brightdata):([1-4]))?)?$/.exec(data);
+    // Old dashboard buttons open the current settings, without changing them.
+    if (apiMatch || /^admin:apify(?::[1-4])?$/.test(data)) {
+      const scope = apiMatch?.[1] as "posts" | "stories" | "both" | undefined;
       let notice = "";
-      if (requested) {
-        if (apifyAccountToken(env, requested)) await setActiveApifyAccount(env, requested);
-        else notice = `توکن اکانت ${requested} هنوز در Secret تنظیم نشده است.\n\n`;
+      if (scope && apiMatch?.[2]) {
+        const selection = { provider: apiMatch[2] as InstagramProvider, account: Number(apiMatch[3]) as ApifyAccount };
+        if (scope !== "posts" && selection.provider === "brightdata")
+          notice = "Bright Data فعلاً مسیر مستند و متصل برای استوری/هایلایت ندارد؛ انتخاب تغییر نکرد.\n\n";
+        else if (!instagramApiToken(env, selection)) notice = "کلید این اکانت هنوز در Secrets تنظیم نشده است.\n\n";
+        else await setInstagramApi(env, scope, selection);
       }
-      // Read the persisted selection even when its Secret has subsequently been
-      // removed, so the administrator can repair it by selecting another slot.
-      const response = await env.ADMIN_STATS.getByName("global").fetch("https://admin-stats/apify-account");
-      if (!response.ok) throw new Error("APIFY_ACCOUNT_SETTING_UNAVAILABLE");
-      const { account } = await response.json() as { account: ApifyAccount };
+      const settings = await instagramApiSettings(env);
+      const label = (item: typeof settings.posts) => `${item.provider === "apify" ? "Apify" : "Bright Data"} — اکانت ${item.account}`;
+      const title = scope === "posts" ? "پست و ریلز" : scope === "stories" ? "استوری و هایلایت" : "هر دو";
+      const rows = scope ? ["apify", "brightdata"].flatMap(provider => {
+        if (provider === "brightdata" && scope !== "posts") return [[{
+          text: "Bright Data — استوری پشتیبانی نمی‌شود", callback_data: `admin:igapi:${scope}:brightdata:1`,
+        }]];
+        return INSTAGRAM_API_ACCOUNTS.map(account => {
+          const selection = { provider: provider as InstagramProvider, account };
+          const active = (scope === "both" ? [settings.posts, settings.stories] : [settings[scope]])
+            .every(item => item.provider === provider && item.account === account);
+          return [{ text: `${active ? "✅ " : ""}${label(selection)} — ${instagramApiToken(env, selection) ? "تنظیم شده" : "تنظیم نشده"}`,
+            callback_data: `admin:igapi:${scope}:${provider}:${account}` }];
+        });
+      }) : [
+        [{ text: "پست و ریلز", callback_data: "admin:igapi:posts" }],
+        [{ text: "استوری و هایلایت", callback_data: "admin:igapi:stories" }],
+        [{ text: "اعمال یک انتخاب برای هر دو", callback_data: "admin:igapi:both" }],
+      ];
       await telegramCall(env.BOT_TOKEN, "editMessageText", {
         chat_id: message.chat.id, message_id: message.message_id,
-        text: `${notice}🔑 اکانت Apify\n\nاکانت انتخاب‌شده: ${account}\nبرای پست، ریلز، استوری و هایلایت.\n\nانتخاب شما برای دانلودهای جدید اعمال می‌شود؛ دانلودهای در حال اجرا با اکانت قبلی ادامه دارند.`,
-        reply_markup: { inline_keyboard: [
-          ...APIFY_ACCOUNTS.map(slot => [{
-            text: `${slot === account ? "✅ " : ""}اکانت ${slot} — ${apifyAccountToken(env, slot) ? "تنظیم شده" : "تنظیم نشده"}`,
-            callback_data: `admin:apify:${slot}`,
-          }]),
-          [{ text: "بازگشت به پنل", callback_data: "admin:stats" }],
-        ] },
+        text: `${notice}🔑 API اینستاگرام${scope ? " — " + title : ""}\n\nپست و ریلز: ${label(settings.posts)}\nاستوری و هایلایت: ${label(settings.stories)}\n\nتغییر فقط برای دانلودهای جدید است. جایگزینی خودکار سرویس یا اکانت وجود ندارد.`,
+        reply_markup: { inline_keyboard: [...rows, [{ text: scope ? "بازگشت به تنظیمات API" : "بازگشت به پنل",
+          callback_data: scope ? "admin:igapi" : "admin:stats" }]] },
       }).catch(error => {
         if (!(error instanceof Error) || !/message is not modified/i.test(error.message)) throw error;
       });

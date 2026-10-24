@@ -26,14 +26,17 @@ const { outputFiles } = await build({
         export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }
         export class WorkflowEntrypoint { constructor(ctx, env) { this.env = env; } }
       ` };
-      if (args.path === './story-main') return { contents: 'export default { fetch() {} }; export const startInstagramStoryRun = async () => {throw Error("Unexpected Story start")}; export const readInstagramStoryRun = async () => {throw Error("Unexpected Story read")}; export const sendResolvedStory = async () => {throw Error("Unexpected Story send")}; export const instagramProfileStories = async () => []; export const parseInstagramProfileCommand = () => null; export const parseInstagramVideoTarget = () => null; export const parseInstagramAudioTarget = () => null; export const resolveInstagramVideo = () => {}; export const instagramVideoErrorText = () => "error";' };
+      if (args.path === './story-main') return { contents: 'export default { fetch() {} }; export const startInstagramStoryRun = async () => {throw Error("Unexpected Story start")}; export const readInstagramStoryRun = async () => {throw Error("Unexpected Story read")}; export const sendResolvedStory = async () => {throw Error("Unexpected Story send")}; export const instagramProfileStories = async () => []; export const parseStoryTarget = () => null; export const parseInstagramProfileCommand = () => null; export const parseInstagramVideoTarget = () => null; export const parseInstagramAudioTarget = () => null; export const resolveInstagramVideo = () => {}; export const instagramVideoErrorText = () => "error";' };
       if (args.path === './index') return { contents: instagram, loader: 'ts' };
       if (args.path === './admin') return { contents: `
         export const recordDownload = async(_env,record)=>{(globalThis.downloadHistory ||= []).push(record);};
         export const isInstagramDownloadLink = text=>/instagram.com\\//.test(text);
         export const telegramTextMotion=async()=>{};
-        export const apifyAccountToken=(env,account)=>env['APIFY_API_TOKEN_'+account]?.trim()||(account===1?env.APIFY_API_TOKEN?.trim():undefined);
-        export const activeApifyAccount=async(env)=>({account:1,token:apifyAccountToken(env,1)});
+        export const instagramApiToken=(env,{provider,account})=>{
+          const key=provider==='apify'?'APIFY_API_TOKEN':'BRIGHTDATA_API_KEY';
+          return env[key+'_'+account]?.trim()||(account===1?env[key]?.trim():undefined);
+        };
+        export const instagramApiSettings=async()=>({posts:{provider:'apify',account:1},stories:{provider:'apify',account:1}});
 
         export const recordUsage=async(...args)=>globalThis.usageTelemetry ? globalThis.usageTelemetry(...args) : true; export const recordMediaDelivery=async()=>{}; export const telegramCustomEmoji=(_method,payload)=>payload;
         export const telegramFileCache=async(...args)=>globalThis.testFileCache ? globalThis.testFileCache(...args) : null; export class AdminStatsStore {}

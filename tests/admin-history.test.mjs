@@ -504,94 +504,110 @@ test('gross cost estimate uses actual CPU and standard-2 memory/disk rates with 
   } finally { f.close(); }
 });
 
-test('Apify selection persists in the existing store, defaults to one and rejects invalid settings',async()=>{
+test('API settings migrate the previous account and persist independent selections; both is atomic',async()=>{
   const f=fixture();
   try {
-    assert.deepEqual(await (await f.request('/apify-account')).json(),{account:1});
-    assert.equal((await f.request('/apify-account',{account:2})).status,200);
-    f.restart();
-    assert.deepEqual(await (await f.request('/apify-account')).json(),{account:2});
-    for(const account of [0,5,-1,1.5,'3',null])assert.equal((await f.request('/apify-account',{account})).status,400);
-    assert.deepEqual(await (await f.request('/apify-account')).json(),{account:2});
+    // Simulate the old deployed selection before the new schema is initialized.
+    f.db.prepare("UPDATE counters SET value=3 WHERE key='apify_account'").run();
+    f.db.exec("DELETE FROM counters WHERE key LIKE 'ig_%'");f.restart();
+    assert.deepEqual(await admin.instagramApiSettings(f.env),{posts:{provider:'apify',account:3},stories:{provider:'apify',account:3}});
+    const env={...f.env,APIFY_API_TOKEN_4:'apify-four',BRIGHTDATA_API_KEY_2:'bright-two'};
+    await admin.setInstagramApi(env,'posts',{provider:'brightdata',account:2});f.restart();
+    assert.deepEqual(await admin.instagramApiSettings(env),{posts:{provider:'brightdata',account:2},stories:{provider:'apify',account:3}});
+    await admin.setInstagramApi(env,'both',{provider:'apify',account:4});
+    const state=await admin.instagramApiSettings(env);
+    for(const payload of [{scope:'both',provider:'brightdata',account:2},{scope:'stories',provider:'brightdata',account:2},
+      {scope:'posts',provider:'other',account:1},{scope:'invalid',provider:'apify',account:1},
+      ...[0,5,-1,1.5,'3',null].map(account=>({scope:'posts',provider:'apify',account}))]){
+      assert.equal((await f.request('/instagram-api',payload)).status,400);
+      assert.deepEqual(await admin.instagramApiSettings(env),state);
+    }
   } finally{f.close();}
 });
 
-test('Apify account mapping preserves the legacy Secret, rejects missing slots and never persists credentials',async()=>{
+test('both services map four Secrets, preserve legacy slot one and reject missing or unsupported selections',async()=>{
   const f=fixture();
-  const env={...f.env,APIFY_API_TOKEN:'legacy-account-one',APIFY_API_TOKEN_2:'private-account-two'};
   try {
-    assert.deepEqual(await admin.activeApifyAccount(env),{account:1,token:'legacy-account-one'});
-    assert.equal(admin.apifyAccountToken({...env,APIFY_API_TOKEN_1:'numbered-account-one'},1),'numbered-account-one');
-    await admin.setActiveApifyAccount(env,2);
-    assert.deepEqual(await admin.activeApifyAccount(env),{account:2,token:'private-account-two'});
-    await assert.rejects(()=>admin.setActiveApifyAccount(env,3),/SECRET_MISSING/);
-    await assert.rejects(()=>admin.activeApifyAccount({...env,APIFY_API_TOKEN_2:''}),/SECRET_MISSING/);
-    assert.deepEqual(await (await f.request('/apify-account')).json(),{account:2});
-    assert.ok(!JSON.stringify(f.db.prepare('SELECT * FROM counters').all()).includes('private-account-two'));
-    assert.ok(!JSON.stringify(await (await f.request('/apify-account')).json()).includes('token'));
+    const env={...f.env,APIFY_API_TOKEN:'legacy-apify',BRIGHTDATA_API_KEY:'legacy-bright'};
+    for(const provider of ['apify','brightdata']){
+      const prefix=provider==='apify'?'APIFY_API_TOKEN':'BRIGHTDATA_API_KEY';
+      assert.equal(admin.instagramApiToken(env,{provider,account:1}),provider==='apify'?'legacy-apify':'legacy-bright');
+      for(const account of [1,2,3,4]){
+        env[prefix+'_'+account]='private-'+provider+'-'+account;
+        assert.equal(admin.instagramApiToken(env,{provider,account}),env[prefix+'_'+account]);
+        await admin.setInstagramApi(env,'posts',{provider,account});
+      }
+      await assert.rejects(()=>admin.setInstagramApi({...env,[prefix+'_4']:''},'posts',{provider,account:4}),/SECRET_MISSING/);
+    }
+    await assert.rejects(()=>admin.setInstagramApi(env,'both',{provider:'brightdata',account:1}),/STORIES_UNSUPPORTED/);
+    assert.ok(!JSON.stringify(f.db.prepare('SELECT * FROM counters').all()).includes('private-'));
+    assert.ok(!JSON.stringify(await admin.instagramApiSettings(env)).includes('token'));
   }finally{f.close();}
 });
 
-test('only the administrator can select configured Apify slots; panel and callbacks never expose tokens',async()=>{
+test('admin panel exposes separate purposes and all eight post choices; only admin can change configured selections',async()=>{
   const f=fixture(),calls=[],previous=globalThis.fetch;
-  const env={...f.env,APIFY_API_TOKEN:'legacy-account-one',APIFY_API_TOKEN_2:'private-account-two'};
-  const callback=(id,data)=>({update_id:800,callback_query:{id:'account-selection',from:{id},data,
-    message:{message_id:20,chat:{id}}}});
+  const env={...f.env,APIFY_API_TOKEN:'legacy-apify',BRIGHTDATA_API_KEY_2:'private-bright-two'};
+  const callback=(id,data)=>({update_id:800,callback_query:{id:'api-selection',from:{id},data,message:{message_id:20,chat:{id}}}});
+  const visit=data=>admin.worker.fetch(webhook(callback(admin.ADMIN_USER_ID,data)),env,{});
+  const panel=()=>calls.filter(c=>c.url.endsWith('/editMessageText')).at(-1).body;
   globalThis.fetch=async(input,init)=>{calls.push({url:String(input),body:JSON.parse(init.body)});return Response.json({ok:true,result:{message_id:20}});};
   try {
-    await admin.worker.fetch(webhook(callback(99,'admin:apify:2')),env,{});
-    assert.equal(calls.length,0);assert.equal((await admin.activeApifyAccount(env)).account,1);
-    await admin.worker.fetch(webhook(callback(admin.ADMIN_USER_ID,'admin:apify')),env,{});
-    let panel=calls.filter(c=>c.url.endsWith('/editMessageText')).at(-1).body;
-    assert.ok(panel.reply_markup.inline_keyboard.flat().some(b=>b.callback_data==='admin:apify:2'));
-    assert.ok(panel.reply_markup.inline_keyboard.flat().some(b=>b.text.includes('اکانت 3 — تنظیم نشده')));
-    await admin.worker.fetch(webhook(callback(admin.ADMIN_USER_ID,'admin:apify:2')),env,{});
-    assert.equal((await admin.activeApifyAccount(env)).account,2);
-    await admin.worker.fetch(webhook(callback(admin.ADMIN_USER_ID,'admin:apify:3')),env,{});
-    assert.equal((await admin.activeApifyAccount(env)).account,2);
-    panel=calls.filter(c=>c.url.endsWith('/editMessageText')).at(-1).body;
-    assert.match(panel.text,/توکن اکانت 3 هنوز/);
-    assert.ok(!JSON.stringify(calls).includes('private-account-two'));
-    assert.ok(!JSON.stringify(calls).includes('legacy-account-one'));
-    assert.ok(admin.adminDashboardKeyboard().inline_keyboard.flat().some(b=>b.callback_data==='admin:apify'));
-    // If an active Secret is removed, the panel remains reachable for repair.
-    await admin.worker.fetch(webhook(callback(admin.ADMIN_USER_ID,'admin:apify:1')),{...env,APIFY_API_TOKEN_2:''},{});
-    assert.equal((await admin.activeApifyAccount(env)).account,1);
+    await admin.worker.fetch(webhook(callback(99,'admin:igapi:posts:brightdata:2')),env,{});
+    assert.equal(calls.length,0);assert.equal((await admin.instagramApiSettings(env)).posts.provider,'apify');
+    await visit('admin:igapi');
+    for(const scope of ['posts','stories','both'])assert.ok(panel().reply_markup.inline_keyboard.flat().some(b=>b.callback_data==='admin:igapi:'+scope));
+    await visit('admin:igapi:posts');
+    for(const provider of ['apify','brightdata'])for(const account of [1,2,3,4])
+      assert.ok(panel().reply_markup.inline_keyboard.flat().some(b=>b.callback_data===`admin:igapi:posts:${provider}:${account}`));
+    await visit('admin:igapi:posts:brightdata:2');
+    assert.deepEqual((await admin.instagramApiSettings(env)).posts,{provider:'brightdata',account:2});
+    await visit('admin:igapi:posts:brightdata:3');assert.match(panel().text,/تنظیم نشده/);
+    assert.equal((await admin.instagramApiSettings(env)).posts.account,2);
+    await visit('admin:igapi:both:brightdata:2');assert.match(panel().text,/استوری/);
+    assert.deepEqual((await admin.instagramApiSettings(env)).stories,{provider:'apify',account:1});
+    await visit('admin:igapi:both:apify:1');
+    assert.equal((await admin.instagramApiSettings(env)).posts.provider,'apify');
+    assert.ok(!JSON.stringify(calls).includes('private-bright-two'));assert.ok(!JSON.stringify(calls).includes('legacy-apify'));
+    assert.ok(admin.adminDashboardKeyboard().inline_keyboard.flat().some(b=>b.callback_data==='admin:igapi'));
+    // A removed active Secret does not block opening or repairing settings.
+    await visit('admin:igapi:posts:brightdata:2');
+    await admin.worker.fetch(webhook(callback(admin.ADMIN_USER_ID,'admin:igapi:posts:apify:1')),{...env,BRIGHTDATA_API_KEY_2:''},{});
+    assert.equal((await admin.instagramApiSettings(env)).posts.provider,'apify');
   }finally{globalThis.fetch=previous;f.close();}
 });
 
-test('production Story and Reel queues capture the chosen slot without tokens in job payloads',async()=>{
+test('all 32 supported combinations pin separate post and Story choices without credentials in queues',async()=>{
   const f=fixture(),previous=globalThis.fetch,created=[];
-  const env={...f.env,APIFY_API_TOKEN_1:'private-one',APIFY_API_TOKEN_2:'private-two',
-    YOUTUBE_DOWNLOAD_WORKFLOW:{async create(value){created.push(value);}}};
+  const env={...f.env,YOUTUBE_DOWNLOAD_WORKFLOW:{async create(value){created.push(value);}}};
+  for(const account of [1,2,3,4]){env['APIFY_API_TOKEN_'+account]='private-apify-'+account;env['BRIGHTDATA_API_KEY_'+account]='private-bright-'+account;}
   globalThis.fetch=async()=>{throw Error('No external requests before the Workflow starts');};
   try {
-    for(const [account,text] of [[1,'https://instagram.com/reel/Abc123/'],[2,'https://instagram.com/stories/example/999/'],
-      [2,'https://instagram.com/p/Abc123/'],[2,'https://instagram.com/stories/highlights/17950000000123456/'],[2,'/instastory example']]){
-      await admin.setActiveApifyAccount(env,account);
-      await admin.worker.fetch(webhook({update_id:900+created.length,message:{message_id:30+created.length,
-        chat:{id:admin.ADMIN_USER_ID},from:{id:admin.ADMIN_USER_ID},text}}),env,{});
-      assert.equal(created.at(-1).params.apifyAccount,account);
+    for(const provider of ['apify','brightdata'])for(const account of [1,2,3,4])for(const storyAccount of [1,2,3,4]){
+      const posts={provider,account},stories={provider:'apify',account:storyAccount};
+      await admin.setInstagramApi(env,'posts',posts);await admin.setInstagramApi(env,'stories',stories);
+      for(const [text,selection] of [['https://instagram.com/reel/Abc123/',posts],['https://instagram.com/p/Abc123/',posts],
+        ['https://instagram.com/stories/example/999/',stories],['https://instagram.com/stories/highlights/17950000000123456/',stories],['/instastory example',stories],['/instapost example',posts]]){
+        const before=created.length;
+        await admin.worker.fetch(webhook({update_id:900+before,message:{message_id:30+before,chat:{id:admin.ADMIN_USER_ID},from:{id:admin.ADMIN_USER_ID},text}}),env,{});
+        assert.equal(created.length,before+1);assert.deepEqual(created.at(-1).params.instagramApi,selection);
+      }
     }
-    assert.equal(created.length,5);
-    assert.equal(created[0].params.apifyAccount,1,'old queued jobs retain their account');
-    assert.ok(!JSON.stringify(created).includes('private-one'));assert.ok(!JSON.stringify(created).includes('private-two'));
+    assert.deepEqual(created[0].params.instagramApi,{provider:'apify',account:1});
+    assert.ok(!JSON.stringify(created).includes('private-'));
+    // Selected slots remain pinned even if their Secret is removed before a new request.
+    await admin.worker.fetch(webhook({update_id:2000,message:{message_id:2000,chat:{id:admin.ADMIN_USER_ID},from:{id:admin.ADMIN_USER_ID},text:'https://instagram.com/reel/Abc123/'}}),{...env,BRIGHTDATA_API_KEY_4:''},{});
+    assert.deepEqual(created.at(-1).params.instagramApi,{provider:'brightdata',account:4});
   }finally{globalThis.fetch=previous;f.close();}
 });
 
-test('reselecting the active Apify account is idempotent when Telegram reports an unchanged panel',async()=>{
-  const f=fixture(),previous=globalThis.fetch,calls=[];
-  const env={...f.env,APIFY_API_TOKEN:'private-one'};
-  globalThis.fetch=async(input,init)=>{
-    const method=String(input).split('/').at(-1);calls.push(method);
-    if(method==='editMessageText')return Response.json({ok:false,description:'Bad Request: message is not modified'},{status:400});
-    return Response.json({ok:true,result:true});
-  };
-  try {
+test('reselecting the same API is idempotent when Telegram reports an unchanged panel',async()=>{
+  const f=fixture(),previous=globalThis.fetch;
+  globalThis.fetch=async(input)=>String(input).endsWith('/editMessageText')
+    ?Response.json({ok:false,description:'Bad Request: message is not modified'},{status:400}):Response.json({ok:true,result:true});
+  try{
     const response=await admin.worker.fetch(webhook({update_id:1001,callback_query:{id:'again',from:{id:admin.ADMIN_USER_ID},
-      data:'admin:apify:1',message:{message_id:20,chat:{id:admin.ADMIN_USER_ID}}}}),env,{});
-    assert.equal(response.status,200);assert.equal(calls.filter(x=>x==='editMessageText').length,1);
-    assert.equal((await admin.activeApifyAccount(env)).account,1);
-    await assert.rejects(()=>admin.activeApifyAccount({...f.env,APIFY_API_TOKEN_2:'two-only'}),/SECRET_MISSING/);
+      data:'admin:igapi:both:apify:1',message:{message_id:20,chat:{id:admin.ADMIN_USER_ID}}}}),{...f.env,APIFY_API_TOKEN:'private-one'},{});
+    assert.equal(response.status,200);assert.equal((await admin.instagramApiSettings(f.env)).posts.account,1);
   }finally{globalThis.fetch=previous;f.close();}
 });

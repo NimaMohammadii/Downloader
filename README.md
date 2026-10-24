@@ -183,19 +183,39 @@ The existing users, link totals and global success counter are preserved. New ta
 
 Never commit the bot token to the repository.
 
-## Apify account selection
+## Instagram API selection
 
-Configure up to four owned Apify accounts with Worker Secrets `APIFY_API_TOKEN_1`,
-`APIFY_API_TOKEN_2`, `APIFY_API_TOKEN_3`, and `APIFY_API_TOKEN_4`. The existing
-`APIFY_API_TOKEN` is still supported as account 1 when `_1` is absent.
+Configure up to four owned accounts per service in Worker Secrets:
 
-Open `/admin` → **🔑 انتخاب اکانت Apify** to select a configured account manually.
-The selection is stored in the existing admin Durable Object and applies to new
-post/Reel, Story/Highlight and profile-Story requests. Existing jobs retain their
-original account number, including across Workflow replay. Tokens stay in Worker
-Secrets; neither Telegram nor Workflow state stores them. Missing slots cannot be
-selected. There is no automatic account rotation, and Bright Data's existing key
-is independent of this setting.
+| Service | Secret names |
+| --- | --- |
+| Apify | `APIFY_API_TOKEN_1`, `APIFY_API_TOKEN_2`, `APIFY_API_TOKEN_3`, `APIFY_API_TOKEN_4` |
+| Bright Data | `BRIGHTDATA_API_KEY_1`, `BRIGHTDATA_API_KEY_2`, `BRIGHTDATA_API_KEY_3`, `BRIGHTDATA_API_KEY_4` |
+
+The existing `APIFY_API_TOKEN` and `BRIGHTDATA_API_KEY` remain aliases for account 1
+of their respective service, when the numbered `_1` Secret is absent.
+
+Open `/admin` → **🔑 API اینستاگرام**. Choose **پست و ریلز**, **استوری و هایلایت**,
+or **اعمال یک انتخاب برای هر دو**. Posts/Reels support either service and any of its
+four configured accounts. Stories/Highlights support the four Apify accounts.
+Bright Data's documented Instagram API covers profiles, posts, reels and comments;
+no documented Story/Highlight extraction endpoint is integrated. The panel explains
+this limitation and refuses unsupported Story/both selections without changing either
+setting. Applying an Apify account to both purposes saves both settings atomically.
+
+Selections persist in the existing admin Durable Object. The previous Apify account
+selection migrates to both purposes. Only the administrator can change them, and
+missing slots cannot be selected. If a selected Secret is later removed, downloads
+report that provider's error; they never silently select another slot or service.
+There is **no automatic extraction fallback**, including to anonymous Instagram.
+
+Every new post/Reel, Story/Highlight, `/instastory` and `/instapost` job captures only
+its purpose's provider and account number. Existing jobs retain that selection across
+admin switches and Workflow replay. Jobs queued before this update with an
+`apifyAccount` also retain their original slot. API credentials stay in Worker Secrets;
+neither Telegram nor Workflow state stores them. Profile-post listing still uses the
+existing Instagram session, while each new profile post is extracted by the selected
+post service. Live, replay and audio paths keep their existing behavior.
 
 ## Optional Instagram secrets
 

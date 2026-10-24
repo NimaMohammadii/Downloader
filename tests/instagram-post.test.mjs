@@ -235,55 +235,32 @@ test('TopAPI ordered mixed childPosts carousel preserves every slide and never s
   assert.equal(result.calls.length,2);
 });
 
-test('TopAPI metadata-only result invokes Bright Data once as the paid fallback', async () => {
-  const result=await run({env:{APIFY_API_TOKEN:'top-key',BRIGHTDATA_API_KEY:'bright-key'},
-    respond(call){
-      if(call.hostname==='api.apify.com')return Response.json([{
-        type:'Video',shortCode:shortcode,displayUrl:'https://scontent.cdninstagram.com/cover.jpg',
-      }]);
-      if(call.hostname==='api.brightdata.com')return Response.json([{
-        shortcode,video_url:'https://scontent.cdninstagram.com/recovered.mp4',
-      }]);
-      throw Error('unexpected request');
-    }});
-  assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com','api.apify.com','api.brightdata.com']);
-  assert.deepEqual(files(result).map(x=>x.method),['sendVideo']);
-  const fallback=result.diagnostics.find(x=>x.message==='instagram topapi fallback')?.info;
-  assert.deepEqual(fallback,{reason:'TOPAPI_NO_MEDIA',next:'brightdata'});
-  assert.ok(result.calls.every(x=>!x.headers.get('cookie')?.includes('sessionid=')));
+test('TopAPI metadata-only results stop at Apify even when a working Bright Data key exists',async()=>{
+ const result=await run({env:{APIFY_API_TOKEN:'top-key',BRIGHTDATA_API_KEY:'bright-key'},respond(call){
+   if(call.hostname==='api.apify.com')return Response.json([{type:'Video',shortCode:shortcode,displayUrl:'https://scontent.cdninstagram.com/cover.jpg'}]);
+   throw Error('No fallback may be called');
+ }});
+ assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com','api.apify.com']);
+ assert.equal(report(result),'TOPAPI_NO_MEDIA');assert.equal(files(result).length,0);
 });
 
-test('TopAPI empty dataset and 429 response fall back once to Bright Data', async () => {
-  for(const topResponse of [Response.json([]),Response.json({error:'rate limit'},{status:429})]){
-    const result=await run({env:{APIFY_API_TOKEN:'top-key',BRIGHTDATA_API_KEY:'bright-key'},
-      respond(call){
-        if(call.hostname==='api.apify.com')return topResponse.clone();
-        if(call.hostname==='api.brightdata.com')return Response.json([{
-          shortcode,video_url:'https://scontent.cdninstagram.com/recovered.mp4',
-        }]);
-      }});
-    assert.deepEqual(result.calls.map(x=>x.hostname),
-      topResponse.status===429 ? ['api.apify.com','api.brightdata.com']
-        : ['api.apify.com','api.apify.com','api.brightdata.com']);
-    assert.deepEqual(files(result).map(x=>x.method),['sendVideo']);
-  }
+test('TopAPI empty datasets and quota failures do not call Bright Data or direct Instagram',async()=>{
+ for(const response of [Response.json([]),Response.json({error:'rate limit'},{status:429})]){
+   const result=await run({env:{APIFY_API_TOKEN:'top-key',BRIGHTDATA_API_KEY:'bright-key'},respond(call){
+     if(call.hostname==='api.apify.com')return response.clone();throw Error('No fallback');
+   }});
+   assert.ok(result.calls.every(x=>x.hostname==='api.apify.com'));
+   assert.equal(report(result),response.status===429?'TOPAPI_QUOTA_OR_RATE_LIMIT':'TOPAPI_NO_MEDIA');
+   assert.equal(files(result).length,0);
+ }
 });
 
-test('TopAPI incomplete carousel falls back to complete Bright Data carousel instead of partial files', async () => {
-  const result=await run({text:'https://www.instagram.com/p/'+shortcode+'/',
-    env:{APIFY_API_TOKEN:'top-key',BRIGHTDATA_API_KEY:'bright-key'},
-    respond(call){
-      if(call.hostname==='api.apify.com')return Response.json([{shortCode:shortcode,type:'Sidecar',
-        childPosts:[{type:'Image',displayUrl:'https://scontent.cdninstagram.com/photo.jpg'},
-          {type:'Video',displayUrl:'https://scontent.cdninstagram.com/cover.jpg'}],
-      }]);
-      if(call.hostname==='api.brightdata.com')return Response.json([{shortcode,carousel_media:[
-        {image_url:'https://scontent.cdninstagram.com/photo.jpg'},
-        {video_url:'https://scontent.cdninstagram.com/real-video.mp4'},
-      ]}]);
-    }});
-  assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com','api.apify.com','api.brightdata.com']);
-  assert.deepEqual(files(result).map(x=>x.method),['sendPhoto','sendVideo']);
+test('TopAPI incomplete carousels stop without changing provider or sending partial files',async()=>{
+ const result=await run({text:'https://www.instagram.com/p/'+shortcode+'/',env:{APIFY_API_TOKEN:'top-key',BRIGHTDATA_API_KEY:'bright-key'},respond(call){
+   if(call.hostname==='api.apify.com')return Response.json([{shortCode:shortcode,type:'Sidecar',childPosts:[{type:'Image',displayUrl:'https://scontent.cdninstagram.com/photo.jpg'},{type:'Video'}]}]);
+   throw Error('No fallback');
+ }});
+ assert.ok(result.calls.every(x=>x.hostname==='api.apify.com'));assert.equal(report(result),'TOPAPI_INCOMPLETE_CAROUSEL');assert.equal(files(result).length,0);
 });
 
 test('TopAPI wrong-shortcode responses never trigger backup downloads', async () => {
@@ -346,20 +323,12 @@ test('TopAPI async run waits for its original ID, reads dataset, and starts only
   assert.ok(!JSON.stringify(result.diagnostics).includes('private-apify-token'));
 });
 
-test('TopAPI known failed run uses existing Bright Data once without rerunning the Actor', async () => {
-  const id='topapiRun000002';
-  const result=await run({env:{APIFY_API_TOKEN:'top-key',BRIGHTDATA_API_KEY:'bright-key'},
-    respond(call){
-      if(call.path==='/v2/actors/topapi~instagram-scraper/runs')
-        return Response.json({data:{id,status:'FAILED',defaultDatasetId:'dataset000002'}},{status:201});
-      if(call.hostname==='api.brightdata.com')return Response.json([{
-        shortcode,video_url:'https://scontent.cdninstagram.com/recovered.mp4',
-      }]);
-      throw Error('unexpected paid action '+call.path);
-    }});
-  assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com','api.brightdata.com']);
-  assert.equal(result.calls.filter(x=>x.method==='POST'&&x.hostname==='api.apify.com').length,1);
-  assert.deepEqual(files(result).map(x=>x.method),['sendVideo']);
+test('TopAPI failed Actor run is terminal without starting Bright Data',async()=>{
+ const result=await run({env:{APIFY_API_TOKEN:'top-key',BRIGHTDATA_API_KEY:'bright-key'},respond(call){
+   if(call.hostname==='api.apify.com')return Response.json({data:{id:'failedRun00001',status:'FAILED',defaultDatasetId:'dataset000002'}},{status:201});
+   throw Error('No fallback');
+ }});
+ assert.deepEqual(result.calls.map(x=>x.hostname),['api.apify.com']);assert.equal(report(result),'TOPAPI_UNAVAILABLE');assert.equal(files(result).length,0);
 });
 
 test('TopAPI missing run ID does not start a new paid run or Bright Data', async () => {
@@ -434,7 +403,7 @@ test('Bright Data post returns every photo in a simple ordered photo post', asyn
   assert.deepEqual(files(result).map(x => x.method), ['sendPhoto', 'sendPhoto']);
 });
 
-test('Bright Data unordered mixed carousel uses one existing public fallback and never sends partial media', async () => {
+test('Bright Data unordered mixed carousel is terminal and never sends partial media', async () => {
   const result = await run({text: 'https://www.instagram.com/p/' + shortcode + '/',
     env: {BRIGHTDATA_API_KEY: 'key'}, respond(call) {
       if (call.hostname === 'api.brightdata.com') return Response.json([{
@@ -445,17 +414,17 @@ test('Bright Data unordered mixed carousel uses one existing public fallback and
       if (call.hostname === 'i.instagram.com') return Response.json({message: 'login_required'}, {status: 401});
     }});
   assert.equal(result.calls.filter(call => call.hostname === 'api.brightdata.com').length, 1);
-  assert.equal(result.calls.length, 3);
+  assert.equal(result.calls.length, 1);
   assert.equal(files(result).length, 0);
   assert.match(report(result), /BRIGHTDATA_INCOMPLETE_CAROUSEL/);
   assert.ok(!result.calls.slice(1).some(call => call.headers.get('cookie')?.includes('sessionid=')));
 });
 
-test('Bright Data refuses wrong shortcode; unusable media only falls back anonymously', async () => {
+test('Bright Data wrong shortcode and unusable media never switch providers', async () => {
   for (const [payload, expected, requestCount] of [
     [[{shortcode: 'another', video_url: 'https://scontent.cdninstagram.com/video.mp4'}], /BRIGHTDATA_WRONG_POST/, 1],
-    [[{shortcode, video_url: 'https://example.com/private.mp4'}], /BRIGHTDATA_NO_MEDIA/, 3],
-    [[{shortcode, thumbnail: 'https://scontent.cdninstagram.com/cover.jpg'}], /BRIGHTDATA_NO_MEDIA/, 3],
+    [[{shortcode, video_url: 'https://example.com/private.mp4'}], /BRIGHTDATA_NO_MEDIA/, 1],
+    [[{shortcode, thumbnail: 'https://scontent.cdninstagram.com/cover.jpg'}], /BRIGHTDATA_NO_MEDIA/, 1],
   ]) {
     const result = await run({env: {BRIGHTDATA_API_KEY: 'key'}, respond(call) {
       if (call.hostname === 'api.brightdata.com') return Response.json(payload);
@@ -469,7 +438,7 @@ test('Bright Data refuses wrong shortcode; unusable media only falls back anonym
   }
 });
 
-test('Bright Data missing video URLs are diagnosed and then attempted by existing anonymous path', async () => {
+test('Bright Data missing video URLs are diagnosed without trying another resolver', async () => {
   for (const [payload, state] of [
     [{url: 'https://www.instagram.com/reel/' + shortcode + '/', description: 'metadata only'}, 'missing'],
     [{url: 'https://www.instagram.com/reel/' + shortcode + '/', video_url: 'https://example.com/file.mp4'}, 'unsupported_host'],
@@ -481,7 +450,7 @@ test('Bright Data missing video URLs are diagnosed and then attempted by existin
       if (call.hostname === 'i.instagram.com') return Response.json({message: 'login_required'}, {status: 401});
     }});
     assert.equal(files(result).length, 0);
-    assert.equal(result.calls.length, 3);
+    assert.equal(result.calls.length, 1);
     assert.match(report(result), /BRIGHTDATA_NO_MEDIA/);
     const diagnostic = result.diagnostics.find(x => x.message === 'instagram brightdata no media')?.info;
     assert.equal(diagnostic?.reason, 'video_link_missing_or_unusable');
@@ -495,11 +464,11 @@ test('Bright Data missing video URLs are diagnosed and then attempted by existin
   }
 });
 
-test('Bright Data provider rejections are terminal; empty results use one free media recovery', async () => {
+test('Bright Data provider rejections and empty results are terminal', async () => {
   for (const [payload, reason, expectedCode, requestCount] of [
     [[{error: 'upstream denied private account', status: 'fail'}],
       'provider_error_record', /BRIGHTDATA_PROVIDER_ERROR/, 1],
-    [[], 'invalid_record_count', /BRIGHTDATA_NO_MEDIA/, 3],
+    [[], 'invalid_record_count', /BRIGHTDATA_NO_MEDIA/, 1],
   ]) {
     const result = await run({env: {BRIGHTDATA_API_KEY: 'sensitive-api-key'}, respond(call) {
       if (call.hostname === 'api.brightdata.com') return Response.json(payload);
@@ -542,20 +511,12 @@ test('Bright Data explicitly single-video Post ignores cover instead of rejectin
   assert.equal(result.calls.length, 1);
 });
 
-test('Bright Data metadata-only Reel is recovered by the existing public webpage without another paid call', async () => {
-  const result = await run({env: {BRIGHTDATA_API_KEY: 'brightdata-key',
-      INSTAGRAM_SESSIONID: 'personal-session-not-for-public-reels'}, respond(call) {
-    if (call.hostname === 'api.brightdata.com') return Response.json([{
-      url: 'https://www.instagram.com/reel/' + shortcode + '/',
-      description: 'The video URL is not included in this provider record',
-    }]);
-    if (call.path === pagePath) return new Response(html(video));
-  }});
-  assert.equal(files(result).length, 1);
-  assert.deepEqual(result.calls.map(call => call.hostname), ['api.brightdata.com', 'www.instagram.com']);
-  assert.equal(result.calls.filter(call => call.hostname === 'api.brightdata.com').length, 1);
-  assert.ok(result.calls.slice(1).every(call => !call.headers.get('cookie')?.includes('sessionid=')));
-  assert.ok(result.diagnostics.some(x => x.message === 'instagram brightdata media recovered'));
+test('Bright Data metadata-only Reel never uses a working anonymous Instagram response as fallback',async()=>{
+ const result=await run({env:{BRIGHTDATA_API_KEY:'key'},respond(call){
+   if(call.hostname==='api.brightdata.com')return Response.json([{shortcode,description:'metadata'}]);
+   if(call.hostname==='www.instagram.com')return new Response(html(video));
+ }});
+ assert.equal(files(result).length,0);assert.deepEqual(result.calls.map(x=>x.hostname),['api.brightdata.com']);assert.equal(report(result),'BRIGHTDATA_NO_MEDIA');
 });
 
 test('Bright Data posts can use a documented single-photo alternate without sending multiple copies', async () => {
@@ -736,7 +697,7 @@ test('videos above the upload ceiling are rejected before creating a job with th
   assert.match(errorText(result), /۲ گیگابایت/);
 });
 
-test('the production entry point hands a large post to the existing workflow and keeps a single status message', async () => {
+test('the production entry point queues the selected API before probing media or sending a status', async () => {
   const bundle = await build({ entryPoints: ['src/app-main.ts'], bundle: true, format: 'esm', write: false,
     plugins: [{ name: 'large-post-runtime', setup(b) {
       b.onResolve({ filter: /^(cloudflare:workers|@cloudflare\/containers)$/ }, a => ({ path: a.path, namespace: 'runtime' }));
@@ -771,10 +732,9 @@ test('the production entry point hands a large post to the existing workflow and
   assert.equal((await production.fetch(request(), bindings, {})).status, 200);
   assert.equal(jobs.length, 1);
   assert.equal(jobs[0].id, 'igdl-42-8-42');
-  assert.equal(jobs[0].params.instagramPost.statusMessageId, 99);
-  assert.equal(jobs[0].params.instagramPost.media[0].size, 120000000);
-  assert.deepEqual(sent.filter(item => item.method !== 'sendMessageDraft').map(item => item.method), ['sendMessage']);
-  assert.equal(requests.filter(value => value.startsWith('i.instagram.com')).length, 1);
+  assert.deepEqual(jobs[0].params.instagramPostRequest,{shortcode});
+  assert.deepEqual(jobs[0].params.instagramApi,{provider:'apify',account:1});
+  assert.equal(sent.length,0);assert.equal(requests.length,0);
   assert.ok(!JSON.stringify(jobs).includes('fixture-session'));
 });
 
@@ -1174,33 +1134,18 @@ test('temporary Telegram failures and invalid bot credentials are not silently a
 
 
 
-test('failed Bright Data fallback retains the original Apify cause instead of masking it',async()=>{
-  for(const [scenario,primaryCode,expectedText] of [
-    ['auth','TOPAPI_AUTH_ERROR',/توکن Apify/],
-    ['quota','TOPAPI_QUOTA_OR_RATE_LIMIT',/سهمیه یا محدودیت/],
-    ['missing_video','TOPAPI_NO_MEDIA',/TopAPI لینک فایل/],
-    ['failed_run','TOPAPI_UNAVAILABLE',/استخراج TopAPI کامل نشد/],
-  ]) {
-    const result=await run({env:{APIFY_API_TOKEN:'private-primary-token',BRIGHTDATA_API_KEY:'private-backup-key'},respond(call){
-      if(call.hostname==='api.brightdata.com')return Response.json([{error:'provider failure including private-backup-key'}]);
-      if(call.hostname==='api.apify.com'){
-        if(scenario==='auth')return Response.json({error:{type:'invalid-token'}},{status:401});
-        if(scenario==='quota')return Response.json({error:{type:'limit-exceeded'}},{status:429});
-        if(call.path.endsWith('/runs'))return Response.json({data:{id:'chainRun00001',status:scenario==='failed_run'?'FAILED':'SUCCEEDED',defaultDatasetId:'chainDataset00001'}});
-        return Response.json([{type:'Video',shortCode:shortcode,displayUrl:'https://scontent.cdninstagram.com/cover.jpg'}]);
-      }
-      throw Error('Unexpected provider');
-    }});
-    assert.equal(report(result),`INSTAGRAM_PROVIDER_CHAIN_FAILED|${primaryCode}|BRIGHTDATA_PROVIDER_ERROR`);
-    assert.match(errorText(result),expectedText);assert.match(errorText(result),/خود Bright Data/);
-    assert.equal(result.calls.filter(x=>x.hostname==='api.brightdata.com').length,1);
-    assert.equal(files(result).length,0);
-    assert.deepEqual(result.diagnostics.find(x=>x.message==='instagram post provider chain failed').info,
-      {primaryCode,fallbackCode:'BRIGHTDATA_PROVIDER_ERROR'});
-    assert.ok(!JSON.stringify(result.diagnostics).includes('private-primary-token'));
-    assert.ok(!JSON.stringify(result.diagnostics).includes('private-backup-key'));
-    assert.ok(!JSON.stringify(result.sent).includes('private-backup-key'));
-  }
+test('explicit service choice overrides other configured credentials; missing selected keys never fall back',async()=>{
+ for(const provider of ['apify','brightdata']){
+   const prefix=provider==='apify'?'TOPAPI':'BRIGHTDATA';
+   const hostname=provider==='apify'?'api.apify.com':'api.brightdata.com';
+   const result=await run({env:{INSTAGRAM_POST_PROVIDER:provider,APIFY_API_TOKEN:'private-apify',BRIGHTDATA_API_KEY:'private-bright'},respond(call){
+     assert.equal(call.hostname,hostname);return Response.json({error:'invalid-token'},{status:401});
+   }});
+   assert.equal(report(result),prefix+'_AUTH_ERROR');assert.equal(result.calls.length,1);assert.equal(files(result).length,0);
+   const missing=await run({env:{INSTAGRAM_POST_PROVIDER:provider,[provider==='apify'?'BRIGHTDATA_API_KEY':'APIFY_API_TOKEN']:'other-service'},respond(){throw Error('No network for missing selected key');}});
+   assert.equal(report(missing),prefix+'_AUTH_ERROR');assert.equal(missing.calls.length,0);
+   assert.ok(!JSON.stringify(result.diagnostics).includes('private-'));
+ }
 });
 
 test('Bright Data-only failures are not falsely reported as failures of Apify',async()=>{

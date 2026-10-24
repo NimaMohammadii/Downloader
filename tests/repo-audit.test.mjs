@@ -8,10 +8,10 @@ const result=await build({entryPoints:['src/app-main.ts'],bundle:true,format:'es
   plugins:[{name:'cloudflare-runtime',setup(b){
     b.onResolve({filter:/^(cloudflare:workers|@cloudflare\/containers)$/},a=>({path:a.path,namespace:'runtime'}));
     b.onLoad({filter:/.*/,namespace:'runtime'},a=>({contents:a.path==='cloudflare:workers'
-      ? 'export class DurableObject{};export class WorkflowEntrypoint{};'
+      ? 'export class DurableObject{};export class WorkflowEntrypoint{constructor(ctx,env){this.env=env;}};'
       : 'export class Container{};export function getContainer(){throw Error("unexpected container startup");}'}));
   }}]});
-const {default:worker}=await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString('base64')}`);
+const {default:worker,YoutubeDownloadWorkflow}=await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString('base64')}`);
 const secret='fictional-private-webhook-secret-32';
 const legacy='dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1';
 
@@ -49,12 +49,13 @@ test('configured webhook secret reaches YouTube, music and delegated Instagram h
   for(const text of ['/start','/music Hello','https://youtube.com/watch?v=abcdefghijk',
     'https://instagram.com/reel/B/','https://instagram.com/stories/example/123/'])
     assert.equal((await worker.fetch(request(text,secret),env,{})).status,200,text);
-  assert.equal(jobs.length,2);
-  assert.ok(calls.some(url=>url.includes('instagram.com')),'delegated Instagram authorization must use the same secret');
+  assert.equal(jobs.length,4);
+  assert.deepEqual(jobs.slice(2).map(job=>job.params.instagramApi),[{provider:'apify',account:1},{provider:'apify',account:1}]);
+  assert.ok(!calls.some(url=>url.includes('instagram.com')),'Instagram extraction is deferred until the authenticated Workflow runs');
 });
 
-test('the production entrypoint downloads an Instagram reel without depending on oEmbed', async () => {
-  const sent = [], instagram = [];
+test('the production entrypoint queues and downloads an Instagram reel through the selected API without oEmbed', async () => {
+  const sent = [], instagram = [], jobs=[];
   globalThis.fetch = async (url, init = {}) => {
     const target = new URL(String(url));
     if (target.hostname === 'api.telegram.org') {
@@ -64,6 +65,10 @@ test('the production entrypoint downloads an Instagram reel without depending on
     }
     if (target.hostname === 'scontent.cdninstagram.com') return new Response(null, { headers: { 'content-length': '1000000' } });
     instagram.push(target.pathname);
+    if(target.hostname==='api.apify.com'){
+      if(target.pathname.endsWith('/runs'))return Response.json({data:{id:'auditRun00001',status:'SUCCEEDED',defaultDatasetId:'auditDataset00001'}});
+      return Response.json([{type:'Video',shortCode:'B',videoUrl:'https://scontent.cdninstagram.com/fixture.mp4',width:720,height:1280}]);
+    }
     if (target.pathname === '/reel/B/') return new Response('<html></html>');
     if (target.pathname === '/api/v1/oembed/') return new Response(null, { status: 403 });
     if (target.pathname === '/api/v1/media/1/info/') return Response.json({ items: [{
@@ -71,13 +76,17 @@ test('the production entrypoint downloads an Instagram reel without depending on
     }] });
     throw Error('Unexpected Instagram endpoint');
   };
+  const bindings={BOT_TOKEN:'fixture',WEBHOOK_SECRET:secret,APIFY_API_TOKEN:'private-audit-token',YOUTUBE_DOWNLOAD_WORKFLOW:{async create(job){jobs.push(job);}}};
   const response = await worker.fetch(new Request('https://worker/telegram/webhook', {
     method: 'POST', headers: { 'content-type': 'application/json', 'x-telegram-bot-api-secret-token': secret },
     body: JSON.stringify({ update_id: 92, message: { message_id: 8, from: { id: 42 }, chat: { id: -42 },
       text: 'https://www.instagram.com/reel/B/' } }),
-  }), { BOT_TOKEN: 'fixture', WEBHOOK_SECRET: secret }, {});
+  }), bindings, {});
   assert.equal(response.status, 200);
-  assert.deepEqual(instagram, ['/reel/B/', '/api/v1/media/1/info/']);
+  assert.equal(jobs.length,1);assert.deepEqual(jobs[0].params.instagramApi,{provider:'apify',account:1});
+  assert.deepEqual(instagram,[]);assert.equal(sent.length,0);
+  await new YoutubeDownloadWorkflow({},bindings).run({payload:jobs[0].params},{async do(name,opts,fn){return (typeof opts==='function'?opts:fn)();}});
+  assert.deepEqual(instagram,['/v2/actors/topapi~instagram-scraper/runs','/v2/datasets/auditDataset00001/items']);
   assert.equal(sent.filter(item => item.method === 'sendVideo').length, 1);
   assert.equal(sent.find(item => item.method === 'sendVideo').body.width, 720);
 });

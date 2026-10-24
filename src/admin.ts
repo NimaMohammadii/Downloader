@@ -193,43 +193,50 @@ export type AdminStatsEnv = {
 };
 
 export type ApifyAccount = 1 | 2 | 3 | 4;
-export type ApifyAccountSecrets = {
+export type InstagramProvider = "apify" | "brightdata";
+export type InstagramApiSelection = { provider: InstagramProvider; account: ApifyAccount };
+export type InstagramApiSettings = { posts: InstagramApiSelection; stories: InstagramApiSelection };
+export type InstagramApiSecrets = {
   APIFY_API_TOKEN?: string;
   APIFY_API_TOKEN_1?: string;
   APIFY_API_TOKEN_2?: string;
   APIFY_API_TOKEN_3?: string;
   APIFY_API_TOKEN_4?: string;
+  BRIGHTDATA_API_KEY?: string;
+  BRIGHTDATA_API_KEY_1?: string;
+  BRIGHTDATA_API_KEY_2?: string;
+  BRIGHTDATA_API_KEY_3?: string;
+  BRIGHTDATA_API_KEY_4?: string;
 };
-export const APIFY_ACCOUNTS: readonly ApifyAccount[] = [1, 2, 3, 4];
+export const INSTAGRAM_API_ACCOUNTS: readonly ApifyAccount[] = [1, 2, 3, 4];
 
-export function apifyAccountToken(env: ApifyAccountSecrets, account: ApifyAccount): string | undefined {
-  // Preserve the existing Secret as account 1; numbered Secrets take priority.
-  return env[`APIFY_API_TOKEN_${account}`]?.trim() || (account === 1 ? env.APIFY_API_TOKEN?.trim() : undefined) || undefined;
+export function instagramApiToken(env: InstagramApiSecrets, selection: InstagramApiSelection): string | undefined {
+  const prefix = selection.provider === "apify" ? "APIFY_API_TOKEN" : "BRIGHTDATA_API_KEY";
+  return env[`${prefix}_${selection.account}`]?.trim()
+    || (selection.account === 1 ? env[prefix]?.trim() : undefined) || undefined;
 }
 
-export async function activeApifyAccount(env: Partial<AdminStatsEnv> & ApifyAccountSecrets): Promise<{
-  account: ApifyAccount; token?: string;
-}> {
-  let account: ApifyAccount = 1;
-  if (env.ADMIN_STATS) {
-    const response = await env.ADMIN_STATS.getByName("global").fetch("https://admin-stats/apify-account");
-    if (!response.ok) throw new Error("APIFY_ACCOUNT_SETTING_UNAVAILABLE");
-    const value = await response.json() as { account?: ApifyAccount };
-    if (!APIFY_ACCOUNTS.includes(value.account!)) throw new Error("APIFY_ACCOUNT_SETTING_INVALID");
-    account = value.account!;
-  }
-  const token = apifyAccountToken(env, account);
-  if (!token && (account !== 1 || APIFY_ACCOUNTS.some(slot => apifyAccountToken(env, slot))))
-    throw new Error("APIFY_ACCOUNT_SECRET_MISSING");
-  return { account, token };
+export async function instagramApiSettings(env: Partial<AdminStatsEnv>): Promise<InstagramApiSettings> {
+  if (!env.ADMIN_STATS) return { posts: { provider: "apify", account: 1 }, stories: { provider: "apify", account: 1 } };
+  const response = await env.ADMIN_STATS.getByName("global").fetch("https://admin-stats/instagram-api");
+  if (!response.ok) throw new Error("INSTAGRAM_API_SETTING_UNAVAILABLE");
+  const value = await response.json() as InstagramApiSettings;
+  if (![value.posts, value.stories].every(item => item && ["apify", "brightdata"].includes(item.provider)
+      && INSTAGRAM_API_ACCOUNTS.includes(item.account)) || value.stories.provider !== "apify")
+    throw new Error("INSTAGRAM_API_SETTING_INVALID");
+  return value;
 }
 
-export async function setActiveApifyAccount(env: AdminStatsEnv & ApifyAccountSecrets, account: ApifyAccount): Promise<void> {
-  if (!APIFY_ACCOUNTS.includes(account) || !apifyAccountToken(env, account)) throw new Error("APIFY_ACCOUNT_SECRET_MISSING");
-  const response = await env.ADMIN_STATS.getByName("global").fetch("https://admin-stats/apify-account", {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ account }),
+export async function setInstagramApi(env: AdminStatsEnv & InstagramApiSecrets,
+  scope: "posts" | "stories" | "both", selection: InstagramApiSelection): Promise<void> {
+  if (!["posts", "stories", "both"].includes(scope) || !["apify", "brightdata"].includes(selection.provider)
+      || !INSTAGRAM_API_ACCOUNTS.includes(selection.account)) throw new Error("INSTAGRAM_API_SETTING_INVALID");
+  if (scope !== "posts" && selection.provider === "brightdata") throw new Error("BRIGHTDATA_STORIES_UNSUPPORTED");
+  if (!instagramApiToken(env, selection)) throw new Error("INSTAGRAM_API_SECRET_MISSING");
+  const response = await env.ADMIN_STATS.getByName("global").fetch("https://admin-stats/instagram-api", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ scope, ...selection }),
   });
-  if (!response.ok) throw new Error("APIFY_ACCOUNT_SETTING_UNAVAILABLE");
+  if (!response.ok) throw new Error("INSTAGRAM_API_SETTING_UNAVAILABLE");
 }
 
 export type TrackedUser = {
@@ -396,6 +403,9 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         SELECT user_id, MIN(created_at) FROM download_history WHERE delivered > 0 GROUP BY user_id;
       INSERT OR IGNORE INTO counters(key, value) VALUES ('membership_enabled', 1);
       INSERT OR IGNORE INTO counters(key, value) VALUES ('apify_account', 1);
+      INSERT OR IGNORE INTO counters(key, value) VALUES ('ig_posts_provider', 1), ('ig_stories_provider', 1);
+      INSERT OR IGNORE INTO counters(key, value) SELECT 'ig_posts_account', value FROM counters WHERE key = 'apify_account';
+      INSERT OR IGNORE INTO counters(key, value) SELECT 'ig_stories_account', value FROM counters WHERE key = 'apify_account';
 
       CREATE TABLE IF NOT EXISTS telegram_file_cache (
         key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at INTEGER NOT NULL
@@ -498,15 +508,29 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       } satisfies AdminUsage);
     }
 
-    if (url.pathname === "/apify-account") {
+    if (url.pathname === "/instagram-api") {
       const sql = this.ctx.storage.sql;
       if (request.method === "POST") {
-        const payload = await request.json().catch(() => null) as { account?: ApifyAccount } | null;
-        if (!payload || !APIFY_ACCOUNTS.includes(payload.account!)) return new Response("Invalid account", { status: 400 });
-        sql.exec("UPDATE counters SET value = ? WHERE key = 'apify_account'", payload.account);
+        const payload = await request.json().catch(() => null) as {
+          scope?: string; provider?: string; account?: ApifyAccount;
+        } | null;
+        if (!payload || !["posts", "stories", "both"].includes(payload.scope!)
+            || !["apify", "brightdata"].includes(payload.provider!)
+            || !INSTAGRAM_API_ACCOUNTS.includes(payload.account!)
+            || (payload.scope !== "posts" && payload.provider === "brightdata"))
+          return new Response("Invalid API selection", { status: 400 });
+        this.ctx.storage.transactionSync(() => {
+          for (const scope of payload.scope === "both" ? ["posts", "stories"] : [payload.scope!]) {
+            sql.exec("UPDATE counters SET value = ? WHERE key = ?", payload.provider === "apify" ? 1 : 2, `ig_${scope}_provider`);
+            sql.exec("UPDATE counters SET value = ? WHERE key = ?", payload.account!, `ig_${scope}_account`);
+          }
+        });
       } else if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
-      const row = sql.exec("SELECT value FROM counters WHERE key = 'apify_account'").one();
-      return Response.json({ account: asNumber(row.value) });
+      const read = (scope: string): InstagramApiSelection => ({
+        provider: asNumber(sql.exec("SELECT value FROM counters WHERE key = ?", `ig_${scope}_provider`).one().value) === 2 ? "brightdata" : "apify",
+        account: asNumber(sql.exec("SELECT value FROM counters WHERE key = ?", `ig_${scope}_account`).one().value) as ApifyAccount,
+      });
+      return Response.json({ posts: read("posts"), stories: read("stories") } satisfies InstagramApiSettings);
     }
 
     if (url.pathname === "/membership") {
@@ -895,7 +919,7 @@ export function adminDashboardKeyboard(): Record<string, unknown> {
         { text: "فعال‌های ۷ روز", callback_data: "admin:users:0:week" }],
       [{ text: "لینک‌فرستاده‌های ۲۴ ساعت", callback_data: "admin:used:0:day" },
         { text: "لینک‌فرستاده‌های ۷ روز", callback_data: "admin:used:0:week" }],
-      [{ text: "🔑 انتخاب اکانت Apify", callback_data: "admin:apify" }],
+      [{ text: "🔑 API اینستاگرام", callback_data: "admin:igapi" }],
       [{ text: "عضویت اجباری چنل", callback_data: "admin:membership" }],
       [{ text: "🔄 بروزرسانی آمار", callback_data: "admin:stats" }],
     ],

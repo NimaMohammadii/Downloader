@@ -29,8 +29,11 @@ const { outputFiles } = await build({
         export const recordDownload = async(_env,record)=>{(globalThis.downloadHistory ||= []).push(record);};
         export const isInstagramDownloadLink = text=>/instagram.com\\//.test(text);
         export const telegramTextMotion=async()=>{};
-        export const apifyAccountToken=(env,account)=>env['APIFY_API_TOKEN_'+account]?.trim()||(account===1?env.APIFY_API_TOKEN?.trim():undefined);
-        export const activeApifyAccount=async(env)=>({account:1,token:apifyAccountToken(env,1)});
+        export const instagramApiToken=(env,{provider,account})=>{
+          const key=provider==='apify'?'APIFY_API_TOKEN':'BRIGHTDATA_API_KEY';
+          return env[key+'_'+account]?.trim()||(account===1?env[key]?.trim():undefined);
+        };
+        export const instagramApiSettings=async()=>({posts:{provider:'apify',account:1},stories:{provider:'apify',account:1}});
 
         export const recordUsage=async()=>true; export const recordMediaDelivery=async()=>{}; export const telegramCustomEmoji=(_method,payload)=>payload;
         export const telegramFileCache=async(...args)=>globalThis.testFileCache ? globalThis.testFileCache(...args) : null; export class AdminStatsStore{} export const ADMIN_USER_ID=1;
@@ -46,9 +49,9 @@ const env = { BOT_TOKEN: 'fictional-bot-token', API_ID: '123', API_HASH: 'fictio
 const liveUrl = 'https://scontent.cdninstagram.com/live.mpd';
 const job = { id: 'igdl-42-7-42', chatId: 42, requestMessageId: 7, userId: 42, url: '', instagram: {kind:'live',broadcastId:'17900000000000001'} };
 
-async function profileWorkflow({ failPost, rejectPage, repeatCursor = false, stories = false } = {}) {
-  const parent={...job,instagram:undefined,url:'https://www.instagram.com/example/',instagramProfile:{username:'example',kind:stories?'story':'posts'}};
-  const checkpoints=new Map(),events=new Map(),waiters=new Map(),children=[],tasks=[],order=[],messages=[],pages=[];
+async function profileWorkflow({ failPost, rejectPage, repeatCursor = false, stories = false, selectedApi } = {}) {
+  const parent={...job,instagram:undefined,url:'https://www.instagram.com/example/',instagramProfile:{username:'example',kind:stories?'story':'posts'},...(selectedApi?{instagramApi:selectedApi}:{})};
+  const checkpoints=new Map(),events=new Map(),waiters=new Map(),children=[],tasks=[],order=[],messages=[],pages=[],apiCalls=[];
   const created=new Set();
   globalThis.downloadHistory=[];globalThis.delivered=0;globalThis.containerIds=[];globalThis.testFileCache=undefined;
   const photo={kind:'photo',url:'https://scontent.cdninstagram.com/picture.jpg',width:1080,height:1080};
@@ -64,6 +67,11 @@ async function profileWorkflow({ failPost, rejectPage, repeatCursor = false, sto
         {pk:'999',media_type:2,video_versions:[{url:'https://scontent.cdninstagram.com/story.mp4',width:1080,height:1920}]},
         {pk:'1000',...node('B')},
       ]}});
+    }
+    if(selectedApi&&String(url).includes('api.brightdata.com')){
+      assert.equal(new Headers(init.headers).get('authorization'),'Bearer private-profile-bright-two');
+      const shortcode=JSON.parse(init.body)[0].url.split('/').filter(Boolean).at(-1);
+      apiCalls.push(shortcode);return Response.json([{shortcode,photos:['https://scontent.cdninstagram.com/picture.jpg']}]);
     }
     assert.equal(String(url),'https://www.instagram.com/graphql/query');
     const variables=JSON.parse(new URLSearchParams(init.body).get('variables'));pages.push(variables.after||null);
@@ -102,7 +110,7 @@ async function profileWorkflow({ failPost, rejectPage, repeatCursor = false, sto
       const result={payload:value};checkpoints.set(key,structuredClone(result));return result;
     },
   });
-  const bindings={...env,YOUTUBE_DOWNLOAD_WORKFLOW:{
+  const bindings={...env,BRIGHTDATA_API_KEY_2:'private-profile-bright-two',YOUTUBE_DOWNLOAD_WORKFLOW:{
     async create({id,params}) {
       if(created.has(id))throw Error('already exists');created.add(id);children.push(params);
       tasks.push(new mod.YoutubeDownloadWorkflow({},bindings).run({payload:params},stepFor(id)));
@@ -114,7 +122,7 @@ async function profileWorkflow({ failPost, rejectPage, repeatCursor = false, sto
   }};
   const replay=()=>new mod.YoutubeDownloadWorkflow({},bindings).run({payload:parent},stepFor(parent.id));
   await replay();await Promise.all(tasks);
-  return {children,order,pages,messages,replay};
+  return {children,order,pages,messages,replay,apiCalls};
 }
 
 test('profile posts paginate, deduplicate overlapping pages, send sequentially and survive replay',async()=>{
@@ -1137,11 +1145,11 @@ test('Instagram rejects ambiguous and unconfirmed floods without any automatic r
 });
 
 async function publicStoryWorkflow({large=false,initialStatus='RUNNING',startError=false,readFailures=0,waitError,
-  checkpoints=new Map(),events=new Map(),interruptOnce=false,finalStatus,datasetFailures=0,selectedAccount}={}) {
+  checkpoints=new Map(),events=new Map(),interruptOnce=false,finalStatus,datasetFailures=0,selectedAccount,selectedApi}={}) {
   const calls=[],messages=[],children=[],options=[];
   globalThis.downloadHistory=[];globalThis.testFileCache=undefined;globalThis.delivered=0;
   const target={kind:'story',username:'example',storyId:'999',url:'https://www.instagram.com/stories/example/999/'};
-  const selected={...job,url:target.url,instagram:undefined,instagramProfile:{kind:'story',username:'example',target},...(selectedAccount?{apifyAccount:selectedAccount}:{})};
+  const selected={...job,url:target.url,instagram:undefined,instagramProfile:{kind:'story',username:'example',target},...(selectedAccount?{apifyAccount:selectedAccount}:{}),...(selectedApi?{instagramApi:selectedApi}:{})};
   const runId='storyRun00001',datasetId='storyDataset00001';
   const bindings={...env,APIFY_API_TOKEN:'private-story-token',APIFY_API_TOKEN_1:'numbered-account-one',APIFY_API_TOKEN_2:'numbered-account-two',YOUTUBE_DOWNLOAD_WORKFLOW:{
     async get(id){return {async sendEvent(event){events.set(event.type,event.payload);}};},
@@ -1328,7 +1336,7 @@ test('queued TopAPI Reel uses its captured slot for the run and dataset instead 
   assert.ok(!JSON.stringify(messages).includes('numbered-two'));
 });
 
-test('post Workflow reports the original Apify cause and pinned account after a failed backup provider',async()=>{
+test('post Workflow reports only the pinned provider failure and never calls a backup',async()=>{
   const requests=[],messages=[],logs=[],previousWarn=console.warn;
   const selected={...job,instagram:undefined,apifyAccount:2,instagramPostRequest:{shortcode:'Abc123'},url:'https://www.instagram.com/reel/Abc123/'};
   globalThis.downloadHistory=[];globalThis.testFileCache=undefined;
@@ -1353,12 +1361,65 @@ test('post Workflow reports the original Apify cause and pinned account after a 
     await new mod.YoutubeDownloadWorkflow({}, {...env,APIFY_API_TOKEN_2:'private-two',BRIGHTDATA_API_KEY:'private-backup'})
       .run({payload:selected},step);
     assert.equal(requests.filter(x=>x==='api.apify.com').length,1);
-    assert.equal(requests.filter(x=>x==='api.brightdata.com').length,1);
+    assert.equal(requests.filter(x=>x==='api.brightdata.com').length,0);
     const diagnostic=logs.find(x=>x.message==='instagram post workflow failed').info;
-    assert.deepEqual(diagnostic,{code:'INSTAGRAM_PROVIDER_CHAIN_FAILED',primaryCode:'TOPAPI_AUTH_ERROR',
-      fallbackCode:'BRIGHTDATA_PROVIDER_ERROR',apifyAccount:2,jobId:selected.id});
-    assert.match(messages.at(-1).body.text,/توکن Apify/);assert.match(messages.at(-1).body.text,/خود Bright Data/);
+    assert.deepEqual(diagnostic,{code:'TOPAPI_AUTH_ERROR',provider:'apify',account:2,jobId:selected.id});
+    assert.match(messages.at(-1).body.text,/توکن Apify/);assert.ok(!messages.at(-1).body.text.includes('Bright Data'));
     assert.equal(globalThis.downloadHistory.at(-1).status,'failed');
     assert.ok(!JSON.stringify(logs).includes('private-two'));assert.ok(!JSON.stringify(messages).includes('private-backup'));
   }finally{console.warn=previousWarn;}
+});
+
+
+test('Story start and original run reads honor the new per-purpose pinned selection',async()=>{
+ const result=await publicStoryWorkflow({selectedApi:{provider:'apify',account:2}});
+ const requests=result.calls.filter(x=>x.url.hostname==='api.apify.com');
+ assert.ok(requests.length>=3);assert.ok(requests.every(x=>x.authorization==='Bearer numbered-account-two'));
+ await result.replay();assert.equal(result.calls.filter(x=>x.url.hostname==='api.apify.com').length,requests.length);
+ assert.ok(!JSON.stringify(result.messages).includes('numbered-account-two'));
+});
+
+test('post Workflows honor all eight service/account choices and never use other credentials',async()=>{
+ const previousWarn=console.warn;console.warn=()=>{};
+ try{
+ for(const provider of ['apify','brightdata'])for(const account of [1,2,3,4])for(const missing of [false,true]){
+   const requests=[],messages=[];globalThis.downloadHistory=[];globalThis.testFileCache=undefined;
+   const selected={...job,instagram:undefined,instagramApi:{provider,account},instagramPostRequest:{shortcode:'Abc123'},url:'https://www.instagram.com/reel/Abc123/'};
+   const bindings={...env,APIFY_API_TOKEN:'legacy-apify',BRIGHTDATA_API_KEY:'legacy-bright'};
+   for(const slot of [1,2,3,4]){bindings['APIFY_API_TOKEN_'+slot]='private-apify-'+slot;bindings['BRIGHTDATA_API_KEY_'+slot]='private-brightdata-'+slot;}
+   const key=provider==='apify'?'APIFY_API_TOKEN':'BRIGHTDATA_API_KEY';
+   if(missing){delete bindings[key+'_'+account];if(account===1)delete bindings[key];}
+   globalThis.fetch=async(input,init={})=>{
+     const url=new URL(input);
+     if(url.hostname==='api.telegram.org'){
+       messages.push(JSON.parse(init.body));return Response.json({ok:true,result:{message_id:33,video:{file_id:'post-file'}}});
+     }
+     if(url.hostname==='cdn.instagram.com')return new Response(null,{headers:{'content-length':'1000000'}});
+     requests.push({hostname:url.hostname,authorization:new Headers(init.headers).get('authorization')});
+     assert.equal(url.hostname,provider==='apify'?'api.apify.com':'api.brightdata.com');
+     if(provider==='brightdata')return Response.json([{shortcode:'Abc123',video_url:'https://cdn.instagram.com/reel.mp4'}]);
+     if(url.pathname.endsWith('/runs'))return Response.json({data:{id:'postRun00001',status:'SUCCEEDED',defaultDatasetId:'postDataset00001'}});
+     return Response.json([{type:'Video',shortCode:'Abc123',videoUrl:'https://cdn.instagram.com/reel.mp4'}]);
+   };
+   const checkpoints=new Map();const step={async do(name,opts,fn){if(typeof opts==='function')fn=opts;
+     if(checkpoints.has(name))return structuredClone(checkpoints.get(name));const value=await fn();checkpoints.set(name,structuredClone(value));return value;}};
+   const replay=()=>new mod.YoutubeDownloadWorkflow({},bindings).run({payload:selected},step);
+   await replay();
+   assert.equal(globalThis.downloadHistory.at(-1).status,missing?'failed':'success');
+   if(missing){assert.equal(requests.length,0);continue;}
+   assert.equal(requests.length,provider==='apify'?2:1);
+   assert.ok(requests.every(x=>x.authorization===`Bearer private-${provider}-${account}`));
+   const sent=messages.length;await replay();assert.equal(messages.length,sent);assert.equal(requests.length,provider==='apify'?2:1);
+   assert.ok(!JSON.stringify(messages).includes('private-'));
+ }
+ }finally{console.warn=previousWarn;}
+});
+
+
+test('profile post extraction uses the selected service for every listed item and checkpoints paid calls',async()=>{
+ const result=await profileWorkflow({selectedApi:{provider:'brightdata',account:2}});
+ assert.deepEqual(result.apiCalls,['A','B','C']);assert.equal(result.children.length,3);
+ assert.equal(globalThis.downloadHistory.findLast(x=>x.source==='Instagram profile posts').status,'success');
+ await result.replay();assert.deepEqual(result.apiCalls,['A','B','C']);
+ assert.ok(!JSON.stringify(result.messages).includes('private-profile-bright-two'));
 });

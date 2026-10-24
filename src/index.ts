@@ -9,6 +9,7 @@ type Env = Partial<AdminStatsEnv> & {
   INSTAGRAM_MID?: string;
   INSTAGRAM_IG_DID?: string;
   BRIGHTDATA_API_KEY?: string;
+  INSTAGRAM_POST_PROVIDER?: "apify" | "brightdata";
   APIFY_API_TOKEN?: string;
   queueInstagramPost?: (post: Omit<InstagramPostUpload, "media" | "statusMessageId">) => Promise<void>;
   uploadInstagramPost?: (post: InstagramPostUpload) => Promise<void>;
@@ -763,7 +764,7 @@ async function resolvePostWithTopApi(
       durationMs: elapsed(),
     });
     // An interrupted POST might already have started a billable Actor run.
-    // Neither re-POST nor start the Bright Data fallback in this case.
+    // Never re-POST a paid extraction after an ambiguous outcome.
     throw new Error(timeout ? "TOPAPI_TIMEOUT" : "TOPAPI_NETWORK_ERROR");
   }
   if (!started.ok) {
@@ -1572,59 +1573,23 @@ async function handleMediaProxy(request: Request, env: Env, url: URL): Promise<R
 
 async function resolveTarget(target: InstagramTarget, env: Env): Promise<ResolvedMedia[]> {
   let groups: MediaCandidate[][] | null = null;
-  let primaryFailure: string | undefined;
-  const providerFailure = (error: unknown): unknown => {
-    const fallbackCode = error instanceof Error ? error.message : "";
-    if (!primaryFailure || !/^BRIGHTDATA_[A-Z0-9_]+$/.test(fallbackCode)) return error;
-    // A serializable machine-code chain survives Workflow step errors. Never
-    // replace the primary Apify cause with the final backup provider's error.
-    console.warn("instagram post provider chain failed", { primaryCode: primaryFailure, fallbackCode });
-    return new Error(`INSTAGRAM_PROVIDER_CHAIN_FAILED|${primaryFailure}|${fallbackCode}`);
-  };
   if (target.kind !== "post") {
     groups = await resolveStory(target, env);
   } else {
-    // TopAPI is the primary post/Reel extractor when its Apify token exists.
-    // Without it, preserve the existing Bright Data / anonymous behavior.
-    if (env.APIFY_API_TOKEN?.trim()) {
-      try {
-        groups = await resolvePostWithTopApi(target, env.APIFY_API_TOKEN.trim());
-        console.log("instagram post resolver success", { resolver: "topapi" });
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : "";
-        // Only deterministic failures may trigger another, potentially paid
-        // extraction. Never mask a wrong-post result or retry ambiguous runs.
-        if (!["TOPAPI_NO_MEDIA", "TOPAPI_INCOMPLETE_CAROUSEL", "TOPAPI_UNAVAILABLE",
-              "TOPAPI_AUTH_ERROR", "TOPAPI_QUOTA_OR_RATE_LIMIT"].includes(reason)) throw error;
-        primaryFailure = reason;
-        console.warn("instagram topapi fallback", {
-          reason, next: env.BRIGHTDATA_API_KEY?.trim() ? "brightdata" : "public",
-        });
-      }
-    }
-    if (!groups) {
-      if (!env.BRIGHTDATA_API_KEY?.trim()) {
-        groups = await resolvePost(target);
-      } else {
-        try {
-          groups = await resolvePostWithBrightData(target, env.BRIGHTDATA_API_KEY.trim());
-          console.log("instagram post resolver success", { resolver: "brightdata" });
-        } catch (error) {
-          const cause = error instanceof Error ? error.message : "";
-          // Bright Data can return valid metadata without downloadable media.
-          // Keep the existing anonymous fallback, with no personal session.
-          if (cause !== "BRIGHTDATA_NO_MEDIA" && cause !== "BRIGHTDATA_INCOMPLETE_CAROUSEL") throw providerFailure(error);
-          try {
-            groups = await resolvePost(target);
-            console.log("instagram brightdata media recovered", { source: "existing-public-resolver" });
-          } catch (publicError) {
-            const raw = publicError instanceof Error ? publicError.message : "";
-            const publicCode = /^INSTAGRAM_[A-Z0-9_]+/.exec(raw)?.[0] || "INSTAGRAM_UNAVAILABLE";
-            console.warn("instagram brightdata media fallback unavailable", { cause, publicCode });
-            throw providerFailure(error);
-          }
-        }
-      }
+    const provider = env.INSTAGRAM_POST_PROVIDER
+      || (env.APIFY_API_TOKEN?.trim() ? "apify" : env.BRIGHTDATA_API_KEY?.trim() ? "brightdata" : undefined);
+    if (provider === "apify") {
+      if (!env.APIFY_API_TOKEN?.trim()) throw new Error("TOPAPI_AUTH_ERROR");
+      groups = await resolvePostWithTopApi(target, env.APIFY_API_TOKEN.trim());
+      console.log("instagram post resolver success", { resolver: "topapi" });
+    } else if (provider === "brightdata") {
+      if (!env.BRIGHTDATA_API_KEY?.trim()) throw new Error("BRIGHTDATA_AUTH_ERROR");
+      groups = await resolvePostWithBrightData(target, env.BRIGHTDATA_API_KEY.trim());
+      console.log("instagram post resolver success", { resolver: "brightdata" });
+    } else {
+      // Standalone legacy entry without an API setting uses its direct resolver.
+      // Production always supplies the administrator's explicit selection.
+      groups = await resolvePost(target);
     }
   }
   const resolved: ResolvedMedia[] = [];
@@ -1633,8 +1598,6 @@ async function resolveTarget(target: InstagramTarget, env: Env): Promise<Resolve
 }
 
 function friendlyError(detail: string, throttle?: InstagramThrottle): string {
-  const chain = /^INSTAGRAM_PROVIDER_CHAIN_FAILED\|(TOPAPI_[A-Z_]+)\|(BRIGHTDATA_[A-Z0-9_]+)$/.exec(detail);
-  if (chain) return `علت مسیر اصلی Apify:\n${friendlyError(chain[1])}\n\nنتیجهٔ مسیر جایگزین:\n${friendlyError(chain[2])}`;
   const value = detail.toLowerCase();
   if (value.startsWith("topapi_still_running")) return "❌ استخراج TopAPI هنوز در Apify در حال اجراست. برای جلوگیری از هزینه تکراری، اجرای جدیدی شروع نشد.";
   if (value.startsWith("topapi_status_unavailable")) return "❌ اجرای TopAPI شروع شد اما دریافت وضعیت یا فایل خروجی ناموفق بود. در Runs حساب Apify وضعیت همین اجرا را بررسی کن.";
@@ -1655,7 +1618,7 @@ function friendlyError(detail: string, throttle?: InstagramThrottle): string {
   if (value.startsWith("brightdata_pending")) return "❌ استخراج Bright Data هنوز تمام نشده؛ برای جلوگیری از مصرف دوباره سهمیه، درخواست را فوراً تکرار نکن.";
   if (value.startsWith("brightdata_incomplete_carousel")) return "❌ Bright Data ترتیب یا همه فایل‌های پست چندرسانه‌ای را برنگرداند؛ دانلود ناقص ارسال نشد.";
   if (value.startsWith("brightdata_wrong_post")) return "❌ Bright Data اطلاعات لینک دیگری را برگرداند؛ برای جلوگیری از ارسال فایل اشتباه، دانلود متوقف شد.";
-  if (value.startsWith("brightdata_no_media")) return "❌ Bright Data لینک فایل این پست را برنگرداند و مسیر عمومی اینستاگرام هم موفق نشد.";
+  if (value.startsWith("brightdata_no_media")) return "❌ Bright Data لینک فایل این پست را برنگرداند.";
   if (value.startsWith("brightdata_")) return "❌ ارتباط با سرویس Bright Data یا دریافت نتیجه کامل نشد.";
   if (value.startsWith("instagram_session_challenge_required")) {
     return "❌ حساب اینستاگرام متصل نیاز به تأیید امنیتی دارد؛ ابتدا در خود اینستاگرام تأیید شود.";
@@ -1829,7 +1792,7 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
     // TopAPI runs inside the durable download Workflow, with an ID stable per
     // message. The Workflow itself sends the status once so webhook redelivery
     // cannot duplicate status messages or costly provider requests.
-    if (target.kind === "post" && env.APIFY_API_TOKEN?.trim() && env.queueInstagramPost) {
+    if (target.kind === "post" && env.queueInstagramPost) {
       await env.queueInstagramPost({ shortcode: target.shortcode, url: target.url,
         chatId: message.chat.id, requestMessageId: message.message_id,
         userId: message.from?.id || message.chat.id });

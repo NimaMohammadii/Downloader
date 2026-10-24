@@ -21,6 +21,7 @@ type Env = AdminStatsEnv & {
   INSTAGRAM_MID?: string;
   INSTAGRAM_IG_DID?: string;
   APIFY_API_TOKEN?: string;
+  INSTAGRAM_STORY_PROVIDER?: "apify" | "brightdata";
   queueInstagramStory?: (target: StoryTarget, message: TelegramMessage) => Promise<void>;
   resolvePublicStory?: (target: StoryTarget) => Promise<MediaCandidate[]>;
 };
@@ -94,7 +95,7 @@ export function parseInstagramProfileCommand(text: string): { kind: "story" | "p
   return { kind: match[1] === "استوری" || match[2]?.toLowerCase() === "instastory" ? "story" : "posts", username: match[3] };
 }
 
-function parseStoryTarget(text: string): StoryTarget | null {
+export function parseStoryTarget(text: string): StoryTarget | null {
   const links = text.match(/https?:\/\/[^\s<>"']+/gi) ?? [];
   for (const raw of links) {
     try {
@@ -646,7 +647,9 @@ export function instagramStoryItems(rows: unknown, target: StoryTarget): MediaCa
 }
 
 async function privateResolve(target: StoryTarget, env: Env, upload = false): Promise<MediaCandidate[] | null> {
-  if (env.APIFY_API_TOKEN?.trim()) {
+  if (env.INSTAGRAM_STORY_PROVIDER === "brightdata") throw new Error("❌ Bright Data برای استوری/هایلایت پشتیبانی نمی‌شود.");
+  if (env.INSTAGRAM_STORY_PROVIDER === "apify" || env.APIFY_API_TOKEN?.trim()) {
+    if (!env.APIFY_API_TOKEN?.trim()) throw new StoryError("apify_auth");
     if (!env.resolvePublicStory) throw new StoryError("apify_workflow_required");
     return env.resolvePublicStory(target);
   }
@@ -975,7 +978,7 @@ export default {
       const text = (message?.text || message?.caption || "").trim();
       const target = parseStoryTarget(text);
       if (update && message && target) {
-        if (env.APIFY_API_TOKEN?.trim() && env.queueInstagramStory) {
+        if ((env.INSTAGRAM_STORY_PROVIDER || env.APIFY_API_TOKEN?.trim()) && env.queueInstagramStory) {
           await env.queueInstagramStory(target, message);
           return Response.json({ ok: true });
         }
