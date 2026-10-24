@@ -400,6 +400,49 @@ def job_timeout(seconds: float) -> float:
     return min(seconds, remaining)
 
 
+ADMIN_USER_ID = 7138547731
+PUBLIC_ERROR_MESSAGE = "❌ خطایی رخ داده است؛ در حال بررسی و پیگیری هستیم و به‌زودی رفع می‌شود."
+ERROR_NOTICE_PATTERN = re.compile(r"(?:^|\n)\s*(?:❌|⚠)|ناموفق|ممکن نیست|نامعتبر|دکمه برای|تأیید نشد|ارسال نشد|کامل نشد|معتبر نیست|منقضی|برای شما نیست|درخواست‌کننده|محدود کرده|موقتاً.*(?:متوقف|محدود)|قابل دسترسی.*ندارد|قبلاً.*(?:شروع|تمام)|آمادهٔ ارسال نیست|صف متوقف شد")
+
+
+def private_error_payload(method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    result = dict(payload)
+    if (method in {"sendMessage", "sendMessageDraft", "editMessageText", "answerCallbackQuery"}
+            and str(payload.get("chat_id")) != str(ADMIN_USER_ID)
+            and isinstance(payload.get("text"), str)
+            and payload["text"] != PUBLIC_ERROR_MESSAGE
+            and ERROR_NOTICE_PATTERN.search(payload["text"])):
+        result["text"] = PUBLIC_ERROR_MESSAGE
+        for key in ("entities", "parse_mode", "reply_markup", "link_preview_options"):
+            result.pop(key, None)
+    return result
+
+
+def report_error_diagnostic(token: str, chat_id: int, diagnostic: dict[str, Any]) -> None:
+    """Diagnostics are internal; send them only to the fixed private admin chat."""
+    try:
+        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                      json={"chat_id": ADMIN_USER_ID,
+                            "text": f"گزارش فنی خطا | chat={chat_id}\n{json.dumps(diagnostic, ensure_ascii=False)}"[:4000]},
+                      timeout=(3, 5))
+    except Exception:
+        pass
+
+
+def prepare_error_notice(token: str, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    safe = private_error_payload(method, payload)
+    if safe.get("text") != payload.get("text"):
+        detail = upload_error_diagnostic(RuntimeError(payload["text"]), token)["diagnostic"]
+        try:
+            requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          json={"chat_id": ADMIN_USER_ID,
+                                "text": f"گزارش خطا | chat={payload.get('chat_id')} | message={payload.get('message_id')}\n{detail}"[:4000]},
+                          timeout=(3, 5))
+        except Exception:
+            pass  # Notification failure must not affect the public error policy.
+    return safe
+
+
 TEXT_MOTION_CHATS: dict[tuple[str, int], float] = {}
 TEXT_MOTION_LOCK = threading.Lock()
 
@@ -415,6 +458,7 @@ TELEGRAM_EMOJI_PATTERN = re.compile("(?:" + "|".join(map(re.escape, TELEGRAM_EMO
 
 
 def telegram_custom_emoji(method: str, payload: dict[str, Any], *, form: bool = False) -> dict[str, Any]:
+    payload = private_error_payload(method, payload)
     if method not in {"sendMessage", "sendMessageDraft", "editMessageText", "editMessageCaption", "editMessageReplyMarkup",
                       "sendVideo", "sendAudio", "sendDocument", "sendPhoto", "sendAnimation", "sendMediaGroup"}:
         return payload
@@ -468,6 +512,7 @@ def telegram_custom_emoji(method: str, payload: dict[str, Any], *, form: bool = 
 
 
 def telegram_text_motion(token: str, method: str, payload: dict[str, Any]) -> None:
+    payload = private_error_payload(method, payload)
     text = payload.get("text")
     if method != "sendMessage" or not isinstance(text, str) or len(text) < 2 or payload.get("parse_mode"):
         return
@@ -550,9 +595,9 @@ def telegram_call(
     timeout: int = 900,
 ) -> Any:
     if json_payload is not None:
-        json_payload = telegram_reply_payload(json_payload)
+        json_payload = prepare_error_notice(token, method, telegram_reply_payload(json_payload))
     if data is not None:
-        data = telegram_reply_payload(data, form=True)
+        data = prepare_error_notice(token, method, telegram_reply_payload(data, form=True))
     if files:
         upload_timeout = job_timeout(timeout)
         return asyncio.run(asyncio.wait_for(
@@ -1424,6 +1469,7 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         JOB_DEADLINE.set(None)
         diagnostic = upload_error_diagnostic(exc, token)
+        report_error_diagnostic(token, chat_id, diagnostic)
         retry_safe = (phase == "upload" and diagnostic.get("rpcCode") == 420
                       and diagnostic.get("errorCode") in {"FLOOD_WAIT", "SLOWMODE_WAIT"}
                       and type(diagnostic.get("retryAfterSeconds")) is int)
@@ -1963,6 +2009,7 @@ class InstagramCapture:
         except Exception as exc:
             # Never print commands, signed stream URLs, bot tokens or account data.
             print(f"instagram capture failed: {type(exc).__name__}", flush=True)
+            report_error_diagnostic(self.payload["botToken"], self.payload["chatId"], upload_error_diagnostic(exc, self.payload["botToken"]))
             self.result = {"ok": False, "message": str(exc) if isinstance(exc, UserVisibleError) else "❌ دریافت یا آماده‌سازی لایو کامل نشد؛ لینک را دوباره بفرست."}
             if self.source.get("playlist") and not isinstance(exc, UserVisibleError):
                 self.result["message"] = "❌ پردازش پلی‌لیست کامل نشد؛ فایل‌های ارسال‌شده را قبل از درخواست دوباره بررسی کن."
@@ -2129,6 +2176,7 @@ class InstagramCapture:
             return {"ok": True, "title": self.source.get("recognizedTitle") or self.source.get("title")}
         except Exception as exc:
             diagnostic = upload_error_diagnostic(exc, self.payload["botToken"])
+            report_error_diagnostic(self.payload["botToken"], self.payload["chatId"], diagnostic)
             retry_safe = (uploading and diagnostic.get("rpcCode") == 420
                           and diagnostic.get("errorCode") in {"FLOOD_WAIT", "SLOWMODE_WAIT"}
                           and type(diagnostic.get("retryAfterSeconds")) is int
@@ -2244,6 +2292,7 @@ class InstagramCapture:
             return {"ok": True, "parts": self.post_sent}
         except Exception as exc:
             diagnostic = upload_error_diagnostic(exc, self.payload["botToken"])
+            report_error_diagnostic(self.payload["botToken"], self.payload["chatId"], diagnostic)
             if (uploading and diagnostic.get("rpcCode") == 420
                     and diagnostic.get("errorCode") in {"FLOOD_WAIT", "SLOWMODE_WAIT"}
                     and type(diagnostic.get("retryAfterSeconds")) is int and not self.cleanup_requested
@@ -2302,6 +2351,7 @@ class InstagramCapture:
             return {"ok": True, "parts": self.social_sent}
         except Exception as exc:
             print(f"social upload failed: {type(exc).__name__}", flush=True)
+            report_error_diagnostic(self.payload["botToken"], self.payload["chatId"], upload_error_diagnostic(exc, self.payload["botToken"]))
             with self.lock:
                 self.state = "failed"
             # Preserve this message for the Workflow, including confirmed count.

@@ -1477,12 +1477,12 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
       await safeTelegramCall(env.BOT_TOKEN, "editMessageText", {
         chat_id: message.chat.id,
         message_id: statusMessageId,
-        text: friendly,
+        text: friendly, _errorDetail: detail,
       });
     } else {
       await safeTelegramCall(env.BOT_TOKEN, "sendMessage", {
         chat_id: message.chat.id,
-        text: friendly,
+        text: friendly, _errorDetail: detail,
         reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
       });
     }

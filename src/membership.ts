@@ -88,17 +88,17 @@ export async function enforceMembership(request: Request, env: MembershipEnv, ct
   try {
     state = await membershipState(env, actor.id);
     if (state.enabled && state.downloaded) member = await isChannelMember(env, actor.id);
-  } catch {
+  } catch (error) {
     if (callback?.id) await telegram(env, "answerCallbackQuery", {
-      callback_query_id: callback.id, text: "بررسی عضویت فعلاً ممکن نیست؛ کمی بعد دوباره امتحان کن.", show_alert: true,
+      callback_query_id: callback.id, _errorUserId: callback.from?.id, _errorDetail: String(error), text: "بررسی عضویت فعلاً ممکن نیست؛ کمی بعد دوباره امتحان کن.", show_alert: true,
     });
     else await telegram(env, "sendMessage", { chat_id: update.message.chat.id,
-      text: "بررسی عضویت فعلاً ممکن نیست؛ کمی بعد دوباره امتحان کن." });
+      _errorDetail: String(error), text: "بررسی عضویت فعلاً ممکن نیست؛ کمی بعد دوباره امتحان کن." });
     return Response.json({ ok: true });
   }
   if (!state.enabled || !state.downloaded || member) {
     if (!checking) return null;
-    await telegram(env, "answerCallbackQuery", { callback_query_id: callback.id, text: "✅ دسترسی فعاله؛ درخواستت رو بفرست." });
+    await telegram(env, "answerCallbackQuery", { callback_query_id: callback.id, _errorUserId: callback.from?.id, text: "✅ دسترسی فعاله؛ درخواستت رو بفرست." });
     // Shared group prompts stay available to other users; confirmation is private.
     if (callback.message?.chat?.id === actor.id) await telegram(env, "deleteMessage", {
       chat_id: actor.id, message_id: callback.message.message_id,
@@ -119,7 +119,7 @@ export async function enforceMembership(request: Request, env: MembershipEnv, ct
     }
     return Response.json({ ok: true });
   }
-  if (callback?.id) await telegram(env, "answerCallbackQuery", { callback_query_id: callback.id,
+  if (callback?.id) await telegram(env, "answerCallbackQuery", { callback_query_id: callback.id, _errorUserId: callback.from?.id,
     text: checking ? "هنوز عضو چنل نیستی؛ اول عضو شو و دوباره بررسی کن." : "برای ادامه، اول عضو چنل شو.", show_alert: true });
   const prompt = membershipPrompt(env.MEMBERSHIP_CHANNEL || MEMBERSHIP_CHANNEL);
   if (checking && callback.message?.chat?.id === actor.id) {

@@ -115,3 +115,14 @@ test('webhook rotation keeps pending updates and never exposes token-bearing fai
   });
   await assert.rejects(()=>setWebhook({BOT_TOKEN:env.BOT_TOKEN,WEBHOOK_SECRET:''},()=>{throw Error('must not call');}),/Set BOT_TOKEN/);
 });
+
+test('unexpected request failures return only the public error message', async()=>{
+  const response=await worker.fetch(new Request('https://worker/health'),{
+    get BOT_TOKEN(){throw Error('PRIVATE_INTERNAL_CAUSE');}
+  },{});
+  assert.equal(response.status,500);
+  const body=await response.json();
+  assert.equal(body.ok,false);
+  assert.ok(body.message.includes('بررسی و پیگیری'));
+  assert.ok(!JSON.stringify(body).includes('PRIVATE_INTERNAL_CAUSE'));
+});

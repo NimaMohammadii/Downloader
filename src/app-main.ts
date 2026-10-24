@@ -1,6 +1,6 @@
 import { handleBroadcastUpdate } from "./broadcast";
 import { enforceMembership } from "./membership";
-import { type AdminStatsEnv } from "./admin";
+import { PUBLIC_ERROR_MESSAGE, telegramTextMotion, telegramCustomEmoji, type AdminStatsEnv } from "./admin";
 import youtubeWorker from "./youtube-main";
 export { AdminStatsStore, DownloadPool, YoutubeDownloaderContainer, YoutubeDownloadWorkflow } from "./youtube-main";
 import { MINI_APP_HTML } from "./mini-app-ui";
@@ -39,7 +39,7 @@ function disabledContainerResponse(request: Request): Response {
     return Response.json(
       {
         ok: false,
-        message: "This feature is temporarily unavailable.",
+        message: PUBLIC_ERROR_MESSAGE,
       },
       {
         status: 503,
@@ -50,7 +50,7 @@ function disabledContainerResponse(request: Request): Response {
       },
     );
   }
-  return new Response("This feature is temporarily unavailable.", {
+  return new Response(PUBLIC_ERROR_MESSAGE, {
     status: 503,
     headers: {
       "cache-control": "no-store",
@@ -60,7 +60,7 @@ function disabledContainerResponse(request: Request): Response {
   });
 }
 
-export default {
+const appWorker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
@@ -96,5 +96,36 @@ export default {
     const membershipResponse = await enforceMembership(request, env, ctx);
     if (membershipResponse) return membershipResponse;
     return youtubeWorker.fetch(request, env as any, ctx);
+  },
+} satisfies ExportedHandler<Env>;
+
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const trustedWebhook = new URL(request.url).pathname === "/telegram/webhook" && env.WEBHOOK_SECRET &&
+      request.headers.get("x-telegram-bot-api-secret-token") === env.WEBHOOK_SECRET;
+    const update = trustedWebhook ? await request.clone().json().catch(() => null) as any : null;
+    try {
+      return await appWorker.fetch(request, env, ctx);
+    } catch (error) {
+      console.error("request failed", { type: error instanceof Error ? error.name : "unknown" });
+      // Only trusted webhook updates may select a Telegram destination.
+      if (trustedWebhook && update) {
+        try {
+          const message = update.message || update.callback_query?.message;
+          if (message?.chat?.id) {
+            const payload: Record<string, unknown> = { chat_id: message.chat.id,
+              text: "❌ پردازش درخواست کامل نشد.", _errorDetail: String(error) };
+            await telegramTextMotion(env.BOT_TOKEN, "sendMessage", payload);
+            await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
+              method: "POST", headers: { "content-type": "application/json" },
+              body: JSON.stringify(telegramCustomEmoji("sendMessage", payload)), signal: AbortSignal.timeout(5000),
+            });
+            return Response.json({ ok: true });
+          }
+        } catch { /* Return only the public message, including notification failures. */ }
+      }
+      return Response.json({ ok: false, message: PUBLIC_ERROR_MESSAGE }, { status: 500 });
+    }
   },
 } satisfies ExportedHandler<Env>;

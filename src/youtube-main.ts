@@ -801,12 +801,12 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
             await safeTelegramCall(this.env.BOT_TOKEN, "editMessageText", {
               chat_id: job.chatId,
               message_id: statusMessageId,
-              text: failureMessage,
+              text: failureMessage, _errorDetail: detail,
             });
           } else {
             await safeTelegramCall(this.env.BOT_TOKEN, "sendMessage", {
               chat_id: job.chatId,
-              text: failureMessage,
+              text: failureMessage, _errorDetail: detail,
               reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
             });
           }
@@ -962,7 +962,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           : job.instagramPost ? "❌ دریافت یا ارسال پست اینستاگرام کامل نشد؛ اگر فایلی دریافت کرده‌ای، پیش از درخواست دوباره بررسی کن."
           : job.social ? `❌ دریافت یا ارسال فایل ${socialName(job.social.platform)} کامل نشد؛ اگر فایلی دریافت کرده‌ای، پیش از درخواست دوباره بررسی کن.` : job.recognition || job.playlist || job.instagram?.kind === "music" || job.instagram?.kind === "audio" ? "❌ دریافت یا ارسال فایل صوتی کامل نشد؛ درخواست را دوباره بفرست." : "❌ ضبط یا ارسال لایو کامل نشد؛ لینک را دوباره بفرست. ممکن است سرور ری‌استارت شده باشد.";
         await safeTelegramCall(this.env.BOT_TOKEN, statusId ? "editMessageText" : "sendMessage", {
-          chat_id: job.chatId, message_id: statusId, text, reply_markup: { inline_keyboard: [] },
+          chat_id: job.chatId, message_id: statusId, text, _errorDetail: redactDiagnostic(String(error), this.env), reply_markup: { inline_keyboard: [] },
         });
         return true;
       });
@@ -1263,6 +1263,7 @@ async function createYoutubeInspectWorkflow(
       console.error("youtube inspect workflow create failed", { jobId: job.id, detail });
       await safeTelegramCall(env.BOT_TOKEN, "sendMessage", {
         chat_id: message.chat.id,
+        _errorDetail: redactDiagnostic(detail, env),
         text: source === "pornhub" ? "❌ شروع دانلود Pornhub ناموفق بود؛ دوباره لینک را بفرست." : "❌ نتونستم کیفیت‌های YouTube رو بررسی کنم. دوباره لینک رو بفرست.",
         reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
       });
@@ -1280,7 +1281,7 @@ async function handleQualityCallback(
   const parsed = parseQualityCallback(callback.data);
   if (!parsed || !callback.message) {
     await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", {
-      callback_query_id: callback.id,
+      callback_query_id: callback.id, _errorUserId: callback.from?.id,
       text: "این انتخاب دیگه معتبر نیست.",
       show_alert: false,
     });
@@ -1289,7 +1290,7 @@ async function handleQualityCallback(
 
   if (callback.from.id !== parsed.userId) {
     await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", {
-      callback_query_id: callback.id,
+      callback_query_id: callback.id, _errorUserId: callback.from?.id,
       text: "این دکمه برای شما نیست.",
       show_alert: true,
     });
@@ -1312,7 +1313,7 @@ async function handleQualityCallback(
   try {
     await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id: job.id, params: job });
     await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", {
-      callback_query_id: callback.id,
+      callback_query_id: callback.id, _errorUserId: callback.from?.id,
       text: `${selectionText} انتخاب شد`,
       show_alert: false,
     });
@@ -1325,7 +1326,7 @@ async function handleQualityCallback(
     const detail = error instanceof Error ? error.message : String(error);
     if (/already|exists|duplicate|conflict/i.test(detail)) {
       await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", {
-        callback_query_id: callback.id,
+        callback_query_id: callback.id, _errorUserId: callback.from?.id,
         text: "دانلود این درخواست قبلاً شروع شده؛ برای دانلود دوباره لینک رو بفرست.",
         show_alert: false,
       });
@@ -1333,8 +1334,8 @@ async function handleQualityCallback(
       await trackJob(env, job, "failed", { detail: "شروع دانلود ناموفق بود." });
       console.error("youtube download workflow create failed", { jobId: job.id, detail });
       await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", {
-        callback_query_id: callback.id,
-        text: "شروع دانلود ناموفق بود. دوباره لینک رو بفرست.",
+        callback_query_id: callback.id, _errorUserId: callback.from?.id,
+        text: "شروع دانلود ناموفق بود. دوباره لینک رو بفرست.", _errorDetail: redactDiagnostic(detail, env),
         show_alert: true,
       });
     }
@@ -1374,7 +1375,7 @@ async function stopInstagramRecording(env: Env, callback: TelegramCallbackQuery)
     const signature = (await instagramSignature(env.BOT_TOKEN, `stop:${chatId}:${match[1]}:${match[2]}`)).slice(0, 16);
     if (equalSignature(signature, match[3])) {
       // Acknowledge immediately; the capture process finalizes its file separately.
-      await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "درخواست توقف ارسال شد…" });
+      await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, _errorUserId: callback.from?.id, text: "درخواست توقف ارسال شد…" });
       try {
         const id = `igdl-${chatId}-${match[1]}-${match[2]}`;
         const lease = await downloadPool(env).lookup(id);
@@ -1388,7 +1389,7 @@ async function stopInstagramRecording(env: Env, callback: TelegramCallbackQuery)
       return Response.json({ ok: true });
     }
   }
-  await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text, show_alert: true });
+  await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, _errorUserId: callback.from?.id, text, show_alert: true });
   return Response.json({ ok: true });
 }
 
@@ -1404,16 +1405,16 @@ async function musicSelection(env: Env, update: TelegramUpdate, callback: Telegr
   const match = /^msc\|([A-Za-z0-9_-]{11})\|(\d+)\|(\d{10})\|([a-f0-9]{16})$/.exec(callback.data || "");
   const message = callback.message;
   if (!match || !message || callback.from.id !== Number(match[2])) {
-    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "این انتخاب برای درخواست‌کنندهٔ آهنگ است.", show_alert: true });
+    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, _errorUserId: callback.from?.id, text: "این انتخاب برای درخواست‌کنندهٔ آهنگ است.", show_alert: true });
     return Response.json({ ok: true });
   }
   const [, videoId, owner, expiry, signature] = match;
   const expected = (await instagramSignature(env.BOT_TOKEN, `music-select:${message.chat.id}:${owner}:${videoId}:${expiry}`)).slice(0, 16);
   if (Number(expiry) < Date.now() / 1000 || Number(expiry) > Date.now() / 1000 + 86460 || !equalSignature(signature, expected)) {
-    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "این فهرست منقضی یا نامعتبر است؛ دوباره جست‌وجو کن.", show_alert: true });
+    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, _errorUserId: callback.from?.id, text: "این فهرست منقضی یا نامعتبر است؛ دوباره جست‌وجو کن.", show_alert: true });
     return Response.json({ ok: true });
   }
-  await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "آهنگ انتخاب شد؛ دانلود شروع می‌شود." });
+  await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, _errorUserId: callback.from?.id, text: "آهنگ انتخاب شد؛ دانلود شروع می‌شود." });
   return createInstagramWorkflow(env, { ...update, message: { ...message, from: callback.from } }, { kind: "music", musicVideoId: videoId });
 }
 
@@ -1442,10 +1443,10 @@ async function instagramAudioCallback(env: Env, update: TelegramUpdate, callback
   const findMusic = callback.data?.startsWith("igm|");
   const match = /^iga\|(p|s)\|([A-Za-z0-9_-]{1,20})\|(\d{1,3})\|(\d+)$/.exec((callback.data || "").replace(/^igm\|/, "iga|"));
   if (!match || !callback.message || callback.from.id !== Number(match[4]) || (match[1] === "s" && !/^\d+$/.test(match[2]))) {
-    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "این دکمه معتبر نیست یا برای شما نیست.", show_alert: true });
+    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, _errorUserId: callback.from?.id, text: "این دکمه معتبر نیست یا برای شما نیست.", show_alert: true });
     return Response.json({ ok: true });
   }
-  await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "در حال آماده‌سازی فایل صوتی…" });
+  await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, _errorUserId: callback.from?.id, text: "در حال آماده‌سازی فایل صوتی…" });
   const target: InstagramVideoTarget = match[1] === "p" ? { kind: "audio", shortcode: match[2], videoIndex: Number(match[3]) } : { kind: "audio", mediaId: match[2] };
   if (findMusic) target.recognizeMusic = true;
   return createInstagramWorkflow(env, { ...update, message: { ...callback.message, from: callback.from } }, target);
@@ -1457,10 +1458,10 @@ async function socialAudioCallback(env: Env, update: TelegramUpdate, callback: T
   const target = message ? parseSocialUrl((message.caption || "").split("\n").at(-1) || "") : null;
   if (!match || !message || !target || target.platform === "soundcloud" || callback.from.id !== Number(match[2])
       || !equalSignature((await instagramSignature(env.BOT_TOKEN, `social-audio:${message.chat.id}:${match[2]}:${match[1]}:${target.url}`)).slice(0, 16), match[3])) {
-    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "این دکمه معتبر نیست یا برای شما نیست.", show_alert: true });
+    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, _errorUserId: callback.from?.id, text: "این دکمه معتبر نیست یا برای شما نیست.", show_alert: true });
     return Response.json({ ok: true });
   }
-  await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "در حال آماده‌سازی فایل صوتی…" });
+  await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, _errorUserId: callback.from?.id, text: "در حال آماده‌سازی فایل صوتی…" });
   return createInstagramWorkflow(env, { ...update, message: { ...message, from: callback.from } }, undefined, undefined, undefined,
     { ...target, audioOnly: true, itemIndex: Number(match[1]) });
 }
