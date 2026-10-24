@@ -823,6 +823,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
     let started = false;
     let lease: PoolLease | undefined;
     let phase = "status";
+    let engineInterrupted = false;
     try {
       statusId = await step.do("show instagram video status", async () => {
         if (job.instagramPost) return job.instagramPost.statusMessageId;
@@ -950,6 +951,14 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       } else throw new Error(`IG_SEND_FAILED ${redactDiagnostic([result.errorCode, result.diagnostic, result.message].filter(Boolean).join(": "), this.env)}`);
       return result;
     } catch (error) {
+      // Workflows interrupts the current invocation during platform lifecycle
+      // changes. This is not a capture failure: the persisted event wait can
+      // resume on a later invocation. Do not notify users or tear down the
+      // Container/lease while its completion event is still outstanding.
+      if (error instanceof Error && error.message === "Aborting engine: Grace period complete") {
+        engineInterrupted = true;
+        throw error;
+      }
       console.error("instagram video workflow failed", { jobId: job.id, phase,
         type: error instanceof Error ? error.name : "error",
         detail: redactDiagnostic(error instanceof Error ? error.message : String(error), this.env) });
@@ -968,15 +977,17 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       });
       return { ok: false };
     } finally {
-      try {
-        if (started) await step.do("release instagram recording", { retries: { limit: 1, delay: "2 seconds" }, timeout: "1 minute" }, async () => {
-          const container = pooledContainer(this.env, job);
-          try { await container.instagramRequest("cleanup", { id: job.id }); }
-          finally { await container.releaseInstagram(job.id); }
-          return true;
-        });
-      } finally {
-        if (lease) await step.do("release download capacity", { retries: { limit: 3, delay: "1 second" }, timeout: "1 minute" }, () => downloadPool(this.env).release(job.id, lease!.token));
+      if (!engineInterrupted) {
+        try {
+          if (started) await step.do("release instagram recording", { retries: { limit: 1, delay: "2 seconds" }, timeout: "1 minute" }, async () => {
+            const container = pooledContainer(this.env, job);
+            try { await container.instagramRequest("cleanup", { id: job.id }); }
+            finally { await container.releaseInstagram(job.id); }
+            return true;
+          });
+        } finally {
+          if (lease) await step.do("release download capacity", { retries: { limit: 3, delay: "1 second" }, timeout: "1 minute" }, () => downloadPool(this.env).release(job.id, lease!.token));
+        }
       }
     }
   }
