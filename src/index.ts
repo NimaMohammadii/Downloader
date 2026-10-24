@@ -995,20 +995,57 @@ async function resolvePostWithBrightData(
     throw new Error("BRIGHTDATA_PENDING");
   }
   if (!response.ok) {
-    // Keep the upstream HTTP status and machine-readable error code for
-    // troubleshooting. Never log freeform provider messages or credentials.
-    const failure: any = await response.json().catch(() => null);
+    // Bright Data documents both JSON validation errors and plain-text HTTP
+    // errors. Reading only response.json() silently discarded the latter.
+    const raw = await response.text().catch(() => "");
+    let failure: any;
+    try { failure = JSON.parse(raw); } catch { failure = null; }
     const rawCode = typeof failure?.code === "string" ? failure.code : "";
-    const code = /^[a-zA-Z0-9_-]{1,64}$/.test(rawCode) ? rawCode : undefined;
+    const code = /^[a-zA-Z0-9_-]{1,64}$/.test(rawCode) && !rawCode.includes(apiKey) ? rawCode : undefined;
+    const message = typeof failure === "string" ? failure
+      : typeof failure?.error === "string" ? failure.error
+      : typeof failure?.message === "string" ? failure.message
+      : failure?.error && typeof failure.error.message === "string" ? failure.error.message
+      : failure ? "" : raw;
+    // Preserve the provider's explanation, never the submitted input/line,
+    // authorization or signed URLs. Bound and redact before logging.
+    const clean = (value: string) => value.split(apiKey).join("[REDACTED]")
+      .replace(/bearer\s+\S+/gi, "Bearer [REDACTED]")
+      .replace(/https?:\/\/[^\s<>"']+/gi, "[URL]")
+      .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[EMAIL]")
+      .replace(/[A-Za-z0-9_-]{24,}/g, "[REDACTED]")
+      .replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, " ").slice(0, 400);
+    const validation = Array.isArray(failure?.errors) ? failure.errors.slice(0, 8).flatMap((entry: unknown) => {
+      if (!Array.isArray(entry) || !["url", "input", "country", "dataset_id"].includes(entry[0])) return [];
+      return [{ field: entry[0], ...(typeof entry[1] === "string" ? { reason: clean(entry[1]) } : {}) }];
+    }) : [];
+    const explanation = message.trim().toLowerCase();
+    let reason = "unclassified";
+    let errorCode = `BRIGHTDATA_SERVICE_HTTP_${response.status}`;
+    if (response.status === 401 || response.status === 403) errorCode = "BRIGHTDATA_AUTH_ERROR";
+    else if (response.status === 402) errorCode = "BRIGHTDATA_CREDITS_ERROR";
+    else if (response.status === 429) errorCode = "BRIGHTDATA_RATE_LIMIT";
+    else if (response.status === 404) errorCode = "BRIGHTDATA_DATASET_UNAVAILABLE";
+    else if (response.status === 400 || response.status === 422) {
+      // A 400 alone does not prove malformed input. Classify only explicit
+      // provider evidence; unknown account/service rejections remain unknown.
+      errorCode = "BRIGHTDATA_REQUEST_REJECTED";
+      if (code === "validation_error" || explanation === "invalid input provided") {
+        reason = "input_validation"; errorCode = "BRIGHTDATA_INVALID_REQUEST";
+      } else if (code === "parse_error" || explanation.startsWith("parser cannot parse input")) {
+        reason = "invalid_json"; errorCode = "BRIGHTDATA_INVALID_REQUEST";
+      } else if (explanation === "no data to trigger") {
+        reason = "empty_input"; errorCode = "BRIGHTDATA_EMPTY_INPUT";
+      } else if (/^should be at least \d+ inputs\.?$/.test(explanation)) {
+        reason = "minimum_inputs"; errorCode = "BRIGHTDATA_MINIMUM_INPUTS";
+      }
+    }
     console.warn("instagram brightdata rejected", {
       status: response.status, dataset: isReel ? "reels" : "posts", ...(code ? { code } : {}),
+      reason, ...(message ? { providerMessage: clean(message) } : {}),
+      ...(validation.length ? { validation } : {}),
     });
-    if (response.status === 401 || response.status === 403) throw new Error("BRIGHTDATA_AUTH_ERROR");
-    if (response.status === 402) throw new Error("BRIGHTDATA_CREDITS_ERROR");
-    if (response.status === 429) throw new Error("BRIGHTDATA_RATE_LIMIT");
-    if (response.status === 400 || response.status === 422) throw new Error("BRIGHTDATA_INVALID_REQUEST");
-    if (response.status === 404) throw new Error("BRIGHTDATA_DATASET_UNAVAILABLE");
-    throw new Error(`BRIGHTDATA_SERVICE_HTTP_${response.status}`);
+    throw new Error(errorCode);
   }
   const payload: unknown = await response.json().catch(() => null);
   const rows: unknown[] = Array.isArray(payload) ? payload
@@ -1612,6 +1649,9 @@ function friendlyError(detail: string, throttle?: InstagramThrottle): string {
   if (value.startsWith("brightdata_auth_error")) return "❌ کلید Bright Data معتبر نیست یا به استخراج‌کننده Instagram دسترسی ندارد.";
   if (value.startsWith("brightdata_credits_error")) return "❌ سهمیه یا اعتبار Bright Data تمام شده است.";
   if (value.startsWith("brightdata_rate_limit")) return "❌ Bright Data درخواست‌های API را موقتاً محدود کرده است.";
+  if (value.startsWith("brightdata_empty_input")) return "❌ Bright Data ورودی درخواست را خالی تشخیص داد؛ جزئیات پاسخ در لاگ ثبت شد.";
+  if (value.startsWith("brightdata_minimum_inputs")) return "❌ Bright Data برای این استخراج‌کننده تعداد ورودی بیشتری می‌خواهد؛ جزئیات پاسخ در لاگ ثبت شد.";
+  if (value.startsWith("brightdata_request_rejected")) return "❌ Bright Data درخواست را رد کرد؛ علت اعلام‌شدهٔ سرویس در لاگ instagram brightdata rejected ثبت شد.";
   if (value.startsWith("brightdata_invalid_request")) return "❌ Bright Data قالب درخواست Instagram را نپذیرفت؛ کد HTTP و code را در لاگ بررسی کن.";
   if (value.startsWith("brightdata_dataset_unavailable")) return "❌ شناسه یا دسترسی Dataset اینستاگرام در Bright Data معتبر نیست.";
   if (value.startsWith("brightdata_provider_error")) return "❌ خود Bright Data دریافت این پست را رد کرد؛ برای جزئیات به نتیجه استخراج در داشبورد Bright Data مراجعه کن.";

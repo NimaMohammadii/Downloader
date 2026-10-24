@@ -566,7 +566,7 @@ test('Bright Data rejects upstream validation errors with safe HTTP diagnostics 
   assert.equal(files(result).length, 0);
   assert.match(report(result), /BRIGHTDATA_INVALID_REQUEST/);
   const diagnostic = result.diagnostics.find(x => x.message === 'instagram brightdata rejected')?.info;
-  assert.deepEqual(diagnostic, {status: 400, dataset: 'reels', code: 'validation_error'});
+  assert.deepEqual(diagnostic, {status: 400, dataset: 'reels', code: 'validation_error',reason:'input_validation',providerMessage:'Private key [REDACTED] must never appear in logs'});
   assert.ok(!JSON.stringify(result.diagnostics).includes('sensitive-api-key'));
 });
 
@@ -1156,4 +1156,35 @@ test('Bright Data-only failures are not falsely reported as failures of Apify',a
   assert.equal(report(result),'BRIGHTDATA_PROVIDER_ERROR');
   assert.ok(!errorText(result).includes('علت مسیر اصلی Apify'));
   assert.ok(!result.diagnostics.some(x=>x.message==='instagram post provider chain failed'));
+});
+
+
+test('Bright Data plain-text and JSON-string 400 explanations survive without guessing or another paid call',async()=>{
+ for(const [body,code,reason] of [
+  ['No data to trigger','BRIGHTDATA_EMPTY_INPUT','empty_input'],
+  ['Should be at least 2 inputs','BRIGHTDATA_MINIMUM_INPUTS','minimum_inputs'],
+  ['Parser cannot parse input: invalid syntax','BRIGHTDATA_INVALID_REQUEST','invalid_json'],
+  ['Account needs activation','BRIGHTDATA_REQUEST_REJECTED','unclassified'],
+  [JSON.stringify('No data to trigger'),'BRIGHTDATA_EMPTY_INPUT','empty_input'],
+  ['<html>upstream request rejected</html>','BRIGHTDATA_REQUEST_REJECTED','unclassified'],
+  ['', 'BRIGHTDATA_REQUEST_REJECTED','unclassified'],
+ ]){
+  const result=await run({env:{INSTAGRAM_POST_PROVIDER:'brightdata',BRIGHTDATA_API_KEY:'private-bright-key',APIFY_API_TOKEN:'other-key'},respond(call){
+   assert.equal(call.hostname,'api.brightdata.com');return new Response(body,{status:400});
+  }});
+  assert.equal(result.calls.length,1);assert.equal(report(result),code);assert.equal(files(result).length,0);
+  assert.equal(result.diagnostics.find(x=>x.message==='instagram brightdata rejected').info.reason,reason);
+ }
+});
+
+test('Bright Data validation details omit raw inputs, credentials, signed URLs and arbitrary fields',async()=>{
+ const result=await run({env:{BRIGHTDATA_API_KEY:'private-key-123'},respond(call){
+  return Response.json({code:'validation_error',error:'Invalid input provided',line:'private-key-123 raw submitted input',
+   errors:[['url','Invalid https://instagram.com/reel/private/?token=private-key-123'],['country','Rejected private-key-123'],
+    ['arbitrary-secret','do not log this'],['input','Bearer private-key-123']]},{status:400});
+ }});
+ assert.equal(report(result),'BRIGHTDATA_INVALID_REQUEST');assert.equal(result.calls.length,1);
+ const info=result.diagnostics.find(x=>x.message==='instagram brightdata rejected').info;
+ assert.deepEqual(info.validation,[{field:'url',reason:'Invalid [URL]'},{field:'country',reason:'Rejected [REDACTED]'},{field:'input',reason:'Bearer [REDACTED]'}]);
+ for(const hidden of ['private-key-123','raw submitted input','arbitrary-secret','do not log this','instagram.com'])assert.ok(!JSON.stringify(info).includes(hidden));
 });
