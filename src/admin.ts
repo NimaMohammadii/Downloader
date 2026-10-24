@@ -239,6 +239,80 @@ export async function setInstagramApi(env: AdminStatsEnv & InstagramApiSecrets,
   if (!response.ok) throw new Error("INSTAGRAM_API_SETTING_UNAVAILABLE");
 }
 
+// One entry per successful Bright Data extraction, independently of Telegram
+// delivery. Workflow replays and duplicate messages use the same stable key.
+export async function recordBrightDataExtraction(env: Partial<AdminStatsEnv>, account: ApifyAccount, key: string): Promise<void> {
+  if (!env.ADMIN_STATS) return;
+  try {
+    const response = await env.ADMIN_STATS.getByName("global").fetch("https://admin-stats/instagram-api-usage", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ account, key }),
+    });
+    if (!response.ok) throw new Error("USAGE_WRITE_FAILED");
+  } catch {
+    // A statistics outage must never restart a paid extraction or lose a file.
+    console.warn("instagram brightdata usage recording failed", { account });
+  }
+}
+
+type BrightDataUsage = { month: string; trackedSince: number; accounts: { account: ApifyAccount; used: number }[] };
+
+export async function instagramAccountBudget(env: AdminStatsEnv & InstagramApiSecrets): Promise<string> {
+  const number = (value: unknown): number | undefined => typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  const usd = (value: unknown): number | undefined => number(value) !== undefined && Number(value) >= 0 ? Number(value) : undefined;
+  const money = (value: number | undefined) => value === undefined ? "نامشخص" : `$${value.toFixed(4)}`;
+  async function read(url: string, token: string): Promise<any> {
+    const response = await fetch(url, { headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+      redirect: "error", signal: AbortSignal.timeout(8000) });
+    if (!response.ok) throw new Error([401, 403].includes(response.status) ? "BILLING_ACCESS" : "BILLING_UNAVAILABLE");
+    return response.json();
+  }
+  const [settings, usageResponse] = await Promise.all([
+    instagramApiSettings(env),
+    env.ADMIN_STATS.getByName("global").fetch("https://admin-stats/instagram-api-usage"),
+  ]);
+  if (!usageResponse.ok) throw new Error("INSTAGRAM_API_USAGE_UNAVAILABLE");
+  const usage = await usageResponse.json() as BrightDataUsage;
+  const jobs = (["apify", "brightdata"] as const).flatMap(provider => INSTAGRAM_API_ACCOUNTS.map(async account => {
+    const selection = { provider, account };
+    const active = [settings.posts.provider === provider && settings.posts.account === account ? "پست/ریلز" : "",
+      settings.stories.provider === provider && settings.stories.account === account ? "استوری" : ""].filter(Boolean);
+    const heading = `${provider === "apify" ? "Apify" : "Bright Data"} ${account}${active.length ? " ✅ " + active.join("، ") : ""}`;
+    const token = instagramApiToken(env, selection);
+    if (!token) return `${heading}\nکلید تنظیم نشده`;
+    if (provider === "brightdata") {
+      const used = usage.accounts.find(item => item.account === account)?.used;
+      const lines = [heading, used === undefined ? "شمارنده: نامشخص"
+        : `مصرف ثبت‌شده: ${used} کردیت | باقی تخمینی: ${Math.max(0, 5000 - used)} از ۵۰۰۰`,
+        ...(used === undefined ? [] : [`معادل مصرف با نرخ $1.50/1000: ${money(used * 0.0015)}`])];
+      try {
+        const balance = await read("https://api.brightdata.com/customer/balance", token);
+        // These are USD fields, never the number of free-tier credits.
+        lines.push(`موجودی دلاری: ${money(number(balance.balance))} | هزینه در انتظار: ${money(number(balance.pending_costs))}`);
+      } catch (error) {
+        lines.push(error instanceof Error && error.message === "BILLING_ACCESS" ? "دسترسی اطلاعات مالی مجاز نیست" : "اطلاعات دلاری دریافت نشد");
+      }
+      return lines.join("\n");
+    }
+    const result = await Promise.allSettled([
+      read("https://api.apify.com/v2/users/me", token),
+      read("https://api.apify.com/v2/users/me/usage/monthly", token),
+    ]);
+    const profile = result[0].status === "fulfilled" ? result[0].value?.data : undefined;
+    const monthly = result[1].status === "fulfilled" ? result[1].value?.data : undefined;
+    const included = usd(profile?.plan?.monthlyUsageCreditsUsd);
+    const spent = usd(monthly?.totalUsageCreditsUsdAfterVolumeDiscount);
+    const remaining = included !== undefined && spent !== undefined ? Math.max(0, included - spent) : undefined;
+    const end = monthly?.usageCycle?.endAt;
+    const lines = [heading, `مصرف دوره: ${money(spent)} | اعتبار پلن: ${money(included)}`,
+      `باقی اعتبار پلن: ${money(remaining)}`];
+    if (typeof end === "string" && Number.isFinite(Date.parse(end))) lines.push(`پایان دوره (UTC): ${new Date(end).toISOString().slice(0, 10)}`);
+    if (result.some(item => item.status === "rejected")) lines.push("بخشی از اطلاعات دریافت نشد؛ دسترسی مالی توکن را بررسی کن.");
+    return lines.join("\n");
+  }));
+  const accounts = await Promise.all(jobs);
+  return `💳 مصرف و اعتبار اکانت‌ها\nبروزرسانی: ${new Date().toISOString().replace("T", " ").slice(0, 19)} UTC\n\n${accounts.join("\n\n")}\n\nBright Data: ماه ${usage.month}؛ ریست اول ماه میلادی UTC. شمارش از ${new Date(usage.trackedSince).toISOString().slice(0, 10)}؛ مصرف قبلی، بیرون ربات و نتایج نامشخص لحاظ نشده. موجودی دلاری با کردیت رایگان متفاوت است.\nApify: باقی اعتبار پلن از سهمیهٔ پلن منهای مصرف گزارش‌شده محاسبه می‌شود؛ موجودی نقدی نیست. اطلاعات مالی سرویس ممکن است با تأخیر ثبت شود.`;
+}
+
 export type TrackedUser = {
   id: number;
   username?: string;
@@ -403,6 +477,12 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         SELECT user_id, MIN(created_at) FROM download_history WHERE delivered > 0 GROUP BY user_id;
       INSERT OR IGNORE INTO counters(key, value) VALUES ('membership_enabled', 1);
       INSERT OR IGNORE INTO counters(key, value) VALUES ('apify_account', 1);
+      CREATE TABLE IF NOT EXISTS instagram_api_extractions (
+        event_key TEXT NOT NULL, account INTEGER NOT NULL, recorded_at INTEGER NOT NULL,
+        PRIMARY KEY (event_key, account)
+      );
+      CREATE INDEX IF NOT EXISTS idx_instagram_api_extractions_at ON instagram_api_extractions(recorded_at, account);
+      INSERT OR IGNORE INTO counters(key, value) VALUES ('bd_tracking_since', ${Date.now()});
       INSERT OR IGNORE INTO counters(key, value) VALUES ('ig_posts_provider', 1), ('ig_stories_provider', 1);
       INSERT OR IGNORE INTO counters(key, value) SELECT 'ig_posts_account', value FROM counters WHERE key = 'apify_account';
       INSERT OR IGNORE INTO counters(key, value) SELECT 'ig_stories_account', value FROM counters WHERE key = 'apify_account';
@@ -506,6 +586,28 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         all: this.usageTotals(0, now, id), day: this.usageTotals(now - 86400_000, now, id),
         week: this.usageTotals(now - 7 * 86400_000, now, id),
       } satisfies AdminUsage);
+    }
+
+    if (url.pathname === "/instagram-api-usage") {
+      const sql = this.ctx.storage.sql;
+      if (request.method === "POST") {
+        const payload = await request.json().catch(() => null) as { account?: ApifyAccount; key?: string } | null;
+        if (!payload || !INSTAGRAM_API_ACCOUNTS.includes(payload.account!) || typeof payload.key !== "string"
+            || !/^[A-Za-z0-9:_-]{1,200}$/.test(payload.key)) return new Response("Invalid extraction", { status: 400 });
+        sql.exec("INSERT OR IGNORE INTO instagram_api_extractions(event_key, account, recorded_at) VALUES (?, ?, ?)",
+          payload.key, payload.account!, Date.now());
+        return Response.json({ ok: true });
+      }
+      if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
+      const now = new Date(Date.now());
+      const start = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
+      const end = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
+      const rows = sql.exec("SELECT account, COUNT(*) AS used FROM instagram_api_extractions WHERE recorded_at >= ? AND recorded_at < ? GROUP BY account", start, end).toArray();
+      return Response.json({ month: now.toISOString().slice(0, 7),
+        trackedSince: asNumber(sql.exec("SELECT value FROM counters WHERE key = 'bd_tracking_since'").one().value),
+        accounts: INSTAGRAM_API_ACCOUNTS.map(account => ({ account,
+          used: asNumber(rows.find(row => asNumber(row.account) === account)?.used || 0) })),
+      } satisfies BrightDataUsage);
     }
 
     if (url.pathname === "/instagram-api") {

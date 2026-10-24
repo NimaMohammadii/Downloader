@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 const bundle = await build({
-  stdin: { contents: 'export {default as worker} from "./src/app-main"; export * from "./src/admin";', resolveDir: process.cwd(), loader: 'ts' },
+  stdin: { contents: 'export {default as worker, YoutubeDownloadWorkflow} from "./src/app-main"; export * from "./src/admin";', resolveDir: process.cwd(), loader: 'ts' },
   bundle: true, format: 'esm', write: false,
   plugins: [{ name: 'cloudflare-runtime', setup(b) {
     b.onResolve({ filter: /^(cloudflare:workers|@cloudflare\/containers)$/ }, a => ({ path: a.path, namespace: 'runtime' }));
@@ -610,4 +610,84 @@ test('reselecting the same API is idempotent when Telegram reports an unchanged 
       data:'admin:igapi:both:apify:1',message:{message_id:20,chat:{id:admin.ADMIN_USER_ID}}}}),{...f.env,APIFY_API_TOKEN:'private-one'},{});
     assert.equal(response.status,200);assert.equal((await admin.instagramApiSettings(f.env)).posts.account,1);
   }finally{globalThis.fetch=previous;f.close();}
+});
+
+test('Bright Data counters persist per account, deduplicate concurrent events and reset at UTC month boundaries',async()=>{
+ const f=fixture();
+ try{
+  Date.now=()=>Date.parse('2026-10-31T23:59:59Z');
+  await Promise.all(Array.from({length:10},()=>admin.recordBrightDataExtraction(f.env,2,'igdl-42-1-42')));
+  await admin.recordBrightDataExtraction(f.env,2,'igdl-42-2-42');
+  await admin.recordBrightDataExtraction(f.env,3,'igdl-42-3-42');f.restart();
+  let usage=await (await f.request('/instagram-api-usage')).json();
+  assert.equal(usage.month,'2026-10');assert.deepEqual(usage.accounts.map(x=>x.used),[0,2,1,0]);
+  Date.now=()=>Date.parse('2026-11-01T00:00:00Z');
+  usage=await (await f.request('/instagram-api-usage')).json();assert.equal(usage.month,'2026-11');
+  assert.deepEqual(usage.accounts.map(x=>x.used),[0,0,0,0]);
+  await admin.recordBrightDataExtraction(f.env,2,'igdl-42-1-42'); // replay from last month
+  await admin.recordBrightDataExtraction(f.env,2,'igdl-42-4-42');
+  usage=await (await f.request('/instagram-api-usage')).json();assert.equal(usage.accounts[1].used,1);
+  for(const payload of [{account:5,key:'valid'},{account:1,key:''},{account:2,key:'credential?bad'}])
+    assert.equal((await f.request('/instagram-api-usage',payload)).status,400);
+ }finally{f.close();}
+});
+
+test('eight-account budget reads real API fields, marks derived credit separately and preserves partial failures',async()=>{
+ const f=fixture(),previous=globalThis.fetch,requests=[];
+ const env={...f.env};for(const account of [1,2,3,4]){env['APIFY_API_TOKEN_'+account]='apify-secret-'+account;env['BRIGHTDATA_API_KEY_'+account]='bright-secret-'+account;}
+ globalThis.fetch=async(input,init)=>{
+  const url=new URL(input),auth=new Headers(init.headers).get('authorization');requests.push({url,auth});
+  assert.equal(init.redirect,'error');assert.ok(init.signal);assert.equal(init.method,undefined);
+  if(url.hostname==='api.brightdata.com')return Response.json({balance:3,credit:999,prepayment:80,pending_costs:0.25});
+  if(auth==='Bearer apify-secret-2')return Response.json({error:'secret should not be exposed'},{status:403});
+  if(url.pathname.endsWith('/monthly'))return Response.json({data:{totalUsageCreditsUsdAfterVolumeDiscount:1.2345,usageCycle:{endAt:'2026-11-01T23:59:59.999Z'}}});
+  return Response.json({data:{plan:auth==='Bearer apify-secret-3'?{}:{monthlyUsageCreditsUsd:5},proxy:{password:'private-proxy-password'}}});
+ };
+ try{
+  await admin.recordBrightDataExtraction(f.env,2,'igdl-fixture');
+  const text=await admin.instagramAccountBudget(env);
+  assert.equal(requests.length,12);assert.match(text,/\$1\.2345/);assert.match(text,/\$3\.7655/);
+  assert.match(text,/مصرف ثبت‌شده: 1 کردیت \| باقی تخمینی: 4999/);
+  assert.match(text,/\$0\.0015/);assert.match(text,/موجودی دلاری: \$3\.0000/);
+  assert.match(text,/اطلاعات دریافت نشد/);assert.match(text,/باقی اعتبار پلن: نامشخص/);
+  assert.ok(!text.includes('$999'));assert.ok(!text.includes('password'));assert.ok(!text.includes('secret'));
+  assert.ok(text.length<4096);
+  for(const account of [1,2,3,4])assert.equal(requests.filter(x=>x.auth==='Bearer apify-secret-'+account).length,2);
+  assert.equal((await admin.instagramApiSettings(env)).posts.account,1,'report never switches accounts');
+ }finally{globalThis.fetch=previous;f.close();}
+});
+
+test('budget panel is admin-only, missing secrets make no paid/API requests and refresh leaves selections intact',async()=>{
+ const f=fixture(),previous=globalThis.fetch,calls=[];
+ globalThis.fetch=async(input,init)=>{calls.push({url:String(input),body:JSON.parse(init.body)});return Response.json({ok:true,result:{message_id:20}});};
+ const visit=id=>admin.worker.fetch(webhook({callback_query:{id:'budget',from:{id},data:'admin:igbudget',message:{message_id:20,chat:{id}}}}),f.env,{});
+ try{
+  await visit(99);assert.equal(calls.length,0);
+  await visit(admin.ADMIN_USER_ID);
+  const panel=calls.find(x=>x.url.endsWith('/editMessageText')).body;
+  assert.equal((panel.text.match(/کلید تنظیم نشده/g)||[]).length,8);
+  assert.ok(panel.reply_markup.inline_keyboard.flat().some(x=>x.callback_data==='admin:igbudget'));
+  assert.ok(calls.every(x=>x.url.includes('api.telegram.org')));
+ }finally{globalThis.fetch=previous;f.close();}
+});
+
+test('a Bright Data extraction is counted once for the pinned account across Workflow replay, even when Telegram fails',async()=>{
+ const f=fixture(),previous=globalThis.fetch;let paid=0;
+ const env={...f.env,BRIGHTDATA_API_KEY_2:'private-bright-two',APIFY_API_TOKEN:'other-account'};
+ const job={id:'igdl-42-55-42',chatId:42,requestMessageId:55,userId:42,url:'https://instagram.com/reel/Abc123/',instagramPostRequest:{shortcode:'Abc123'},instagramApi:{provider:'brightdata',account:2}};
+ const checkpoints=new Map();const step={async do(name,opts,fn){if(typeof opts==='function')fn=opts;if(checkpoints.has(name))return structuredClone(checkpoints.get(name));const value=await fn();checkpoints.set(name,structuredClone(value));return value;}};
+ globalThis.fetch=async(input,init={})=>{
+  const url=new URL(input);
+  if(url.hostname==='api.brightdata.com'){paid++;assert.equal(new Headers(init.headers).get('authorization'),'Bearer private-bright-two');return Response.json([{shortcode:'Abc123',video_url:'https://cdn.instagram.com/video.mp4'}]);}
+  if(url.hostname==='cdn.instagram.com')return new Response(null,{headers:{'content-length':'1000000'}});
+  if(url.hostname==='api.telegram.org')return url.pathname.endsWith('/sendVideo')?Response.json({ok:false,description:'Forbidden: cannot send video'},{status:403}):Response.json({ok:true,result:{message_id:33}});
+  throw Error('Unexpected request');
+ };
+ try{
+  await f.record(1);
+  const replay=()=>new admin.YoutubeDownloadWorkflow({},env).run({payload:job},step);
+  await replay();await replay();
+  const usage=await (await f.request('/instagram-api-usage')).json();
+  assert.equal(paid,1);assert.deepEqual(usage.accounts.map(x=>x.used),[0,1,0,0]);
+ }finally{globalThis.fetch=previous;f.close();}
 });

@@ -14,6 +14,7 @@ import {
   telegramCustomEmoji,
   ADMIN_USER_ID,
   instagramApiSettings,
+  recordBrightDataExtraction,
   instagramApiToken,
   type InstagramApiSelection,
   type ApifyAccount,
@@ -497,6 +498,7 @@ async function trackJob(env: Env, job: YoutubeDownloadJob, status: DownloadStatu
 export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDownloadJob> {
   private instagramEnvironment(job: YoutubeDownloadJob): Env & {
     INSTAGRAM_POST_PROVIDER?: "apify" | "brightdata"; INSTAGRAM_STORY_PROVIDER?: "apify" | "brightdata";
+    recordBrightDataExtraction?: () => Promise<void>;
   } {
     const selection = job.instagramApi || (job.apifyAccount !== undefined
       ? { provider: "apify" as const, account: job.apifyAccount } : undefined);
@@ -504,7 +506,9 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
     const token = instagramApiToken(this.env, selection);
     return { ...this.env, INSTAGRAM_POST_PROVIDER: selection.provider, INSTAGRAM_STORY_PROVIDER: selection.provider,
       APIFY_API_TOKEN: selection.provider === "apify" ? token : undefined,
-      BRIGHTDATA_API_KEY: selection.provider === "brightdata" ? token : undefined };
+      BRIGHTDATA_API_KEY: selection.provider === "brightdata" ? token : undefined,
+      recordBrightDataExtraction: selection.provider === "brightdata"
+        ? () => recordBrightDataExtraction(this.env, selection.account, job.id) : undefined };
   }
 
   async run(event: WorkflowEvent<YoutubeDownloadJob>, step: WorkflowStep) {
@@ -717,7 +721,10 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           const childId = `${job.id}-profile-${sequence}`;
           const prepared = await step.do(`prepare instagram profile post ${sequence}`, { retries: { limit: 0, delay: "1 second" }, timeout: "8 minutes" }, async () => {
             try { return { media: !stories && job.instagramApi
-              ? await resolveInstagramPostForWorkflow(post.url, post.shortcode, providerEnv)
+              ? await resolveInstagramPostForWorkflow(post.url, post.shortcode, { ...providerEnv,
+                  recordBrightDataExtraction: job.instagramApi.provider === "brightdata"
+                    ? () => recordBrightDataExtraction(this.env, job.instagramApi!.account, `${job.id}:profile:${post.shortcode}`) : undefined,
+                })
               : await instagramProfilePostMedia(post, this.env) }; }
             catch (error) { return { error: !stories && job.instagramApi
               ? instagramPostFriendlyError(error) : instagramProfileErrorText(error) }; }

@@ -33,6 +33,7 @@ const { outputFiles } = await build({
           const key=provider==='apify'?'APIFY_API_TOKEN':'BRIGHTDATA_API_KEY';
           return env[key+'_'+account]?.trim()||(account===1?env[key]?.trim():undefined);
         };
+        export const recordBrightDataExtraction=async(...args)=>globalThis.brightUsage?.(...args);
         export const instagramApiSettings=async()=>({posts:{provider:'apify',account:1},stories:{provider:'apify',account:1}});
 
         export const recordUsage=async()=>true; export const recordMediaDelivery=async()=>{}; export const telegramCustomEmoji=(_method,payload)=>payload;

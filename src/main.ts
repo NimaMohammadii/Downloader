@@ -7,6 +7,7 @@ import {
   INSTAGRAM_API_ACCOUNTS,
   instagramApiToken,
   instagramApiSettings,
+  instagramAccountBudget,
   setInstagramApi,
   type InstagramProvider,
   type ApifyAccount,
@@ -147,6 +148,20 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
   await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: query.id });
 
   try {
+    if (data === "admin:igbudget") {
+      const text = await instagramAccountBudget(env);
+      await telegramCall(env.BOT_TOKEN, "editMessageText", {
+        chat_id: message.chat.id, message_id: message.message_id, text,
+        reply_markup: { inline_keyboard: [
+          [{ text: "🔄 بروزرسانی موجودی", callback_data: "admin:igbudget" }],
+          [{ text: "انتخاب سرویس و اکانت", callback_data: "admin:igapi" }],
+        ] },
+      }).catch(error => {
+        if (!(error instanceof Error) || !/message is not modified/i.test(error.message)) throw error;
+      });
+      return Response.json({ ok: true });
+    }
+
     const apiMatch = /^admin:igapi(?::(posts|stories|both)(?::(apify|brightdata):([1-4]))?)?$/.exec(data);
     // Old dashboard buttons open the current settings, without changing them.
     if (apiMatch || /^admin:apify(?::[1-4])?$/.test(data)) {
@@ -181,7 +196,7 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
       await telegramCall(env.BOT_TOKEN, "editMessageText", {
         chat_id: message.chat.id, message_id: message.message_id,
         text: `${notice}🔑 API اینستاگرام${scope ? " — " + title : ""}\n\nپست و ریلز: ${label(settings.posts)}\nاستوری و هایلایت: ${label(settings.stories)}\n\nتغییر فقط برای دانلودهای جدید است. جایگزینی خودکار سرویس یا اکانت وجود ندارد.`,
-        reply_markup: { inline_keyboard: [...rows, [{ text: scope ? "بازگشت به تنظیمات API" : "بازگشت به پنل",
+        reply_markup: { inline_keyboard: [...rows, [{ text: "💳 مصرف و اعتبار اکانت‌ها", callback_data: "admin:igbudget" }], [{ text: scope ? "بازگشت به تنظیمات API" : "بازگشت به پنل",
           callback_data: scope ? "admin:igapi" : "admin:stats" }]] },
       }).catch(error => {
         if (!(error instanceof Error) || !/message is not modified/i.test(error.message)) throw error;

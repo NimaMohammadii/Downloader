@@ -217,6 +217,46 @@ neither Telegram nor Workflow state stores them. Profile-post listing still uses
 existing Instagram session, while each new profile post is extracted by the selected
 post service. Live, replay and audio paths keep their existing behavior.
 
+### Account usage and budget
+
+Open `/admin` → **🔑 API اینستاگرام** → **💳 مصرف و اعتبار اکانت‌ها**.
+Only the administrator can read this report. **🔄 بروزرسانی موجودی** performs
+on-demand reads; no timer, scheduled reset, polling or automatic account switch is added.
+
+For each configured Apify token the report reads `/v2/users/me` and
+`/v2/users/me/usage/monthly`. It shows the provider-reported period usage, the
+plan's included USD credits, the remaining plan credits (included minus usage,
+clamped at zero), and the billing period end. Remaining plan credit is not a cash
+balance or the account's spending limit. Unavailable or unauthorized fields are
+shown as unknown, never replaced with an assumed $5 balance. These account-level
+figures include activity outside this bot and may reflect provider reporting delays.
+The same Secrets are used; tokens need permission to read account/billing data.
+
+For Bright Data each numbered slot has a **local estimate** of used credits and
+remaining credits out of 5,000. A successful single-record extraction increments
+it once, before media probing and delivery; Telegram failure therefore does not
+undo provider usage. Stable job/account keys deduplicate replays and redeliveries;
+profile posts have individual stable keys. Carousels count once rather than once
+per attached file. Provider error records, empty responses, failed HTTP requests,
+and pending/ambiguous results are not counted. A fresh paid extraction still counts
+if its file is later sent using a Telegram file ID. A cache-only send adds no count.
+
+The existing admin SQLite store keeps extraction events. Current-month totals use
+UTC calendar-month boundaries, so the displayed allowance resets at 00:00 UTC on
+the first day without a cron job, while previous events remain available for replay
+deduplication. Counting starts when this feature is enabled. Historical usage, other
+apps using the account and eventual results of pending/ambiguous requests are not
+known; replacing a slot's Secret does not erase that slot's history. The report labels
+the allowance as estimated and shows tracking start/month. It also shows the USD
+equivalent at $1.50 per 1,000 recorded credits, not an actual invoice.
+
+Bright Data's `/customer/balance` is read separately for actual USD balance and
+pending invoice costs. Its USD `credit` field is never treated as the 5,000 free
+credits: the official API does not expose free-tier credits used or remaining.
+Financial read errors do not prevent showing local counters or other accounts.
+A failed statistics write logs a credential-free warning and does not retry the
+paid extractor or interrupt delivery.
+
 ## Optional Instagram secrets
 
 For Story/Highlight/Live/replay support and content that Instagram gates behind login, add these as Cloudflare Worker secrets/environment variables:

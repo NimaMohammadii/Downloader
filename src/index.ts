@@ -9,6 +9,7 @@ type Env = Partial<AdminStatsEnv> & {
   INSTAGRAM_MID?: string;
   INSTAGRAM_IG_DID?: string;
   BRIGHTDATA_API_KEY?: string;
+  recordBrightDataExtraction?: () => Promise<void>;
   INSTAGRAM_POST_PROVIDER?: "apify" | "brightdata";
   APIFY_API_TOKEN?: string;
   queueInstagramPost?: (post: Omit<InstagramPostUpload, "media" | "statusMessageId">) => Promise<void>;
@@ -963,7 +964,7 @@ async function resolvePostWithTopApi(
 // Use the documented synchronous Web Scraper API for one exact post/Reel;
 // never submit a second paid extraction as a fallback after an ambiguous run.
 async function resolvePostWithBrightData(
-  target: Extract<InstagramTarget, { kind: "post" }>, apiKey: string,
+  target: Extract<InstagramTarget, { kind: "post" }>, apiKey: string, recordExtraction?: () => Promise<void>,
 ): Promise<MediaCandidate[][]> {
   const route = /\/(p|reels?|tv)\/([A-Za-z0-9_-]+)(?:\/|$)/.exec(new URL(target.url).pathname);
   const isReel = route?.[1] === "reel" || route?.[1] === "reels";
@@ -1070,7 +1071,7 @@ async function resolvePostWithBrightData(
 
     // Log only a fixed set of known field names, never arbitrary upstream values.
     const knownFields = ["video_url", "videos", "photos", "carousel_media", "image_url", "display_url",
-      "thumbnail", "error", "error_type", "status", "code", "url", "shortcode", "content_type",
+      "thumbnail", "error", "error_type", "error_code", "status", "code", "url", "shortcode", "content_type",
       "product_type", "post_content", "media", "images"];
     console.warn("instagram brightdata no media", {
       dataset: isReel ? "reels" : "posts", status: response.status, reason,
@@ -1086,7 +1087,9 @@ async function resolvePostWithBrightData(
 
   if (rows.length !== 1 || !rows[0] || typeof rows[0] !== "object") noMedia("invalid_record_count");
   const item = rows[0] as Record<string, any>;
-  if (item.error || item.error_type || item.status === "fail") noMedia("provider_error_record", item);
+  if (item.error || item.error_type || item.error_code || item.status === "fail") noMedia("provider_error_record", item);
+  // Count the successful provider record even if probing or Telegram later fails.
+  if (recordExtraction) await recordExtraction();
 
   // An unrelated record must not become a download for the user's link.
   const returnedShortcode = String(item.shortcode || "").trim();
@@ -1621,7 +1624,7 @@ async function resolveTarget(target: InstagramTarget, env: Env): Promise<Resolve
       console.log("instagram post resolver success", { resolver: "topapi" });
     } else if (provider === "brightdata") {
       if (!env.BRIGHTDATA_API_KEY?.trim()) throw new Error("BRIGHTDATA_AUTH_ERROR");
-      groups = await resolvePostWithBrightData(target, env.BRIGHTDATA_API_KEY.trim());
+      groups = await resolvePostWithBrightData(target, env.BRIGHTDATA_API_KEY.trim(), env.recordBrightDataExtraction);
       console.log("instagram post resolver success", { resolver: "brightdata" });
     } else {
       // Standalone legacy entry without an API setting uses its direct resolver.

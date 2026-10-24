@@ -1188,3 +1188,19 @@ test('Bright Data validation details omit raw inputs, credentials, signed URLs a
  assert.deepEqual(info.validation,[{field:'url',reason:'Invalid [URL]'},{field:'country',reason:'Rejected [REDACTED]'},{field:'input',reason:'Bearer [REDACTED]'}]);
  for(const hidden of ['private-key-123','raw submitted input','arbitrary-secret','do not log this','instagram.com'])assert.ok(!JSON.stringify(info).includes(hidden));
 });
+
+test('Bright Data counts provider records rather than sent files; errors and pending responses consume no local credit',async()=>{
+ for(const [payload,status,expected] of [
+  [[{shortcode,video_url:'https://scontent.cdninstagram.com/video.mp4'}],200,1],
+  [[{shortcode,description:'metadata only'}],200,1],
+  [[{shortcode:'wrong',video_url:'https://scontent.cdninstagram.com/video.mp4'}],200,1],
+  [[{error:'dead page'}],200,0],[[{error_code:'dead_page'}],200,0],[[],200,0],
+  [{snapshot_id:'sd_pending'},202,0],[{error:'bad request'},400,0],
+ ]){
+  let count=0;
+  const result=await run({env:{BRIGHTDATA_API_KEY:'key',recordBrightDataExtraction:async()=>{count++;}},respond(call){
+   assert.equal(call.hostname,'api.brightdata.com');return Response.json(payload,{status});
+  }});
+  assert.equal(count,expected);assert.equal(result.calls.length,1);
+ }
+});
