@@ -133,6 +133,89 @@ async function run({ session = '12345%3Afixture-session', env = {}, respond, cdn
   return { calls, sent, diagnostics, history: globalThis.history };
 }
 
+
+test('Bright Data Reel uses documented sync endpoint and never sends Instagram session credentials', async () => {
+  const result = await run({env: {BRIGHTDATA_API_KEY: 'private-brightdata-key'}, respond(call) {
+    if (call.hostname === 'api.brightdata.com') return Response.json([{
+      url: 'https://www.instagram.com/reel/' + shortcode + '/',
+      shortcode, video_url: 'https://scontent.cdninstagram.com/video.mp4',
+      thumbnail: 'https://scontent.cdninstagram.com/cover.jpg',
+    }]);
+    throw Error('unexpected Instagram scrape request: ' + call.hostname);
+  }});
+  assert.equal(files(result).length, 1);
+  assert.equal(result.calls.length, 1);
+  const request = result.calls[0];
+  assert.equal(request.hostname, 'api.brightdata.com');
+  assert.equal(request.path, '/datasets/v3/scrape');
+  assert.equal(request.url.searchParams.get('dataset_id'), 'gd_lyclm20il4r5helnj');
+  assert.equal(request.headers.get('authorization'), 'Bearer private-brightdata-key');
+  assert.equal(request.headers.get('cookie'), null);
+  assert.deepEqual(JSON.parse(request.body), {input: [{url: 'https://www.instagram.com/reel/' + shortcode + '/'}]});
+  assert.ok(!JSON.stringify(result.sent).includes('private-brightdata-key'));
+  assert.ok(!JSON.stringify(result.diagnostics).includes('private-brightdata-key'));
+});
+
+test('Bright Data post returns every photo in a simple ordered photo post', async () => {
+  const result = await run({text: 'https://www.instagram.com/p/' + shortcode + '/', env: {BRIGHTDATA_API_KEY: 'key'}, respond(call) {
+    if (call.hostname === 'api.brightdata.com') return Response.json([{
+      shortcode, photos: ['https://scontent.cdninstagram.com/one.jpg',
+        'https://scontent.cdninstagram.com/two.jpg'], videos: [],
+    }]);
+  }});
+  assert.equal(result.calls[0].url.searchParams.get('dataset_id'), 'gd_lk5ns7kz21pck8jpis');
+  assert.equal(result.calls.length, 1);
+  assert.deepEqual(files(result).map(x => x.method), ['sendPhoto', 'sendPhoto']);
+});
+
+test('Bright Data mixed carousel without slide ordering must fail rather than shuffle media', async () => {
+  const result = await run({text: 'https://www.instagram.com/p/' + shortcode + '/',
+    env: {BRIGHTDATA_API_KEY: 'key'}, respond(call) {
+      if (call.hostname === 'api.brightdata.com') return Response.json([{
+        photos: ['https://scontent.cdninstagram.com/cover.jpg'],
+        videos: ['https://scontent.cdninstagram.com/movie.mp4'],
+      }]);
+    }});
+  assert.equal(result.calls.length, 1);
+  assert.equal(files(result).length, 0);
+  assert.match(report(result), /BRIGHTDATA_INCOMPLETE_CAROUSEL/);
+});
+
+test('Bright Data refuses another post, unsafe media URLs and missing Reel video', async () => {
+  for (const [payload, expected] of [
+    [[{shortcode: 'another', video_url: 'https://scontent.cdninstagram.com/video.mp4'}], /BRIGHTDATA_WRONG_POST/],
+    [[{shortcode, video_url: 'https://example.com/private.mp4'}], /BRIGHTDATA_NO_MEDIA/],
+    [[{shortcode, thumbnail: 'https://scontent.cdninstagram.com/cover.jpg'}], /BRIGHTDATA_NO_MEDIA/],
+  ]) {
+    const result = await run({env: {BRIGHTDATA_API_KEY: 'key'}, respond(call) {
+      if (call.hostname === 'api.brightdata.com') return Response.json(payload);
+    }});
+    assert.equal(files(result).length, 0);
+    assert.equal(result.calls.length, 1);
+    assert.match(report(result), expected);
+  }
+});
+
+test('Bright Data 202 pending snapshot does not retry or silently switch to Instagram', async () => {
+  const result = await run({env: {BRIGHTDATA_API_KEY: 'key'}, respond(call) {
+    if (call.hostname === 'api.brightdata.com') return Response.json({snapshot_id: 's_fixture'},
+      {status: 202});
+  }});
+  assert.equal(result.calls.length, 1);
+  assert.equal(files(result).length, 0);
+  assert.match(report(result), /BRIGHTDATA_PENDING/);
+});
+
+test('Bright Data authentication failures are reported with no anonymous retry', async () => {
+  const result = await run({env: {BRIGHTDATA_API_KEY: 'key'}, respond(call) {
+    if (call.hostname === 'api.brightdata.com') return Response.json({error: 'unauthorized'}, {status: 401});
+  }});
+  assert.equal(result.calls.length, 1);
+  assert.equal(files(result).length, 0);
+  assert.match(report(result), /BRIGHTDATA_AUTH_ERROR/);
+  assert.match(errorText(result), /کلید Bright Data/);
+});
+
 function noObsoleteRequests(result) {
   assert.ok(!result.calls.some(call => /oembed|embed/.test(call.path) || call.path === '/'));
   assert.ok(result.calls.length <= 7, 'each page may issue one shortcode web-info query');
