@@ -47,6 +47,29 @@ function fixture(legacy = false) {
   return { db, request, record, detail, env, close() { Date.now = realNow; db.close(); } };
 }
 
+test('anonymous Instagram cooldown persists across Worker requests without altering other admin counters', async () => {
+  const f = fixture();
+  try {
+    const start = 1_800_000_000_000;
+    Date.now = () => start;
+    const get = async () => (await f.request('/instagram-public-cooldown')).json();
+    assert.deepEqual(await get(), { remainingSeconds: 0 });
+    assert.equal((await f.request('/instagram-public-cooldown', { seconds: 900 })).status, 200);
+    assert.deepEqual(await get(), { remainingSeconds: 900 });
+    Date.now = () => start + 60_000;
+    assert.equal((await f.request('/instagram-public-cooldown', { seconds: 30 })).status, 200);
+    assert.deepEqual(await get(), { remainingSeconds: 840 }, 'a shorter pause must not overwrite an existing longer pause');
+    assert.equal((await f.request('/instagram-public-cooldown', { seconds: 0 })).status, 400);
+    assert.equal((await f.request('/instagram-public-cooldown', { seconds: 86401 })).status, 400);
+    Date.now = () => start + 901_000;
+    assert.deepEqual(await get(), { remainingSeconds: 0 });
+    assert.equal((await f.request('/instagram-public-cooldown', { seconds: 45 })).status, 200);
+    assert.deepEqual(await get(), { remainingSeconds: 45 });
+    const rows = f.db.prepare("SELECT key FROM counters").all().map(row => row.key);
+    assert.ok(rows.includes('successful_downloads') && rows.includes('instagram_public_cooldown_until'));
+  } finally { f.close(); }
+});
+
 test('existing users and counters survive migration; historical visits remain explicitly unavailable', async () => {
   const f = fixture(true);
   try {
