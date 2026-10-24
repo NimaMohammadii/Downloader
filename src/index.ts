@@ -797,7 +797,7 @@ async function resolvePostWithBrightData(
       photoCount: Array.isArray(row.photos) ? row.photos.length : null,
       carouselCount: Array.isArray(row.carousel_media) ? row.carousel_media.length : null,
     });
-    throw new Error("BRIGHTDATA_NO_MEDIA");
+    throw new Error(reason === "provider_error_record" ? "BRIGHTDATA_PROVIDER_ERROR" : "BRIGHTDATA_NO_MEDIA");
   }
 
   if (rows.length !== 1 || !rows[0] || typeof rows[0] !== "object") noMedia("invalid_record_count");
@@ -836,7 +836,7 @@ async function resolvePostWithBrightData(
     for (const slide of carousel) {
       const video = mediaUrl(slide?.video_url) || urls(slide?.videos)[0];
       const photo = mediaUrl(slide?.image_url) || mediaUrl(slide?.display_url)
-        || urls(slide?.photos)[0];
+        || urls(slide?.photos)[0] || urls(slide?.images)[0];
       if (video) groups.push(candidate("video", video));
       else if (photo && !slide?.is_video && slide?.media_type !== 2) groups.push(candidate("photo", photo));
       else throw new Error("BRIGHTDATA_INCOMPLETE_CAROUSEL");
@@ -849,15 +849,25 @@ async function resolvePostWithBrightData(
     ...urls(item.videos), ...(mediaUrl(item.video_url) ? [mediaUrl(item.video_url)!] : []),
   ])];
   const photos = urls(item.photos);
+  const imageAlternates = urls(item.images);
+  // 'images' is documented as alternate resolutions, not a carousel.
+  // Only use one image when the record identifies a single-photo post.
+  const photoCount = Number(item.photos_number);
+  const hasKnownPhotoCount = Number.isSafeInteger(photoCount) && photoCount > 0;
+  if (hasKnownPhotoCount && photos.length && photos.length < photoCount) {
+    throw new Error("BRIGHTDATA_INCOMPLETE_CAROUSEL");
+  }
   // Flat videos/photos arrays have no shared ordering for a mixed carousel.
   // Never silently deliver slides out of order or pass a video's cover as media.
   if (videos.length && photos.length) throw new Error("BRIGHTDATA_INCOMPLETE_CAROUSEL");
   if (videos.length > 20 || photos.length > 20) throw new Error("BRIGHTDATA_INCOMPLETE_CAROUSEL");
   if (videos.length) return videos.map(url => candidate("video", url));
-  const hasVideo = isReel || /video|reel/i.test(String(item.content_type || item.product_type || ""));
+  const hasVideo = isReel || item.is_video === true
+    || /video|reel|clips/i.test(String(item.content_type || item.product_type || ""));
   if (hasVideo) noMedia("video_link_missing_or_unusable", item);
   if (photos.length) return photos.map(url => candidate("photo", url));
-  const image = mediaUrl(item.image_url) || mediaUrl(item.display_url);
+  if (hasKnownPhotoCount && photoCount > 1) noMedia("incomplete_photo_carousel", item);
+  const image = mediaUrl(item.image_url) || imageAlternates[0] || mediaUrl(item.display_url);
   if (image) return [candidate("photo", image)];
   noMedia("media_links_missing_or_unusable", item);
 }
@@ -1312,11 +1322,35 @@ async function handleMediaProxy(request: Request, env: Env, url: URL): Promise<R
 }
 
 async function resolveTarget(target: InstagramTarget, env: Env): Promise<ResolvedMedia[]> {
-  const groups = target.kind === "post"
-    ? env.BRIGHTDATA_API_KEY?.trim()
-      ? await resolvePostWithBrightData(target, env.BRIGHTDATA_API_KEY.trim())
-      : await resolvePost(target)
-    : await resolveStory(target, env);
+  let groups: MediaCandidate[][];
+  if (target.kind !== "post") {
+    groups = await resolveStory(target, env);
+  } else if (!env.BRIGHTDATA_API_KEY?.trim()) {
+    groups = await resolvePost(target);
+  } else {
+    try {
+      groups = await resolvePostWithBrightData(target, env.BRIGHTDATA_API_KEY.trim());
+    } catch (error) {
+      const cause = error instanceof Error ? error.message : "";
+      // A provider result can contain valid metadata but omit CDN URLs or
+      // carousel ordering. Give the already-existing anonymous extractor one
+      // chance to complete it; never re-run the paid API or use login cookies.
+      // Other failures (authorization, rate limit, wrong post, provider error,
+      // pending snapshot) remain terminal and do not trigger retries.
+      if (cause !== "BRIGHTDATA_NO_MEDIA" && cause !== "BRIGHTDATA_INCOMPLETE_CAROUSEL") throw error;
+      try {
+        groups = await resolvePost(target);
+        console.log("instagram brightdata media recovered", { source: "existing-public-resolver" });
+      } catch (publicError) {
+        const raw = publicError instanceof Error ? publicError.message : "";
+        const publicCode = /^INSTAGRAM_[A-Z0-9_]+/.exec(raw)?.[0] || "INSTAGRAM_UNAVAILABLE";
+        console.warn("instagram brightdata media fallback unavailable", {
+          cause, publicCode,
+        });
+        throw error;
+      }
+    }
+  }
   const resolved: ResolvedMedia[] = [];
   for (const group of groups) resolved.push(await chooseCandidate(group, target.kind === "post" && Boolean(env.uploadInstagramPost)));
   return resolved;
@@ -1329,10 +1363,11 @@ function friendlyError(detail: string, throttle?: InstagramThrottle): string {
   if (value.startsWith("brightdata_rate_limit")) return "❌ Bright Data درخواست‌های API را موقتاً محدود کرده است.";
   if (value.startsWith("brightdata_invalid_request")) return "❌ Bright Data قالب درخواست Instagram را نپذیرفت؛ کد HTTP و code را در لاگ بررسی کن.";
   if (value.startsWith("brightdata_dataset_unavailable")) return "❌ شناسه یا دسترسی Dataset اینستاگرام در Bright Data معتبر نیست.";
+  if (value.startsWith("brightdata_provider_error")) return "❌ خود Bright Data دریافت این پست را رد کرد؛ برای جزئیات به نتیجه استخراج در داشبورد Bright Data مراجعه کن.";
   if (value.startsWith("brightdata_pending")) return "❌ استخراج Bright Data هنوز تمام نشده؛ برای جلوگیری از مصرف دوباره سهمیه، درخواست را فوراً تکرار نکن.";
   if (value.startsWith("brightdata_incomplete_carousel")) return "❌ Bright Data ترتیب یا همه فایل‌های پست چندرسانه‌ای را برنگرداند؛ دانلود ناقص ارسال نشد.";
   if (value.startsWith("brightdata_wrong_post")) return "❌ Bright Data اطلاعات لینک دیگری را برگرداند؛ برای جلوگیری از ارسال فایل اشتباه، دانلود متوقف شد.";
-  if (value.startsWith("brightdata_no_media")) return "❌ Bright Data فایل قابل دانلود این پست را برنگرداند.";
+  if (value.startsWith("brightdata_no_media")) return "❌ Bright Data لینک فایل این پست را برنگرداند و مسیر عمومی اینستاگرام هم موفق نشد.";
   if (value.startsWith("brightdata_")) return "❌ ارتباط با سرویس Bright Data یا دریافت نتیجه کامل نشد.";
   if (value.startsWith("instagram_session_challenge_required")) {
     return "❌ حساب اینستاگرام متصل نیاز به تأیید امنیتی دارد؛ ابتدا در خود اینستاگرام تأیید شود.";
