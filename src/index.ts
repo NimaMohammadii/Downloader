@@ -724,20 +724,20 @@ async function resolvePostWithTopApi(
   const route = /\/(p|reels?|tv)\/([A-Za-z0-9_-]+)(?:\/|$)/.exec(new URL(target.url).pathname);
   const isReel = route?.[1] === "reel" || route?.[1] === "reels";
   const canonicalUrl = "https://www.instagram.com/" + (isReel ? "reel" : "p") + "/" + target.shortcode + "/";
-  const endpoint = "https://api.apify.com/v2/actors/topapi~instagram-scraper/run-sync-get-dataset-items";
-  // The Actor synchronous API can take up to 300 seconds. This runs inside
-  // the existing durable download Workflow, not the Telegram webhook request.
-  // Keep its single paid invocation inside one no-retry Workflow step.
+  const actorApi = "https://api.apify.com/v2/actors/topapi~instagram-scraper";
+  const authorization = "Bearer " + apiToken;
   const startedAt = Date.now();
-  let response: Response;
+  const elapsed = () => Math.max(0, Date.now() - startedAt);
+  const authHeaders = { authorization, accept: "application/json" };
+
+  // Run once and receive its ID immediately. Keeping a sync HTTP connection
+  // open for several minutes loses the run ID when Cloudflare or the upstream
+  // closes an idle connection. Status and dataset GETs never start paid runs.
+  let started: Response;
   try {
-    response = await fetch(endpoint, {
+    started = await fetch(actorApi + "/runs?waitForFinish=0&restartOnError=false", {
       method: "POST",
-      headers: {
-        authorization: "Bearer " + apiToken,
-        "content-type": "application/json",
-        accept: "application/json",
-      },
+      headers: { ...authHeaders, "content-type": "application/json" },
       body: JSON.stringify({
         postUrls: [canonicalUrl],
         postType: "all",
@@ -749,33 +749,125 @@ async function resolvePostWithTopApi(
         includeProfileSummary: false,
         compact: false,
       }),
-      redirect: "error",
-      // An interrupted paid request is ambiguous: do not retry automatically.
-      signal: AbortSignal.timeout(270_000),
+      // Redirects are reported explicitly, not disguised as network errors.
+      // Never forward Authorization to an unexpected redirect destination.
+      redirect: "manual",
+      signal: AbortSignal.timeout(25_000),
     });
   } catch (error) {
     const timeout = error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
     console.warn("instagram topapi request failed", {
-      stage: "fetch", kind: isReel ? "reels" : "posts",
-      reason: timeout ? "timeout" : "network_or_redirect",
-      durationMs: Math.max(0, Date.now() - startedAt),
+      stage: "start", kind: isReel ? "reels" : "posts",
+      reason: timeout ? "timeout" : "network",
+      errorType: error instanceof Error ? error.name.slice(0, 32) : "unknown",
+      durationMs: elapsed(),
     });
+    // An interrupted POST might already have started a billable Actor run.
+    // Neither re-POST nor start the Bright Data fallback in this case.
     throw new Error(timeout ? "TOPAPI_TIMEOUT" : "TOPAPI_NETWORK_ERROR");
   }
-  if (!response.ok) {
-    await response.body?.cancel().catch(() => undefined);
+  if (!started.ok) {
+    const failure: any = await started.json().catch(() => null);
+    const rawCode = typeof failure?.error?.type === "string" ? failure.error.type : "";
+    const providerCode = /^[a-zA-Z0-9_-]{1,64}$/.test(rawCode) ? rawCode : undefined;
     console.warn("instagram topapi rejected", {
-      status: response.status, kind: isReel ? "reels" : "posts",
-      durationMs: Math.max(0, Date.now() - startedAt),
+      stage: "start", status: started.status,
+      kind: isReel ? "reels" : "posts", durationMs: elapsed(),
+      ...(providerCode ? { providerCode } : {}),
     });
-    if (response.status === 401 || response.status === 403) throw new Error("TOPAPI_AUTH_ERROR");
-    if (response.status === 402 || response.status === 429) throw new Error("TOPAPI_QUOTA_OR_RATE_LIMIT");
-    if ([400, 404, 422].includes(response.status)) throw new Error("TOPAPI_UNAVAILABLE");
-    // A gateway timeout/server error may follow a completed, billable run:
-    // do not automatically initiate an additional paid provider request.
+    if (started.status === 401 || started.status === 403) throw new Error("TOPAPI_AUTH_ERROR");
+    if (started.status === 402 || started.status === 429) throw new Error("TOPAPI_QUOTA_OR_RATE_LIMIT");
+    if ([400, 404, 422].includes(started.status)) throw new Error("TOPAPI_UNAVAILABLE");
     throw new Error("TOPAPI_AMBIGUOUS_PROVIDER_ERROR");
   }
-  const payload: unknown = await response.json().catch(() => null);
+  const startedBody: any = await started.json().catch(() => null);
+  const initial = startedBody?.data;
+  const runId = typeof initial?.id === "string" ? initial.id : "";
+  const safeApifyId = (value: unknown): value is string =>
+    typeof value === "string" && /^[a-zA-Z0-9]{6,40}$/.test(value);
+  if (!safeApifyId(runId)) {
+    console.warn("instagram topapi missing run reference", {
+      stage: "start", status: started.status, durationMs: elapsed(),
+    });
+    throw new Error("TOPAPI_AMBIGUOUS_PROVIDER_ERROR");
+  }
+  console.log("instagram topapi run started", {
+    kind: isReel ? "reels" : "posts", runId, durationMs: elapsed(),
+  });
+
+  let run = initial;
+  // Each status read waits no longer than 20s upstream. The Workflow step
+  // allows 8 minutes; we cap waiting at ~4 minutes, without any new paid POST.
+  for (let attempt = 0; attempt < 12 && run?.status !== "SUCCEEDED"; attempt++) {
+    if (["FAILED", "ABORTED", "TIMED-OUT"].includes(String(run?.status))) {
+      console.warn("instagram topapi actor failed", {
+        runId, status: run.status, kind: isReel ? "reels" : "posts",
+        durationMs: elapsed(),
+      });
+      throw new Error("TOPAPI_UNAVAILABLE");
+    }
+    let poll: Response;
+    try {
+      poll = await fetch("https://api.apify.com/v2/actor-runs/" + runId + "?waitForFinish=20", {
+        headers: authHeaders, redirect: "manual",
+        signal: AbortSignal.timeout(28_000),
+      });
+    } catch (error) {
+      const timeout = error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
+      console.warn("instagram topapi status unavailable", {
+        runId, stage: "poll", reason: timeout ? "timeout" : "network",
+        durationMs: elapsed(),
+      });
+      // A GET failure is safe to retry, unlike starting another Actor run.
+      if (attempt === 11) throw new Error("TOPAPI_STATUS_UNAVAILABLE");
+      continue;
+    }
+    if (!poll.ok) {
+      await poll.body?.cancel().catch(() => undefined);
+      console.warn("instagram topapi status rejected", {
+        runId, stage: "poll", status: poll.status, durationMs: elapsed(),
+      });
+      if (poll.status === 401 || poll.status === 403) throw new Error("TOPAPI_AUTH_ERROR");
+      if (attempt === 11 || (poll.status >= 400 && poll.status < 500 && poll.status !== 429))
+        throw new Error("TOPAPI_STATUS_UNAVAILABLE");
+      continue;
+    }
+    const statusBody: any = await poll.json().catch(() => null);
+    if (!statusBody?.data || statusBody.data.id !== runId) {
+      console.warn("instagram topapi status invalid", { runId, stage: "poll" });
+      throw new Error("TOPAPI_STATUS_UNAVAILABLE");
+    }
+    run = statusBody.data;
+  }
+  if (run?.status !== "SUCCEEDED") {
+    console.warn("instagram topapi still running", {
+      runId, status: typeof run?.status === "string" ? run.status.slice(0, 24) : "unknown",
+      durationMs: elapsed(),
+    });
+    // The running Actor remains known; do not make a second paid request.
+    throw new Error("TOPAPI_STILL_RUNNING");
+  }
+
+  const datasetId = run.defaultDatasetId || initial.defaultDatasetId;
+  if (!safeApifyId(datasetId)) {
+    console.warn("instagram topapi missing dataset", { runId, stage: "result" });
+    throw new Error("TOPAPI_STATUS_UNAVAILABLE");
+  }
+  let dataset: Response;
+  try {
+    dataset = await fetch("https://api.apify.com/v2/datasets/" + datasetId + "/items?format=json&limit=2", {
+      headers: authHeaders, redirect: "manual", signal: AbortSignal.timeout(25_000),
+    });
+  } catch {
+    console.warn("instagram topapi dataset unavailable", { runId, stage: "result", reason: "network" });
+    throw new Error("TOPAPI_STATUS_UNAVAILABLE");
+  }
+  if (!dataset.ok) {
+    await dataset.body?.cancel().catch(() => undefined);
+    console.warn("instagram topapi dataset rejected", { runId, status: dataset.status, stage: "result" });
+    throw new Error("TOPAPI_STATUS_UNAVAILABLE");
+  }
+  const payload: unknown = await dataset.json().catch(() => null);
   if (!Array.isArray(payload) || payload.length === 0) throw new Error("TOPAPI_NO_MEDIA");
   if (payload.length !== 1 || !payload[0] || typeof payload[0] !== "object"
       || Array.isArray(payload[0])) throw new Error("TOPAPI_INVALID_RESULT");
@@ -1525,7 +1617,9 @@ async function resolveTarget(target: InstagramTarget, env: Env): Promise<Resolve
 
 function friendlyError(detail: string, throttle?: InstagramThrottle): string {
   const value = detail.toLowerCase();
-  if (value.startsWith("topapi_timeout")) return "❌ مهلت استخراج TopAPI تمام شد؛ اجرای قبلی ممکن است هنوز در Apify ادامه داشته باشد. از تکرار فوری لینک خودداری کن.";
+  if (value.startsWith("topapi_still_running")) return "❌ استخراج TopAPI هنوز در Apify در حال اجراست. برای جلوگیری از هزینه تکراری، اجرای جدیدی شروع نشد.";
+  if (value.startsWith("topapi_status_unavailable")) return "❌ اجرای TopAPI شروع شد اما دریافت وضعیت یا فایل خروجی ناموفق بود. در Runs حساب Apify وضعیت همین اجرا را بررسی کن.";
+    if (value.startsWith("topapi_timeout")) return "❌ مهلت استخراج TopAPI تمام شد؛ اجرای قبلی ممکن است هنوز در Apify ادامه داشته باشد. از تکرار فوری لینک خودداری کن.";
   if (value.startsWith("topapi_network_error")) return "❌ ارتباط با TopAPI قطع شد یا مسیر شبکه پاسخ نداد؛ برای جلوگیری از پرداخت تکراری، درخواست خودکار تکرار نشد.";
   if (value.startsWith("topapi_auth_error")) return "❌ توکن Apify معتبر نیست یا دسترسی TopAPI فعال نشده است.";
   if (value.startsWith("topapi_quota_or_rate_limit")) return "❌ سهمیه یا محدودیت اجرای TopAPI اجازه استخراج این پست را نمی‌دهد.";
