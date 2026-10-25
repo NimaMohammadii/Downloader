@@ -1204,3 +1204,36 @@ test('Bright Data counts provider records rather than sent files; errors and pen
   assert.equal(count,expected);assert.equal(result.calls.length,1);
  }
 });
+
+test('TopAPI no-media diagnostics distinguish empty outputs, missing video, rejected URLs and unknown types safely',async()=>{
+ for(const [payload,reason,state,text] of [
+  [[], 'empty_dataset','missing',undefined],
+  [[{type:'Video',shortCode:shortcode,videoUrl:null,displayUrl:'https://scontent.cdninstagram.com/cover.jpg'}], 'video_url_unavailable','null',undefined],
+  [[{type:'Video',shortCode:shortcode,videoUrl:'https://example.com/private-token',caption:'private-caption'}], 'video_url_unavailable','unsupported_host',undefined],
+  [[{type:'Video',shortCode:shortcode,videoUrl:{url:'https://scontent.cdninstagram.com/video.mp4'}}], 'video_url_unavailable','non_string',undefined],
+  [[{type:'Image',shortCode:shortcode}], 'image_url_unavailable','missing','https://instagram.com/p/'+shortcode+'/'],
+  [[{shortCode:shortcode,displayUrl:'https://scontent.cdninstagram.com/cover.jpg'}], 'unknown_media_type','missing','https://instagram.com/p/'+shortcode+'/'],
+ ]){
+  const result=await run({text,env:{APIFY_API_TOKEN:'private-token'},respond(call){
+   if(call.hostname==='api.apify.com')return Response.json(payload);throw Error('No automatic fallback');
+  }});
+  assert.equal(report(result),'TOPAPI_NO_MEDIA');assert.equal(files(result).length,0);
+  const info=result.diagnostics.find(x=>x.message==='instagram topapi no media').info;
+  assert.equal(info.reason,reason);assert.equal(info.videoUrlState,state);assert.equal(info.runId,'mockRun123456');
+  assert.ok(!JSON.stringify(info).includes('private-token'));assert.ok(!JSON.stringify(info).includes('private-caption'));
+  assert.ok(result.calls.every(x=>x.hostname==='api.apify.com'));
+  assert.equal(result.calls.filter(x=>x.method==='POST').length,1);
+ }
+});
+
+test('TopAPI invalid JSON and non-array datasets are invalid results, not evidence of missing video',async()=>{
+ for(const payload of ['not JSON',JSON.stringify({unexpected:'dataset shape'})]){
+  const result=await run({env:{APIFY_API_TOKEN:'key'},respond(call){
+   if(call.path.endsWith('/runs'))return Response.json({data:{id:'invalidRun00001',status:'SUCCEEDED',defaultDatasetId:'invalidDataset00001'}});
+   return new Response(payload);
+  }});
+  assert.equal(report(result),'TOPAPI_INVALID_RESULT');assert.equal(files(result).length,0);
+  assert.ok(result.diagnostics.some(x=>x.message==='instagram topapi invalid result'));
+  assert.equal(result.calls.filter(x=>x.method==='POST').length,1);
+ }
+});

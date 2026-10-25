@@ -876,8 +876,44 @@ async function resolvePostWithTopApi(
     console.warn("instagram topapi dataset rejected", { runId, status: dataset.status, stage: "result" });
     throw new Error("TOPAPI_STATUS_UNAVAILABLE");
   }
-  const payload: unknown = await dataset.json().catch(() => null);
-  if (!Array.isArray(payload) || payload.length === 0) throw new Error("TOPAPI_NO_MEDIA");
+  let payload: unknown;
+  try { payload = await dataset.json(); }
+  catch {
+    console.warn("instagram topapi invalid result", { runId, datasetId, reason: "invalid_dataset_json" });
+    throw new Error("TOPAPI_INVALID_RESULT");
+  }
+  const mediaState = (value: unknown): string => {
+    if (value === undefined) return "missing";
+    if (value === null) return "null";
+    if (typeof value !== "string") return "non_string";
+    if (!value.trim()) return "empty";
+    try {
+      const url = new URL(value);
+      if (url.protocol !== "https:" || url.username || url.password || url.port) return "invalid_url";
+      return allowedMediaHost(url.hostname) ? "accepted" : "unsupported_host";
+    } catch { return "invalid_url"; }
+  };
+  const noMedia = (reason: string, row?: Record<string, any>): never => {
+    const type = typeof row?.type === "string" ? row.type.toLowerCase() : "";
+    const detail = row?.dataDetailLevel;
+    console.warn("instagram topapi no media", {
+      runId, datasetId, kind: isReel ? "reels" : "posts", reason,
+      records: Array.isArray(payload) ? payload.length : null,
+      mediaType: ["image", "photo", "video", "sidecar", "carousel", "profile"].includes(type) ? type : "unknown",
+      detailLevel: detail === "basicData" || detail === "detailedData" ? detail : "unspecified",
+      videoUrlState: mediaState(row?.videoUrl), displayUrlState: mediaState(row?.displayUrl),
+      childCount: Array.isArray(row?.childPosts) ? row.childPosts.length : null,
+      // Fixed field names only: no credentials, signed media URLs or captions.
+      fields: ["type", "videoUrl", "displayUrl", "images", "childPosts", "dataDetailLevel", "productType", "error", "error_type"]
+        .filter(field => row && Object.prototype.hasOwnProperty.call(row, field)),
+    });
+    throw new Error("TOPAPI_NO_MEDIA");
+  };
+  if (!Array.isArray(payload)) {
+    console.warn("instagram topapi invalid result", { runId, datasetId, reason: "dataset_not_array" });
+    throw new Error("TOPAPI_INVALID_RESULT");
+  }
+  if (!payload.length) noMedia("empty_dataset");
   if (payload.length !== 1 || !payload[0] || typeof payload[0] !== "object"
       || Array.isArray(payload[0])) throw new Error("TOPAPI_INVALID_RESULT");
   const item = payload[0] as Record<string, any>;
@@ -945,19 +981,19 @@ async function resolvePostWithTopApi(
   }
   if (isReel || type === "video" || item.isVideo === true) {
     const found = video(item);
-    if (!found) throw new Error("TOPAPI_NO_MEDIA");
+    if (!found) return noMedia("video_url_unavailable", item);
     return [found];
   }
   if (type === "image" || type === "photo") {
     const found = photo(item);
-    if (!found) throw new Error("TOPAPI_NO_MEDIA");
+    if (!found) return noMedia("image_url_unavailable", item);
     return [found];
   }
   // No declared type: accept an actual videoUrl, never a possible cover as a
   // replacement for a missing video. Unknown image-only records are ambiguous.
   const found = video(item);
   if (found) return [found];
-  throw new Error("TOPAPI_NO_MEDIA");
+  return noMedia("unknown_media_type", item);
 }
 
 // Bright Data returns metadata and signed CDN URLs, not a media file.
@@ -1645,6 +1681,7 @@ function friendlyError(detail: string, throttle?: InstagramThrottle): string {
   if (value.startsWith("topapi_network_error")) return "❌ ارتباط با TopAPI قطع شد یا مسیر شبکه پاسخ نداد؛ برای جلوگیری از پرداخت تکراری، درخواست خودکار تکرار نشد.";
   if (value.startsWith("topapi_auth_error")) return "❌ توکن Apify معتبر نیست یا دسترسی TopAPI فعال نشده است.";
   if (value.startsWith("topapi_quota_or_rate_limit")) return "❌ سهمیه یا محدودیت اجرای TopAPI اجازه استخراج این پست را نمی‌دهد.";
+  if (value.startsWith("topapi_invalid_result")) return "❌ خروجی TopAPI قالب معتبر و قابل‌خواندن نداشت؛ لاگ instagram topapi invalid result را بررسی کن.";
   if (value.startsWith("topapi_no_media")) return "❌ TopAPI لینک فایل این پست یا ریلز را برنگرداند.";
   if (value.startsWith("topapi_incomplete_carousel")) return "❌ TopAPI همه اسلایدهای پست چندرسانه‌ای را برنگرداند؛ ارسال ناقص انجام نشد.";
   if (value.startsWith("topapi_wrong_post")) return "❌ TopAPI اطلاعات پست دیگری را برگرداند؛ فایل اشتباه ارسال نشد.";
