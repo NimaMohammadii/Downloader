@@ -38,6 +38,7 @@ const { outputFiles } = await build({
 
         export const recordUsage=async()=>true; export const recordMediaDelivery=async()=>{}; export const telegramCustomEmoji=(_method,payload)=>payload;
         export const telegramFileCache=async(...args)=>globalThis.testFileCache ? globalThis.testFileCache(...args) : null; export class AdminStatsStore{} export const ADMIN_USER_ID=1;
+        export const isAdmin=(_env,id)=>id===ADMIN_USER_ID;
         export const recordUserActivity=async()=>{};
         export const recordSuccessfulDelivery=async()=>{globalThis.delivered++;};` };
       throw Error(a.path);

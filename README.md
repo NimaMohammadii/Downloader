@@ -156,7 +156,9 @@ For this Worker media-proxy path, Telegram's Bot API remote-URL limits apply: cu
 
 ## Telegram admin panel
 
-The configured admin can open `/admin` → «لیست کاربران». Users appear as paginated buttons; selecting one opens their profile, usage counts and paginated request history, with refresh and back buttons. Dates use Tehran time. Admin commands and callbacks remain restricted to `ADMIN_USER_ID`.
+The configured admin can open `/admin` → «لیست کاربران». Users appear as paginated buttons; selecting one opens their profile, usage counts and paginated request history, with refresh and back buttons. Dates use Tehran time. Admin commands and callbacks are restricted to the original owner (`7138547731`) and the numeric Telegram user IDs in the optional Worker secret `ADMIN_IDS`.
+
+To add administrators, set **Workers & Pages → downloader → Settings → Variables and Secrets → Add → Secret**, name `ADMIN_IDS`, value such as `7138547731,123456789`, then deploy the change. Commas, spaces and newlines separate IDs; use numeric user IDs, not usernames or phone numbers. The original owner keeps access when the secret is empty or malformed. Added administrators have the same panel controls, including broadcast and membership settings, and bypass mandatory channel membership. Broadcast drafts belong to their composing administrator; delivery progress goes to the administrator who starts the campaign. Only one campaign sends at a time. Instagram session-failure notifications keep their original owner destination.
 
 A visit begins with the first recorded interaction or an interaction after at least 30 minutes of inactivity. Returns are visits minus the first visit. Messages and callbacks count as interactions; `/start` is also counted separately. Authenticated Telegram `update_id` values deduplicate activity across delegated handlers and redeliveries for seven days. Link counts count messages containing supported links, separately from download requests and search queries.
 

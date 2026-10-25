@@ -13,7 +13,7 @@ const bundle = await build({stdin:{contents:'export {default as worker} from "./
 const api = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`);
 const textValue = 'متن بولد و لینک و ایموجی ✅';
 const text = {kind:'text',text:textValue,entities:[{type:'bold',offset:0,length:3},{type:'text_link',offset:textValue.indexOf('لینک'),length:4,url:'https://example.com'},{type:'custom_emoji',offset:textValue.indexOf('✅'),length:1,custom_emoji_id:'5400130177319580649'}]};
-function fixture() {
+function fixture(adminConfig = {}, legacyDraft = false) {
   const db = new DatabaseSync(':memory:'), calls = [], alarms = [], originalFetch = globalThis.fetch, originalNow = Date.now;
   let now = 1_800_000_000_000, nextMessage = 100, responder;
   Date.now = () => now;
@@ -27,7 +27,9 @@ function fixture() {
   const ctx={storage:{sql,async setAlarm(at){alarms.push(Number(at));},transactionSync(fn){
     db.exec('BEGIN');try{const result=fn();db.exec('COMMIT');return result;}catch(error){db.exec('ROLLBACK');throw error;}
   }}};
-  let store=new api.AdminStatsStore(ctx,{BOT_TOKEN:'fixture-token'});
+  const storeEnv = {BOT_TOKEN:'fixture-token', ...adminConfig};
+  if (legacyDraft) db.exec(`CREATE TABLE broadcast_draft (id INTEGER PRIMARY KEY CHECK(id = 1), waiting INTEGER NOT NULL, version INTEGER, content TEXT); INSERT INTO broadcast_draft VALUES (1,1,NULL,NULL);`);
+  let store=new api.AdminStatsStore(ctx,storeEnv);
   globalThis.fetch=async(input,init)=>{
     const method=String(input).split('/').at(-1),body=JSON.parse(init.body);
     calls.push({method,body});
@@ -35,7 +37,7 @@ function fixture() {
     if(responder){const result=await responder(method,body);if(result)return result;}
     return Response.json({ok:true,result:{message_id:nextMessage++}});
   };
-  const env={BOT_TOKEN:'fixture-token',WEBHOOK_SECRET:'test-secret',ADMIN_STATS:{getByName(){return {fetch:(input,init)=>store.fetch(new Request(input,init))};}}};
+  const env={...storeEnv,WEBHOOK_SECRET:'test-secret',ADMIN_STATS:{getByName(){return {fetch:(input,init)=>store.fetch(new Request(input,init))};}}};
   const request=(body,id)=>store.fetch(new Request('https://store/broadcast'+(id?'?id='+id:''),body?{method:'POST',body:JSON.stringify(body)}:{}));
   const state=async id=>(await (await request(undefined,id)).json()).status;
   const addUsers=count=>{for(let i=0;i<count;i++)sql.exec('INSERT INTO users(id,first_seen,last_seen) VALUES (?,?,?)',String(42+i),now,now);};
@@ -48,7 +50,7 @@ function fixture() {
       ...(callback?{callback_query:{id:'callback',from:{id:user},data:callback,message:{message_id:90,chat:{id:user}}}}
         :{message:{message_id:7,from:{id:user},chat:{id:user},...message}})})});
   return {db,env,calls,alarms,request,state,addUsers,start,webhook,
-    async alarm(){await store.alarm();},advance(ms){now+=ms;},restart(){store=new api.AdminStatsStore(ctx,{BOT_TOKEN:'fixture-token'});},
+    async alarm(){await store.alarm();},advance(ms){now+=ms;},restart(){store=new api.AdminStatsStore(ctx,storeEnv);},
     respond(fn){responder=fn;},close(){globalThis.fetch=originalFetch;Date.now=originalNow;db.close();}};
 }
 
@@ -183,5 +185,77 @@ test('progress is published before deliveries and continues during slow batches 
     const updates=f.calls.filter(c=>c.method==='editMessageText');
     assert.ok(updates.some(c=>c.body.text.includes('ارسال موفق: 1')));
     assert.match(updates.at(-1).body.text,/وضعیت خواندن مشخص نیست/);
+  }finally{f.close();}
+});
+
+test('ADMIN_IDS adds validated administrators without replacing the owner or leaking between environments',()=>{
+  const env={ADMIN_IDS:'123456789, 123456789\n987654321 bad 1e3 -42 0 9007199254740992 0x2a 12.5 @admin'};
+  assert.deepEqual(api.getAdminIds(env),[api.ADMIN_USER_ID,123456789,987654321]);
+  assert.equal(api.isAdmin(env,123456789),true);
+  for(const id of [42,'123456789',undefined,null,NaN]) assert.equal(api.isAdmin(env,id),false);
+  assert.equal(api.isAdmin({},123456789),false);
+  assert.equal(api.isAdmin({ADMIN_IDS:'invalid'},api.ADMIN_USER_ID),true);
+});
+
+test('additional admin opens the real panel and changes settings; outsiders and revoked admins cannot',async()=>{
+  const second=123456789,f=fixture({ADMIN_IDS:String(second)});
+  try{
+    await api.worker.fetch(f.webhook({text:'/admin'},undefined,second),f.env,{});
+    assert.ok(f.calls.some(c=>c.body.chat_id===second&&c.body.reply_markup?.inline_keyboard.flat().some(b=>b.callback_data==='admin:broadcast')));
+    await api.worker.fetch(f.webhook(undefined,'admin:membership:disable',second),f.env,{});
+    assert.equal((await (await f.env.ADMIN_STATS.getByName('global').fetch('https://store/membership')).json()).enabled,false);
+    const before=f.calls.length;
+    await api.worker.fetch(f.webhook(undefined,'admin:membership:enable',99),f.env,{});
+    await api.worker.fetch(f.webhook(undefined,'admin:membership:enable',second),{...f.env,ADMIN_IDS:''},{});
+    assert.equal(f.calls.length,before);
+    assert.equal((await (await f.env.ADMIN_STATS.getByName('global').fetch('https://store/membership')).json()).enabled,false);
+    assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM users').get().n,0);
+    const payload={chat_id:second,text:'❌ خطای پنل',_errorDetail:'private diagnostic'};
+    assert.match(api.telegramCustomEmoji('sendMessage',payload,f.env).text,/private diagnostic/);
+    assert.ok(!api.telegramCustomEmoji('sendMessage',{...payload,chat_id:-100},f.env).text.includes('private diagnostic'));
+  }finally{f.close();}
+});
+
+test('two admins keep separate drafts and colliding message IDs; progress returns to the sender after restart',async()=>{
+  const second=123456789,f=fixture({ADMIN_IDS:String(second)});
+  const visit=(id,message,callback)=>api.worker.fetch(f.webhook(message,callback,id),f.env,{});
+  try{
+    f.addUsers(2);
+    for(const id of [api.ADMIN_USER_ID,second]) f.db.prepare('INSERT INTO users(id,first_seen,last_seen) VALUES (?,?,?)').run(String(id),Date.now(),Date.now());
+    for(const id of [api.ADMIN_USER_ID,second]) await visit(id,undefined,'admin:broadcast:compose');
+    await visit(api.ADMIN_USER_ID,{text:'پیام مالک'});
+    await visit(second,{text:text.text,entities:text.entities});
+    assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM broadcast_draft').get().n,2);
+    await visit(second,undefined,'admin:broadcast:start:7');
+    assert.equal((await f.state()).id,`${second}-7`);
+    assert.equal((await f.state()).total,2);
+    f.restart();await f.alarm();
+    const sent=f.calls.filter(c=>c.method==='sendMessage'&&[42,43].includes(c.body.chat_id));
+    assert.equal(sent.length,2);for(const c of sent) assert.deepEqual(c.body.entities,text.entities);
+    const progress=f.calls.filter(c=>c.method==='editMessageText'&&c.body.chat_id===second).at(-1).body;
+    assert.match(progress.text,/ارسال موفق: 2/);assert.ok(progress.reply_markup);
+    assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM broadcast_draft').get().n,1);
+    await visit(api.ADMIN_USER_ID,undefined,'admin:broadcast:start:7');
+    await f.alarm();
+    assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM broadcast_jobs').get().n,2);
+    assert.equal((await f.state('7')).sent,2);
+    assert.equal(f.calls.filter(c=>c.method==='sendMessage'&&[42,43].includes(c.body.chat_id)&&c.body.text==='پیام مالک').length,2);
+    await visit(second,undefined,'admin:broadcast:start:7');
+    assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM broadcast_jobs').get().n,2);
+  }finally{f.close();}
+});
+
+test('legacy draft migrates without loss and private composer cannot be driven from a group',async()=>{
+  const second=123456789,f=fixture({ADMIN_IDS:String(second)},true);
+  try{
+    assert.equal(f.db.prepare('SELECT id,waiting FROM broadcast_draft').get().id,api.ADMIN_USER_ID);
+    f.restart();assert.equal(f.db.prepare('SELECT waiting FROM broadcast_draft').get().waiting,1);
+    await api.worker.fetch(f.webhook(undefined,'admin:broadcast:compose',second),f.env,{});
+    await api.worker.fetch(f.webhook({text:'group text',chat:{id:-100}},undefined,second),f.env,{});
+    assert.equal(f.db.prepare('SELECT waiting FROM broadcast_draft WHERE id=?').get(second).waiting,1);
+    const denied=await f.env.ADMIN_STATS.getByName('global').fetch('https://store/broadcast?adminId=99',{method:'POST',body:JSON.stringify({action:'compose'})});
+    assert.equal(denied.status,403);
+    await api.worker.fetch(f.webhook(undefined,'admin:broadcast:cancel',second),f.env,{});
+    assert.equal(f.db.prepare('SELECT waiting FROM broadcast_draft WHERE id=?').get(api.ADMIN_USER_ID).waiting,1);
   }finally{f.close();}
 });

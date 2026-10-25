@@ -1,4 +1,4 @@
-import { ADMIN_USER_ID, telegramCustomEmoji, telegramTextMotion, type AdminStatsEnv } from "./admin";
+import { ADMIN_USER_ID, getAdminIds, isAdmin, telegramCustomEmoji, telegramTextMotion, type AdminStatsEnv, type AdminAccessEnv } from "./admin";
 
 type Env = Partial<AdminStatsEnv> & { BOT_TOKEN?: string; WEBHOOK_SECRET?: string };
 type Entity = Record<string, unknown>;
@@ -45,10 +45,10 @@ export function broadcastPanel(status?: BroadcastStatus): Record<string, unknown
 // Uses the existing stats Durable Object: no new binding or container is needed.
 export class BroadcastManager {
   private running = false;
-  constructor(private ctx: DurableObjectState, private env: { BOT_TOKEN?: string }) {
+  constructor(private ctx: DurableObjectState, private env: AdminAccessEnv & { BOT_TOKEN?: string }) {
     ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS broadcast_draft (
-        id INTEGER PRIMARY KEY CHECK(id = 1), waiting INTEGER NOT NULL, version INTEGER, content TEXT
+        id INTEGER PRIMARY KEY, waiting INTEGER NOT NULL, version INTEGER, content TEXT
       );
       CREATE TABLE IF NOT EXISTS broadcast_jobs (
         id TEXT PRIMARY KEY, status TEXT NOT NULL, content TEXT NOT NULL, chat_id TEXT NOT NULL,
@@ -61,6 +61,16 @@ export class BroadcastManager {
       );
       CREATE INDEX IF NOT EXISTS idx_broadcast_recipients_state ON broadcast_recipients(job_id, state, user_id);
     `);
+    // Preserve an existing owner's draft while allowing one draft per administrator.
+    const schema = ctx.storage.sql.exec("SELECT sql FROM sqlite_master WHERE name = 'broadcast_draft'").one();
+    if (/CHECK\s*\(\s*id\s*=\s*1\s*\)/i.test(String(schema.sql))) {
+      ctx.storage.transactionSync(() => {
+        ctx.storage.sql.exec("ALTER TABLE broadcast_draft RENAME TO broadcast_draft_legacy");
+        ctx.storage.sql.exec("CREATE TABLE broadcast_draft (id INTEGER PRIMARY KEY, waiting INTEGER NOT NULL, version INTEGER, content TEXT)");
+        ctx.storage.sql.exec("INSERT INTO broadcast_draft SELECT ?,waiting,version,content FROM broadcast_draft_legacy", ADMIN_USER_ID);
+        ctx.storage.sql.exec("DROP TABLE broadcast_draft_legacy");
+      });
+    }
   }
   private job(id?: string): Job | undefined {
     return this.ctx.storage.sql.exec(id ? "SELECT * FROM broadcast_jobs WHERE id = ?" : "SELECT * FROM broadcast_jobs ORDER BY created_at DESC, CAST(id AS INTEGER) DESC LIMIT 1",
@@ -79,9 +89,11 @@ export class BroadcastManager {
   }
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    const adminId = url.searchParams.has("adminId") ? Number(url.searchParams.get("adminId")) : ADMIN_USER_ID;
+    if (!isAdmin(this.env, adminId)) return new Response("Forbidden", {status:403});
     if (request.method === "GET") {
       const job = this.job(url.searchParams.get("id") || undefined);
-      const draft = this.ctx.storage.sql.exec("SELECT * FROM broadcast_draft WHERE id = 1").toArray()[0];
+      const draft = this.ctx.storage.sql.exec("SELECT * FROM broadcast_draft WHERE id = ?", adminId).toArray()[0];
       return Response.json({ status:job ? this.status(job) : null, waiting:draft?.waiting === 1 });
     }
     const body = await request.json() as { action:string; version?:number; content?:BroadcastContent; messageId?:number; id?:string };
@@ -89,31 +101,33 @@ export class BroadcastManager {
     if (body.action === "compose") {
       const active = this.active();
       if (active) return Response.json({ status:this.status(active) });
-      sql.exec("INSERT INTO broadcast_draft(id,waiting) VALUES (1,1) ON CONFLICT(id) DO UPDATE SET waiting=1,version=NULL,content=NULL");
+      sql.exec("INSERT INTO broadcast_draft(id,waiting) VALUES (?,1) ON CONFLICT(id) DO UPDATE SET waiting=1,version=NULL,content=NULL", adminId);
       return Response.json({ waiting:true });
     }
     if (body.action === "cancel") {
-      sql.exec("DELETE FROM broadcast_draft WHERE id = 1");
+      sql.exec("DELETE FROM broadcast_draft WHERE id = ?", adminId);
       return Response.json({ ok:true });
     }
     if (body.action === "capture") {
       if (!validContent(body.content) || !Number.isSafeInteger(body.version) || body.version! <= 0) return new Response("Invalid content",{status:400});
-      const changed = sql.exec("UPDATE broadcast_draft SET waiting=0,version=?,content=? WHERE id=1 AND waiting=1", body.version!, JSON.stringify(body.content));
+      const changed = sql.exec("UPDATE broadcast_draft SET waiting=0,version=?,content=? WHERE id=? AND waiting=1", body.version!, JSON.stringify(body.content), adminId);
       return Response.json({ captured:changed.rowsWritten > 0 });
     }
     if (body.action === "start") {
       if (!Number.isSafeInteger(body.version) || body.version! <= 0 || !Number.isSafeInteger(body.messageId) || body.messageId! <= 0) return new Response("Invalid request",{status:400});
-      const id = String(body.version);
+      // Keep legacy owner job IDs; other admins' message IDs are scoped to their chat.
+      const id = adminId === ADMIN_USER_ID ? String(body.version) : `${adminId}-${body.version}`;
       let job = this.job(id);
       if (!job) {
         const active = this.active();
         if (active) return Response.json({ status:this.status(active) });
-        const draft = sql.exec("SELECT * FROM broadcast_draft WHERE id=1 AND waiting=0 AND version=?",body.version!).toArray()[0];
+        const draft = sql.exec("SELECT * FROM broadcast_draft WHERE id=? AND waiting=0 AND version=?",adminId,body.version!).toArray()[0];
         if (!draft?.content) return new Response("Draft expired",{status:409});
         this.ctx.storage.transactionSync(() => {
-          sql.exec("INSERT INTO broadcast_jobs(id,status,content,chat_id,message_id,created_at) VALUES (?,'running',?,?,?,?)",id,String(draft.content),String(ADMIN_USER_ID),body.messageId!,Date.now());
-          sql.exec("INSERT INTO broadcast_recipients(job_id,user_id) SELECT ?,id FROM users WHERE id != ?",id,String(ADMIN_USER_ID));
-          sql.exec("DELETE FROM broadcast_draft WHERE id=1");
+          sql.exec("INSERT INTO broadcast_jobs(id,status,content,chat_id,message_id,created_at) VALUES (?,'running',?,?,?,?)",id,String(draft.content),String(adminId),body.messageId!,Date.now());
+          const admins = getAdminIds(this.env).map(String);
+          sql.exec(`INSERT INTO broadcast_recipients(job_id,user_id) SELECT ?,id FROM users WHERE id NOT IN (${admins.map(() => "?").join(",")})`,id,...admins);
+          sql.exec("DELETE FROM broadcast_draft WHERE id=?",adminId);
         });
         job = this.job(id)!;
         if (!this.status(job).total) { sql.exec("UPDATE broadcast_jobs SET status='completed' WHERE id=?",id); job = this.job(id)!; }
@@ -132,7 +146,7 @@ export class BroadcastManager {
     try {
       await telegram(this.env,"editMessageText",telegramCustomEmoji("editMessageText",{
         chat_id:Number(job.chat_id), message_id:Number(job.message_id), ...broadcastPanel(this.status(job)),
-      }));
+      },this.env));
     } catch { console.warn("broadcast progress update unavailable"); }
   }
   async alarm(): Promise<void> {
@@ -191,16 +205,16 @@ export class BroadcastManager {
   }
 }
 
-async function store(env: Env, body?: Record<string, unknown>, id?: string): Promise<any> {
+async function store(env: Env, adminId: number, body?: Record<string, unknown>, id?: string): Promise<any> {
   if (!env.ADMIN_STATS) throw new Error("BROADCAST_STORE_UNAVAILABLE");
-  const response = await env.ADMIN_STATS.getByName("global").fetch(`https://admin-stats/broadcast${id ? `?id=${encodeURIComponent(id)}` : ""}`,
+  const response = await env.ADMIN_STATS.getByName("global").fetch(`https://admin-stats/broadcast?adminId=${adminId}${id ? `&id=${encodeURIComponent(id)}` : ""}`,
     body ? { method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify(body) } : undefined);
   if (!response.ok) throw new Error("BROADCAST_REQUEST_FAILED");
   return response.json();
 }
 async function control(env: Env, method: string, body: Record<string, unknown>, animate = true) {
-  if (env.BOT_TOKEN && animate) await telegramTextMotion(env.BOT_TOKEN,method,body,{animateEdits:true});
-  const result = await telegram(env,method,telegramCustomEmoji(method,body));
+  if (env.BOT_TOKEN && animate) await telegramTextMotion(env.BOT_TOKEN,method,body,{animateEdits:true,adminEnv:env});
+  const result = await telegram(env,method,telegramCustomEmoji(method,body,env));
   if (!result.ok && !(method === "editMessageText" && /message is not modified/i.test(result.description || ""))) throw new Error("BROADCAST_CONTROL_FAILED");
   return result.result;
 }
@@ -213,15 +227,15 @@ export async function handleBroadcastUpdate(request: Request, env: Env): Promise
   const query = update?.callback_query, message = update?.message;
   const broadcastCallback = typeof query?.data === "string" && /^admin:broadcast(?::|$)/.test(query.data);
   const actor = query?.from || message?.from;
-  if (actor?.id !== ADMIN_USER_ID) return broadcastCallback ? Response.json({ok:true}) : null;
+  if (!isAdmin(env, actor?.id)) return broadcastCallback ? Response.json({ok:true}) : null;
   const chat = query?.message?.chat?.id || message?.chat?.id;
-  if (chat !== ADMIN_USER_ID) {
+  if (chat !== actor.id) {
     if (broadcastCallback) await control(env,"answerCallbackQuery",{callback_query_id:query.id,text:"پیام همگانی را از پیوی ربات مدیریت کن.",show_alert:true});
     return broadcastCallback ? Response.json({ok:true}) : null;
   }
   try {
     if (!broadcastCallback && (query?.data?.startsWith("admin:") || /^\/admin(?:@\w+)?$/i.test(message?.text?.trim() || ""))) {
-      await store(env,{action:"cancel"});
+      await store(env,actor.id,{action:"cancel"});
       return null;
     }
     if (!broadcastCallback && !message) return null;
@@ -230,7 +244,7 @@ export async function handleBroadcastUpdate(request: Request, env: Env): Promise
       const parts = query.data.split(":"), action = parts[2] || "status", id = parts[3];
       let result:any;
       if (action === "compose") {
-        result = await store(env,{action:"compose"});
+        result = await store(env,actor.id,{action:"compose"});
         if (result.waiting) {
           await control(env,"editMessageText",{chat_id:chat,message_id:query.message.message_id,
             text:"📤 پیام همگانی\n\nمتن، عکس یا عکس همراه کپشن را بفرست.\nقالب‌بندی را با ابزار بولد و لینک تلگرام انجام بده؛ نیازی به HTML نیست.",
@@ -238,10 +252,10 @@ export async function handleBroadcastUpdate(request: Request, env: Env): Promise
             reply_markup:{inline_keyboard:[[{text:"انصراف",callback_data:"admin:broadcast:cancel"}]]}});
           return Response.json({ok:true});
         }
-      } else if (action === "cancel") { await store(env,{action:"cancel"}); result = await store(env); }
-      else if (action === "start" && /^\d{1,16}$/.test(id || "")) result = await store(env,{action:"start",version:Number(id),messageId:query.message.message_id});
-      else if (action === "stop" && /^\d{1,16}$/.test(id || "")) result = await store(env,{action:"stop",id});
-      else if (action === "status") result = await store(env,undefined,id);
+      } else if (action === "cancel") { await store(env,actor.id,{action:"cancel"}); result = await store(env,actor.id); }
+      else if (action === "start" && /^\d{1,16}$/.test(id || "")) result = await store(env,actor.id,{action:"start",version:Number(id),messageId:query.message.message_id});
+      else if (action === "stop" && /^(?:\d{1,16}-)?\d{1,16}$/.test(id || "")) result = await store(env,actor.id,{action:"stop",id});
+      else if (action === "status") result = await store(env,actor.id,undefined,id);
       else return Response.json({ok:true});
       // The background job owns this status message once sending starts. Avoid
       // overwriting its newer counters with the initial start response.
@@ -249,7 +263,7 @@ export async function handleBroadcastUpdate(request: Request, env: Env): Promise
       await control(env,"editMessageText",{chat_id:chat,message_id:query.message.message_id,...broadcastPanel(result.status || undefined)},!result.status);
       return Response.json({ok:true});
     }
-    const state = await store(env);
+    const state = await store(env,actor.id);
     if (!state.waiting) return null;
     const photo = Array.isArray(message.photo) ? message.photo.at(-1)?.file_id : undefined;
     const content:BroadcastContent | undefined = photo ? {kind:"photo",photo,caption:message.caption,caption_entities:message.caption_entities}
@@ -258,7 +272,7 @@ export async function handleBroadcastUpdate(request: Request, env: Env): Promise
       await control(env,"sendMessage",{chat_id:chat,text:"متن، عکس یا عکس همراه کپشن بفرست؛ قالب‌های دیگر پشتیبانی نمی‌شوند."});
       return Response.json({ok:true});
     }
-    const captured = await store(env,{action:"capture",version:message.message_id,content});
+    const captured = await store(env,actor.id,{action:"capture",version:message.message_id,content});
     if (!captured.captured) return Response.json({ok:true});
     // Native Telegram entities preserve the admin's actual formatting, including custom emoji.
     const preview = await telegram(env,content.kind === "photo" ? "sendPhoto" : "sendMessage",{chat_id:chat,...contentPayload(content)});

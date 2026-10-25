@@ -3,7 +3,7 @@ import downloaderWorker from "./entry";
 import {
   telegramTextMotion,
   telegramCustomEmoji,
-  ADMIN_USER_ID,
+  isAdmin,
   INSTAGRAM_API_ACCOUNTS,
   instagramApiToken,
   instagramApiSettings,
@@ -82,15 +82,15 @@ type TelegramApiResponse<T> = {
 const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
 
 async function telegramCall<T = unknown>(
-  token: string,
+  env: Env,
   method: string,
   payload: Record<string, unknown>,
 ): Promise<T> {
-  await telegramTextMotion(token, method, payload, { animateEdits: true });
-  const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+  await telegramTextMotion(env.BOT_TOKEN, method, payload, { animateEdits: true, adminEnv: env });
+  const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(telegramCustomEmoji(method, payload)),
+    body: JSON.stringify(telegramCustomEmoji(method, payload, env)),
   });
   const data = (await response.json()) as TelegramApiResponse<T>;
   if (!response.ok || !data.ok) throw new Error(data.description || `Telegram ${method} failed`);
@@ -98,12 +98,12 @@ async function telegramCall<T = unknown>(
 }
 
 async function safeTelegramCall(
-  token: string,
+  env: Env,
   method: string,
   payload: Record<string, unknown>,
 ): Promise<void> {
   try {
-    await telegramCall(token, method, payload);
+    await telegramCall(env, method, payload);
   } catch (error) {
     console.warn("admin telegram call failed", {
       method,
@@ -130,7 +130,7 @@ function isAdminCommand(text: string): boolean {
 
 async function sendAdminDashboard(env: Env, chatId: number): Promise<void> {
   const summary = await getAdminSummary(env);
-  await telegramCall(env.BOT_TOKEN, "sendMessage", {
+  await telegramCall(env, "sendMessage", {
     chat_id: chatId,
     text: formatAdminDashboard(summary),
     reply_markup: adminDashboardKeyboard(),
@@ -138,21 +138,21 @@ async function sendAdminDashboard(env: Env, chatId: number): Promise<void> {
 }
 
 async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Promise<Response> {
-  if (query.from.id !== ADMIN_USER_ID) return Response.json({ ok: true });
+  if (!isAdmin(env, query.from.id)) return Response.json({ ok: true });
 
   const message = query.message;
   const data = query.data || "";
   if (!message) {
-    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: query.id });
+    await safeTelegramCall(env, "answerCallbackQuery", { callback_query_id: query.id });
     return Response.json({ ok: true });
   }
 
-  await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: query.id });
+  await safeTelegramCall(env, "answerCallbackQuery", { callback_query_id: query.id });
 
   try {
     if (data === "admin:downloads") {
       const stats = await getDownloadStatistics(env);
-      await telegramCall(env.BOT_TOKEN, "editMessageText", {
+      await telegramCall(env, "editMessageText", {
         chat_id: message.chat.id, message_id: message.message_id,
         text: formatDownloadStatistics(stats), parse_mode: "HTML",
         reply_markup: { inline_keyboard: [
@@ -167,7 +167,7 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
 
     if (data === "admin:igbudget") {
       const text = await instagramAccountBudget(env);
-      await telegramCall(env.BOT_TOKEN, "editMessageText", {
+      await telegramCall(env, "editMessageText", {
         chat_id: message.chat.id, message_id: message.message_id, text,
         reply_markup: { inline_keyboard: [
           [{ text: "🔄 بروزرسانی موجودی", callback_data: "admin:igbudget" }],
@@ -210,7 +210,7 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
         [{ text: "استوری و هایلایت", callback_data: "admin:igapi:stories" }],
         [{ text: "اعمال یک انتخاب برای هر دو", callback_data: "admin:igapi:both" }],
       ];
-      await telegramCall(env.BOT_TOKEN, "editMessageText", {
+      await telegramCall(env, "editMessageText", {
         chat_id: message.chat.id, message_id: message.message_id,
         text: `${notice}🔑 API اینستاگرام${scope ? " — " + title : ""}\n\nپست و ریلز: ${label(settings.posts)}\nاستوری و هایلایت: ${label(settings.stories)}\n\nتغییر فقط برای دانلودهای جدید است. جایگزینی خودکار سرویس یا اکانت وجود ندارد.`,
         reply_markup: { inline_keyboard: [...rows, [{ text: "💳 مصرف و اعتبار اکانت‌ها", callback_data: "admin:igbudget" }], [{ text: scope ? "بازگشت به تنظیمات API" : "بازگشت به پنل",
@@ -229,7 +229,7 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
       const title = "عضویت اجباری چنل";
       const status = `وضعیت: ${state.enabled ? "فعال ✅" : "غیرفعال"}`;
       const text = `${title}\n\n${status}\nزمان درخواست عضویت: ${MEMBERSHIP_MODE_LABELS[state.mode]}\nزمان دلخواه را از دکمه‌های زیر انتخاب کن.`;
-      await telegramCall(env.BOT_TOKEN, "editMessageText", {
+      await telegramCall(env, "editMessageText", {
         chat_id: message.chat.id, message_id: message.message_id, text,
         entities: [{ type: "bold", offset: 0, length: title.length },
           { type: "bold", offset: text.indexOf(status), length: status.length }],
@@ -245,7 +245,7 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
 
     if (data === "admin:stats") {
       const summary = await getAdminSummary(env);
-      await telegramCall(env.BOT_TOKEN, "editMessageText", {
+      await telegramCall(env, "editMessageText", {
         chat_id: message.chat.id,
         message_id: message.message_id,
         text: formatAdminDashboard(summary),
@@ -258,7 +258,7 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
     if (usageMatch) {
       const usage = await getAdminUsage(env, usageMatch[1]);
       const back = usageMatch[1] ? `admin:user:${usageMatch[1]}:${usageMatch[2]}:${usageMatch[3]}${usageMatch[4] || ""}${usageMatch[5] ? `:${usageMatch[5]}` : ""}` : "admin:stats";
-      await telegramCall(env.BOT_TOKEN, "editMessageText", {
+      await telegramCall(env, "editMessageText", {
         chat_id: message.chat.id, message_id: message.message_id, text: formatAdminUsage(usage),
         reply_markup: { inline_keyboard: [[{ text: "🔄 بروزرسانی", callback_data: data }], [{ text: "بازگشت", callback_data: back }]] },
       });
@@ -268,7 +268,7 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
     const userMatch = /^admin:user:([1-9]\d{0,15}):(\d{1,8}):(\d{1,8})(:used)?(?::(day|week))?$/.exec(data);
     if (userMatch) {
       const detail = await getAdminUserDetail(env, userMatch[1], Number(userMatch[3]));
-      await telegramCall(env.BOT_TOKEN, "editMessageText", {
+      await telegramCall(env, "editMessageText", {
         chat_id: message.chat.id, message_id: message.message_id,
         text: detail ? formatAdminUserDetail(detail) : "این کاربر پیدا نشد.",
         reply_markup: detail ? adminUserDetailKeyboard(detail, Number(userMatch[2]), Boolean(userMatch[4]), userMatch[5] as AdminPeriod | undefined) : adminDashboardKeyboard(),
@@ -280,7 +280,7 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
     const usersMatch = /^admin:(users|used):(\d+)(?::(day|week))?$/.exec(data);
     if (usersMatch) {
       const page = await getAdminUsersPage(env, Number(usersMatch[2]), usersMatch[1] === "used", usersMatch[3] as AdminPeriod | undefined);
-      await telegramCall(env.BOT_TOKEN, "editMessageText", {
+      await telegramCall(env, "editMessageText", {
         chat_id: message.chat.id,
         message_id: message.message_id,
         text: formatAdminUsers(page),
@@ -292,7 +292,7 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
     console.error("admin panel callback failed", {
       detail: error instanceof Error ? error.message : String(error),
     });
-    await safeTelegramCall(env.BOT_TOKEN, "editMessageText", {
+    await safeTelegramCall(env, "editMessageText", {
       chat_id: message.chat.id,
       message_id: message.message_id,
       text: "❌ آمار پنل ادمین فعلاً در دسترس نیست.",
@@ -304,7 +304,7 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
 }
 
 async function handleAdminCommand(env: Env, message: TelegramMessage): Promise<Response> {
-  if (message.from?.id !== ADMIN_USER_ID) {
+  if (!isAdmin(env, message.from?.id)) {
     return Response.json({ ok: true });
   }
 
@@ -314,7 +314,7 @@ async function handleAdminCommand(env: Env, message: TelegramMessage): Promise<R
     console.error("admin panel open failed", {
       detail: error instanceof Error ? error.message : String(error),
     });
-    await safeTelegramCall(env.BOT_TOKEN, "sendMessage", {
+    await safeTelegramCall(env, "sendMessage", {
       chat_id: message.chat.id,
       text: "❌ آمار پنل ادمین فعلاً در دسترس نیست.",
     });
@@ -350,7 +350,7 @@ export default {
         if (isAdminCommand(text)) return handleAdminCommand(env, message);
 
         const user = trackedUserFromMessage(message);
-        if (user && user.id !== ADMIN_USER_ID) {
+        if (user && !isAdmin(env, user.id)) {
           await recordUserActivity(env, user, isInstagramDownloadLink(text), update.update_id, /^\/start(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text));
         }
       }

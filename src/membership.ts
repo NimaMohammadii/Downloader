@@ -1,4 +1,4 @@
-import { ADMIN_USER_ID, telegramCustomEmoji, telegramTextMotion, type AdminStatsEnv } from "./admin";
+import { isAdmin, telegramCustomEmoji, telegramTextMotion, type AdminStatsEnv } from "./admin";
 
 // The channel must be public and this bot must be a channel administrator.
 export const MEMBERSHIP_CHANNEL = "@VexaOrder";
@@ -59,10 +59,10 @@ function isDownloadRequest(message: any): boolean {
 
 async function telegram(env: MembershipEnv, method: string, payload: Record<string, unknown>): Promise<any> {
   if (!env.BOT_TOKEN) throw new Error("MEMBERSHIP_BOT_UNAVAILABLE");
-  await telegramTextMotion(env.BOT_TOKEN, method, payload, { animateEdits: true });
+  await telegramTextMotion(env.BOT_TOKEN, method, payload, { animateEdits: true, adminEnv: env });
   const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify(telegramCustomEmoji(method, payload)), signal: AbortSignal.timeout(8000),
+    body: JSON.stringify(telegramCustomEmoji(method, payload, env)), signal: AbortSignal.timeout(8000),
   });
   const body = await response.json() as { ok: boolean; result?: unknown; error_code?: number; description?: string };
   if (!response.ok || !body.ok) {
@@ -101,7 +101,7 @@ export function membershipPrompt(channel = MEMBERSHIP_CHANNEL): Record<string, u
 }
 
 export async function notifyFirstDownload(env: MembershipEnv, userId: number): Promise<void> {
-  if (!env.BOT_TOKEN || userId === ADMIN_USER_ID) return;
+  if (!env.BOT_TOKEN || isAdmin(env, userId)) return;
   const state = await membershipState(env, userId);
   if (!state.enabled || state.mode !== "after_download" || !state.downloaded || await isChannelMember(env, userId)) return;
   await telegram(env, "sendMessage", { chat_id: userId, ...membershipPrompt(env.MEMBERSHIP_CHANNEL || MEMBERSHIP_CHANNEL) });
@@ -116,7 +116,7 @@ export async function enforceMembership(request: Request, env: MembershipEnv, ct
   try { update = await request.clone().json(); } catch { return null; }
   const callback = update?.callback_query;
   const actor = callback?.from || update?.message?.from;
-  if (!Number.isSafeInteger(actor?.id) || actor.id <= 0 || actor.id === ADMIN_USER_ID) return null;
+  if (!Number.isSafeInteger(actor?.id) || actor.id <= 0 || isAdmin(env, actor.id)) return null;
   const checking = callback?.data === "membership:check";
   let state: MembershipState;
   let member = false;

@@ -13,6 +13,7 @@ import {
   telegramTextMotion,
   telegramCustomEmoji,
   ADMIN_USER_ID,
+  isAdmin,
   instagramApiSettings,
   recordBrightDataExtraction,
   instagramApiToken,
@@ -1839,11 +1840,11 @@ export default {
       // Count every authenticated interaction once, including routes delegated to older handlers.
       const actor = update?.callback_query?.from || update?.message?.from;
       const activityText = (update?.message?.text || update?.message?.caption || "").trim();
-      if (actor?.id === ADMIN_USER_ID && update?.callback_query?.data?.startsWith("admin:usage") && env.YOUTUBE_DOWNLOADER_CONTAINER) {
+      if (isAdmin(env, actor?.id) && update?.callback_query?.data?.startsWith("admin:usage") && env.YOUTUBE_DOWNLOADER_CONTAINER) {
         await Promise.allSettled(Array.from({ length: POOL_INSTANCES }, async (_, index) =>
           pooledContainer(env, { containerIndex: index }).refreshUsage()));
       }
-      if (actor && actor.id !== ADMIN_USER_ID && !update?.callback_query?.data?.startsWith("admin:")
+      if (actor && !isAdmin(env, actor.id) && !update?.callback_query?.data?.startsWith("admin:")
           && !/^\/admin(?:@[A-Za-z0-9_]+)?$/i.test(activityText)) {
         const linkSent = Boolean(parseInstagramProfileCommand(activityText) || isInstagramDownloadLink(activityText) || extractYouTubeUrl(activityText)
           || extractPornhubUrl(activityText) || parseSocialUrl(activityText) || parsePlaylist(activityText));

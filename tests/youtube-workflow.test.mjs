@@ -43,6 +43,7 @@ const { outputFiles } = await build({
         export const telegramFileCache=async(...args)=>globalThis.testFileCache ? globalThis.testFileCache(...args) : null; export class AdminStatsStore {}
         export const ADMIN_USER_ID = 1;
         export const recordSuccessfulDelivery = async () => { globalThis.delivered++; };
+        export const isAdmin=(_env,id)=>id===ADMIN_USER_ID;
         export const recordUserActivity = async () => {};
       ` };
       throw Error('Unexpected import ' + args.path);

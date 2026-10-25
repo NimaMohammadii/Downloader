@@ -7,7 +7,7 @@ import { DurableObject } from "cloudflare:workers";
 export function isErrorNotice(text: string): boolean {
   return !isPublicErrorMessage(text) && /(?:^|\n)\s*(?:❌|⚠)|ناموفق|ممکن نیست|نامعتبر|دکمه برای|تأیید نشد|ارسال نشد|کامل نشد|معتبر نیست|معتبر نیستند|منقضی|برای شما نیست|درخواست‌کننده|محدود کرده|موقتاً.*(?:متوقف|محدود)|قابل دسترسی.*ندارد|قبلاً.*(?:شروع|تمام)|آمادهٔ ارسال نیست|صف متوقف شد/.test(text);
 }
-export function privateErrorPayload(method: string, payload: Record<string, unknown>): Record<string, unknown> {
+export function privateErrorPayload(method: string, payload: Record<string, unknown>, env: AdminAccessEnv = {}): Record<string, unknown> {
   const result = { ...payload };
   delete result._errorUserId;
   delete result._errorDetail;
@@ -17,8 +17,7 @@ export function privateErrorPayload(method: string, payload: Record<string, unkn
   if (!/^(sendMessage|sendMessageDraft|editMessageText|answerCallbackQuery)$/.test(method) ||
       typeof payload.text !== "string" || (!isPublicErrorMessage(payload.text) && !isErrorNotice(payload.text) && !payload._errorDetail)) return result;
   // A group is never an admin-only destination, even when the requester is admin.
-  const admin = method === "answerCallbackQuery" ? Number(payload._errorUserId) === ADMIN_USER_ID
-    : Number(payload.chat_id) === ADMIN_USER_ID;
+  const admin = isAdmin(env, Number(method === "answerCallbackQuery" ? payload._errorUserId : payload.chat_id));
   if (admin && !isPublicErrorMessage(payload.text)) {
     if (payload._errorDetail && method !== "answerCallbackQuery") result.text = `${payload.text}\n${payload._errorDetail}`;
     return result;
@@ -34,9 +33,9 @@ export function privateErrorPayload(method: string, payload: Record<string, unkn
   ];
   return result;
 }
-function prepareErrorNotice(method: string, payload: Record<string, unknown>): void {
+function prepareErrorNotice(method: string, payload: Record<string, unknown>, env: AdminAccessEnv): void {
   const actor = payload._errorUserId;
-  const safe = privateErrorPayload(method, payload);
+  const safe = privateErrorPayload(method, payload, env);
   for (const key of Object.keys(payload)) delete payload[key];
   Object.assign(payload, safe);
   if (method === "answerCallbackQuery" && actor !== undefined) payload._errorUserId = actor;
@@ -53,8 +52,8 @@ const telegramEmojiIds: Record<string, string> = {
 const telegramEmojiPattern = /(?:❌|✅|⚠|🔎|⬇|📤|⏳|🎵|🎧|🎼|🎬|⭐|🔴|⏹|👤|⚡|👇)\uFE0F?/gu;
 
 // Keep literal text and UTF-16 offsets intact; button icons use Telegram's own field.
-export function telegramCustomEmoji(method: string, payload: Record<string, unknown>): Record<string, unknown> {
-  payload = privateErrorPayload(method, payload);
+export function telegramCustomEmoji(method: string, payload: Record<string, unknown>, env: AdminAccessEnv = {}): Record<string, unknown> {
+  payload = privateErrorPayload(method, payload, env);
   if (!/^(sendMessage|sendMessageDraft|editMessageText|editMessageCaption|editMessageReplyMarkup|sendVideo|sendAudio|sendDocument|sendPhoto|sendAnimation|sendMediaGroup)$/.test(method)) return payload;
   const decorate = (body: Record<string, unknown>): Record<string, unknown> => {
     const result = { ...body };
@@ -97,9 +96,9 @@ const textMotionChats = new Map<string, number>();
 // Drafts use Telegram’s native append animation. Public errors and panel edits
 // reveal text on the existing message; other edits keep their current behavior.
 export async function telegramTextMotion(
-  token: string, method: string, payload: Record<string, unknown>, options: { animateEdits?: boolean } = {},
+  token: string, method: string, payload: Record<string, unknown>, options: { animateEdits?: boolean; adminEnv?: AdminAccessEnv } = {},
 ): Promise<void> {
-  prepareErrorNotice(method, payload);
+  prepareErrorNotice(method, payload, options.adminEnv || {});
   const editing = method === "editMessageText" && (options.animateEdits || isPublicErrorMessage(payload.text)) && Number.isSafeInteger(payload.message_id);
   if ((method !== "sendMessage" && !editing) || typeof payload.text !== "string" || payload.parse_mode ||
       payload.text.length < 2 || payload.inline_message_id || payload.business_connection_id) return;
@@ -113,7 +112,7 @@ export async function telegramTextMotion(
   const deadline = performance.now() + 4500;
   const post = async (action: string, body: Record<string, unknown>) => {
     const response = await fetch(`https://api.telegram.org/bot${token}/${action}`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(telegramCustomEmoji(action, body)),
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(telegramCustomEmoji(action, body, options.adminEnv)),
       signal: AbortSignal.timeout(Math.max(1, Math.min(800, Math.ceil(deadline - performance.now())))),
     });
     const result = await response.json() as { ok?: boolean; parameters?: { retry_after?: number } };
@@ -144,6 +143,16 @@ export async function telegramTextMotion(
 }
 
 export const ADMIN_USER_ID = 7138547731;
+export type AdminAccessEnv = { ADMIN_IDS?: string };
+// Additional administrators never replace the original owner. Reject malformed IDs.
+export function getAdminIds(env: AdminAccessEnv): number[] {
+  const ids = (env.ADMIN_IDS || "").split(/[,\s]+/).filter(id => /^[1-9]\d*$/.test(id))
+    .map(Number).filter(id => Number.isSafeInteger(id) && id > 0);
+  return [...new Set([ADMIN_USER_ID, ...ids])];
+}
+export function isAdmin(env: AdminAccessEnv, userId: unknown): userId is number {
+  return typeof userId === "number" && Number.isSafeInteger(userId) && getAdminIds(env).includes(userId);
+}
 export const ADMIN_USERS_PAGE_SIZE = 8;
 export const ADMIN_DOWNLOADS_PAGE_SIZE = 5;
 export const VISIT_IDLE_MS = 30 * 60_000;
@@ -227,9 +236,9 @@ export type AdminUsage = {
   all: UsageTotals; day: UsageTotals; week: UsageTotals;
 };
 
-type StoreEnv = { BOT_TOKEN?: string };
+type StoreEnv = AdminAccessEnv & { BOT_TOKEN?: string };
 
-export type AdminStatsEnv = {
+export type AdminStatsEnv = AdminAccessEnv & {
   ADMIN_STATS: DurableObjectNamespace<AdminStatsStore>;
 };
 
@@ -1026,7 +1035,7 @@ export async function recordUserActivity(
   eventId?: number,
   start = false,
 ): Promise<void> {
-  if (!env.ADMIN_STATS) return;
+  if (!env.ADMIN_STATS || isAdmin(env, user.id)) return;
   try {
     const response = await statsStub(env).fetch("https://admin-stats/record", {
       method: "POST",
@@ -1173,7 +1182,7 @@ function displayText(value: unknown, limit: number): string | null {
 }
 
 export async function recordDownload(env: Partial<AdminStatsEnv> & { BOT_TOKEN?: string }, record: DownloadRecord): Promise<void> {
-  if (!env.ADMIN_STATS || record.userId === ADMIN_USER_ID) return;
+  if (!env.ADMIN_STATS || isAdmin(env, record.userId)) return;
   try {
     const response = await statsStub(env as AdminStatsEnv).fetch("https://admin-stats/download", {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(record),

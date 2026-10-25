@@ -15,6 +15,18 @@ const bundle = await build({
 });
 const api = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`);
 const download = { key: 'trial', userId: 42, source: 'YouTube', request: 'https://youtube.com/watch?v=abcdefghijk', status: 'success', delivered: 1 };
+test('additional administrators bypass channel membership without exposing controls to regular users',async()=>{
+  const f=fixture();
+  try{
+    f.env.ADMIN_IDS='123456789';
+    await api.setMembershipMode(f.env,'start');
+    assert.equal(await api.enforceMembership(f.webhook('/admin',123456789),f.env),null);
+    await api.notifyFirstDownload(f.env,123456789);
+    assert.equal(f.calls.length,0);
+    assert.ok(await api.enforceMembership(f.webhook('/admin',42),f.env) instanceof Response);
+    assert.ok(f.calls.some(c=>c.method==='getChatMember'));
+  }finally{f.close();}
+});
 function fixture() {
   const db = new DatabaseSync(':memory:');
   const sql = { exec(query, ...params) {
