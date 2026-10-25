@@ -1237,3 +1237,26 @@ test('TopAPI invalid JSON and non-array datasets are invalid results, not eviden
   assert.equal(result.calls.filter(x=>x.method==='POST').length,1);
  }
 });
+
+test('TopAPI honors an explicit Image result for the same shortcode across p, reel and reels share routes',async()=>{
+ for(const route of ['p','reel','reels']){
+  const result=await run({text:`https://instagram.com/${route}/${shortcode}/`,env:{APIFY_API_TOKEN:'private-token'},respond(call){
+   if(call.hostname==='api.apify.com')return Response.json([{shortCode:shortcode,type:'Image',url:`https://instagram.com/p/${shortcode}/`,videoUrl:null,displayUrl:'https://scontent.cdninstagram.com/actual-photo.jpg'}]);
+   throw Error('No provider switch');
+  }});
+  assert.deepEqual(files(result).map(x=>x.method),['sendPhoto']);
+  assert.equal(result.calls.filter(x=>x.method==='POST').length,1);
+  assert.ok(!result.diagnostics.some(x=>x.message==='instagram topapi no media'));
+ }
+});
+
+test('a declared Video without videoUrl never falls back to displayUrl on any share route',async()=>{
+ for(const route of ['p','reel','reels']){
+  const result=await run({text:`https://instagram.com/${route}/${shortcode}/`,env:{APIFY_API_TOKEN:'key'},respond(call){
+   if(call.hostname==='api.apify.com')return Response.json([{shortCode:shortcode,type:'Video',videoUrl:null,displayUrl:'https://scontent.cdninstagram.com/video-cover.jpg'}]);
+   throw Error('No fallback');
+  }});
+  assert.equal(report(result),'TOPAPI_NO_MEDIA');assert.equal(files(result).length,0);
+  assert.equal(result.diagnostics.find(x=>x.message==='instagram topapi no media').info.videoUrlState,'null');
+ }
+});

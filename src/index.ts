@@ -979,7 +979,11 @@ async function resolvePostWithTopApi(
     }
     return groups;
   }
-  if (isReel || type === "video" || item.isVideo === true) {
+  // The returned media type takes precedence over the submitted URL route.
+  // A matching shortcode with an explicit Image row is an image, even if
+  // Instagram/its share link presented it under /reel/. Never use a Video
+  // row's displayUrl as a replacement for its missing videoUrl.
+  if (type === "video" || item.isVideo === true) {
     const found = video(item);
     if (!found) return noMedia("video_url_unavailable", item);
     return [found];
@@ -993,7 +997,7 @@ async function resolvePostWithTopApi(
   // replacement for a missing video. Unknown image-only records are ambiguous.
   const found = video(item);
   if (found) return [found];
-  return noMedia("unknown_media_type", item);
+  return noMedia(isReel ? "video_url_unavailable" : "unknown_media_type", item);
 }
 
 // Bright Data returns metadata and signed CDN URLs, not a media file.
