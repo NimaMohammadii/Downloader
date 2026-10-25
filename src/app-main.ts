@@ -93,7 +93,14 @@ const appWorker = {
 
     const broadcastResponse = await handleBroadcastUpdate(request, env);
     if (broadcastResponse) return broadcastResponse;
-    const membershipResponse = await enforceMembership(request, env, ctx);
+    const membershipResponse = await enforceMembership(request, env, ctx, async update => {
+      // Membership already accepted this request. Resume the original update only
+      // after confirmation deletion, preserving message IDs and workflow identity.
+      const response = await youtubeWorker.fetch(new Request(request.url, {
+        method: "POST", headers: request.headers, body: JSON.stringify(update),
+      }), env as any, ctx);
+      if (!response.ok) throw new Error("MEMBERSHIP_RESUME_FAILED");
+    });
     if (membershipResponse) return membershipResponse;
     return youtubeWorker.fetch(request, env as any, ctx);
   },

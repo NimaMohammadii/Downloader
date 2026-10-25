@@ -9,6 +9,17 @@ Start mode also checks direct requests from users who skip /start. Channel
 membership is checked again so leaving the channel restores the gate. The admin
 remains exempt. Disabled mode does not enforce membership.
 
+A blocked request is saved per user. After a successful membership check, the
+confirmation emoji remains visible for four seconds. Only a successful deletion
+(or Telegram reporting that it is already gone) allows the original request to
+resume. Start commands, links, media and download-button selections preserve their
+original update/message IDs. Restarting does not discard pending work. A newer
+blocked request replaces an older one; duplicate updates cannot restore consumed
+work. Pending actions are claimed atomically so repeated confirmations cannot
+start the same saved request twice. Failed deletion or leaving the channel keeps
+the request pending. A completed first free download is never queued for replay.
+
+
 Public errors are selected from `container/public_errors.json`, shared by the
 Worker and Python container. The catalog distinguishes invalid links/selections,
 private or expired content, formats, audio, recognition, source and Telegram

@@ -405,3 +405,183 @@ test('mode selection is admin-only, persists independently of enablement, and re
     assert.ok(!f.calls.some(c=>c.method==='sendMessage' && c.body.reply_markup?.inline_keyboard?.flat().some(b=>b.callback_data==='membership:check')));
   } finally {f.close();}
 });
+
+async function gateRequest(f, text = '/start', user = 42, updateId = 700) {
+  const body = { update_id: updateId, message: { message_id: updateId, from: { id: user }, chat: { id: user }, text } };
+  const request = new Request('https://worker/telegram/webhook', { method:'POST',
+    headers:{'content-type':'application/json','x-telegram-bot-api-secret-token':'test-secret'},body:JSON.stringify(body) });
+  await api.worker.fetch(request, f.env, {});
+  return body;
+}
+
+test('a blocked start resumes through production only after the confirmation emoji is deleted', async t=>{
+  const f=fixture(), tasks=[];
+  try {
+    await api.setMembershipMode(f.env,'start');
+    await gateRequest(f);
+    f.restart();
+    f.setMember({status:'member'});
+    f.calls.length=0;
+    t.mock.timers.enable({apis:['setTimeout']});
+    await api.worker.fetch(f.webhook('',42,'membership:check'),f.env,{waitUntil(p){tasks.push(p);}});
+    assert.equal(tasks.length,1);
+    assert.equal(f.calls.filter(c=>c.method==='sendMessage').length,1,'only the emoji is sent before its removal');
+    t.mock.timers.tick(3999);
+    await Promise.resolve();
+    assert.equal(f.calls.filter(c=>c.method==='deleteMessage').length,1,'only the old prompt is deleted');
+    t.mock.timers.tick(1);
+    t.mock.timers.reset();
+    await Promise.all(tasks);
+    const removed=f.calls.findIndex(c=>c.method==='deleteMessage'&&c.body.message_id===80);
+    const next=f.calls.findIndex(c=>c.method==='sendMessage'&&c.body.text!=='✅');
+    assert.ok(removed>=0 && next>removed,'the original start response must follow successful emoji deletion');
+    assert.equal(f.calls[next].body.chat_id,42);
+    assert.equal(f.jobs.length,0);
+  } finally {t.mock.timers.reset();f.close();}
+});
+
+test('a blocked YouTube link resumes with its original IDs only after emoji deletion',async t=>{
+  const f=fixture(),tasks=[];
+  try {
+    await api.setMembershipMode(f.env,'first_link');
+    const original=await gateRequest(f,'https://youtube.com/watch?v=abcdefghijk',42,701);
+    assert.equal(f.jobs.length,0);
+    f.setMember({status:'member'});
+    f.calls.length=0;
+    f.env.YOUTUBE_DOWNLOAD_WORKFLOW.create=async job=>{
+      assert.ok(f.calls.some(c=>c.method==='deleteMessage'&&c.body.message_id===80));
+      f.jobs.push(job);return {id:job.id};
+    };
+    t.mock.timers.enable({apis:['setTimeout']});
+    await api.worker.fetch(f.webhook('',42,'membership:check'),f.env,{waitUntil(p){tasks.push(p);}});
+    assert.equal(f.jobs.length,0);
+    t.mock.timers.tick(4000);
+    t.mock.timers.reset();
+    await Promise.all(tasks);
+    assert.equal(f.jobs.length,1);
+    assert.equal(f.jobs[0].params.requestMessageId,original.message.message_id);
+    assert.equal(f.jobs[0].params.userId,42);
+    assert.ok(f.jobs[0].params.url.includes('abcdefghijk'));
+  } finally {t.mock.timers.reset();f.close();}
+});
+
+test('pending actions are isolated, retain the latest request, and cannot be consumed twice',async()=>{
+  const f=fixture();
+  const message=(id,user=42,text='/start')=>({update_id:id,message:{message_id:id,chat:{id:user},from:{id:user},text}});
+  try {
+    for(const update of [message(800),message(802,42,'https://youtu.be/abcdefghijk'),message(801)])
+      assert.equal((await f.request('/membership-pending',{op:'save',userId:42,update})).status,200);
+    assert.equal((await (await f.request('/membership-pending',{op:'take',userId:43})).json()).update,null);
+    const taken=await Promise.all([1,2].map(async()=> (await (await f.request('/membership-pending',{op:'take',userId:42})).json()).update));
+    assert.equal(taken.filter(Boolean).length,1);
+    assert.equal(taken.find(Boolean).update_id,802);
+    await f.request('/membership-pending',{op:'save',userId:42,update:message(802)});
+    f.restart();
+    assert.equal((await (await f.request('/membership-pending',{op:'take',userId:42})).json()).update,null,'webhook redelivery must not restore consumed work');
+    assert.equal((await f.request('/membership-pending',{op:'save',userId:42,update:message(803,43)})).status,400);
+  } finally {f.close();}
+});
+
+test('failed emoji removal keeps the original request pending and never resumes it',async t=>{
+  const f=fixture(),tasks=[],resumed=[];
+  try {
+    await api.setMembershipMode(f.env,'start');
+    const original=await gateRequest(f,'/start',42,810);
+    f.setMember({status:'member'});
+    const currentFetch=globalThis.fetch;
+    globalThis.fetch=async(url,init)=>{
+      if(String(url).endsWith('/deleteMessage')&&JSON.parse(init.body).message_id===80)
+        return Response.json({ok:false,description:'message cannot be deleted'},{status:400});
+      return currentFetch(url,init);
+    };
+    t.mock.timers.enable({apis:['setTimeout']});
+    await api.enforceMembership(f.webhook('',42,'membership:check'),f.env,{waitUntil(p){tasks.push(p);}},async update=>resumed.push(update));
+    t.mock.timers.tick(4000);t.mock.timers.reset();
+    await Promise.all(tasks);
+    assert.equal(resumed.length,0);
+    assert.equal((await (await f.request('/membership-pending',{op:'take',userId:42})).json()).update.update_id,original.update_id);
+  } finally {t.mock.timers.reset();f.close();}
+});
+
+test('leaving during confirmation preserves pending work instead of resuming without membership',async t=>{
+  const f=fixture(),tasks=[],resumed=[];
+  try {
+    await api.setMembershipMode(f.env,'start');
+    await gateRequest(f,'/start',42,820);
+    f.setMember({status:'member'});
+    t.mock.timers.enable({apis:['setTimeout']});
+    await api.enforceMembership(f.webhook('',42,'membership:check'),f.env,{waitUntil(p){tasks.push(p);}},async update=>resumed.push(update));
+    f.setMember({status:'left'});
+    t.mock.timers.tick(4000);t.mock.timers.reset();
+    await Promise.all(tasks);
+    assert.equal(resumed.length,0);
+    assert.equal((await (await f.request('/membership-pending',{op:'take',userId:42})).json()).update.update_id,820);
+  } finally {t.mock.timers.reset();f.close();}
+});
+
+test('repeated membership confirmations resume the saved request once',async t=>{
+  const f=fixture(),tasks=[],resumed=[];
+  try {
+    await api.setMembershipMode(f.env,'start');
+    await gateRequest(f,'/start',42,830);
+    f.setMember({status:'member'});
+    t.mock.timers.enable({apis:['setTimeout']});
+    for(let i=0;i<2;i++) await api.enforceMembership(f.webhook('',42,'membership:check'),f.env,
+      {waitUntil(p){tasks.push(p);}},async update=>resumed.push(update));
+    assert.equal(resumed.length,0);
+    t.mock.timers.tick(4000);t.mock.timers.reset();
+    await Promise.all(tasks);
+    assert.equal(resumed.length,1);
+    assert.equal(resumed[0].update_id,830);
+  } finally {t.mock.timers.reset();f.close();}
+});
+
+test('a gated quality button resumes its original download selection after confirmation',async t=>{
+  const f=fixture(),tasks=[];
+  try {
+    await api.setMembershipMode(f.env,'first_link');
+    await api.worker.fetch(f.webhook('',42,'ytq|abcdefghijk|720|7|42'),f.env,{});
+    assert.equal(f.jobs.length,0);
+    f.setMember({status:'member'});
+    f.calls.length=0;
+    t.mock.timers.enable({apis:['setTimeout']});
+    await api.worker.fetch(f.webhook('',42,'membership:check'),f.env,{waitUntil(p){tasks.push(p);}});
+    assert.equal(f.jobs.length,0);
+    t.mock.timers.tick(4000);t.mock.timers.reset();
+    await Promise.all(tasks);
+    assert.equal(f.jobs.length,1);
+    assert.equal(f.jobs[0].params.quality,720);
+    assert.equal(f.jobs[0].params.requestMessageId,7);
+    assert.equal(f.jobs[0].params.statusMessageId,70,'the original button message remains the status target');
+    assert.equal(f.jobs[0].params.userId,42);
+  } finally {t.mock.timers.reset();f.close();}
+});
+
+test('continuation waits for Telegram to acknowledge deletion, not just for the timer',async t=>{
+  const f=fixture(),tasks=[],resumed=[];
+  let acknowledge, deletionRequested=false;
+  const deletion=new Promise(resolve=>{acknowledge=resolve;});
+  try {
+    await api.setMembershipMode(f.env,'start');
+    await gateRequest(f,'/start',42,840);
+    f.setMember({status:'member'});
+    const currentFetch=globalThis.fetch;
+    globalThis.fetch=async(url,init)=>{
+      if(String(url).endsWith('/deleteMessage')&&JSON.parse(init.body).message_id===80) {
+        deletionRequested=true;
+        return deletion;
+      }
+      return currentFetch(url,init);
+    };
+    t.mock.timers.enable({apis:['setTimeout']});
+    await api.enforceMembership(f.webhook('',42,'membership:check'),f.env,
+      {waitUntil(p){tasks.push(p);}},async update=>resumed.push(update));
+    t.mock.timers.tick(4000);t.mock.timers.reset();
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(deletionRequested,true);
+    assert.equal(resumed.length,0,'elapsed time and a pending delete request do not permit continuation');
+    acknowledge(Response.json({ok:true,result:true}));
+    await Promise.all(tasks);
+    assert.equal(resumed.length,1);
+  } finally {t.mock.timers.reset();f.close();}
+});

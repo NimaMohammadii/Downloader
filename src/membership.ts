@@ -57,6 +57,14 @@ function isDownloadRequest(message: any): boolean {
     /\.(mp3|m4a|wav|ogg|opus|flac|aac|aiff|mp4|mov|mkv|webm|avi|wma)$/i.test(message?.document?.file_name || ""));
 }
 
+async function pendingRequest(env: MembershipEnv, userId: number, op: "save" | "take", update?: unknown): Promise<any | null> {
+  const response = await env.ADMIN_STATS!.getByName("global").fetch("https://admin-stats/membership-pending", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ op, userId, update }),
+  });
+  if (!response.ok) throw new Error("MEMBERSHIP_PENDING_UNAVAILABLE");
+  return (await response.json() as { update?: unknown }).update || null;
+}
+
 async function telegram(env: MembershipEnv, method: string, payload: Record<string, unknown>): Promise<any> {
   if (!env.BOT_TOKEN) throw new Error("MEMBERSHIP_BOT_UNAVAILABLE");
   await telegramTextMotion(env.BOT_TOKEN, method, payload, { animateEdits: true, adminEnv: env });
@@ -108,7 +116,7 @@ export async function notifyFirstDownload(env: MembershipEnv, userId: number): P
 }
 
 // Run once at the production webhook boundary, before any delegated command or callback.
-export async function enforceMembership(request: Request, env: MembershipEnv, ctx?: Pick<ExecutionContext, "waitUntil">): Promise<Response | null> {
+export async function enforceMembership(request: Request, env: MembershipEnv, ctx?: Pick<ExecutionContext, "waitUntil">, resume?: (update: any) => Promise<void>): Promise<Response | null> {
   if (!env.ADMIN_STATS || !env.BOT_TOKEN || request.method !== "POST"
       || new URL(request.url).pathname !== "/telegram/webhook"
       || request.headers.get("x-telegram-bot-api-secret-token") !== (env.WEBHOOK_SECRET || "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1")) return null;
@@ -151,13 +159,33 @@ export async function enforceMembership(request: Request, env: MembershipEnv, ct
         await new Promise(resolve => setTimeout(resolve, 4000));
         try {
           await telegram(env, "deleteMessage", { chat_id: actor.id, message_id: confirmation.message_id });
-        } catch { console.warn("membership confirmation cleanup unavailable"); }
+        } catch {
+          console.warn("membership confirmation cleanup unavailable");
+          // Keep the request pending until Telegram confirms the emoji is gone.
+          try { await telegram(env, "sendMessage", { chat_id: actor.id, ...membershipPrompt(env.MEMBERSHIP_CHANNEL || MEMBERSHIP_CHANNEL) }); } catch {}
+          return;
+        }
+        if (!resume) return;
+        try {
+          const latest = await membershipState(env, actor.id);
+          if (requiresMembership(latest) && !await isChannelMember(env, actor.id)) {
+            await telegram(env, "sendMessage", { chat_id: actor.id, ...membershipPrompt(env.MEMBERSHIP_CHANNEL || MEMBERSHIP_CHANNEL) });
+            return;
+          }
+          const pending = await pendingRequest(env, actor.id, "take");
+          if (pending) await resume(pending);
+        } catch {
+          console.warn("membership request continuation unavailable");
+          try { await telegram(env, "sendMessage", { chat_id: actor.id,
+            text: "❌ پردازش درخواست کامل نشد؛ لینک یا درخواست را دوباره بفرست." }); } catch {}
+        }
       })();
       if (typeof ctx?.waitUntil === "function") ctx.waitUntil(cleanup);
       else await cleanup;
     }
     return Response.json({ ok: true });
   }
+  if (!checking) await pendingRequest(env, actor.id, "save", update);
   if (callback?.id) await telegram(env, "answerCallbackQuery", { callback_query_id: callback.id, _errorUserId: callback.from?.id,
     text: checking ? "هنوز عضو چنل نیستی؛ اول عضو شو و دوباره بررسی کن." : "برای ادامه، اول عضو چنل شو.", show_alert: true });
   const prompt = membershipPrompt(env.MEMBERSHIP_CHANNEL || MEMBERSHIP_CHANNEL);

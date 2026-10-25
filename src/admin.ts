@@ -533,6 +533,10 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       INSERT OR IGNORE INTO counters(key, value) VALUES ('membership_enabled', 1);
       INSERT OR IGNORE INTO counters(key, value) VALUES ('membership_mode', 0);
       CREATE TABLE IF NOT EXISTS membership_link_triggers (user_id TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS membership_pending (
+        user_id TEXT PRIMARY KEY, request_key TEXT NOT NULL, payload TEXT,
+        update_id INTEGER, created_at INTEGER NOT NULL
+      );
       INSERT OR IGNORE INTO counters(key, value) VALUES ('apify_account', 1);
       CREATE TABLE IF NOT EXISTS instagram_api_extractions (
         event_key TEXT NOT NULL, account INTEGER NOT NULL, recorded_at INTEGER NOT NULL,
@@ -716,6 +720,48 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         account: asNumber(sql.exec("SELECT value FROM counters WHERE key = ?", `ig_${scope}_account`).one().value) as ApifyAccount,
       });
       return Response.json({ posts: read("posts"), stories: read("stories") } satisfies InstagramApiSettings);
+    }
+
+    if (url.pathname === "/membership-pending" && request.method === "POST") {
+      const input = await request.json() as { op?: string; userId?: number; update?: any };
+      if (!Number.isSafeInteger(input.userId) || input.userId! <= 0 || !["save", "take"].includes(input.op || ""))
+        return new Response("Invalid request", { status: 400 });
+      const user = String(input.userId), now = Date.now(), cutoff = now - 24 * 3600_000;
+      const sql = this.ctx.storage.sql;
+      if (input.op === "save") {
+        const update = input.update;
+        const actor = update?.callback_query?.from || update?.message?.from;
+        const message = update?.message || update?.callback_query?.message;
+        if (actor?.id !== input.userId || !Number.isSafeInteger(message?.chat?.id) ||
+            !Number.isSafeInteger(message?.message_id) || update?.callback_query?.data === "membership:check")
+          return new Response("Invalid request", { status: 400 });
+        const payload = JSON.stringify(update);
+        if (payload.length > 64_000) return new Response("Request too large", { status: 413 });
+        const updateId = Number.isSafeInteger(update.update_id) ? update.update_id : null;
+        const key = updateId !== null ? `update:${updateId}` : update.callback_query
+          ? `callback:${update.callback_query.id}` : `message:${message.chat.id}:${message.message_id}`;
+        this.ctx.storage.transactionSync(() => {
+          const saved = sql.exec("SELECT request_key, update_id, created_at FROM membership_pending WHERE user_id = ?", user).toArray()[0];
+          // Retain the newest gated request, and remember consumed keys so webhook
+          // redelivery cannot schedule the same action again.
+          if (saved && asNumber(saved.created_at) >= cutoff && (saved.request_key === key ||
+              (updateId !== null && saved.update_id !== null && updateId <= asNumber(saved.update_id)))) return;
+          sql.exec(`INSERT INTO membership_pending(user_id, request_key, payload, update_id, created_at)
+            VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET
+            request_key = excluded.request_key, payload = excluded.payload,
+            update_id = excluded.update_id, created_at = excluded.created_at`, user, key, payload, updateId, now);
+        });
+        return Response.json({ ok: true });
+      }
+      const update = this.ctx.storage.transactionSync(() => {
+        const saved = sql.exec("SELECT payload, created_at FROM membership_pending WHERE user_id = ?", user).toArray()[0];
+        if (!saved?.payload) return null;
+        // Consume atomically before dispatch: duplicate confirmation callbacks
+        // must never replay a download whose delivery may already have started.
+        sql.exec("UPDATE membership_pending SET payload = NULL WHERE user_id = ?", user);
+        return JSON.parse(String(saved.payload));
+      });
+      return Response.json({ update });
     }
 
     if (url.pathname === "/membership") {
