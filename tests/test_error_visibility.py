@@ -11,7 +11,7 @@ class ErrorVisibilityTests(unittest.TestCase):
         for chat in (42, -123, app.ADMIN_USER_ID, str(app.ADMIN_USER_ID)):
             body = {'chat_id': chat, 'text': '❌ نشست منقضی شده', 'parse_mode': 'HTML', 'entities': []}
             safe = app.private_error_payload('editMessageText', body)
-            self.assertEqual(safe['text'], body['text'] if str(chat) == str(app.ADMIN_USER_ID) else app.PUBLIC_ERROR_MESSAGE)
+            self.assertEqual(safe['text'], body['text'] if str(chat) == str(app.ADMIN_USER_ID) else '⚠️ این قابلیت موقتاً در دسترس نیست؛ مشکل سرویس در حال پیگیری است. کمی بعد دوباره تلاش کن.')
             self.assertEqual(body['text'], '❌ نشست منقضی شده')
 
     def test_public_message_matches_requested_text(self):
@@ -19,7 +19,7 @@ class ErrorVisibilityTests(unittest.TestCase):
 
     def test_partial_and_retry_errors_but_not_media_captions(self):
         for text in ('🎵 list\n❌ دریافت نشد: 2', '⏳ تلگرام موقتاً ارسال را متوقف کرده'):
-            self.assertEqual(app.private_error_payload('editMessageText', {'chat_id': 42, 'text': text})['text'], app.PUBLIC_ERROR_MESSAGE)
+            self.assertNotEqual(app.private_error_payload('editMessageText', {'chat_id': 42, 'text': text})['text'], text)
         body = {'chat_id': 42, 'caption': '❌ song title'}
         self.assertEqual(app.telegram_custom_emoji('sendAudio', body)['caption'], body['caption'])
 

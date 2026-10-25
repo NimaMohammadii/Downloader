@@ -1,0 +1,262 @@
+[
+  {
+    "input": "BOT_USER_BLOCKED",
+    "category": "user_restricted"
+  },
+  {
+    "input": "❌ دسترسی شما محدود شده است",
+    "category": "user_restricted"
+  },
+  {
+    "input": "MEMBERSHIP_TELEGRAM_UNAVAILABLE",
+    "category": "membership_check"
+  },
+  {
+    "input": "این دکمه برای شما نیست.",
+    "category": "callback_owner"
+  },
+  {
+    "input": "این فهرست منقضی یا نامعتبر است",
+    "category": "callback_expired"
+  },
+  {
+    "input": "دانلود این درخواست قبلاً شروع شده",
+    "category": "job_started"
+  },
+  {
+    "input": "FLOOD_WAIT",
+    "category": "telegram_rate"
+  },
+  {
+    "input": "⏳ تلگرام موقتاً ارسال را متوقف کرده؛ درخواست محفوظ است و خودکار ادامه پیدا می‌کند.",
+    "category": "retry_pending"
+  },
+  {
+    "input": "❌ ارسال فایل در تلگرام تأیید نشد؛ اگر فایلی دریافت کرده‌ای بررسی کن.",
+    "category": "delivery_uncertain"
+  },
+  {
+    "input": "🎵 title\n❌ دریافت نشد: 2",
+    "category": "partial"
+  },
+  {
+    "input": "TOPAPI_INCOMPLETE_CAROUSEL",
+    "category": "partial"
+  },
+  {
+    "input": "APIFY_STILL_RUNNING",
+    "category": "service_pending"
+  },
+  {
+    "input": "INSTAGRAM_RATE_LIMIT_429",
+    "category": "rate_limit"
+  },
+  {
+    "input": "❌ YouTube تعداد درخواست‌های این سرور را محدود کرده؛ کمی بعد دوباره امتحان کن.",
+    "category": "rate_limit"
+  },
+  {
+    "input": "SOURCE_RATE_LIMITED",
+    "category": "rate_limit"
+  },
+  {
+    "input": "APIFY_AUTH_ERROR",
+    "category": "service_unavailable"
+  },
+  {
+    "input": "TOPAPI_QUOTA_OR_RATE_LIMIT",
+    "category": "service_unavailable"
+  },
+  {
+    "input": "BRIGHTDATA_CREDITS_ERROR",
+    "category": "service_unavailable"
+  },
+  {
+    "input": "INSTAGRAM_LOGIN_REQUIRED",
+    "category": "service_unavailable"
+  },
+  {
+    "input": "❌ سشن ذخیره‌شده را قبول نکرد؛ سشن نیاز به ورود دوباره دارد.",
+    "category": "service_unavailable"
+  },
+  {
+    "input": "API_ID API_HASH SECRET",
+    "category": "service_unavailable"
+  },
+  {
+    "input": "❌ لینک معتبر این سرویس را بفرست.",
+    "category": "invalid_link"
+  },
+  {
+    "input": "INVALID_URL",
+    "category": "invalid_link"
+  },
+  {
+    "input": "❌ لینک مستقیم یک ویدیو یا Shorts رو بفرست، نه Playlist یا کانال.",
+    "category": "invalid_link"
+  },
+  {
+    "input": "TELEGRAM_FILE_TOO_LARGE",
+    "category": "too_large"
+  },
+  {
+    "input": "❌ حجم فایل از سقف ۲ گیگابایت بیشتر است.",
+    "category": "too_large"
+  },
+  {
+    "input": "❌ این ویدیو صدا ندارد.",
+    "category": "audio_missing"
+  },
+  {
+    "input": "❌ صدای کافی برای تشخیص ندارم؛ حداقل 3 ثانیه بفرست.",
+    "category": "audio_short"
+  },
+  {
+    "input": "❌ آهنگ شناسایی نشد؛ یک بخش واضح‌تر بفرست.",
+    "category": "music_not_found"
+  },
+  {
+    "input": "❌ کیفیت 1080p برای این ویدیو موجود نیست.",
+    "category": "quality_unavailable"
+  },
+  {
+    "input": "SOURCE_FORMAT_UNAVAILABLE",
+    "category": "quality_unavailable"
+  },
+  {
+    "input": "❌ کیفیت قابل دانلود برای این ویدیو پیدا نشد.",
+    "category": "quality_unavailable"
+  },
+  {
+    "input": "age-restricted video",
+    "category": "age_restricted"
+  },
+  {
+    "input": "❌ این ویدیو به‌خاطر محدودیت صاحب محتوا قابل دانلود نیست.",
+    "category": "copyright"
+  },
+  {
+    "input": "not available in your country",
+    "category": "region"
+  },
+  {
+    "input": "private video",
+    "category": "content_private"
+  },
+  {
+    "input": "❌ این ویدیو فقط برای اعضای کانال قابل مشاهده است.",
+    "category": "content_private"
+  },
+  {
+    "input": "INSTAGRAM_STORY_EXPIRED",
+    "category": "content_expired"
+  },
+  {
+    "input": "❌ لینک موقت فایل YouTube اعتبار ندارد.",
+    "category": "content_expired"
+  },
+  {
+    "input": "TOPAPI_RECORD_DEAD_PAGE",
+    "category": "content_unavailable"
+  },
+  {
+    "input": "SOURCE_UNAVAILABLE",
+    "category": "content_unavailable"
+  },
+  {
+    "input": "❌ این پست حذف شده یا در دسترس نیست.",
+    "category": "content_unavailable"
+  },
+  {
+    "input": "❌ این لایو هنوز در حال پخش است؛ /live را بفرست.",
+    "category": "live_active"
+  },
+  {
+    "input": "APIFY_TIMEOUT",
+    "category": "timeout"
+  },
+  {
+    "input": "❌ ارتباط با YouTube بیشتر از حد معمول طول کشید.",
+    "category": "timeout"
+  },
+  {
+    "input": "DOWNLOAD_POOL_FULL",
+    "category": "capacity"
+  },
+  {
+    "input": "HTTP Error 403: Forbidden",
+    "category": "access_unavailable"
+  },
+  {
+    "input": "INSTAGRAM_NETWORK_ERROR",
+    "category": "network"
+  },
+  {
+    "input": "❌ ارتباط با سرور قطع شد.",
+    "category": "network"
+  },
+  {
+    "input": "❌ دریافت فایل از منبع کامل نشد؛ دوباره امتحان کن.",
+    "category": "download_failed"
+  },
+  {
+    "input": "❌ unknown decoder failure",
+    "category": "fallback"
+  },
+  {
+    "input": "TOPAPI_RECORD_BUCKET_RATE_LIMIT",
+    "category": "rate_limit"
+  },
+  {
+    "input": "APIFY_WRONG_TARGET",
+    "category": "content_mismatch"
+  },
+  {
+    "input": "❌ لینک کوتاه پینترست باز نشد؛ لینک کامل همان پست را بفرست.",
+    "category": "short_link"
+  },
+  {
+    "input": "❌ شناسهٔ فایل معتبر نیست؛ فایل را دوباره بفرست.",
+    "category": "invalid_selection"
+  },
+  {
+    "input": "❌ این اکانت الان لایو فعالِ قابل مشاهده ندارد.",
+    "category": "live_unavailable"
+  },
+  {
+    "input": "❌ این مسیر برای پست منتشرشده است؛ لایو این سرویس پشتیبانی نمی‌شود.",
+    "category": "unsupported_live"
+  },
+  {
+    "input": "❌ فایل ویدیوی سالم برای ارسال ساخته نشد.",
+    "category": "output_invalid"
+  },
+  {
+    "input": "❌ فقط پیش‌نمایش یا نسخهٔ محدود آهنگ در دسترس است؛ فایل کامل ارسال نشد.",
+    "category": "preview_only"
+  },
+  {
+    "input": "❌ پلی‌لیست یا این بازه قابل دریافت نیست؛ لینک عمومی و بازهٔ درست را بفرست.",
+    "category": "playlist_invalid"
+  },
+  {
+    "input": "❌ کوکی Pinterest نامعتبر یا منقضی است؛ خروجی کامل را در PINTEREST_COOKIES قرار بده.",
+    "category": "service_unavailable"
+  },
+  {
+    "input": "❌ استخراج TopAPI هنوز در Apify در حال اجراست.",
+    "category": "service_pending"
+  },
+  {
+    "input": "❌ اطلاعات ویدیو از YouTube دریافت نشد.",
+    "category": "download_failed"
+  },
+  {
+    "input": "❌ حجم این فایل برای ارسال مستقیم با Bot API تلگرام زیادی بالاست.",
+    "category": "too_large"
+  },
+  {
+    "input": "❌ unknown decoder failure token=private https://secret.example/members-only",
+    "category": "fallback"
+  }
+]

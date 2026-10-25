@@ -4,15 +4,24 @@ import { ADMIN_USER_ID, telegramCustomEmoji, telegramTextMotion, type AdminStats
 export const MEMBERSHIP_CHANNEL = "@VexaOrder";
 
 type MembershipEnv = Partial<AdminStatsEnv> & { BOT_TOKEN?: string; WEBHOOK_SECRET?: string; MEMBERSHIP_CHANNEL?: string };
-export type MembershipState = { enabled: boolean; downloaded: boolean };
+export const MEMBERSHIP_MODES = ["after_download", "start", "first_link"] as const;
+export type MembershipMode = typeof MEMBERSHIP_MODES[number];
+export const MEMBERSHIP_MODE_LABELS: Record<MembershipMode, string> = {
+  after_download: "بعد از اولین دانلود موفق", start: "هنگام استارت", first_link: "با اولین لینک",
+};
+export type MembershipState = { enabled: boolean; downloaded: boolean; mode: MembershipMode; linkTriggered: boolean };
 
-export async function membershipState(env: Partial<AdminStatsEnv>, userId?: number): Promise<MembershipState> {
-  if (!env.ADMIN_STATS) return { enabled: false, downloaded: false };
+export async function membershipState(env: Partial<AdminStatsEnv>, userId?: number, linkRequest = false): Promise<MembershipState> {
+  if (!env.ADMIN_STATS) return { enabled: false, downloaded: false, mode: "after_download", linkTriggered: false };
   const url = new URL("https://admin-stats/membership");
   if (userId !== undefined) url.searchParams.set("user", String(userId));
-  const response = await env.ADMIN_STATS.getByName("global").fetch(url.toString());
+  const response = await env.ADMIN_STATS.getByName("global").fetch(url.toString(), linkRequest ? {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ triggerLink: true, userId }),
+  } : undefined);
   if (!response.ok) throw new Error("MEMBERSHIP_STATE_UNAVAILABLE");
-  return await response.json() as MembershipState;
+  const state = await response.json() as MembershipState;
+  return { ...state, mode: MEMBERSHIP_MODES.includes(state.mode) ? state.mode : "after_download", linkTriggered: !!state.linkTriggered };
 }
 
 export async function setMembershipEnabled(env: AdminStatsEnv, enabled: boolean): Promise<void> {
@@ -20,6 +29,32 @@ export async function setMembershipEnabled(env: AdminStatsEnv, enabled: boolean)
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled }),
   });
   if (!response.ok) throw new Error("MEMBERSHIP_SETTING_UNAVAILABLE");
+}
+
+export async function setMembershipMode(env: AdminStatsEnv, mode: MembershipMode): Promise<void> {
+  const response = await env.ADMIN_STATS.getByName("global").fetch("https://admin-stats/membership", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode }),
+  });
+  if (!response.ok) throw new Error("MEMBERSHIP_SETTING_UNAVAILABLE");
+}
+
+function requiresMembership(state: MembershipState): boolean {
+  return state.enabled && (state.mode === "start" || state.downloaded || (state.mode === "first_link" && state.linkTriggered));
+}
+
+// Only download links/commands activate first-link mode. Plain text and /start do not.
+function isDownloadRequest(message: any): boolean {
+  const text = String(message?.text || message?.caption || "");
+  if (/^\/(?:music|live|replay|audio|playlist|instastory|instapost|findmusic|shazam)(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) return true;
+  for (const raw of text.match(/https?:\/\/[^\s<>"']+/gi) || []) {
+    try {
+      const host = new URL(raw).hostname.toLowerCase().replace(/^www\./, "");
+      if (["instagram.com", "youtube.com", "youtu.be", "x.com", "twitter.com", "tiktok.com", "pinterest.com", "pin.it", "soundcloud.com", "aparat.com", "pornhub.com"].some(domain => host === domain || host.endsWith(`.${domain}`))) return true;
+    } catch { /* Invalid links do not consume the first-link trigger. */ }
+  }
+  return !!(message?.voice || message?.audio || message?.video || message?.video_note ||
+    /^(audio|video)\//i.test(message?.document?.mime_type || "") ||
+    /\.(mp3|m4a|wav|ogg|opus|flac|aac|aiff|mp4|mov|mkv|webm|avi|wma)$/i.test(message?.document?.file_name || ""));
 }
 
 async function telegram(env: MembershipEnv, method: string, payload: Record<string, unknown>): Promise<any> {
@@ -68,7 +103,7 @@ export function membershipPrompt(channel = MEMBERSHIP_CHANNEL): Record<string, u
 export async function notifyFirstDownload(env: MembershipEnv, userId: number): Promise<void> {
   if (!env.BOT_TOKEN || userId === ADMIN_USER_ID) return;
   const state = await membershipState(env, userId);
-  if (!state.enabled || !state.downloaded || await isChannelMember(env, userId)) return;
+  if (!state.enabled || state.mode !== "after_download" || !state.downloaded || await isChannelMember(env, userId)) return;
   await telegram(env, "sendMessage", { chat_id: userId, ...membershipPrompt(env.MEMBERSHIP_CHANNEL || MEMBERSHIP_CHANNEL) });
 }
 
@@ -87,7 +122,11 @@ export async function enforceMembership(request: Request, env: MembershipEnv, ct
   let member = false;
   try {
     state = await membershipState(env, actor.id);
-    if (state.enabled && state.downloaded) member = await isChannelMember(env, actor.id);
+    if (state.enabled && state.mode === "first_link" && !state.linkTriggered &&
+        (isDownloadRequest(update.message) || /^(?:ytq|msc|iga|igm|igs|soa)\|/.test(callback?.data || ""))) {
+      state = await membershipState(env, actor.id, true);
+    }
+    if (requiresMembership(state) || (checking && state.enabled)) member = await isChannelMember(env, actor.id);
   } catch (error) {
     if (callback?.id) await telegram(env, "answerCallbackQuery", {
       callback_query_id: callback.id, _errorUserId: callback.from?.id, _errorDetail: String(error), text: "بررسی عضویت فعلاً ممکن نیست؛ کمی بعد دوباره امتحان کن.", show_alert: true,
@@ -96,7 +135,7 @@ export async function enforceMembership(request: Request, env: MembershipEnv, ct
       _errorDetail: String(error), text: "بررسی عضویت فعلاً ممکن نیست؛ کمی بعد دوباره امتحان کن." });
     return Response.json({ ok: true });
   }
-  if (!state.enabled || !state.downloaded || member) {
+  if (!requiresMembership(state) || member) {
     if (!checking) return null;
     await telegram(env, "answerCallbackQuery", { callback_query_id: callback.id, _errorUserId: callback.from?.id, text: "✅ دسترسی فعاله؛ درخواستت رو بفرست." });
     // Shared group prompts stay available to other users; confirmation is private.

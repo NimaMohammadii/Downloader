@@ -1896,7 +1896,7 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
   if (!target) {
     await telegramCall(env.BOT_TOKEN, "sendMessage", {
       chat_id: message.chat.id,
-      text: "یه لینک معتبر Instagram بفرست 👇",
+      text: /https?:\/\//i.test(text) ? "❌ این لینک معتبر یا قابل پشتیبانی نیست؛ لینک کامل و مستقیم محتوا را بفرست." : "یه لینک معتبر Instagram بفرست 👇",
       reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
     });
     return Response.json({ ok: true });

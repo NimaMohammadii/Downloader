@@ -401,7 +401,20 @@ def job_timeout(seconds: float) -> float:
 
 
 ADMIN_USER_ID = 7138547731
-PUBLIC_ERROR_MESSAGE = "⚠️ مثل اینکه خطایی پیش اومده، در حال بررسی و پیگیری است، به زودی رفع می‌شود."
+PUBLIC_ERROR_CATALOG = json.loads(Path(__file__).with_name("public_errors.json").read_text())
+PUBLIC_ERROR_MESSAGE = PUBLIC_ERROR_CATALOG[-1]["message"]
+PUBLIC_ERROR_MESSAGES = {row["message"] for row in PUBLIC_ERROR_CATALOG}
+
+
+def public_error(text: str, detail: str = "") -> dict[str, Any]:
+    known = next((row for row in PUBLIC_ERROR_CATALOG if row["message"] == text), None)
+    if known:
+        return known
+    value = re.sub(r"https?://\S+", "[URL]", detail + "\n" + text, flags=re.I)
+    value = re.sub(r"(?:token|secret|cookie|sessionid|authorization|api_hash)\s*[:=]\s*\S+", "[REDACTED]", value, flags=re.I)
+    return next((row for row in PUBLIC_ERROR_CATALOG if any(re.search(pattern, value, re.I) for pattern in row["patterns"])), PUBLIC_ERROR_CATALOG[-1])
+
+
 ERROR_NOTICE_PATTERN = re.compile(r"(?:^|\n)\s*(?:❌|⚠)|ناموفق|ممکن نیست|نامعتبر|دکمه برای|تأیید نشد|ارسال نشد|کامل نشد|معتبر نیست|منقضی|برای شما نیست|درخواست‌کننده|محدود کرده|موقتاً.*(?:متوقف|محدود)|قابل دسترسی.*ندارد|قبلاً.*(?:شروع|تمام)|آمادهٔ ارسال نیست|صف متوقف شد")
 
 
@@ -410,21 +423,22 @@ def private_error_payload(method: str, payload: dict[str, Any]) -> dict[str, Any
     result.pop("_publicErrorFrame", None)
     text = payload.get("text")
     if (payload.get("_publicErrorFrame") is True and method in {"sendMessageDraft", "editMessageText"}
-            and isinstance(text, str) and PUBLIC_ERROR_MESSAGE.startswith(text)):
+            and isinstance(text, str) and any(row["message"].startswith(text) for row in PUBLIC_ERROR_CATALOG)):
         return result
     if (method in {"sendMessage", "sendMessageDraft", "editMessageText", "answerCallbackQuery"}
             and isinstance(text, str)
-            and (text == PUBLIC_ERROR_MESSAGE or
+            and (text in PUBLIC_ERROR_MESSAGES or
                  (str(payload.get("chat_id")) != str(ADMIN_USER_ID) and ERROR_NOTICE_PATTERN.search(text)))):
-        result["text"] = PUBLIC_ERROR_MESSAGE
+        notice = public_error(text)
+        result["text"] = notice["message"]
         for key in ("entities", "parse_mode", "reply_markup", "link_preview_options"):
             result.pop(key, None)
         if method != "answerCallbackQuery":
             result["entities"] = [{"type": "custom_emoji", "offset": 0, "length": 2,
                                    "custom_emoji_id": "5447644880824181073"}]
-            for phrase in ("خطایی پیش اومده", "در حال بررسی و پیگیری", "به زودی رفع می‌شود"):
-                offset = PUBLIC_ERROR_MESSAGE.index(phrase)
-                result["entities"].append({"type": "bold", "offset": len(PUBLIC_ERROR_MESSAGE[:offset].encode("utf-16-le")) // 2,
+            for phrase in notice["bold"]:
+                offset = notice["message"].index(phrase)
+                result["entities"].append({"type": "bold", "offset": len(notice["message"][:offset].encode("utf-16-le")) // 2,
                                            "length": len(phrase.encode("utf-16-le")) // 2})
     return result
 
@@ -500,7 +514,7 @@ def telegram_custom_emoji(method: str, payload: dict[str, Any], *, form: bool = 
 def telegram_text_motion(token: str, method: str, payload: dict[str, Any]) -> None:
     payload = private_error_payload(method, payload)
     text = payload.get("text")
-    editing = method == "editMessageText" and text == PUBLIC_ERROR_MESSAGE and bool(payload.get("message_id"))
+    editing = method == "editMessageText" and text in PUBLIC_ERROR_MESSAGES and bool(payload.get("message_id"))
     if (method != "sendMessage" and not editing) or not isinstance(text, str) or len(text) < 2 or payload.get("parse_mode"):
         return
     if payload.get("inline_message_id") or payload.get("business_connection_id"):
@@ -537,7 +551,7 @@ def telegram_text_motion(token: str, method: str, payload: dict[str, Any]) -> No
             prefix = "".join(chars[:end])
             if not prefix.strip():
                 continue
-            body = {"chat_id": chat, "text": prefix, "_publicErrorFrame": text == PUBLIC_ERROR_MESSAGE}
+            body = {"chat_id": chat, "text": prefix, "_publicErrorFrame": text in PUBLIC_ERROR_MESSAGES}
             if editing:
                 body["message_id"] = payload["message_id"]
             else:

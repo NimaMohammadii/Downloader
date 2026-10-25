@@ -20,6 +20,7 @@ RUN python3 -m venv --system-site-packages /opt/venv \
     && /opt/venv/bin/python -c 'import requests, telethon, cryptg, shazamio, shazamio_core, gallery_dl, yt_dlp, yt_dlp_ejs; from yt_dlp.networking._curlcffi import CurlCFFIRH; assert CurlCFFIRH._SUPPORTED_IMPERSONATE_TARGET_MAP, "Browser impersonation unavailable"'
 
 WORKDIR /app
+COPY container/public_errors.json /app/public_errors.json
 COPY container/youtube_app.py /app/youtube_app.py
 COPY container/youtube_pipeline.py /app/youtube_pipeline.py
 COPY container/pornhub.py /app/pornhub.py

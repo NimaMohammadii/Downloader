@@ -1,4 +1,4 @@
-import { membershipState, setMembershipEnabled } from "./membership";
+import { membershipState, setMembershipEnabled, setMembershipMode, MEMBERSHIP_MODES, MEMBERSHIP_MODE_LABELS, type MembershipMode } from "./membership";
 import downloaderWorker from "./entry";
 import {
   telegramTextMotion,
@@ -221,13 +221,14 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
       return Response.json({ ok: true });
     }
 
-    const membershipMatch = /^admin:membership(?::(enable|disable))?$/.exec(data);
+    const membershipMatch = /^admin:membership(?::(enable|disable|after_download|start|first_link))?$/.exec(data);
     if (membershipMatch) {
-      if (membershipMatch[1]) await setMembershipEnabled(env, membershipMatch[1] === "enable");
+      if (membershipMatch[1] === "enable" || membershipMatch[1] === "disable") await setMembershipEnabled(env, membershipMatch[1] === "enable");
+      else if (membershipMatch[1]) await setMembershipMode(env, membershipMatch[1] as MembershipMode);
       const state = await membershipState(env);
       const title = "عضویت اجباری چنل";
       const status = `وضعیت: ${state.enabled ? "فعال ✅" : "غیرفعال"}`;
-      const text = `${title}\n\n${status}\nپس از اولین دانلود موفق، ادامهٔ استفاده نیازمند عضویت در چنل است.`;
+      const text = `${title}\n\n${status}\nزمان درخواست عضویت: ${MEMBERSHIP_MODE_LABELS[state.mode]}\nزمان دلخواه را از دکمه‌های زیر انتخاب کن.`;
       await telegramCall(env.BOT_TOKEN, "editMessageText", {
         chat_id: message.chat.id, message_id: message.message_id, text,
         entities: [{ type: "bold", offset: 0, length: title.length },
@@ -235,6 +236,7 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
         reply_markup: { inline_keyboard: [
           [{ text: state.enabled ? "غیرفعال کردن عضویت اجباری" : "فعال کردن عضویت اجباری",
             callback_data: `admin:membership:${state.enabled ? "disable" : "enable"}` }],
+          ...MEMBERSHIP_MODES.map(mode => [{ text: `${state.mode === mode ? "✅ " : ""}${MEMBERSHIP_MODE_LABELS[mode]}`, callback_data: `admin:membership:${mode}` }]),
           [{ text: "بازگشت به پنل", callback_data: "admin:stats" }],
         ] },
       });

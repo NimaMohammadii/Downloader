@@ -13,10 +13,10 @@ test('details reach only the private admin chat, including admin requests in gro
   const calls=[];
   globalThis.fetch=async(url,init)=>{ calls.push({url,body:JSON.parse(init.body)});return Response.json({ok:true}); };
   for(const chat of [42,-123,ADMIN_USER_ID]) {
-    const body={chat_id:chat,message_id:8,text:'❌ INSTAGRAM_LOGIN_REQUIRED',entities:[{type:'bold',offset:0,length:3}],reply_markup:{inline_keyboard:[]}};
+    const body={chat_id:chat,message_id:8,text:'❌ unknown internal failure',entities:[{type:'bold',offset:0,length:3}],reply_markup:{inline_keyboard:[]}};
     await telegramTextMotion('fake-token','editMessageText',body);
     const outgoing=telegramCustomEmoji('editMessageText',body);
-    assert.equal(outgoing.text,chat===ADMIN_USER_ID?'❌ INSTAGRAM_LOGIN_REQUIRED':PUBLIC_ERROR_MESSAGE);
+    assert.equal(outgoing.text,chat===ADMIN_USER_ID?'❌ unknown internal failure':PUBLIC_ERROR_MESSAGE);
     if(chat!==ADMIN_USER_ID) assert.equal(outgoing.reply_markup,undefined);
   }
   assert.ok(calls.length > 0);
@@ -43,7 +43,7 @@ test('callbacks preserve actor visibility through preparation without notificati
     const original={callback_query_id:'x',_errorUserId:user,text:'شروع دانلود ناموفق بود.'};
     await telegramTextMotion('fake-token','answerCallbackQuery',original);
     const body=telegramCustomEmoji('answerCallbackQuery',original);
-    assert.equal(body.text,user===ADMIN_USER_ID?'شروع دانلود ناموفق بود.':PUBLIC_ERROR_MESSAGE);
+    assert.equal(body.text,user===ADMIN_USER_ID?'شروع دانلود ناموفق بود.':'⚠️ دریافت یا آماده‌سازی این فایل انجام نشد؛ لینک را بررسی کن و کمی بعد دوباره بفرست.');
     assert.equal(body._errorUserId,undefined);
   }
   assert.equal(calls.length,0);
@@ -51,7 +51,7 @@ test('callbacks preserve actor visibility through preparation without notificati
 
 test('partial failure and retry notices are hidden; successful media captions remain intact',()=>{
   for(const text of ['🎵 playlist\n❌ دریافت نشد: 2','⏳ تلگرام موقتاً ارسال را متوقف کرده','این فهرست منقضی یا نامعتبر است'])
-    assert.equal(privateErrorPayload('editMessageText',{chat_id:42,text}).text,PUBLIC_ERROR_MESSAGE);
+    assert.notEqual(privateErrorPayload('editMessageText',{chat_id:42,text}).text,text);
   const body={chat_id:42,caption:'❌ a song title',video:'file'};
   assert.deepEqual(privateErrorPayload('sendVideo',body),body);
   assert.equal(privateErrorPayload('sendMessage',{chat_id:42,text:'✅ فایل ارسال شد'}).text,'✅ فایل ارسال شد');

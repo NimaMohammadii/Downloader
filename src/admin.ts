@@ -1,10 +1,11 @@
+import { PUBLIC_ERROR_MESSAGE, isPublicErrorMessage, isPublicErrorFrame, publicError } from "./public-errors";
+export { PUBLIC_ERROR_MESSAGE } from "./public-errors";
 import { BroadcastManager } from "./broadcast";
 import { DurableObject } from "cloudflare:workers";
 
 // Error visibility is enforced before both drafts and final Telegram messages.
-export const PUBLIC_ERROR_MESSAGE = "⚠️ مثل اینکه خطایی پیش اومده، در حال بررسی و پیگیری است، به زودی رفع می‌شود.";
 export function isErrorNotice(text: string): boolean {
-  return text !== PUBLIC_ERROR_MESSAGE && /(?:^|\n)\s*(?:❌|⚠)|ناموفق|ممکن نیست|نامعتبر|دکمه برای|تأیید نشد|ارسال نشد|کامل نشد|معتبر نیست|معتبر نیستند|منقضی|برای شما نیست|درخواست‌کننده|محدود کرده|موقتاً.*(?:متوقف|محدود)|قابل دسترسی.*ندارد|قبلاً.*(?:شروع|تمام)|آمادهٔ ارسال نیست|صف متوقف شد/.test(text);
+  return !isPublicErrorMessage(text) && /(?:^|\n)\s*(?:❌|⚠)|ناموفق|ممکن نیست|نامعتبر|دکمه برای|تأیید نشد|ارسال نشد|کامل نشد|معتبر نیست|معتبر نیستند|منقضی|برای شما نیست|درخواست‌کننده|محدود کرده|موقتاً.*(?:متوقف|محدود)|قابل دسترسی.*ندارد|قبلاً.*(?:شروع|تمام)|آمادهٔ ارسال نیست|صف متوقف شد/.test(text);
 }
 export function privateErrorPayload(method: string, payload: Record<string, unknown>): Record<string, unknown> {
   const result = { ...payload };
@@ -12,22 +13,23 @@ export function privateErrorPayload(method: string, payload: Record<string, unkn
   delete result._errorDetail;
   delete result._publicErrorFrame;
   if (payload._publicErrorFrame === true && /^(sendMessageDraft|editMessageText)$/.test(method) &&
-      typeof payload.text === "string" && PUBLIC_ERROR_MESSAGE.startsWith(payload.text)) return result;
+      typeof payload.text === "string" && isPublicErrorFrame(payload.text)) return result;
   if (!/^(sendMessage|sendMessageDraft|editMessageText|answerCallbackQuery)$/.test(method) ||
-      typeof payload.text !== "string" || (payload.text !== PUBLIC_ERROR_MESSAGE && !isErrorNotice(payload.text) && !payload._errorDetail)) return result;
+      typeof payload.text !== "string" || (!isPublicErrorMessage(payload.text) && !isErrorNotice(payload.text) && !payload._errorDetail)) return result;
   // A group is never an admin-only destination, even when the requester is admin.
   const admin = method === "answerCallbackQuery" ? Number(payload._errorUserId) === ADMIN_USER_ID
     : Number(payload.chat_id) === ADMIN_USER_ID;
-  if (admin && payload.text !== PUBLIC_ERROR_MESSAGE) {
+  if (admin && !isPublicErrorMessage(payload.text)) {
     if (payload._errorDetail && method !== "answerCallbackQuery") result.text = `${payload.text}\n${payload._errorDetail}`;
     return result;
   }
-  result.text = PUBLIC_ERROR_MESSAGE;
+  const notice = publicError(payload.text, String(payload._errorDetail || ""));
+  result.text = notice.message;
   for (const key of ["entities", "parse_mode", "reply_markup", "link_preview_options"]) delete result[key];
   if (method !== "answerCallbackQuery") result.entities = [
     { type: "custom_emoji", offset: 0, length: 2, custom_emoji_id: "5447644880824181073" },
-    ...["خطایی پیش اومده", "در حال بررسی و پیگیری", "به زودی رفع می‌شود"].map(text => ({
-      type: "bold", offset: PUBLIC_ERROR_MESSAGE.indexOf(text), length: text.length,
+    ...notice.bold.map(text => ({
+      type: "bold", offset: notice.message.indexOf(text), length: text.length,
     })),
   ];
   return result;
@@ -98,7 +100,7 @@ export async function telegramTextMotion(
   token: string, method: string, payload: Record<string, unknown>, options: { animateEdits?: boolean } = {},
 ): Promise<void> {
   prepareErrorNotice(method, payload);
-  const editing = method === "editMessageText" && (options.animateEdits || payload.text === PUBLIC_ERROR_MESSAGE) && Number.isSafeInteger(payload.message_id);
+  const editing = method === "editMessageText" && (options.animateEdits || isPublicErrorMessage(payload.text)) && Number.isSafeInteger(payload.message_id);
   if ((method !== "sendMessage" && !editing) || typeof payload.text !== "string" || payload.parse_mode ||
       payload.text.length < 2 || payload.inline_message_id || payload.business_connection_id) return;
   const chat = Number(payload.chat_id);
@@ -131,8 +133,8 @@ export async function telegramTextMotion(
         .filter(e => Number(e.offset) < text.length && (e.type !== "custom_emoji" || Number(e.offset) + Number(e.length) <= text.length))
         .map(e => ({ ...e, length: Math.min(Number(e.length), text.length - Number(e.offset)) })) : undefined;
       await post(editing ? "editMessageText" : "sendMessageDraft", editing
-        ? { chat_id: chat, message_id: payload.message_id, text, entities, reply_markup: payload.reply_markup, _publicErrorFrame: payload.text === PUBLIC_ERROR_MESSAGE }
-        : { chat_id: chat, message_thread_id: payload.message_thread_id, draft_id, text, entities, _publicErrorFrame: payload.text === PUBLIC_ERROR_MESSAGE });
+        ? { chat_id: chat, message_id: payload.message_id, text, entities, reply_markup: payload.reply_markup, _publicErrorFrame: isPublicErrorMessage(payload.text) }
+        : { chat_id: chat, message_thread_id: payload.message_thread_id, draft_id, text, entities, _publicErrorFrame: isPublicErrorMessage(payload.text) });
       // Wait after acknowledgement: network time must not consume the reveal time.
       // Persisting immediately would replace the draft before its animation finishes.
       const pause = editing ? 450 : frame === 0 ? 120 : Math.min(1000, Math.max(500, chars.length * 12));
@@ -520,6 +522,8 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       INSERT OR IGNORE INTO membership_access(user_id, first_download_at)
         SELECT user_id, MIN(created_at) FROM download_history WHERE delivered > 0 GROUP BY user_id;
       INSERT OR IGNORE INTO counters(key, value) VALUES ('membership_enabled', 1);
+      INSERT OR IGNORE INTO counters(key, value) VALUES ('membership_mode', 0);
+      CREATE TABLE IF NOT EXISTS membership_link_triggers (user_id TEXT PRIMARY KEY);
       INSERT OR IGNORE INTO counters(key, value) VALUES ('apify_account', 1);
       CREATE TABLE IF NOT EXISTS instagram_api_extractions (
         event_key TEXT NOT NULL, account INTEGER NOT NULL, recorded_at INTEGER NOT NULL,
@@ -708,15 +712,25 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
     if (url.pathname === "/membership") {
       const sql = this.ctx.storage.sql;
       if (request.method === "POST") {
-        const payload = await request.json() as { enabled?: boolean };
-        if (typeof payload.enabled !== "boolean") return new Response("Invalid setting", { status: 400 });
-        sql.exec("UPDATE counters SET value = ? WHERE key = 'membership_enabled'", payload.enabled ? 1 : 0);
+        const payload = await request.json() as { enabled?: boolean; mode?: string; triggerLink?: boolean; userId?: number };
+        const modes = ["after_download", "start", "first_link"];
+        if ((payload.enabled !== undefined && typeof payload.enabled !== "boolean") ||
+            (payload.mode !== undefined && !modes.includes(payload.mode)) ||
+            (payload.triggerLink !== undefined && (payload.triggerLink !== true || !Number.isSafeInteger(payload.userId) || payload.userId! <= 0)) ||
+            (payload.enabled === undefined && payload.mode === undefined && !payload.triggerLink)) return new Response("Invalid setting", { status: 400 });
+        this.ctx.storage.transactionSync(() => {
+          if (payload.enabled !== undefined) sql.exec("UPDATE counters SET value = ? WHERE key = 'membership_enabled'", payload.enabled ? 1 : 0);
+          if (payload.mode !== undefined) sql.exec("UPDATE counters SET value = ? WHERE key = 'membership_mode'", modes.indexOf(payload.mode));
+          if (payload.triggerLink) sql.exec("INSERT OR IGNORE INTO membership_link_triggers(user_id) VALUES (?)", String(payload.userId));
+        });
       } else if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
       const user = url.searchParams.get("user");
       if (user !== null && !/^[1-9]\d{0,15}$/.test(user)) return new Response("Invalid user", { status: 400 });
       const enabled = sql.exec("SELECT value FROM counters WHERE key = 'membership_enabled'").one();
       const access = user ? sql.exec("SELECT user_id FROM membership_access WHERE user_id = ?", user).toArray() : [];
-      return Response.json({ enabled: asNumber(enabled.value) === 1, downloaded: access.length > 0 });
+      const mode = ["after_download", "start", "first_link"][asNumber(sql.exec("SELECT value FROM counters WHERE key = 'membership_mode'").one().value)] || "after_download";
+      const triggered = user ? sql.exec("SELECT user_id FROM membership_link_triggers WHERE user_id = ?", user).toArray() : [];
+      return Response.json({ enabled: asNumber(enabled.value) === 1, downloaded: access.length > 0, mode, linkTriggered: triggered.length > 0 });
     }
 
     if (request.method === "POST" && url.pathname === "/file-cache") {

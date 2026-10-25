@@ -63,7 +63,7 @@ function fixture() {
 test('only delivered media consumes the trial; settings and first-download state survive restart', async () => {
   const f = fixture();
   try {
-    assert.deepEqual(await api.membershipState(f.env, 42), { enabled: true, downloaded: false });
+    assert.deepEqual(await api.membershipState(f.env, 42), { enabled: true, downloaded: false, mode: "after_download", linkTriggered: false });
     for (const status of ['pending', 'failed', 'results']) {
       await f.request('/download', { ...download, key: status, status, delivered: 0 });
       assert.equal((await api.membershipState(f.env, 42)).downloaded, false);
@@ -73,7 +73,7 @@ test('only delivered media consumes the trial; settings and first-download state
     assert.equal((await (await f.request('/download', download)).json()).firstDownload, false);
     await api.setMembershipEnabled(f.env, false);
     f.restart();
-    assert.deepEqual(await api.membershipState(f.env, 42), { enabled: false, downloaded: true });
+    assert.deepEqual(await api.membershipState(f.env, 42), { enabled: false, downloaded: true, mode: "after_download", linkTriggered: false });
     await api.setMembershipEnabled(f.env, true);
     assert.equal((await api.membershipState(f.env, 42)).enabled, true);
     await f.request('/download', { ...download, key: 'partial', userId: 43, status: 'partial' });
@@ -156,7 +156,7 @@ test('verification failures block work without falsely claiming the user is not 
     f.setUnavailable(true);
     await api.worker.fetch(f.webhook('https://youtube.com/watch?v=abcdefghijk'), f.env, {});
     assert.equal(f.jobs.length, 0);
-    assert.match(f.calls.at(-1).body.text, /در حال بررسی و پیگیری/);
+    assert.match(f.calls.at(-1).body.text, /بررسی عضویت فعلاً ممکن نیست/);
     assert.ok(!f.calls.some(c => c.body.chat_id === 7138547731), "user errors must not notify the admin");
     assert.equal(f.calls.at(-1).body.reply_markup, undefined);
     f.calls.length = 0;
@@ -312,4 +312,84 @@ test('panel text motion progressively reveals edits without splitting graphemes 
     }
     assert.ok(calls.at(-1).body.text.length < text.length);
   } finally { globalThis.fetch = previousFetch; globalThis.setTimeout = previousTimeout; }
+});
+
+
+test('start mode gates the first start and prevents bypass by sending a direct link', async()=>{
+  const f=fixture();
+  try {
+    await api.setMembershipMode(f.env,'start');
+    for(const text of ['/start','https://youtube.com/watch?v=abcdefghijk']) {
+      f.calls.length=0;
+      assert.ok(await api.enforceMembership(f.webhook(text),f.env));
+      assert.ok(f.calls.some(c=>c.method==='getChatMember'));
+      assert.ok(f.calls.some(c=>c.body.reply_markup?.inline_keyboard?.flat().some(b=>b.callback_data==='membership:check')));
+    }
+    assert.equal(f.jobs.length,0);
+    f.setMember({status:'member'});
+    assert.equal(await api.enforceMembership(f.webhook('/start'),f.env),null);
+    f.setMember({status:'left'});
+    assert.ok(await api.enforceMembership(f.webhook('/start'),f.env));
+    assert.equal(await api.enforceMembership(f.webhook('/start',7138547731),f.env),null);
+  } finally {f.close();}
+});
+
+test('first-link mode leaves start/help open, gates the first link, and remains durable after restart',async()=>{
+  const f=fixture();
+  try {
+    await api.setMembershipMode(f.env,'first_link');
+    assert.equal(await api.enforceMembership(f.webhook('/start'),f.env),null);
+    assert.equal(await api.enforceMembership(f.webhook('سلام'),f.env),null);
+    assert.equal((await api.membershipState(f.env,42)).linkTriggered,false);
+    assert.ok(await api.enforceMembership(f.webhook('https://instagram.com/reel/example/'),f.env));
+    assert.equal((await api.membershipState(f.env,42)).linkTriggered,true);
+    f.restart();
+    assert.equal((await api.membershipState(f.env,42)).mode,'first_link');
+    assert.ok(await api.enforceMembership(f.webhook('/start'),f.env));
+    f.setMember({status:'member'});
+    assert.equal(await api.enforceMembership(f.webhook('https://youtu.be/abcdefghijk'),f.env),null);
+    f.setMember({status:'left'});
+    assert.ok(await api.enforceMembership(f.webhook('https://youtu.be/abcdefghijk'),f.env));
+    await api.setMembershipEnabled(f.env,false);
+    assert.equal(await api.enforceMembership(f.webhook('/start'),f.env),null);
+    assert.equal((await api.membershipState(f.env,42)).mode,'first_link');
+    await api.setMembershipEnabled(f.env,true);
+    assert.ok(await api.enforceMembership(f.webhook('/start'),f.env));
+  } finally {f.close();}
+});
+
+test('first-link mode gates old download callbacks and link requests across supported services',async()=>{
+  const f=fixture();
+  try {
+    await api.setMembershipMode(f.env,'first_link');
+    for(const [i,text] of ['https://x.com/user/status/123','/music Hello','https://pin.it/example','https://aparat.com/v/test'].entries())
+      assert.ok(await api.enforceMembership(f.webhook(text,100+i),f.env));
+    for (const [i,data] of ['ytq|old','soa|old','igm|old'].entries())
+      assert.ok(await api.enforceMembership(f.webhook('',200+i,data),f.env));
+    assert.equal(await api.enforceMembership(f.webhook('https://unrelated.example',301),f.env),null);
+    assert.equal((await api.membershipState(f.env,301)).linkTriggered,false);
+  } finally {f.close();}
+});
+
+test('mode selection is admin-only, persists independently of enablement, and rejects invalid settings',async()=>{
+  const f=fixture();
+  try {
+    await api.worker.fetch(f.webhook('',42,'admin:membership:start'),f.env,{});
+    assert.equal((await api.membershipState(f.env)).mode,'after_download');
+    for(const mode of ['start','first_link','after_download']) {
+      await api.worker.fetch(f.webhook('',7138547731,`admin:membership:${mode}`),f.env,{});
+      assert.equal((await api.membershipState(f.env)).mode,mode);
+      const panel=f.calls.filter(c=>c.method==='editMessageText').at(-1).body;
+      const choices=panel.reply_markup.inline_keyboard.flat().filter(b=>/admin:membership:(start|first_link|after_download)$/.test(b.callback_data||''));
+      assert.equal(choices.length,3);
+      assert.equal(choices.find(b=>b.callback_data===`admin:membership:${mode}`).icon_custom_emoji_id,'5352871660024246779');
+    }
+    const before=await api.membershipState(f.env);
+    for(const body of [{mode:'bad'},{enabled:false,mode:'bad'},{triggerLink:true,userId:-1}])
+      assert.equal((await f.request('/membership',body)).status,400);
+    assert.deepEqual(await api.membershipState(f.env),before);
+    await api.setMembershipMode(f.env,'start');
+    await api.recordDownload(f.env,download);
+    assert.ok(!f.calls.some(c=>c.method==='sendMessage' && c.body.reply_markup?.inline_keyboard?.flat().some(b=>b.callback_data==='membership:check')));
+  } finally {f.close();}
 });
