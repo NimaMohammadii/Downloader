@@ -5,7 +5,7 @@ import {
   type WorkflowEvent,
   type WorkflowStep,
 } from "cloudflare:workers";
-import storyWorker, { startInstagramStoryRun, readInstagramStoryRun, sendResolvedStory, parseStoryTarget, type StoryTarget, instagramProfileStories, parseInstagramProfileCommand, parseInstagramVideoTarget, parseInstagramAudioTarget, resolveInstagramVideo, instagramVideoErrorText, type InstagramVideoTarget, type InstagramVideoSource } from "./story-main";
+import storyWorker, { resolveInstagramSessionPost, instagramSessionFailure, startInstagramStoryRun, readInstagramStoryRun, sendResolvedStory, parseStoryTarget, type StoryTarget, instagramProfileStories, parseInstagramProfileCommand, parseInstagramVideoTarget, parseInstagramAudioTarget, resolveInstagramVideo, instagramVideoErrorText, type InstagramVideoTarget, type InstagramVideoSource } from "./story-main";
 import { instagramProfilePage, instagramProfilePostMedia, instagramProfileErrorText,
   resolveInstagramPostForWorkflow, sendInstagramPostDirect, instagramPostFriendlyError,
   type InstagramPostUpload } from "./index";
@@ -540,11 +540,28 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
     return this.runYoutube(job, step);
   }
 
+  private async notifyInstagramSessionFailure(job: YoutubeDownloadJob, step: WorkflowStep,
+    providerCode: string, failure: ReturnType<typeof instagramSessionFailure>): Promise<void> {
+    await step.do("notify admin Instagram session failure once", {
+      retries: { limit: 0, delay: "1 second" }, timeout: "30 seconds",
+    }, async () => {
+      try {
+        await telegramCall(this.env.BOT_TOKEN, "sendMessage", { chat_id: ADMIN_USER_ID,
+          disable_notification: false, link_preview_options: { is_disabled: true },
+          text: `⚠️ دانلود اینستاگرام با سشن حساب ناموفق بود\n\nلینک: https://www.instagram.com/p/${job.instagramPostRequest!.shortcode}/\nشناسه درخواست: ${job.id}\nسرویس اول: ${job.instagramApi?.provider || (job.apifyAccount !== undefined || this.env.APIFY_API_TOKEN?.trim() ? "apify" : "brightdata")}\nخطای سرویس: ${providerCode}\nخطای سشن: ${failure.code}\n${failure.status !== undefined ? `HTTP: ${failure.status}\n` : ""}${failure.endpoint ? `مسیر: ${failure.endpoint}\n` : ""}${failure.upstreamCode ? `پاسخ اینستاگرام: ${failure.upstreamCode}\n` : ""}\n${failure.message}` });
+      } catch { console.warn("instagram session admin notification failed", { jobId: job.id }); }
+      return true;
+    });
+  }
+
   // Resolve public posts inside the durable Workflow. The Telegram webhook
   // already returned, so Apify can finish without depending on that socket.
   // A no-retry paid step and a stable Workflow ID prevent double billing when
   // Telegram re-delivers an update or the Worker is restarted.
+
   private async runInstagramPostRequest(job: YoutubeDownloadJob, step: WorkflowStep): Promise<void> {
+    let sessionUsed = false;
+    let providerCode = "INSTAGRAM_NO_MEDIA";
     try {
       const providerEnv = this.instagramEnvironment(job);
       // Creating the Telegram status in a checkpointed step prevents duplicate
@@ -560,11 +577,43 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         return status.message_id;
       });
       job.statusMessageId = statusId;
-      const media = await step.do("resolve public Instagram post once", {
+      const primary = await step.do("resolve public Instagram post once", {
         // A TopAPI run can take nearly five minutes. Never retry a paid extraction.
         retries: { limit: 0, delay: "1 second" }, timeout: "8 minutes",
-      }, () => resolveInstagramPostForWorkflow(job.url, job.instagramPostRequest!.shortcode, providerEnv));
-      if (!media.length) throw new Error("INSTAGRAM_NO_MEDIA");
+      }, async () => {
+        try { return { media: await resolveInstagramPostForWorkflow(job.url, job.instagramPostRequest!.shortcode, providerEnv) }; }
+        catch (error) {
+          const detail = error instanceof Error ? error.message : "";
+          return { error: /^(?:TOPAPI|BRIGHTDATA|INSTAGRAM)_[A-Z0-9_]+$/.test(detail) ? detail : "INSTAGRAM_PROVIDER_FAILED" };
+        }
+      });
+      let media = primary.media;
+      if (!media?.length) {
+        sessionUsed = true;
+        providerCode = primary.error || providerCode;
+        // One personal-account attempt after the chosen provider fails. Neither
+        // the paid provider nor a rejected session is retried automatically.
+        const fallback = await step.do("resolve Instagram post with saved session once", {
+          retries: { limit: 0, delay: "1 second" }, timeout: "2 minutes",
+        }, async () => {
+          try {
+            const post = await resolveInstagramSessionPost(job.instagramPostRequest!.shortcode, this.env);
+            return { media: await instagramProfilePostMedia(post, this.env) };
+          } catch (error) { return { failure: instagramSessionFailure(error) }; }
+        });
+        media = fallback.media;
+        if (fallback.failure || !media?.length) {
+          const failure = fallback.failure || instagramSessionFailure(new Error("INSTAGRAM_NO_MEDIA"));
+          console.warn("instagram session fallback failed", { jobId: job.id, providerCode: primary.error,
+            code: failure.code, status: failure.status, endpoint: failure.endpoint, upstreamCode: failure.upstreamCode });
+          await this.notifyInstagramSessionFailure(job, step, primary.error || "INSTAGRAM_NO_MEDIA", failure);
+          await step.do("track Instagram session fallback failure", () => trackJob(this.env, job, "failed", { detail: failure.code }));
+          await step.do("report Instagram session fallback failure", { retries: { limit: 0, delay: "1 second" } }, () =>
+            safeTelegramCall(this.env.BOT_TOKEN, "editMessageText", { chat_id: job.chatId, message_id: statusId, text: failure.message }));
+          return;
+        }
+      }
+      if (!media?.length) throw new Error("INSTAGRAM_NO_MEDIA");
 
       if (media.some(item => item.kind === "video" && (item.size === null || item.size > 19_000_000))) {
         // The same complete-file uploader is used only when Telegram's direct
@@ -575,7 +624,9 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           requestMessageId: job.requestMessageId,
           statusMessageId: job.statusMessageId!, media,
         };
-        await this.runInstagram({ ...job, instagramPost: upload, instagramPostRequest: undefined }, step);
+        const result = await this.runInstagram({ ...job, instagramPost: upload, instagramPostRequest: undefined }, step);
+        if (sessionUsed && !result.ok) await this.notifyInstagramSessionFailure(job, step, providerCode,
+          { code: "session_media_delivery_failed", message: "فایل با سشن پیدا شد، اما دانلود/ارسال کامل نشد؛ این خطا به‌تنهایی به معنی قفل حساب نیست." });
         return;
       }
 
@@ -595,6 +646,8 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       }));
     } catch (error) {
       const cause = error instanceof Error ? error.message : "UNKNOWN";
+      if (sessionUsed) await this.notifyInstagramSessionFailure(job, step, providerCode,
+        { code: "session_media_delivery_failed", message: "مسیر دانلود با سشن کامل نشد؛ خطا ممکن است مربوط به دریافت یا ارسال فایل باشد و قفل حساب را ثابت نمی‌کند." });
       console.warn("instagram post workflow failed", {
         code: /^TOPAPI_[A-Z0-9_]+$/.test(cause) || /^BRIGHTDATA_[A-Z0-9_]+$/.test(cause)
           ? cause : "INSTAGRAM_RESOLUTION_OR_DELIVERY_ERROR",

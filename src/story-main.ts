@@ -271,6 +271,8 @@ type StoryFailure = "session_missing" | "login_required" | "challenge_required" 
   | "apify_wrong_target" | "apify_invalid_media" | "apify_no_media" | "apify_too_many" | "apify_unavailable";
 
 type StoryProviderDiagnostic = {
+  endpoint?: string;
+  upstreamCode?: string;
   stage: "request" | "status" | "dataset";
   runId?: string;
   status?: number;
@@ -340,7 +342,9 @@ async function jsonRequest(url: string, headers: Headers, jar: CookieJar): Promi
     else if (response.status === 429 || /please wait|rate_limit|too many requests|feedback_required/.test(message)) failure = "rate_limited";
     else if (response.status === 401 || /login_required|user_has_logged_out|session_expired/.test(message) || /\/accounts\/login/.test(location)) failure = "login_required";
     console.log("instagram story response", { path: new URL(url).pathname, status: response.status, failure, json: Boolean(data) });
-    if (failure) throw new StoryError(failure);
+    if (failure) throw new StoryError(failure, { stage: "request", status: response.status,
+      endpoint: new URL(url).pathname, durationMs: 0,
+      upstreamCode: /^[a-z][a-z0-9_]{0,63}$/.test(message) ? message : undefined });
     return { data: response.ok ? data : null, status: response.status };
   } catch (error) {
     if (error instanceof StoryError) throw error;
@@ -795,6 +799,45 @@ async function instagramVideoRequest(path: string, jar: CookieJar): Promise<any>
     throw new InstagramVideoError("❌ اینستاگرام اطلاعات این لایو را برنگرداند؛ دسترسی حساب یا لینک را بررسی کن.");
   }
   return result.data;
+}
+
+// Reuse the authenticated media-info transport already used by /replay.
+// Return every carousel item in order; never substitute a video's cover.
+export async function resolveInstagramSessionPost(shortcode: string, env: Env): Promise<InstagramProfilePost> {
+  if (!/^[A-Za-z0-9_-]{1,20}$/.test(shortcode)) throw new StoryError("unavailable");
+  const jar = createJar(env);
+  if (!authParts(jar)) throw new StoryError("session_missing");
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  let id = 0n;
+  for (const char of shortcode) id = id * 64n + BigInt(alphabet.indexOf(char));
+  const endpoint = `/api/v1/media/${id}/info/`;
+  const result = await jsonRequest(`https://i.instagram.com${endpoint}`, privateHeaders(jar)!, jar);
+  const data = result.data;
+  if (!data || data.status === "fail") throw new StoryError("unavailable", {
+    stage: "request", status: result.status, endpoint, durationMs: 0,
+    upstreamCode: /^[a-z][a-z0-9_]{0,63}$/.test(String(data?.message || "")) ? data.message : undefined,
+  });
+  const item = (Array.isArray(data.items) ? data.items : []).find((v: any) =>
+    [v.pk, v.id].some(value => String(value || "").split("_")[0] === String(id)));
+  if (!item) throw new StoryError("unavailable");
+  const nodes = Array.isArray(item.carousel_media) ? item.carousel_media : [item];
+  if (!nodes.length || nodes.length > 20) throw new StoryError("no_media");
+  const groups = nodes.map((node: any) => {
+    if ((node.media_type === 2 || node.is_video === true) && !node.video_versions?.length)
+      throw new StoryError("no_media");
+    const candidates = itemCandidates(node).filter(candidate => instagramMediaUrl(candidate.url));
+    if (!candidates.length) throw new StoryError("no_media");
+    return candidates;
+  });
+  return { shortcode, url: `https://www.instagram.com/p/${shortcode}/`, groups };
+}
+
+export function instagramSessionFailure(error: unknown): { code: string; message: string; status?: number; endpoint?: string; upstreamCode?: string } {
+  if (error instanceof StoryError) return { code: error.code, message: storyErrorText(error),
+    status: error.diagnostic?.status, endpoint: error.diagnostic?.endpoint, upstreamCode: error.diagnostic?.upstreamCode };
+  const code = error instanceof Error && /^INSTAGRAM_[A-Z0-9_]+$/.test(error.message)
+    ? error.message : "session_resolution_failed";
+  return { code, message: "❌ پاسخ سشن فایل قابل دانلود نداشت یا دریافت فایل کامل نشد؛ علت قطعی از این پاسخ مشخص نیست." };
 }
 
 function replayMediaSource(item: any): InstagramVideoSource | null {

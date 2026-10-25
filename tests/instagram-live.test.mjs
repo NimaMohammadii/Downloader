@@ -363,7 +363,8 @@ test('TopAPI posts resolve in durable Workflow once with no webhook wait, repeat
       return Response.json({ok:true,result:{message_id:33,video:{file_id:'delivered-video'}}});
     }
     if(raw.includes('api.apify.com')) {
-      apiRequests.push({url:raw,body:JSON.parse(init.body),auth:new Headers(init.headers).get('authorization')});
+      apiRequests.push({url:raw,body:init.body ? JSON.parse(init.body) : undefined,auth:new Headers(init.headers).get('authorization')});
+      if(raw.includes('/runs?'))return Response.json({data:{id:'postRun00001',status:'SUCCEEDED',defaultDatasetId:'postDataset00001'}});
       return Response.json([{type:'Video',shortCode:'Abc123',
         videoUrl:'https://scontent.cdninstagram.com/video.mp4',
         displayUrl:'https://scontent.cdninstagram.com/cover.jpg'}]);
@@ -380,7 +381,7 @@ test('TopAPI posts resolve in durable Workflow once with no webhook wait, repeat
   const bindings={...env,APIFY_API_TOKEN:'private-topapi-key',BRIGHTDATA_API_KEY:'private-bright-key'};
   const replay=()=>new mod.YoutubeDownloadWorkflow({},bindings).run({payload:selected},step);
   await replay();
-  assert.equal(apiRequests.length,1);
+  assert.equal(apiRequests.length,2);
   assert.equal(apiRequests[0].auth,'Bearer private-topapi-key');
   assert.deepEqual(apiRequests[0].body.postUrls,['https://www.instagram.com/reel/Abc123/']);
   assert.deepEqual(messages.map(x=>x.method),['sendMessage','sendVideo','deleteMessage']);
@@ -389,7 +390,7 @@ test('TopAPI posts resolve in durable Workflow once with no webhook wait, repeat
   assert.equal(globalThis.downloadHistory.at(-1).status,'success');
   const sent=messages.length;
   await replay();
-  assert.equal(apiRequests.length,1,'checkpoint must never restart the paid Actor');
+  assert.equal(apiRequests.length,2,'checkpoint must never restart the paid Actor');
   assert.equal(messages.length,sent,'checkpoint must not resend Telegram messages');
   assert.ok(!JSON.stringify(messages).includes('private-topapi-key'));
   assert.ok(!JSON.stringify(messages).includes('private-bright-key'));
@@ -417,8 +418,8 @@ test('TopAPI network failure in Workflow reports once and does not automatically
   await new mod.YoutubeDownloadWorkflow({}, {...env,APIFY_API_TOKEN:'private-topapi',BRIGHTDATA_API_KEY:'private-bright'})
     .run({payload:selected},step);
   assert.equal(apiRequests.length,1);
-  assert.deepEqual(messages.map(x=>x.method),['sendMessage','editMessageText']);
-  assert.match(messages[1].body.text,/TopAPI/);
+  assert.deepEqual(messages.map(x=>x.method),['sendMessage','sendMessage','editMessageText']);
+  assert.match(messages[1].body.text,/TOPAPI_NETWORK_ERROR/);
   assert.equal(globalThis.downloadHistory.at(-1).status,'failed');
   assert.ok(steps.find(x=>x.name==='resolve public Instagram post once').options.retries.limit===0);
 });
@@ -1337,39 +1338,6 @@ test('queued TopAPI Reel uses its captured slot for the run and dataset instead 
   assert.ok(!JSON.stringify(messages).includes('numbered-two'));
 });
 
-test('post Workflow reports only the pinned provider failure and never calls a backup',async()=>{
-  const requests=[],messages=[],logs=[],previousWarn=console.warn;
-  const selected={...job,instagram:undefined,apifyAccount:2,instagramPostRequest:{shortcode:'Abc123'},url:'https://www.instagram.com/reel/Abc123/'};
-  globalThis.downloadHistory=[];globalThis.testFileCache=undefined;
-  console.warn=(message,info)=>logs.push({message,info});
-  globalThis.fetch=async(input,init={})=>{
-    const url=new URL(input);requests.push(url.hostname);
-    if(url.hostname==='api.apify.com')return Response.json({error:{type:'invalid-token'}},{status:401});
-    if(url.hostname==='api.brightdata.com')return Response.json([{error:'provider failure'}]);
-    if(url.hostname==='api.telegram.org'){
-      messages.push({method:url.pathname.split('/').at(-1),body:JSON.parse(init.body)});
-      return Response.json({ok:true,result:{message_id:33}});
-    }
-    throw Error('Unexpected provider');
-  };
-  const checkpoints=new Map();const step={async do(name,opts,fn){if(typeof opts==='function')fn=opts;
-    if(checkpoints.has(name))return structuredClone(checkpoints.get(name));
-    // Serialize an exhausted step failure as the Workflow engine does.
-    try{const result=await fn();checkpoints.set(name,structuredClone(result));return result;}
-    catch(error){throw new Error(error.message);}
-  }};
-  try{
-    await new mod.YoutubeDownloadWorkflow({}, {...env,APIFY_API_TOKEN_2:'private-two',BRIGHTDATA_API_KEY:'private-backup'})
-      .run({payload:selected},step);
-    assert.equal(requests.filter(x=>x==='api.apify.com').length,1);
-    assert.equal(requests.filter(x=>x==='api.brightdata.com').length,0);
-    const diagnostic=logs.find(x=>x.message==='instagram post workflow failed').info;
-    assert.deepEqual(diagnostic,{code:'TOPAPI_AUTH_ERROR',provider:'apify',account:2,jobId:selected.id});
-    assert.match(messages.at(-1).body.text,/توکن Apify/);assert.ok(!messages.at(-1).body.text.includes('Bright Data'));
-    assert.equal(globalThis.downloadHistory.at(-1).status,'failed');
-    assert.ok(!JSON.stringify(logs).includes('private-two'));assert.ok(!JSON.stringify(messages).includes('private-backup'));
-  }finally{console.warn=previousWarn;}
-});
 
 
 test('Story start and original run reads honor the new per-purpose pinned selection',async()=>{
@@ -1386,7 +1354,7 @@ test('post Workflows honor all eight service/account choices and never use other
  for(const provider of ['apify','brightdata'])for(const account of [1,2,3,4])for(const missing of [false,true]){
    const requests=[],messages=[];globalThis.downloadHistory=[];globalThis.testFileCache=undefined;
    const selected={...job,instagram:undefined,instagramApi:{provider,account},instagramPostRequest:{shortcode:'Abc123'},url:'https://www.instagram.com/reel/Abc123/'};
-   const bindings={...env,APIFY_API_TOKEN:'legacy-apify',BRIGHTDATA_API_KEY:'legacy-bright'};
+   const bindings={...env,INSTAGRAM_SESSIONID:undefined,APIFY_API_TOKEN:'legacy-apify',BRIGHTDATA_API_KEY:'legacy-bright'};
    for(const slot of [1,2,3,4]){bindings['APIFY_API_TOKEN_'+slot]='private-apify-'+slot;bindings['BRIGHTDATA_API_KEY_'+slot]='private-brightdata-'+slot;}
    const key=provider==='apify'?'APIFY_API_TOKEN':'BRIGHTDATA_API_KEY';
    if(missing){delete bindings[key+'_'+account];if(account===1)delete bindings[key];}
@@ -1423,4 +1391,72 @@ test('profile post extraction uses the selected service for every listed item an
  assert.equal(globalThis.downloadHistory.findLast(x=>x.source==='Instagram profile posts').status,'success');
  await result.replay();assert.deepEqual(result.apiCalls,['A','B','C']);
  assert.ok(!JSON.stringify(result.messages).includes('private-profile-bright-two'));
+});
+
+
+async function sessionFallbackWorkflow({provider='brightdata',failure,session=true,album=false,coverOnly=false,notifyFails=false,wrongTarget=false,badHost=false}={}) {
+ const calls=[],messages=[],checkpoints=new Map();
+ globalThis.downloadHistory=[];globalThis.testFileCache=undefined;globalThis.delivered=0;
+ const selected={...job,instagram:undefined,instagramApi:{provider,account:2},instagramPostRequest:{shortcode:'B'},url:'https://www.instagram.com/reel/B/'};
+ globalThis.fetch=async(input,init={})=>{
+  const url=new URL(input);calls.push({host:url.hostname,path:url.pathname,headers:new Headers(init.headers)});
+  if(url.hostname==='api.brightdata.com')return Response.json([{error:'unavailable',error_code:'dead_page'}]);
+  if(url.hostname==='api.apify.com')return Response.json({error:{type:'invalid-token'}},{status:401});
+  if(url.hostname==='i.instagram.com'){
+   assert.match(new Headers(init.headers).get('cookie'),/sessionid=12345/);
+   if(failure)return Response.json(failure.body,{status:failure.status});
+   const video={media_type:2,video_versions:coverOnly?[]:[{url:badHost?'https://example.com/private.mp4':'https://scontent.cdninstagram.com/movie.mp4',width:100,height:100}],image_versions2:{candidates:[{url:'https://scontent.cdninstagram.com/cover.jpg'}]}};
+   const photo={media_type:1,image_versions2:{candidates:[{url:'https://scontent.cdninstagram.com/picture.jpg',width:100,height:100}]}};
+   return Response.json({items:[album?{pk:'1',carousel_media:[photo,video]}:{pk:wrongTarget?'2':'1',...video}]});
+  }
+  if(url.hostname==='scontent.cdninstagram.com')return new Response(null,{headers:{'content-length':'1000000'}});
+  if(url.hostname==='api.telegram.org'){
+   const body=JSON.parse(init.body);const method=url.pathname.split('/').at(-1);messages.push({method,body});
+   if(notifyFails&&body.text?.startsWith('⚠️'))return Response.json({ok:false,description:'blocked',error_code:403});
+   return Response.json({ok:true,result:{message_id:33,video:{file_id:'session-video'}}});
+  }
+  throw Error('Unexpected request '+url.hostname);
+ };
+ const step={async do(name,opts,fn){if(typeof opts==='function')fn=opts;
+  if(checkpoints.has(name))return structuredClone(checkpoints.get(name));
+  const value=await fn();checkpoints.set(name,structuredClone(value));return value;}};
+ const bindings={...env,INSTAGRAM_SESSIONID:session?'12345%3Asecret-session':undefined,APIFY_API_TOKEN_2:'private-apify',BRIGHTDATA_API_KEY_2:'private-bright'};
+ const replay=()=>new mod.YoutubeDownloadWorkflow({},bindings).run({payload:selected},step);
+ await replay();return {calls,messages,replay};
+}
+
+test('both selected providers fall back once to the saved session and deliver a complete carousel in order',async()=>{
+ for(const provider of ['apify','brightdata']){
+  const result=await sessionFallbackWorkflow({provider,album:true});
+  assert.equal(result.calls.filter(x=>x.host==='i.instagram.com').length,1);
+  assert.equal(result.calls.filter(x=>x.host===(provider==='apify'?'api.brightdata.com':'api.apify.com')).length,0);
+  assert.deepEqual(result.messages.filter(x=>['sendPhoto','sendVideo'].includes(x.method)).map(x=>x.method),['sendPhoto','sendVideo']);
+  assert.equal(globalThis.downloadHistory.at(-1).status,'success');
+  assert.equal(result.messages.filter(x=>x.body.text?.startsWith('⚠️')).length,0);
+  const count=result.calls.length;await result.replay();assert.equal(result.calls.length,count);
+ }
+});
+
+test('session failures notify the admin with exact safe diagnostics once and do not retry or leak credentials',async()=>{
+ for(const [body,status,code] of [[{message:'challenge_required'},400,'challenge_required'],[{message:'login_required'},401,'login_required'],[{message:'feedback_required'},400,'rate_limited'],[{},429,'rate_limited']]){
+  const result=await sessionFallbackWorkflow({failure:{body,status}});
+  const alert=result.messages.find(x=>x.body.text?.startsWith('⚠️'));assert.ok(alert);
+  assert.equal(alert.body.chat_id,1);assert.equal(alert.body.disable_notification,false);
+  assert.ok(alert.body.text.includes('خطای سشن: '+code));assert.ok(alert.body.text.includes('HTTP: '+status));
+  assert.ok(alert.body.text.includes('/api/v1/media/1/info/'));assert.ok(alert.body.text.includes('BRIGHTDATA_RECORD_DEAD_PAGE'));
+  assert.equal(result.calls.filter(x=>x.host==='i.instagram.com').length,1);
+  assert.ok(!JSON.stringify(result.messages).includes('secret-session'));assert.ok(!JSON.stringify(result.messages).includes('private-bright'));
+  const count=result.calls.length;await result.replay();assert.equal(result.calls.length,count);
+  assert.equal(globalThis.downloadHistory.at(-1).status,'failed');
+ }
+});
+
+test('missing sessions and cover-only videos fail visibly; a blocked admin notification does not hide the user error',async()=>{
+ for(const options of [{session:false},{coverOnly:true},{wrongTarget:true},{badHost:true},{failure:{body:{message:'challenge_required'},status:400},notifyFails:true}]){
+  const result=await sessionFallbackWorkflow(options);
+  assert.equal(result.messages.filter(x=>x.body.text?.startsWith('⚠️')).length,1);
+  assert.equal(result.messages.filter(x=>['sendVideo','sendPhoto','sendMediaGroup'].includes(x.method)).length,0);
+  assert.ok(result.messages.some(x=>x.method==='editMessageText'));
+  assert.equal(globalThis.downloadHistory.at(-1).status,'failed');
+ }
 });
