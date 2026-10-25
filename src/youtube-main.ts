@@ -596,7 +596,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
     } catch (error) {
       const cause = error instanceof Error ? error.message : "UNKNOWN";
       console.warn("instagram post workflow failed", {
-        code: /^TOPAPI_[A-Z_]+$/.test(cause) || /^BRIGHTDATA_[A-Z0-9_]+$/.test(cause)
+        code: /^TOPAPI_[A-Z0-9_]+$/.test(cause) || /^BRIGHTDATA_[A-Z0-9_]+$/.test(cause)
           ? cause : "INSTAGRAM_RESOLUTION_OR_DELIVERY_ERROR",
         provider: job.instagramApi?.provider || (job.apifyAccount !== undefined || this.env.APIFY_API_TOKEN?.trim() ? "apify" : "brightdata"),
         account: job.instagramApi?.account ?? job.apifyAccount ?? 1,

@@ -720,6 +720,25 @@ async function resolveViaPostPage(
 // structure from Bright Data: childPosts are ordered carousel slides, whereas
 // images are alternative sizes of a single photo. Never infer a video's file
 // from its displayUrl cover.
+function providerDiagnosticText(value: string, secret: string): string {
+  return value.split(secret).join("[REDACTED]")
+    .replace(/bearer\s+\S+/gi, "Bearer [REDACTED]")
+    .replace(/https?:\/\/[^\s<>"']+/gi, "[URL]")
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[EMAIL]")
+    .replace(/[A-Za-z0-9_-]{24,}/g, "[REDACTED]")
+    .replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, " ").slice(0, 400);
+}
+
+function providerRecordDiagnostic(row: Record<string, any>, secret: string): { providerCode?: string; providerMessage?: string } {
+  const raw = row.error_code ?? row.error_type ?? row.code;
+  const providerCode = typeof raw === "string" && /^[a-z][a-z0-9_-]{0,63}$/i.test(raw)
+    && !raw.toLowerCase().includes(secret.toLowerCase()) ? raw.toLowerCase() : undefined;
+  const message = typeof row.error === "string" ? row.error
+    : typeof row.error?.message === "string" ? row.error.message : "";
+  return { ...(providerCode ? { providerCode } : {}),
+    ...(message ? { providerMessage: providerDiagnosticText(message, secret) } : {}) };
+}
+
 async function resolvePostWithTopApi(
   target: Extract<InstagramTarget, { kind: "post" }>, apiToken: string,
 ): Promise<MediaCandidate[][]> {
@@ -898,6 +917,7 @@ async function resolvePostWithTopApi(
     const detail = row?.dataDetailLevel;
     console.warn("instagram topapi no media", {
       runId, datasetId, kind: isReel ? "reels" : "posts", reason,
+      ...(typeof run?.statusMessage === "string" ? { runMessage: providerDiagnosticText(run.statusMessage, apiToken) } : {}),
       records: Array.isArray(payload) ? payload.length : null,
       mediaType: ["image", "photo", "video", "sidecar", "carousel", "profile"].includes(type) ? type : "unknown",
       detailLevel: detail === "basicData" || detail === "detailedData" ? detail : "unspecified",
@@ -917,7 +937,12 @@ async function resolvePostWithTopApi(
   if (payload.length !== 1 || !payload[0] || typeof payload[0] !== "object"
       || Array.isArray(payload[0])) throw new Error("TOPAPI_INVALID_RESULT");
   const item = payload[0] as Record<string, any>;
-  if (item.error || item.error_type || item.status === "fail") throw new Error("TOPAPI_UNAVAILABLE");
+  if (item.error || item.error_type || item.error_code || item.status === "fail") {
+    const diagnostic = providerRecordDiagnostic(item, apiToken);
+    console.warn("instagram topapi provider error record", { runId, datasetId, ...diagnostic });
+    throw new Error(diagnostic.providerCode
+      ? "TOPAPI_RECORD_" + diagnostic.providerCode.toUpperCase().replace(/-/g, "_") : "TOPAPI_UNAVAILABLE");
+  }
 
   // Verify the returned result matches the exact URL requested. The uploader
   // must never publish a different user's post on an incorrect Actor result.
@@ -1050,12 +1075,7 @@ async function resolvePostWithBrightData(
       : failure ? "" : raw;
     // Preserve the provider's explanation, never the submitted input/line,
     // authorization or signed URLs. Bound and redact before logging.
-    const clean = (value: string) => value.split(apiKey).join("[REDACTED]")
-      .replace(/bearer\s+\S+/gi, "Bearer [REDACTED]")
-      .replace(/https?:\/\/[^\s<>"']+/gi, "[URL]")
-      .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[EMAIL]")
-      .replace(/[A-Za-z0-9_-]{24,}/g, "[REDACTED]")
-      .replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, " ").slice(0, 400);
+    const clean = (value: string) => providerDiagnosticText(value, apiKey);
     const validation = Array.isArray(failure?.errors) ? failure.errors.slice(0, 8).flatMap((entry: unknown) => {
       if (!Array.isArray(entry) || !["url", "input", "country", "dataset_id"].includes(entry[0])) return [];
       return [{ field: entry[0], ...(typeof entry[1] === "string" ? { reason: clean(entry[1]) } : {}) }];
@@ -1116,13 +1136,17 @@ async function resolvePostWithBrightData(
     console.warn("instagram brightdata no media", {
       dataset: isReel ? "reels" : "posts", status: response.status, reason,
       records: rows.length,
+      ...(reason === "provider_error_record" ? providerRecordDiagnostic(row, apiKey) : {}),
       fields: knownFields.filter(key => Object.prototype.hasOwnProperty.call(row, key)),
       videoUrlState,
       videoCount: Array.isArray(row.videos) ? row.videos.length : null,
       photoCount: Array.isArray(row.photos) ? row.photos.length : null,
       carouselCount: Array.isArray(row.carousel_media) ? row.carousel_media.length : null,
     });
-    throw new Error(reason === "provider_error_record" ? "BRIGHTDATA_PROVIDER_ERROR" : "BRIGHTDATA_NO_MEDIA");
+    const diagnostic = reason === "provider_error_record" ? providerRecordDiagnostic(row, apiKey) : {};
+    throw new Error(reason === "provider_error_record"
+      ? diagnostic.providerCode ? "BRIGHTDATA_RECORD_" + diagnostic.providerCode.toUpperCase().replace(/-/g, "_") : "BRIGHTDATA_PROVIDER_ERROR"
+      : "BRIGHTDATA_NO_MEDIA");
   }
 
   if (rows.length !== 1 || !rows[0] || typeof rows[0] !== "object") noMedia("invalid_record_count");
@@ -1679,6 +1703,17 @@ async function resolveTarget(target: InstagramTarget, env: Env): Promise<Resolve
 
 function friendlyError(detail: string, throttle?: InstagramThrottle): string {
   const value = detail.toLowerCase();
+  const record = /^(topapi|brightdata)_record_([a-z0-9_]+)$/.exec(value);
+  if (record) {
+    const provider = record[1] === "topapi" ? "TopAPI" : "Bright Data";
+    const code = record[2];
+    if (["bucket_rate_limit", "global_rate_limit"].includes(code))
+      return `❌ اینستاگرام درخواست‌های استخراج‌کنندهٔ ${provider} را محدود کرده است؛ تلاش خودکار دیگری انجام نشد. [${code}]`;
+    if (code === "dead_page")
+      return `❌ استخراج‌کنندهٔ ${provider} برای این لینک پاسخ صفحهٔ ناموجود/غیرقابل‌دسترسی گرفته است؛ این پاسخ به‌تنهایی حذف قطعی پست را ثابت نمی‌کند. [${code}]`;
+    return `❌ استخراج‌کنندهٔ ${provider} این لینک را دریافت نکرد. کد اعلام‌شده: ${code}؛ توضیح سرویس در لاگ ثبت شد.`;
+  }
+
   if (value.startsWith("topapi_still_running")) return "❌ استخراج TopAPI هنوز در Apify در حال اجراست. برای جلوگیری از هزینه تکراری، اجرای جدیدی شروع نشد.";
   if (value.startsWith("topapi_status_unavailable")) return "❌ اجرای TopAPI شروع شد اما دریافت وضعیت یا فایل خروجی ناموفق بود. در Runs حساب Apify وضعیت همین اجرا را بررسی کن.";
     if (value.startsWith("topapi_timeout")) return "❌ مهلت استخراج TopAPI تمام شد؛ اجرای قبلی ممکن است هنوز در Apify ادامه داشته باشد. از تکرار فوری لینک خودداری کن.";

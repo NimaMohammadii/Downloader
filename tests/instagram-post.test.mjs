@@ -480,7 +480,8 @@ test('Bright Data provider rejections and empty results are terminal', async () 
     assert.match(report(result), expectedCode);
     const diagnostic = result.diagnostics.find(x => x.message === 'instagram brightdata no media')?.info;
     assert.equal(diagnostic?.reason, reason);
-    assert.ok(!JSON.stringify(result.diagnostics).includes('upstream denied'));
+    assert.ok(!JSON.stringify(result.diagnostics).includes('sensitive-api-key'));
+    if(reason==='provider_error_record')assert.equal(diagnostic.providerMessage,'upstream denied private account');
   }
 });
 
@@ -1258,5 +1259,29 @@ test('a declared Video without videoUrl never falls back to displayUrl on any sh
   }});
   assert.equal(report(result),'TOPAPI_NO_MEDIA');assert.equal(files(result).length,0);
   assert.equal(result.diagnostics.find(x=>x.message==='instagram topapi no media').info.videoUrlState,'null');
+ }
+});
+
+test('both providers retain record error codes and explain target rate limits without retries or charging local credits',async()=>{
+ for(const provider of ['topapi','brightdata'])for(const code of ['dead_page','bucket_rate_limit','global_rate_limit','unknown_scraper_error']){
+  let credits=0;
+  const result=await run({env:provider==='topapi'?{APIFY_API_TOKEN:'private-token'}:{BRIGHTDATA_API_KEY:'private-token',recordBrightDataExtraction:async()=>{credits++;}},respond(call){
+   return Response.json([{error_code:code,error:'Failed at https://instagram.com/reel/secret/?token=private-token using private-token',caption:'do-not-log-caption'}]);
+  }});
+  assert.equal(report(result),(provider==='topapi'?'TOPAPI':'BRIGHTDATA')+'_RECORD_'+code.toUpperCase());
+  assert.ok(errorText(result).includes(code));assert.equal(credits,0);assert.equal(files(result).length,0);
+  const diagnostic=result.diagnostics.find(x=>x.message===(provider==='topapi'?'instagram topapi provider error record':'instagram brightdata no media')).info;
+  assert.equal(diagnostic.providerCode,code);assert.equal(diagnostic.providerMessage,'Failed at [URL] using [REDACTED]');
+  assert.equal(result.calls.filter(x=>x.method==='POST').length,1);
+  assert.ok(result.calls.every(x=>x.hostname===(provider==='topapi'?'api.apify.com':'api.brightdata.com')));
+  for(const hidden of ['private-token','secret/?','do-not-log-caption'])assert.ok(!JSON.stringify(result.diagnostics).includes(hidden));
+ }
+});
+
+test('malformed or credential-containing provider codes cannot become public messages or logs',async()=>{
+ for(const code of ['private-token','https://bad.example/secret','unsafe\ncode']){
+  const result=await run({env:{BRIGHTDATA_API_KEY:'private-token'},respond(){return Response.json([{error_code:code,error:'private-token'}]);}});
+  assert.equal(report(result),'BRIGHTDATA_PROVIDER_ERROR');assert.ok(!JSON.stringify(result.diagnostics).includes('private-token'));
+  assert.ok(!result.diagnostics.find(x=>x.message==='instagram brightdata no media').info.providerCode);
  }
 });
