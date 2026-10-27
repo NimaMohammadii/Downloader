@@ -847,6 +847,9 @@ test('cache keys separate exact music choices, quality and private Instagram own
   assert.equal(a,undefined);
   assert.equal(await mod.mediaCacheKey({...job,instagram:{kind:'music',musicVideoId:'abcdefghijk'}}),'yt:abcdefghijk:mp3');
   assert.equal(await mod.mediaCacheKey({...job,instagram:{kind:'music',musicVideoId:'bbbbbbbbbbb'}}),'yt:bbbbbbbbbbb:mp3');
+  const recognitionKey=await mod.mediaCacheKey({...job,instagram:{kind:'audio',mediaId:'123',recognizeMusic:true}});
+  assert.ok(recognitionKey.endsWith(':song-v2'));
+  assert.notEqual(recognitionKey,await mod.mediaCacheKey({...job,instagram:{kind:'audio',mediaId:'123'}}));
   assert.notEqual(await mod.mediaCacheKey({...job,instagram:{kind:'audio',mediaId:'123'}}),await mod.mediaCacheKey({...job,userId:99,instagram:{kind:'audio',mediaId:'123'}}));
 });
 

@@ -401,7 +401,7 @@ async function mediaCacheKey(job: YoutubeDownloadJob): Promise<string | undefine
   }
   const target = job.instagram;
   const id = target?.shortcode || target?.mediaId;
-  if (target && id && target.kind !== "live") return `ig:${job.userId}:${id}:${target.videoIndex ?? 0}:${target.recognizeMusic ? "song" : target.kind}`;
+  if (target && id && target.kind !== "live") return `ig:${job.userId}:${id}:${target.videoIndex ?? 0}:${target.recognizeMusic ? "song-v2" : target.kind}`;
   if (job.quality || job.audioMode) {
     const id = new URL(job.url).searchParams.get("v");
     if (id && /^[A-Za-z0-9_-]{11}$/.test(id)) return `yt:${id}:${job.audioMode ? job.audioMode === "hq" ? "ah" : "al" : `v${job.quality}`}`;

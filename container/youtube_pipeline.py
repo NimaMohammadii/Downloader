@@ -832,8 +832,28 @@ def music_candidates(query: str) -> list[dict[str, Any]]:
     return sorted(candidates, key=score, reverse=True)
 
 
-def prepare_music(query: str, workdir: Path) -> tuple[Path, str, str, str]:
-    candidates = music_candidates(query)
+def _recognized_music_matches(item: dict[str, Any], recognized: dict[str, str]) -> bool:
+    # Used only by clip recognition. Ordinary /music search keeps its ranking.
+    def words(value: str) -> set[str]:
+        value = unicodedata.normalize("NFKC", value).casefold().replace("ي", "ی").replace("ك", "ک")
+        return set(re.findall(r"\w+", value))
+    title = words(recognized["title"])
+    artist = words(recognized["artist"])
+    actual_title = words(str(item.get("track") or item.get("title") or ""))
+    actual_artist = words(str(item.get("artist") or item.get("channel") or item.get("uploader") or ""))
+    if not title or not artist:
+        return False
+    if len(title & actual_title) / len(title) < 0.8 or len(artist & (actual_title | actual_artist)) / len(artist) < 0.6:
+        return False
+    variants = {"cover", "karaoke", "remix", "slowed", "sped", "live", "ریمیکس", "کاور"}
+    return not ((actual_title & variants) - (title | artist))
+
+
+def prepare_music(query: str, workdir: Path, *, recognized: dict[str, str] | None = None) -> tuple[Path, str, str, str]:
+    search_query = f"{recognized['artist'][:99]} {recognized['title'][:100]}" if recognized is not None else query
+    candidates = music_candidates(search_query)
+    if recognized is not None:
+        candidates = [item for item in candidates if _recognized_music_matches(item, recognized)]
     if not candidates:
         raise app.UserVisibleError("❌ آهنگی با این نام پیدا نشد؛ نام خواننده را هم بنویس.")
     selected = None
@@ -842,6 +862,8 @@ def prepare_music(query: str, workdir: Path) -> tuple[Path, str, str, str]:
         url = f"https://www.youtube.com/watch?v={item['id']}"
         try:
             metadata = fetch_metadata(url)
+            if recognized is not None and not _recognized_music_matches(metadata, recognized):
+                continue
             if not audio_formats(metadata):
                 continue
             selected = metadata, url

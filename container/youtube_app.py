@@ -1504,12 +1504,12 @@ INSTAGRAM_LOCK = threading.Lock()
 
 RECOGNITION_FILE_LIMIT = 20_000_000
 RECOGNITION_WINDOW_SECONDS = 12
-RECOGNITION_SAMPLE_SECONDS = 36
+RECOGNITION_SAMPLE_SECONDS = 120
 
 
-def music_query_key(query: str) -> str:
+def music_query_key(query: str, *, recognition: bool = False) -> str:
     normalized = " ".join(unicodedata.normalize("NFKC", query).lower().split())
-    return "mq:" + hashlib.sha256(normalized.encode()).hexdigest()
+    return ("mq:r2:" if recognition else "mq:") + hashlib.sha256(normalized.encode()).hexdigest()
 
 
 def file_cache(payload: dict[str, Any], op: str, key: str | None, value: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -1615,20 +1615,27 @@ def recognition_samples(source: Path | str, workdir: Path, *, remote: bool = Fal
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=45)
     except subprocess.SubprocessError as exc:
         raise UserVisibleError("❌ صدای قابل خواندن داخل این فایل نیست؛ یک ویس یا ویدیوی صدادار بفرست.") from exc
-    samples = []
+    # Decode once, then choose audible windows across the bounded clip, rather
+    # than spending every request on its intro. Never lengthen Shazam's 12s window.
+    windows = []
     with wave.open(str(decoded), "rb") as audio:
-        while len(samples) < 3:
-            frames = audio.readframes(16000 * RECOGNITION_WINDOW_SECONDS)
+        while frames := audio.readframes(16000 * RECOGNITION_WINDOW_SECONDS):
             if len(frames) < 16000 * 2 * 3:
-                break
-            # Ignore digital silence rather than spend a recognition request on it.
-            if max(map(abs, array("h", frames)), default=0) < 8:
                 continue
-            sample = workdir / f"recognition-{len(samples)}.wav"
-            with wave.open(str(sample), "wb") as output:
-                output.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
-                output.writeframes(frames)
-            samples.append(sample)
+            values = array("h", frames)
+            energy = sum(value * value for value in values) / len(values)
+            if energy >= 64:
+                windows.append((frames, energy))
+    samples = []
+    count = min(3, len(windows))
+    for index in range(count):
+        group = windows[index * len(windows) // count:(index + 1) * len(windows) // count]
+        frames, _ = max(group, key=lambda window: window[1])
+        sample = workdir / f"recognition-{index}.wav"
+        with wave.open(str(sample), "wb") as output:
+            output.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+            output.writeframes(frames)
+        samples.append(sample)
     if not samples:
         raise UserVisibleError("❌ صدای کافی برای تشخیص ندارم؛ حداقل 3 ثانیه و ترجیحاً 10 تا 30 ثانیه از آهنگ را بفرست.")
     return samples
@@ -1644,19 +1651,38 @@ async def recognize_samples(samples: list[Path]) -> dict[str, str]:
     try:
         async with HTTPClient(retry_options=ExponentialRetry(attempts=1)) as client:
             async with Shazam(http_client=client, segment_duration_seconds=12) as recognizer:
+                votes: dict[str, tuple[int, dict[str, str]]] = {}
+                service_error = None
                 for sample in samples[:3]:
-                    result = await asyncio.wait_for(recognizer.recognize(str(sample)), timeout=25)
-                    if not isinstance(result, dict):
-                        raise ValueError("Invalid recognition response")
-                    if not isinstance(result.get("matches"), list):
-                        raise ValueError("Invalid recognition matches")
-                    track = result.get("track")
-                    if not result.get("matches") or not isinstance(track, dict):
-                        continue
-                    title = " ".join(str(track.get("title") or "").split())[:180]
-                    artist = " ".join(str(track.get("subtitle") or "").split())[:120]
-                    if title and artist:
-                        return {"title": title, "artist": artist}
+                    try:
+                        result = await asyncio.wait_for(recognizer.recognize(str(sample)), timeout=25)
+                        if not isinstance(result, dict) or not isinstance(result.get("matches"), list):
+                            raise ValueError("Invalid recognition response")
+                        track = result.get("track")
+                        if not result["matches"] or not isinstance(track, dict):
+                            continue
+                        title = " ".join(str(track.get("title") or "").split())[:180]
+                        artist = " ".join(str(track.get("subtitle") or "").split())[:120]
+                        if not title or not artist:
+                            continue
+                        key = str(track.get("key") or unicodedata.normalize("NFKC", f"{artist}|{title}").casefold())
+                        count = votes.get(key, (0, {}))[0] + 1
+                        votes[key] = (count, {"title": title, "artist": artist})
+                        if count >= 2:
+                            return votes[key][1]
+                    except RateLimited:
+                        raise  # Respect an explicit service limit; no further requests.
+                    except Exception as exc:
+                        service_error = exc
+                        print(f"music recognition sample failed: {type(exc).__name__}", flush=True)
+                if len(votes) == 1:
+                    return next(iter(votes.values()))[1]
+                if len(votes) > 1:
+                    raise UserVisibleError("❌ بخش‌های فایل به آهنگ‌های متفاوتی تطبیق خوردند؛ یک تکهٔ واضح‌تر از آهنگ موردنظر بفرست.")
+                if service_error is not None:
+                    raise service_error
+    except UserVisibleError:
+        raise
     except Exception as exc:
         print(f"music recognition service failed: {type(exc).__name__}", flush=True)
         message = "❌ سرویس تشخیص آهنگ موقتاً پاسخ نداد؛ کمی بعد دوباره امتحان کن."
@@ -1899,7 +1925,7 @@ class InstagramCapture:
             if self.source.get("musicQuery") or self.source.get("musicVideoId"):
                 from youtube_pipeline import prepare_music, prepare_music_url
                 selected_id = self.source.get("musicVideoId")
-                cache_key = f"yt:{selected_id}:mp3" if selected_id else music_query_key(self.source["musicQuery"])
+                cache_key = f"yt:{selected_id}:mp3" if selected_id else music_query_key(self.source["musicQuery"], recognition=bool(self.source.get("recognition") or self.source.get("recognizeMusic")))
                 if reuse_cached_file(self.payload, cache_key):
                     self.cached = True
                     self.result = {"ok": True}
@@ -1908,8 +1934,10 @@ class InstagramCapture:
                     return
                 if not self.source.get("recognition") and not self.source.get("recognizeMusic"):
                     self.safe_status("⬇️ دارم آهنگ انتخاب‌شده را دانلود می‌کنم…")
+                recognition_options = ({"recognized": {"title": self.source["recognizedTitle"],
+                    "artist": self.source["recognizedArtist"]}} if self.source.get("recognizedTitle") else {})
                 self.path, title, artist, url = (prepare_music_url(f"https://www.youtube.com/watch?v={selected_id}", self.workdir)
-                    if selected_id else prepare_music(self.source["musicQuery"], self.workdir))
+                    if selected_id else prepare_music(self.source["musicQuery"], self.workdir, **recognition_options))
                 self.source.update({"title": title, "performer": artist, "musicUrl": url})
                 video_id = parse_qs(urlparse(url).query).get("v", [""])[0]
                 self.source["musicFileKey"] = f"yt:{video_id}:mp3"
@@ -2173,7 +2201,7 @@ class InstagramCapture:
                 sent = asyncio.run(asyncio.wait_for(upload_complete_file(self.payload["botToken"], method, data, (self.path.name, handle, mime)), timeout=25 * 60))
                 uploading = False
             store_uploaded_file(self.payload, [self.payload.get("mediaCacheKey"), self.source.get("musicFileKey"),
-                music_query_key(self.source["musicQuery"]) if self.source.get("musicQuery") else None], method, data, sent)
+                music_query_key(self.source["musicQuery"], recognition=bool(self.source.get("recognition") or self.source.get("recognizeMusic"))) if self.source.get("musicQuery") else None], method, data, sent)
             with self.lock:
                 self.state = "sent"
             delete_status(self.payload["botToken"], self.payload["chatId"], self.payload["statusMessageId"])

@@ -369,9 +369,9 @@ class RecognitionServiceTests(unittest.TestCase):
 
     def test_no_match_tries_next_window_then_stops_on_match(self):
         match={'matches':[{'id':'1'}],'track':{'title':' Hello\n','subtitle':' Adele '}}
-        result,count=self.recognize([{'matches':[]},match])
+        result,count=self.recognize([{'matches':[]},match,{'matches':[]}])
         self.assertEqual(result,{'title':'Hello','artist':'Adele'})
-        self.assertEqual(count,2)
+        self.assertEqual(count,3)
 
     def test_no_match_does_not_invent_a_title(self):
         with self.assertRaisesRegex(app.UserVisibleError,'شناسایی نشد'):
@@ -653,7 +653,8 @@ class PlaylistAndCacheTests(unittest.TestCase):
 
     def test_instagram_capture_identifies_before_searching_and_sends_mp3(self):
         job=app.InstagramCapture(self.payload(recognizeMusic=True,url='https://scontent.cdninstagram.com/video.mp4'))
-        def prepare(query,workdir):
+        def prepare(query,workdir,**kwargs):
+            self.assertEqual(kwargs['recognized'],{'title':'Hello','artist':'Adele'})
             self.assertEqual(query,'Adele Hello')
             path=workdir/'Music.mp3';path.write_bytes(b'complete')
             return path,'Hello','Adele','https://www.youtube.com/watch?v=abcdefghijk'
@@ -683,6 +684,94 @@ class PlaylistAndCacheTests(unittest.TestCase):
                 with self.assertRaises(app.UserVisibleError):
                     app.recognize_instagram_music('https://attacker.example/video.mp4',workdir)
                 samples.assert_not_called()
+
+
+class RecognitionRegressionTests(unittest.TestCase):
+    def recognize(self, answers):
+        from shazamio import Shazam
+        with patch.object(Shazam, 'recognize', new=AsyncMock(side_effect=answers)) as recognize:
+            result = asyncio.run(app.recognize_samples([Path(f'sample-{i}') for i in range(len(answers))]))
+            return result, recognize.await_count
+
+    def match(self, title):
+        return {'matches': [{'id': '1'}], 'track': {'title': title, 'subtitle': 'Artist'}}
+
+    def test_two_later_votes_override_first_conflicting_match(self):
+        result, calls = self.recognize([self.match('Wrong'), self.match('Right'), self.match('Right')])
+        self.assertEqual(result['title'], 'Right')
+        self.assertEqual(calls, 3)
+
+    def test_conflicting_matches_are_not_guessed(self):
+        with self.assertRaisesRegex(app.UserVisibleError, 'متفاوت'):
+            self.recognize([self.match('One'), self.match('Two'), {'matches': []}])
+
+    def test_timeout_does_not_discard_later_match(self):
+        result, calls = self.recognize([asyncio.TimeoutError(), self.match('Right')])
+        self.assertEqual(result['title'], 'Right')
+        self.assertEqual(calls, 2)
+
+    def test_rate_limit_stops_without_further_requests(self):
+        from shazamio import Shazam
+        from shazamio.exceptions import RateLimited
+        with patch.object(Shazam, 'recognize', new=AsyncMock(side_effect=[RateLimited('limit'), self.match('Right')])) as recognize:
+            with self.assertRaisesRegex(app.UserVisibleError, 'محدود'):
+                asyncio.run(app.recognize_samples([Path('a'), Path('b')]))
+            self.assertEqual(recognize.await_count, 1)
+
+    def test_two_agreeing_matches_stop_at_two(self):
+        result, calls = self.recognize([self.match('Right'), self.match('Right'), self.match('Other')])
+        self.assertEqual(calls, 2)
+
+    def test_recognition_query_cache_does_not_reuse_legacy_music_cache(self):
+        self.assertNotEqual(app.music_query_key('Artist Song'), app.music_query_key('Artist Song', recognition=True))
+
+    def test_unrelated_youtube_results_never_start_download(self):
+        unrelated = {'id': 'aaaaaaaaaaa', 'title': 'Other Song', 'channel': 'Other Artist'}
+        with patch.object(pipeline, 'music_candidates', return_value=[unrelated]), patch.object(pipeline, 'fetch_metadata') as metadata, patch.object(pipeline, 'prepare_music_file') as prepare:
+            with self.assertRaises(app.UserVisibleError):
+                pipeline.prepare_music('Adele Hello', Path('/tmp'), recognized={'title': 'Hello', 'artist': 'Adele'})
+            metadata.assert_not_called()
+            prepare.assert_not_called()
+
+    def test_cover_is_rejected_but_requested_remix_is_allowed(self):
+        self.assertFalse(pipeline._recognized_music_matches({'title': 'Adele Hello cover'}, {'title': 'Hello', 'artist': 'Adele'}))
+        self.assertTrue(pipeline._recognized_music_matches({'title': 'Adele Hello Remix Official Audio'}, {'title': 'Hello Remix', 'artist': 'Adele'}))
+        self.assertTrue(pipeline._recognized_music_matches({'title': 'Hello', 'channel': 'Adele - Topic'}, {'title': 'Hello', 'artist': 'Adele'}))
+
+    def test_matching_result_uses_existing_file_preparation(self):
+        item = {'id': 'aaaaaaaaaaa', 'title': 'Adele Hello Official Audio', 'artist': 'Adele'}
+        with patch.object(pipeline, 'music_candidates', return_value=[item]), patch.object(pipeline, 'fetch_metadata', return_value=item), patch.object(pipeline, 'audio_formats', return_value=[{}]), patch.object(pipeline, 'prepare_music_file', return_value='prepared') as prepare:
+            self.assertEqual(pipeline.prepare_music('Adele Hello', Path('/tmp'), recognized={'title': 'Hello', 'artist': 'Adele'}), 'prepared')
+            prepare.assert_called_once()
+
+    def test_long_recognized_names_keep_full_identity_but_bound_search(self):
+        recognized = {'artist': 'Artist ' * 20, 'title': 'Song ' * 40}
+        with patch.object(pipeline, 'music_candidates', return_value=[]) as search:
+            with self.assertRaises(app.UserVisibleError):
+                pipeline.prepare_music('full identity', Path('/tmp'), recognized=recognized)
+            self.assertLessEqual(len(search.call_args.args[0]), 200)
+
+    def test_ordinary_music_keeps_existing_selection_without_recognition_filter(self):
+        item = {'id': 'aaaaaaaaaaa', 'title': 'Other Song'}
+        with patch.object(pipeline, 'music_candidates', return_value=[item]), patch.object(pipeline, 'fetch_metadata', return_value=item), patch.object(pipeline, 'audio_formats', return_value=[{}]), patch.object(pipeline, 'prepare_music_file', return_value='prepared'):
+            self.assertEqual(pipeline.prepare_music('original query', Path('/tmp')), 'prepared')
+
+    def test_changed_metadata_cannot_bypass_match_check(self):
+        with patch.object(pipeline, 'music_candidates', return_value=[{'id': 'aaaaaaaaaaa', 'title': 'Adele Hello'}]), patch.object(pipeline, 'fetch_metadata', return_value={'title': 'Unrelated song'}), patch.object(pipeline, 'prepare_music_file') as prepare:
+            with self.assertRaises(app.UserVisibleError):
+                pipeline.prepare_music('Adele Hello', Path('/tmp'), recognized={'title': 'Hello', 'artist': 'Adele'})
+            prepare.assert_not_called()
+
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'FFmpeg required')
+    def test_audio_after_first_36_seconds_is_sampled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workdir = Path(directory)
+            source = workdir / 'late.wav'
+            subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=48', '-af', r'volume=0:enable=lt(t\,36)', '-y', str(source)], check=True)
+            samples = app.recognition_samples(source, workdir)
+            self.assertEqual(len(samples), 1)
+            with wave.open(str(samples[0]), 'rb') as audio:
+                self.assertGreater(audio.getnframes(), 11 * 16000)
 
 
 if __name__=='__main__':
