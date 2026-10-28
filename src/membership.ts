@@ -101,13 +101,26 @@ export async function isChannelMember(env: MembershipEnv, userId: number): Promi
     || (member?.status === "restricted" && member?.is_member === true);
 }
 
-export function membershipPrompt(channel = MEMBERSHIP_CHANNEL): Record<string, unknown> {
+export type MembershipInstagram = { enabled: boolean; total: number; day: number; week: number };
+export async function membershipInstagram(env: MembershipEnv, enabled?: boolean, actorId?: number): Promise<MembershipInstagram> {
+  if (!env.ADMIN_STATS) return { enabled: true, total: 0, day: 0, week: 0 };
+  const response = await env.ADMIN_STATS.getByName("global").fetch("https://admin-stats/membership-instagram", enabled === undefined ? undefined : {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled, actorId }),
+  });
+  if (!response.ok) throw new Error("MEMBERSHIP_INSTAGRAM_UNAVAILABLE");
+  return response.json();
+}
+async function configuredMembershipPrompt(env: MembershipEnv): Promise<Record<string, unknown>> {
+  return membershipPrompt(env.MEMBERSHIP_CHANNEL || MEMBERSHIP_CHANNEL, (await membershipInstagram(env)).enabled);
+}
+
+export function membershipPrompt(channel = MEMBERSHIP_CHANNEL, instagramEnabled = true): Record<string, unknown> {
   const title = "ادامه با عضویت در چنل";
-  const text = `⚡️ ${title}\nعضو چنلمون شو و پیج @Vexa.Order رو هم فالو کن؛ خبرهای تازه اونجاست!\nبعد از عضویت در چنل، «عضو شدم» رو بزن.`;
+  const text = `⚡️ ${title}\n${instagramEnabled ? "عضو چنلمون شو و پیج @Vexa.Order رو هم فالو کن؛ خبرهای تازه اونجاست!" : "عضو چنلمون شو؛ ابزارها و قابلیت‌های جدید هم اونجاست!"}\nبعد از عضویت در چنل، «عضو شدم» رو بزن.`;
   return { text, entities: [{ type: "bold", offset: text.indexOf(title), length: title.length }],
     reply_markup: { inline_keyboard: [[
       { text: "ورود به چنل", icon_custom_emoji_id: "5260285114448891086", url: `https://t.me/${channel.replace(/^@/, "")}` },
-      { text: "ورود به پیج اینستاگرام", icon_custom_emoji_id: "5278573677900752088", url: "https://www.instagram.com/vexa.order/" },
+      ...(instagramEnabled ? [{ text: "ورود به پیج اینستاگرام", icon_custom_emoji_id: "5278573677900752088", callback_data: "membership:instagram" }] : []),
     ], [
       { text: "✅ عضو شدم", callback_data: "membership:check" },
     ]] },
@@ -118,7 +131,7 @@ export async function notifyFirstDownload(env: MembershipEnv, userId: number): P
   if (!env.BOT_TOKEN || isAdmin(env, userId)) return;
   const state = await membershipState(env, userId);
   if (!state.enabled || state.mode !== "after_download" || !state.downloaded || await isChannelMember(env, userId)) return;
-  await telegram(env, "sendMessage", { chat_id: userId, ...membershipPrompt(env.MEMBERSHIP_CHANNEL || MEMBERSHIP_CHANNEL) });
+  await telegram(env, "sendMessage", { chat_id: userId, ...await configuredMembershipPrompt(env) });
 }
 
 // Run once at the production webhook boundary, before any delegated command or callback.
@@ -130,7 +143,21 @@ export async function enforceMembership(request: Request, env: MembershipEnv, ct
   try { update = await request.clone().json(); } catch { return null; }
   const callback = update?.callback_query;
   const actor = callback?.from || update?.message?.from;
-  if (!Number.isSafeInteger(actor?.id) || actor.id <= 0 || isAdmin(env, actor.id)) return null;
+  if (!Number.isSafeInteger(actor?.id) || actor.id <= 0) return null;
+  if (callback?.data === "membership:instagram") {
+    await telegram(env, "answerCallbackQuery", { callback_query_id: callback.id });
+    const settings = await membershipInstagram(env);
+    if (settings.enabled) {
+      const response = await env.ADMIN_STATS.getByName("global").fetch("https://admin-stats/membership-instagram", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ userId: actor.id, eventId: callback.id }),
+      });
+      if (!response.ok) throw new Error("MEMBERSHIP_INSTAGRAM_CLICK_UNAVAILABLE");
+      await telegram(env, "sendMessage", { chat_id: actor.id, text: "پیج @Vexa.Order منتظرته؛ وارد شو و فالو کن 💜",
+        reply_markup: { inline_keyboard: [[{ text: "باز کردن پیج اینستاگرام", icon_custom_emoji_id: "5278573677900752088", url: "https://www.instagram.com/vexa.order/" }]] } });
+    } else await telegram(env, "sendMessage", { chat_id: actor.id, ...await configuredMembershipPrompt(env) });
+    return Response.json({ ok: true });
+  }
+  if (isAdmin(env, actor.id)) return null;
   const checking = callback?.data === "membership:check";
   let state: MembershipState;
   let member = false;
@@ -168,14 +195,14 @@ export async function enforceMembership(request: Request, env: MembershipEnv, ct
         } catch {
           console.warn("membership confirmation cleanup unavailable");
           // Keep the request pending until Telegram confirms the emoji is gone.
-          try { await telegram(env, "sendMessage", { chat_id: actor.id, ...membershipPrompt(env.MEMBERSHIP_CHANNEL || MEMBERSHIP_CHANNEL) }); } catch {}
+          try { await telegram(env, "sendMessage", { chat_id: actor.id, ...await configuredMembershipPrompt(env) }); } catch {}
           return;
         }
         if (!resume) return;
         try {
           const latest = await membershipState(env, actor.id);
           if (requiresMembership(latest) && !await isChannelMember(env, actor.id)) {
-            await telegram(env, "sendMessage", { chat_id: actor.id, ...membershipPrompt(env.MEMBERSHIP_CHANNEL || MEMBERSHIP_CHANNEL) });
+            await telegram(env, "sendMessage", { chat_id: actor.id, ...await configuredMembershipPrompt(env) });
             return;
           }
           const pending = await pendingRequest(env, actor.id, "take");
@@ -194,7 +221,7 @@ export async function enforceMembership(request: Request, env: MembershipEnv, ct
   if (!checking) await pendingRequest(env, actor.id, "save", update);
   if (callback?.id) await telegram(env, "answerCallbackQuery", { callback_query_id: callback.id, _errorUserId: callback.from?.id,
     text: checking ? "هنوز عضو چنل نیستی؛ اول عضو شو و دوباره بررسی کن." : "برای ادامه، اول عضو چنل شو.", show_alert: true });
-  const prompt = membershipPrompt(env.MEMBERSHIP_CHANNEL || MEMBERSHIP_CHANNEL);
+  const prompt = await configuredMembershipPrompt(env);
   if (checking && callback.message?.chat?.id === actor.id) {
     // Refresh old prompts too, so channel corrections fix their existing join button.
     await telegram(env, "editMessageText", {

@@ -474,6 +474,10 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
     super(ctx, env);
     this.broadcasts = new BroadcastManager(ctx, env);
     this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS membership_instagram_clicks (
+        event_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, recorded_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_membership_ig_click_time ON membership_instagram_clicks(recorded_at, user_id);
       CREATE TABLE IF NOT EXISTS user_restrictions (
         user_id TEXT PRIMARY KEY, until_ms INTEGER
       );
@@ -493,6 +497,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         value INTEGER NOT NULL DEFAULT 0
       );
       INSERT OR IGNORE INTO counters(key, value) VALUES ('successful_downloads', 0);
+      INSERT OR IGNORE INTO counters(key,value) VALUES ('membership_instagram_enabled',1);
 
       CREATE TABLE IF NOT EXISTS delivered_media (
         delivery_key TEXT PRIMARY KEY,
@@ -766,6 +771,29 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         return JSON.parse(String(saved.payload));
       });
       return Response.json({ update });
+    }
+
+    if (url.pathname === "/membership-instagram") {
+      const sql = this.ctx.storage.sql;
+      if (request.method === "POST") {
+        const body = await request.json() as { actorId?: number; enabled?: boolean; eventId?: string; userId?: number };
+        if (body.enabled !== undefined) {
+          if (!isAdmin(this.env, body.actorId)) return new Response("Forbidden", { status: 403 });
+          if (typeof body.enabled !== "boolean") return new Response("Invalid setting", { status: 400 });
+          sql.exec("UPDATE counters SET value=? WHERE key='membership_instagram_enabled'", body.enabled ? 1 : 0);
+        } else {
+          if (!Number.isSafeInteger(body.userId) || body.userId! <= 0 || !/^[A-Za-z0-9_-]{1,128}$/.test(body.eventId || "")) return new Response("Invalid click", { status: 400 });
+          if (!isAdmin(this.env, body.userId) && asNumber(sql.exec("SELECT value FROM counters WHERE key='membership_instagram_enabled'").one().value) === 1)
+            sql.exec("INSERT OR IGNORE INTO membership_instagram_clicks(event_id,user_id,recorded_at) VALUES (?,?,?)", body.eventId!, String(body.userId), Date.now());
+        }
+      } else if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
+      const now = Date.now();
+      const counts = sql.exec(`SELECT COUNT(DISTINCT user_id) AS total,
+        COUNT(DISTINCT CASE WHEN recorded_at >= ? THEN user_id END) AS day,
+        COUNT(DISTINCT CASE WHEN recorded_at >= ? THEN user_id END) AS week
+        FROM membership_instagram_clicks`, now - 86400_000, now - 7 * 86400_000).one();
+      return Response.json({ enabled: asNumber(sql.exec("SELECT value FROM counters WHERE key='membership_instagram_enabled'").one().value) === 1,
+        total: asNumber(counts.total), day: asNumber(counts.day), week: asNumber(counts.week) });
     }
 
     if (url.pathname === "/membership") {

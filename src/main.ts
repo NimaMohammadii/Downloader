@@ -1,4 +1,4 @@
-import { membershipState, setMembershipEnabled, setMembershipMode, MEMBERSHIP_MODES, MEMBERSHIP_MODE_LABELS, type MembershipMode } from "./membership";
+import { membershipInstagram, membershipState, setMembershipEnabled, setMembershipMode, MEMBERSHIP_MODES, MEMBERSHIP_MODE_LABELS, type MembershipMode } from "./membership";
 import downloaderWorker from "./entry";
 import {
   telegramTextMotion,
@@ -235,14 +235,16 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
       return Response.json({ ok: true });
     }
 
-    const membershipMatch = /^admin:membership(?::(enable|disable|after_download|start|first_link))?$/.exec(data);
+    const membershipMatch = /^admin:membership(?::(enable|disable|after_download|start|first_link|instagram_on|instagram_off))?$/.exec(data);
     if (membershipMatch) {
       if (membershipMatch[1] === "enable" || membershipMatch[1] === "disable") await setMembershipEnabled(env, membershipMatch[1] === "enable");
+      else if (membershipMatch[1]?.startsWith("instagram_")) await membershipInstagram(env, membershipMatch[1] === "instagram_on", query.from.id);
       else if (membershipMatch[1]) await setMembershipMode(env, membershipMatch[1] as MembershipMode);
       const state = await membershipState(env);
+      const instagram = await membershipInstagram(env);
       const title = "عضویت اجباری چنل";
       const status = `وضعیت: ${state.enabled ? "فعال ✅" : "غیرفعال"}`;
-      const text = `${title}\n\n${status}\nزمان درخواست عضویت: ${MEMBERSHIP_MODE_LABELS[state.mode]}\nزمان دلخواه را از دکمه‌های زیر انتخاب کن.`;
+      const text = `${title}\n\n${status}\nزمان درخواست عضویت: ${MEMBERSHIP_MODE_LABELS[state.mode]}\nزمان دلخواه را از دکمه‌های زیر انتخاب کن.\n\nدکمهٔ اینستاگرام: ${instagram.enabled ? "نمایش داده می‌شود" : "حذف شده"}\nافراد کلیک‌کننده روی ورود به پیج:\nکل: ${instagram.total} نفر\n۲۴ ساعت گذشته: ${instagram.day} نفر\n۷ روز گذشته: ${instagram.week} نفر\nافراد یکتا در هر بازه؛ تأیید بازشدن پیج یا فالو نیست.`;
       await telegramCall(env, "editMessageText", {
         chat_id: message.chat.id, message_id: message.message_id, text,
         entities: [{ type: "bold", offset: 0, length: title.length },
@@ -250,9 +252,13 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
         reply_markup: { inline_keyboard: [
           [{ text: state.enabled ? "غیرفعال کردن عضویت اجباری" : "فعال کردن عضویت اجباری",
             callback_data: `admin:membership:${state.enabled ? "disable" : "enable"}` }],
+          [{ text: instagram.enabled ? "حذف دکمهٔ اینستاگرام" : "نمایش دکمهٔ اینستاگرام", callback_data: `admin:membership:${instagram.enabled ? "instagram_off" : "instagram_on"}` }],
+          [{ text: "🔄 بروزرسانی آمار کلیک", callback_data: "admin:membership" }],
           ...MEMBERSHIP_MODES.map(mode => [{ text: `${state.mode === mode ? "✅ " : ""}${MEMBERSHIP_MODE_LABELS[mode]}`, callback_data: `admin:membership:${mode}` }]),
           [{ text: "بازگشت به پنل", callback_data: "admin:stats" }],
         ] },
+      }).catch(error => {
+        if (!(error instanceof Error) || !/message is not modified/i.test(error.message)) throw error;
       });
       return Response.json({ ok: true });
     }

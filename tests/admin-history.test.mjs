@@ -978,3 +978,41 @@ test('restriction motion uses native draft reveal, preserves final bold and cust
   assert.equal(calls.at(-1).method,'sendMessage');assert.match(calls.at(-1).body.text,/زمان باقی‌مانده/);
  }finally{globalThis.fetch=previous;globalThis.setTimeout=previousTimeout;f.close();}
 });
+
+test('Instagram membership control persists, counts unique clickers per rolling window and ignores duplicate callbacks',async()=>{
+ const f=fixture();
+ try{
+  const now=Date.now();Date.now=()=>now-8*86400000;
+  const click=(id,event)=>f.request('/membership-instagram',{userId:id,eventId:event});
+  await click(41,'old');Date.now=()=>now-2*86400000;await click(42,'week');
+  Date.now=()=>now-1000;await click(43,'today');await click(43,'today-again');await click(43,'today');
+  await click(admin.ADMIN_USER_ID,'admin');Date.now=()=>now;
+  let state=await (await f.request('/membership-instagram')).json();
+  assert.deepEqual(state,{enabled:true,total:3,day:1,week:2});
+  assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM membership_instagram_clicks').get().n,4);
+  assert.equal((await f.request('/membership-instagram',{actorId:43,enabled:false})).status,403);
+  await f.request('/membership-instagram',{actorId:admin.ADMIN_USER_ID,enabled:false});f.restart();
+  await click(44,'hidden');state=await (await f.request('/membership-instagram')).json();
+  assert.deepEqual(state,{enabled:false,total:3,day:1,week:2});
+  await f.request('/membership-instagram',{actorId:admin.ADMIN_USER_ID,enabled:true});
+  assert.equal((await (await f.request('/membership-instagram')).json()).enabled,true);
+ }finally{f.close();}
+});
+
+test('Instagram membership button click delivers the page link and admin can hide it without losing counters',async()=>{
+ const f=fixture(),previous=globalThis.fetch,calls=[];
+ globalThis.fetch=async(input,init)=>{calls.push({method:String(input).split('/').at(-1),body:JSON.parse(init.body)});return Response.json({ok:true,result:{status:'left'}});};
+ try{
+  const click=id=>admin.worker.fetch(webhook({callback_query:{id:'ig-click',from:{id},data:'membership:instagram',message:{message_id:5,chat:{id}}}}),f.env,{});
+  await click(42);assert.match(JSON.stringify(calls),/https:\/\/www.instagram.com\/vexa.order\//);
+  assert.equal((await (await f.request('/membership-instagram')).json()).total,1);
+  const panel=(data,id=admin.ADMIN_USER_ID)=>admin.worker.fetch(webhook({callback_query:{id:'ig-panel',from:{id},data,message:{message_id:5,chat:{id}}}}),f.env,{});
+  await panel('admin:membership:instagram_off');
+  assert.equal((await (await f.request('/membership-instagram')).json()).enabled,false);
+  assert.match(calls.at(-1).body.text,/کل: 1 نفر/);
+  calls.length=0;await click(42);
+  assert.doesNotMatch(JSON.stringify(calls),/membership:instagram|instagram.com|@Vexa.Order/);
+  await panel('admin:membership:instagram_on',43);
+  assert.equal((await (await f.request('/membership-instagram')).json()).enabled,false);
+ }finally{globalThis.fetch=previous;f.close();}
+});
