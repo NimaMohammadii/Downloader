@@ -805,7 +805,10 @@ test('restricted webhook blocks links, music, media and old quality buttons befo
   assert.ok(calls.every(c=>!/getChatMember/.test(c.url)));
   for(const {body} of notices){
    assert.match(body.text,/محدود شده/);assert.doesNotMatch(body.text,/ادمین/);
-   assert.deepEqual(body.entities,[{type:'custom_emoji',offset:0,length:1,custom_emoji_id:'5260293700088511294'}]);
+   assert.deepEqual(body.entities.filter(e=>e.type==='custom_emoji'),[
+    {type:'custom_emoji',offset:0,length:1,custom_emoji_id:'5260293700088511294'},
+    {type:'custom_emoji',offset:body.text.indexOf('💜'),length:2,custom_emoji_id:'5442678635909621223'}]);
+   assert.ok(body.entities.some(e=>e.type==='bold'));
   }
   assert.equal(await admin.enforceRestriction(webhook(updates[0],'wrong'),f.env),null);
   assert.equal(await admin.enforceRestriction(webhook({message:{from:{id:42},chat:{id:42},text:'/start'}}),f.env),null);
@@ -906,5 +909,29 @@ test('restricted-users panel is admin-only and links to restriction management w
   assert.match(JSON.stringify(calls.at(-1).reply_markup),/admin:stats/);
   await f.request('/restriction?id=42',{actorId:admin.ADMIN_USER_ID,seconds:0});
   await visit(admin.ADMIN_USER_ID);assert.match(calls.at(-1).text,/هیچ کاربری محدودیت فعال ندارد/);
+ }finally{globalThis.fetch=previous;f.close();}
+});
+
+
+test('restriction notices use bold sections and a live remaining duration per request without dates',async()=>{
+ const f=fixture(),previous=globalThis.fetch,calls=[];
+ try{
+  const now=Date.now();Date.now=()=>now;
+  await f.record(9300);await f.request('/restriction?id=42',{actorId:admin.ADMIN_USER_ID,seconds:3600});
+  globalThis.fetch=async(input,init)=>{calls.push(JSON.parse(init.body));return Response.json({ok:true,result:true});};
+  const visit=()=>admin.enforceRestriction(webhook({message:{message_id:1,from:{id:42},chat:{id:42},text:'https://youtu.be/abcdefghijk'}}),f.env);
+  await visit();const first=calls.at(-1);
+  assert.match(first.text,/زمان باقی‌مانده: ۱ ساعت/);
+  Date.now=()=>now+61000;await visit();const second=calls.at(-1);
+  assert.match(second.text,/زمان باقی‌مانده: ۵۸ دقیقه و ۵۹ ثانیه/);
+  assert.doesNotMatch(second.text,/تهران|تاریخ|\//);
+  for(const body of [first,second,admin.restrictionNotice({restricted:true,until:null})]){
+   const bold=body.entities.filter(e=>e.type==='bold').map(e=>body.text.slice(e.offset,e.offset+e.length));
+   assert.ok(bold.includes('دسترسی دانلودت محدود شده'));
+   assert.ok(body.text.includes('\n\n'));
+   assert.equal(body.entities.at(-1).custom_emoji_id,'5442678635909621223');
+   assert.equal(body.text.slice(body.entities.at(-1).offset,body.entities.at(-1).offset+body.entities.at(-1).length),'💜');
+  }
+  assert.match(admin.restrictionNotice({restricted:true,until:null}).text,/بدون زمان پایان/);
  }finally{globalThis.fetch=previous;f.close();}
 });

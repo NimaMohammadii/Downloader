@@ -29,12 +29,29 @@ function date(value: number): string {
 }
 
 export function restrictionNotice(state: Restriction): { text: string; entities: Record<string, unknown>[] } {
-  return {
-    text: state.until === null
-      ? "⏹ دسترسی دانلودت فعلاً محدود شده.\nمی‌دونیم منتظر فایل‌های جذابی هستی؛ در حال حاضر امکان ثبت دانلود تازه برات فعال نیست. مرسی از همراهی و صبوری‌ات 💜"
-      : `⏹ یه مکث کوتاه توی دانلودها\nدسترسی دانلودت تا ${date(state.until)} (به وقت تهران) محدود شده. بعد از این زمان، خودکار می‌تونی دوباره دانلود کنی. مرسی که همراه مایی 💜`,
-    entities: [{ type: "custom_emoji", offset: 0, length: 1, custom_emoji_id: EMOJI }],
-  };
+  const title = "دسترسی دانلودت محدود شده";
+  let remaining = "بدون زمان پایان";
+  if (state.until !== null) {
+    let seconds = Math.max(0, Math.ceil((state.until - Date.now()) / 1000));
+    const parts: string[] = [];
+    for (const [unit, size] of [["روز", 86400], ["ساعت", 3600], ["دقیقه", 60], ["ثانیه", 1]] as const) {
+      const count = Math.floor(seconds / size);
+      seconds %= size;
+      if (count) parts.push(`${count.toLocaleString("fa-IR", { useGrouping: false })} ${unit}`);
+    }
+    remaining = parts.join(" و ") || "۰ ثانیه";
+  }
+  const label = state.until === null ? "مدت محدودیت:" : "زمان باقی‌مانده:";
+  const footer = state.until === null
+    ? "فعلاً امکان ثبت دانلود تازه برات فعال نیست."
+    : "بعد از پایان این زمان، دسترسی دانلودت خودکار فعال می‌شه.";
+  const text = `⏹ ${title}\n\nیه مکث توی دانلودها؛ هنوز اینجاییم و همراهتیم.\n\n${label} ${remaining}\n${footer}\n\nمرسی از همراهی و صبوری‌ات 💜`;
+  const entities: Record<string, unknown>[] = [
+    { type: "custom_emoji", offset: 0, length: 1, custom_emoji_id: EMOJI },
+    ...[title, label, remaining].map(value => ({ type: "bold", offset: text.indexOf(value), length: value.length })),
+    { type: "custom_emoji", offset: text.indexOf("💜"), length: "💜".length, custom_emoji_id: "5442678635909621223" },
+  ];
+  return { text, entities };
 }
 
 async function telegram(env: RestrictionEnv, method: string, payload: Record<string, unknown>): Promise<void> {
