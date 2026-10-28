@@ -1,4 +1,6 @@
 import { enforceRestriction } from "./restrictions";
+import { parseBandcampUrl, bandcampFailureDiagnostic } from "./bandcamp";
+import { publicError } from "./public-errors";
 import { handleBroadcastUpdate } from "./broadcast";
 import { enforceMembership } from "./membership";
 import { PUBLIC_ERROR_MESSAGE, telegramTextMotion, telegramCustomEmoji, type AdminStatsEnv } from "./admin";
@@ -120,14 +122,16 @@ export default {
     try {
       return await appWorker.fetch(request, env, ctx);
     } catch (error) {
-      console.error("request failed", { type: error instanceof Error ? error.name : "unknown" });
+      const bandcamp = update && parseBandcampUrl(String(update.message?.text || update.message?.caption || ""));
+      console.error("request failed", { type: error instanceof Error ? error.name : "unknown",
+        ...(bandcamp ? { phase: "webhook", ...bandcampFailureDiagnostic(error, env) } : {}) });
       // Only trusted webhook updates may select a Telegram destination.
       if (trustedWebhook && update) {
         try {
           const message = update.message || update.callback_query?.message;
           if (message?.chat?.id) {
             const payload: Record<string, unknown> = { chat_id: message.chat.id,
-              text: "❌ پردازش درخواست کامل نشد.", _errorDetail: String(error) };
+              text: bandcamp ? publicError("❌ پردازش درخواست کامل نشد.").message : "❌ پردازش درخواست کامل نشد.", _errorDetail: String(error) };
             await telegramTextMotion(env.BOT_TOKEN, "sendMessage", payload);
             await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
               method: "POST", headers: { "content-type": "application/json" },

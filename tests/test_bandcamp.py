@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 from pathlib import Path
 import shutil
@@ -8,6 +9,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
+from contextlib import redirect_stdout
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'container'))
 import bandcamp as bc
 import youtube_app as app
@@ -37,6 +39,56 @@ class BandcampTests(unittest.TestCase):
         self.assertEqual(args[-2:],['--',ALBUM]);self.assertIn('--flat-playlist',args)
         self.assertEqual(args[args.index('--playlist-end')+1],'21')
         self.assertNotIn('--cookies',args);self.assertNotIn('--extractor-args',args)
+
+    def test_provider_errors_are_classified_without_guessing_private_content(self):
+        cases=[
+            (subprocess.TimeoutExpired('yt-dlp',90),'timeout','BANDCAMP_TIMEOUT'),
+            (subprocess.CalledProcessError(1,['yt-dlp',URL],stderr='certificate verify failed'),'network','BANDCAMP_TLS_FAILED'),
+            (subprocess.CalledProcessError(1,['yt-dlp',URL],stderr='HTTP Error 403: Forbidden'),'access_unavailable','BANDCAMP_ACCESS_DENIED'),
+            (subprocess.CalledProcessError(1,['yt-dlp',URL],stderr='HTTP Error 429: Too Many Requests'),'rate_limit','BANDCAMP_RATE_LIMITED'),
+            (subprocess.CalledProcessError(1,['yt-dlp',URL],stderr='HTTP Error 404: Not Found'),'content_unavailable','BANDCAMP_NOT_FOUND'),
+            (subprocess.CalledProcessError(1,['yt-dlp',URL],stderr='HTTP Error 503: Service unavailable'),'service_unavailable','BANDCAMP_SOURCE_UNAVAILABLE'),
+            (subprocess.CalledProcessError(1,['yt-dlp',URL],stderr='This track is private'),'content_private','BANDCAMP_CONTENT_PRIVATE'),
+            (subprocess.CalledProcessError(1,['yt-dlp',URL],stderr='No video formats found'),'content_unavailable','BANDCAMP_NO_PUBLIC_AUDIO'),
+            (FileNotFoundError(2,'file not found'),'service_unavailable','BANDCAMP_DEPENDENCY_MISSING'),
+            (subprocess.CalledProcessError(1,['yt-dlp',URL],stderr='unknown extraction failure'),'download_failed','BANDCAMP_SOURCE_FAILED'),
+        ]
+        for error,category,code in cases:
+            with self.subTest(category=category),patch.object(bc.subprocess,'run',side_effect=error),redirect_stdout(io.StringIO()) as output:
+                with self.assertRaises(app.UserVisibleError) as caught:bc.metadata(URL)
+            self.assertEqual(app.public_error(str(caught.exception))['id'],category)
+            # The public message remains stable through both Container and Worker filtering.
+            self.assertEqual(app.private_error_payload('editMessageText',{'chat_id':42,'text':str(caught.exception)})['text'],str(caught.exception))
+            event=json.loads(output.getvalue());self.assertEqual(event['errorCode'],code);self.assertEqual(event['phase'],'metadata')
+
+    def test_metadata_log_never_prints_stderr_commands_or_signed_urls(self):
+        sensitive='private-token-value'
+        error=subprocess.CalledProcessError(1,['yt-dlp','https://signed.example/private?token='+sensitive],stderr='HTTP Error 403 Cookie: '+sensitive)
+        with patch.object(bc.subprocess,'run',side_effect=error),redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(app.UserVisibleError):bc.metadata(URL)
+        event=json.loads(output.getvalue());self.assertEqual(event['httpStatus'],403);self.assertEqual(event['exitCode'],1)
+        self.assertNotIn(sensitive,output.getvalue());self.assertNotIn('signed.example',output.getvalue());self.assertNotIn('yt-dlp',output.getvalue())
+
+    def test_invalid_provider_json_does_not_claim_private_content(self):
+        for raw in ['<html>temporary error</html>','[]']:
+            with patch.object(bc.subprocess,'run',return_value=subprocess.CompletedProcess([],0,raw)),redirect_stdout(io.StringIO()) as output:
+                with self.assertRaises(app.UserVisibleError) as caught:bc.metadata(URL)
+            self.assertEqual(app.public_error(str(caught.exception))['id'],'download_failed')
+            self.assertEqual(json.loads(output.getvalue())['errorCode'],'BANDCAMP_INVALID_METADATA')
+
+    def test_media_transport_preserves_tls_and_reports_timeout_access_and_rate_errors(self):
+        cases=[(app.requests.exceptions.SSLError('certificate verify failed'),'network'),(app.requests.Timeout('timed out'),'timeout'),
+               (app.requests.ConnectionError('connection reset'),'network')]
+        for error,category in cases:
+            with tempfile.TemporaryDirectory() as directory,patch.object(app.requests,'get',side_effect=error) as get,redirect_stdout(io.StringIO()):
+                with self.assertRaises(app.UserVisibleError) as caught:bc.download('https://t4.bcbits.com/a',Path(directory)/'a',100,time.monotonic()+10)
+                self.assertEqual(app.public_error(str(caught.exception))['id'],category)
+                self.assertNotIn('verify',get.call_args.kwargs)
+        for status,category in [(401,'access_unavailable'),(403,'access_unavailable'),(404,'content_unavailable'),(429,'rate_limit'),(503,'service_unavailable')]:
+            response=MagicMock();response.__enter__.return_value=response;response.status_code=status
+            with tempfile.TemporaryDirectory() as directory,patch.object(app.requests,'get',return_value=response),redirect_stdout(io.StringIO()):
+                with self.assertRaises(app.UserVisibleError) as caught:bc.download('https://t4.bcbits.com/a',Path(directory)/'a',100,time.monotonic()+10)
+                self.assertEqual(app.public_error(str(caught.exception))['id'],category)
 
     def test_no_public_audio_never_downloads(self):
         with patch.object(bc,'metadata',return_value={'formats':[]}),patch.object(bc,'download') as download:

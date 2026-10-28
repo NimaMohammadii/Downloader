@@ -2,7 +2,7 @@ import {build} from 'esbuild';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 const parser = await build({entryPoints:['src/bandcamp.ts'],bundle:true,format:'esm',write:false});
-const {parseBandcampUrl} = await import(`data:text/javascript;base64,${Buffer.from(parser.outputFiles[0].text).toString('base64')}`);
+const {parseBandcampUrl,bandcampFailureDiagnostic} = await import(`data:text/javascript;base64,${Buffer.from(parser.outputFiles[0].text).toString('base64')}`);
 const bundle = await build({entryPoints:['src/app-main.ts'],bundle:true,format:'esm',write:false,plugins:[{name:'runtime',setup(b){
  b.onResolve({filter:/^(cloudflare:workers|@cloudflare\/containers)$/},a=>({path:a.path,namespace:'runtime'}));
  b.onLoad({filter:/.*/,namespace:'runtime'},a=>({contents:a.path==='cloudflare:workers'?'export class DurableObject{}; export class WorkflowEntrypoint{constructor(ctx,env){this.env=env;}}':'export class Container{}; export const getContainer=()=>globalThis.container;'}));
@@ -40,4 +40,45 @@ test('Bandcamp reuses completion events and complete-file transport without Inst
  await new YoutubeDownloadWorkflow({},env).run({payload:{id:'igdl-42-7-42',chatId:42,userId:42,requestMessageId:7,url:'',bandcamp:{url:'https://artist.bandcamp.com/album/example'}}},step);
  assert.deepEqual(calls,['boot','start','send','cleanup','release']);
  assert.deepEqual(payloads.find(x=>x.source).source,{mode:'replay',title:'Bandcamp',audioOnly:true,bandcamp:{url:'https://artist.bandcamp.com/album/example'}});
+});
+
+test('Bandcamp diagnostics retain failure reason and stack without credentials or URLs',()=>{
+ const secrets={BOT_TOKEN:'123456:private-token-value-1234567890',WEBHOOK_SECRET:'fictional-webhook-secret',API_HASH:'fictional-api-hash'};
+ const error=new Error(`storage handshake failed ${secrets.BOT_TOKEN} ${secrets.API_HASH} https://signed.example/private?token=hidden\nCookie: session-value`);
+ const result=bandcampFailureDiagnostic(error,secrets),serialized=JSON.stringify(result);
+ assert.equal(result.source,'Bandcamp');assert.ok(result.detail.includes('storage handshake failed'));assert.ok(result.stack.includes('Error:'));
+ for(const secret of [...Object.values(secrets),'signed.example','session-value'])assert.ok(!serialized.includes(secret),secret);
+ assert.ok(bandcampFailureDiagnostic(new Error('x'.repeat(10000))).detail.length<=1500);
+ assert.ok(bandcampFailureDiagnostic(new Error('x'.repeat(10000))).stack.length<=2500);
+});
+
+test('failed Bandcamp workflow creation logs its cause once without retrying or exposing diagnostics',async()=>{
+ const logs=[],sent=[];const previous=console.error;
+ console.error=(message,detail)=>logs.push({message,detail});
+ globalThis.fetch=async(url,init)=>{sent.push(JSON.parse(init.body));return Response.json({ok:true,result:{message_id:9}});};
+ let creates=0;
+ try{
+  const response=await worker.fetch(message('https://essence-music.bandcamp.com/track/munus'),{...env,YOUTUBE_DOWNLOAD_WORKFLOW:{async create(){creates++;throw new Error(`binding unavailable ${env.BOT_TOKEN} https://internal.example/private`);}}},{});
+  assert.equal(response.status,200);assert.equal(creates,1);assert.equal(logs.length,1);
+  assert.equal(logs[0].detail.phase,'workflow_create');assert.ok(logs[0].detail.detail.includes('binding unavailable'));
+  assert.ok(!JSON.stringify(logs).includes('internal.example'));assert.ok(!JSON.stringify(sent).includes('binding unavailable'));
+ }finally{console.error=previous;}
+});
+
+test('Bandcamp webhook exceptions log a sanitized cause while other requests keep their current logging',async()=>{
+ const logs=[],sent=[];const previous=console.error;
+ console.error=(message,detail)=>logs.push({message,detail});
+ globalThis.fetch=async(url,init)=>{sent.push(JSON.parse(init.body));return Response.json({ok:true,result:{message_id:9}});};
+ const bindings={...env,API_HASH:'confidential-api-hash',ADMIN_STATS:{getByName(){throw new Error('private storage unavailable confidential-api-hash https://internal.example/secret');}}};
+ try{
+  await worker.fetch(message('https://essence-music.bandcamp.com/track/munus'),bindings,{});
+  assert.equal(logs[0].message,'request failed');assert.equal(logs[0].detail.phase,'webhook');assert.equal(logs[0].detail.source,'Bandcamp');
+  assert.ok(logs[0].detail.detail.includes('storage unavailable'));assert.ok(logs[0].detail.stack);
+  assert.ok(!JSON.stringify(logs).includes('confidential-api-hash'));assert.ok(!JSON.stringify(logs).includes('internal.example'));
+  const final=sent.filter(x=>x.text&&!x.draft_id).at(-1);
+  assert.ok(final.text.includes('دریافت یا آماده‌سازی'));assert.ok(!final.text.includes('خصوصی'));assert.ok(!JSON.stringify(sent).includes('storage unavailable'));
+  logs.length=0;
+  await worker.fetch(message('https://youtube.com/watch?v=abcdefghijk'),bindings,{});
+  assert.deepEqual(logs[0],{message:'request failed',detail:{type:'Error'}});
+ }finally{console.error=previous;}
 });

@@ -1,4 +1,4 @@
-import { parseBandcampUrl, type BandcampInput } from "./bandcamp";
+import { parseBandcampUrl, bandcampFailureDiagnostic, type BandcampInput } from "./bandcamp";
 import { parseRedditUrl, type RedditInput } from "./reddit";
 import { Container, getContainer } from "@cloudflare/containers";
 import {
@@ -1633,6 +1633,7 @@ async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target?
     await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id: job.id, params: job });
   } catch (error) {
     if (!/already|exists|duplicate|conflict/i.test(error instanceof Error ? error.message : String(error))) {
+      if (bandcamp) console.error("bandcamp request failed", { jobId: job.id, phase: "workflow_create", ...bandcampFailureDiagnostic(error, env) });
       await trackJob(env, job, "failed", { detail: "شروع دریافت فایل ناموفق بود." });
       await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id, text: "❌ شروع دریافت فایل ناموفق بود؛ درخواست را دوباره بفرست." });
     }
