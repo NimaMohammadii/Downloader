@@ -47,6 +47,7 @@ const WATCH_QUALITY_VALUES = [360, 480, 720, 1080] as const;
 const SESSION_ID_RE = /^[a-f0-9]{32}$/;
 const TAB_ID_RE = /^[A-Za-z0-9_-]{12,64}$/;
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+const SUBTITLE_ID_RE = /^[a-f0-9]{16}$/;
 const FILE_ID_RE = /^[A-Za-z0-9_-]{16,64}$/;
 const encoder = new TextEncoder();
 
@@ -212,6 +213,29 @@ function watchSignaturePayload(
   return `web-watch|${sessionId}|${tabId}|${streamId}|${expires}`;
 }
 
+function subtitleSignaturePayload(sessionId: string, tabId: string, streamId: string, trackId: string, expires: number): string {
+  return `web-subtitle|${sessionId}|${tabId}|${streamId}|${trackId}|${expires}`;
+}
+
+async function signedSubtitleTracks(request: Request, env: WebAppEnv, auth: BrowserAuth, mediaId: string, expires: number, value: unknown) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const tracks = value.slice(0, 200).filter(item => {
+    if (!item || typeof item !== "object" || typeof item.id !== "string" || !SUBTITLE_ID_RE.test(item.id) || seen.has(item.id)
+        || typeof item.language !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(item.language)
+        || !["manual", "automatic", "translated"].includes(item.kind)) return false;
+    seen.add(item.id); return true;
+  });
+  return Promise.all(tracks.map(async item => {
+    const sig = await signValue(env.BOT_TOKEN, subtitleSignaturePayload(auth.id, auth.tabId, mediaId, item.id, expires));
+    const url = new URL(makeWatchUrl(request, auth, mediaId, expires, sig));
+    url.pathname = "/web/subtitle";
+    url.searchParams.set("track", item.id);
+    return { id: item.id as string, language: item.language as string, kind: item.kind as string,
+      label: String(item.label || item.language).slice(0, 100), url: url.toString() };
+  }));
+}
+
 function makeDownloadUrl(
   request: Request,
   auth: BrowserAuth,
@@ -351,6 +375,7 @@ async function handlePrepare(request: Request, env: WebAppEnv, watch: boolean): 
       : downloadSignaturePayload(auth.id, auth.tabId, mediaId, expires);
     const sig = await signValue(env.BOT_TOKEN, payload);
     return watch ? { ok: true, title: result.title, mime: "video/mp4", quality: result.quality,
+      subtitles: await signedSubtitleTracks(request, env, auth, mediaId, expires, result.subtitles),
       qualities: normalizeWatchQualities(result.qualities), streamUrl: makeWatchUrl(request, auth, mediaId, expires, sig) }
       : { ok: true, state: "ready", fileName: result.fileName, size: result.size, mime: result.mime,
         downloadUrl: makeDownloadUrl(request, auth, mediaId, expires, sig) };
@@ -360,14 +385,15 @@ async function handlePrepare(request: Request, env: WebAppEnv, watch: boolean): 
 async function validateSignedMediaRequest(
   request: Request,
   env: WebAppEnv,
-  kind: "download" | "watch",
-): Promise<{ auth: BrowserAuth; mediaId: string } | null> {
+  kind: "download" | "watch" | "subtitle",
+): Promise<{ auth: BrowserAuth; mediaId: string; trackId: string } | null> {
   const session = await readBrowserSession(request, env);
   if (!session) return null;
   const url = new URL(request.url);
   const sessionId = url.searchParams.get("sid") || "";
   const tabId = url.searchParams.get("tab") || "";
   const mediaId = url.searchParams.get(kind === "download" ? "f" : "w") || "";
+  const trackId = url.searchParams.get("track") || "";
   const expires = Number(url.searchParams.get("e") || "0");
   const sig = url.searchParams.get("sig") || "";
   const now = Math.floor(Date.now() / 1000);
@@ -377,6 +403,7 @@ async function validateSignedMediaRequest(
     !SESSION_ID_RE.test(sessionId) ||
     !TAB_ID_RE.test(tabId) ||
     !FILE_ID_RE.test(mediaId) ||
+    (kind === "subtitle" && !SUBTITLE_ID_RE.test(trackId)) ||
     !Number.isSafeInteger(expires) ||
     expires < now ||
     expires > now + ttl + 60 ||
@@ -387,10 +414,11 @@ async function validateSignedMediaRequest(
   const payload =
     kind === "download"
       ? downloadSignaturePayload(sessionId, tabId, mediaId, expires)
+      : kind === "subtitle" ? subtitleSignaturePayload(sessionId, tabId, mediaId, trackId, expires)
       : watchSignaturePayload(sessionId, tabId, mediaId, expires);
   const expected = await signValue(env.BOT_TOKEN, payload);
   if (!constantTimeEqual(expected.toLowerCase(), sig.toLowerCase())) return null;
-  return { auth: { ...session, tabId }, mediaId };
+  return { auth: { ...session, tabId }, mediaId, trackId };
 }
 
 async function handleFile(request: Request, env: WebAppEnv): Promise<Response> {
@@ -466,6 +494,26 @@ async function handleWatchStream(request: Request, env: WebAppEnv): Promise<Resp
   });
 }
 
+async function handleSubtitle(request: Request, env: WebAppEnv): Promise<Response> {
+  const verified = await validateSignedMediaRequest(request, env, "subtitle");
+  if (!verified) return new Response("Subtitle link expired or invalid.", { status: 403 });
+  const container = getContainer(env.WEB_APP_CONTAINER, containerId(verified.auth));
+  const source = await container.webRequest(new Request(
+    `http://container/mini/subtitle?streamId=${encodeURIComponent(verified.mediaId)}&trackId=${verified.trackId}`,
+    { method: request.method === "HEAD" ? "HEAD" : "GET" },
+  ));
+  if (!source.ok || !source.headers.get("content-type")?.startsWith("text/vtt")) {
+    await source.body?.cancel();
+    return new Response("Subtitles are unavailable. Video playback is unaffected.", { status: source.status === 404 ? 404 : 502,
+      headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff" } });
+  }
+  const headers = new Headers({ "content-type": "text/vtt; charset=utf-8", "cache-control": "private, no-store",
+    "x-content-type-options": "nosniff", "content-security-policy": "default-src 'none'; sandbox" });
+  const length = source.headers.get("content-length");
+  if (length) headers.set("content-length", length);
+  return new Response(request.method === "HEAD" ? null : source.body, { headers });
+}
+
 function htmlHeaders(): Headers {
   return new Headers({
     "content-type": "text/html; charset=utf-8",
@@ -510,6 +558,7 @@ export async function handleWebAppRequest(
   if (url.pathname === "/web/api/start" && request.method === "POST") return handlePrepare(request, env, false);
   if (url.pathname === "/web/api/watch" && request.method === "POST") return handlePrepare(request, env, true);
   if (url.pathname === "/web/file" && (request.method === "GET" || request.method === "HEAD")) return handleFile(request, env);
+  if (url.pathname === "/web/subtitle" && (request.method === "GET" || request.method === "HEAD")) return handleSubtitle(request, env);
   if (url.pathname === "/web/stream" && (request.method === "GET" || request.method === "HEAD")) return handleWatchStream(request, env);
   if (url.pathname.startsWith("/web/")) return new Response("Not found", { status: 404 });
   return null;

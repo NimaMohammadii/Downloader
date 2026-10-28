@@ -140,5 +140,116 @@ class WebPlayerTests(unittest.TestCase):
             metadata.assert_not_called()
 
 
+class SubtitleTests(unittest.TestCase):
+    file_id = '6' * 32
+    video_id = 'abcdefghijk'
+    vtt = b'WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nHello world\n'
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.patch = patch.object(web.mini_pipeline, 'MINI_ROOT', self.root)
+        self.patch.start()
+        directory = self.root / self.file_id; directory.mkdir()
+        (directory / 'video.mp4').write_bytes(b'video')
+        (directory / 'manifest.json').write_text(json.dumps({'fileId': self.file_id, 'fileName': 'video.mp4'}))
+
+    def tearDown(self):
+        self.patch.stop(); self.temp.cleanup()
+
+    def track(self, language='en', **extra):
+        return {'ext': 'vtt', 'name': language, 'url': f'https://www.youtube.com/api/timedtext?v={self.video_id}&lang=en&fmt=vtt', **extra}
+
+    def catalog(self):
+        return {'id': self.video_id, 'http_headers': {'User-Agent': 'fixture-agent', 'Cookie': 'private-secret'},
+                'subtitles': {'en': [self.track()]},
+                'automatic_captions': {'en-orig': [self.track()], 'fa': [self.track('Persian', url=self.track()['url']+'&tlang=fa')]}}
+
+    class Response:
+        def __init__(self, data, status=200, headers=None):
+            self.data, self.status_code, self.headers = data, status, headers or {}
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def iter_content(self, chunk_size):
+            yield self.data
+
+    def test_catalog_uses_existing_metadata_and_does_not_expose_source_urls(self):
+        with patch.object(pipeline, '_fetch_metadata_for_client') as extract:
+            tracks = web._save_subtitle_catalog(self.catalog(), self.file_id)
+        extract.assert_not_called()
+        self.assertEqual([item['kind'] for item in tracks], ['manual', 'automatic', 'translated'])
+        self.assertEqual({item['language'] for item in tracks}, {'en', 'en-orig', 'fa'})
+        self.assertTrue(all(set(item) == {'id', 'language', 'label', 'kind'} for item in tracks))
+        self.assertNotIn('private-secret', (self.root / self.file_id / 'subtitles.json').read_text())
+        self.assertEqual(web._save_subtitle_catalog({'id': self.video_id}, self.file_id), [])
+
+    def test_untrusted_urls_cross_video_redirect_targets_and_paths_are_not_catalogued(self):
+        bad = ['http://www.youtube.com/api/timedtext?v=abcdefghijk&fmt=vtt',
+               'https://127.0.0.1/api/timedtext?v=abcdefghijk&fmt=vtt',
+               'https://www.youtube.com.evil.test/api/timedtext?v=abcdefghijk&fmt=vtt',
+               'https://www.youtube.com@127.0.0.1/api/timedtext?v=abcdefghijk&fmt=vtt',
+               'https://www.youtube.com:8443/api/timedtext?v=abcdefghijk&fmt=vtt',
+               'https://www.youtube.com/admin?v=abcdefghijk&fmt=vtt',
+               'https://www.youtube.com/api/timedtext?v=other_video&fmt=vtt',
+               'https://www.youtube.com/api/timedtext?v=abcdefghijk&v=other_video&fmt=vtt',
+               'https://www.youtube.com/api/timedtext?v=abcdefghijk&fmt=json3']
+        for url in bad:
+            self.assertEqual(web._save_subtitle_catalog({'id':self.video_id,'subtitles':{'en':[self.track(url=url)]}},self.file_id), [], url)
+        self.assertEqual(web._save_subtitle_catalog({'id':self.video_id,'subtitles':{'live_chat':[self.track()],'../../secret':[self.track()]}},self.file_id), [])
+
+    def test_only_selected_track_is_fetched_once_and_cached_without_credentials_or_redirects(self):
+        tracks=web._save_subtitle_catalog(self.catalog(), self.file_id)
+        with patch.object(web.app.requests, 'get', return_value=self.Response(self.vtt)) as fetch:
+            self.assertEqual(web._subtitle_bytes(self.file_id, tracks[0]['id']), self.vtt)
+            self.assertEqual(web._subtitle_bytes(self.file_id, tracks[0]['id']), self.vtt)
+        fetch.assert_called_once()
+        args=fetch.call_args.kwargs
+        self.assertFalse(args['allow_redirects']); self.assertEqual(args['timeout'], (5,15))
+        self.assertNotIn('Cookie',args['headers']); self.assertNotIn('Authorization',args['headers'])
+        self.assertEqual(args['headers']['User-Agent'],'fixture-agent')
+
+    def test_unknown_or_traversal_track_never_causes_a_network_request(self):
+        web._save_subtitle_catalog(self.catalog(),self.file_id)
+        with patch.object(web.app.requests,'get') as fetch:
+            for file_id,track_id in [(self.file_id,'../secret'),('../secret','a'*16),(self.file_id,'0'*16)]:
+                with self.assertRaises(FileNotFoundError): web._subtitle_bytes(file_id,track_id)
+        fetch.assert_not_called()
+
+    def test_http_errors_empty_html_oversized_and_invalid_utf8_are_not_cached_or_retried(self):
+        track=web._save_subtitle_catalog(self.catalog(),self.file_id)[0]
+        responses=[self.Response(self.vtt,status=302,headers={'location':'http://127.0.0.1/secret'}),
+                   self.Response(self.vtt,status=429), self.Response(b'<html>denied</html>'),
+                   self.Response(b''), self.Response(b'WEBVTT\n\xff'),
+                   self.Response(self.vtt,headers={'content-length':str(web.SUBTITLE_MAX_BYTES+1)}),
+                   self.Response(b'WEBVTT\n'+b'x'*web.SUBTITLE_MAX_BYTES)]
+        for response in responses:
+            with patch.object(web.app.requests,'get',return_value=response) as fetch:
+                with self.assertRaises((web.app.UserVisibleError, UnicodeError)):
+                    web._subtitle_bytes(self.file_id,track['id'])
+                fetch.assert_called_once()
+            self.assertFalse((self.root/self.file_id/f"subtitle-{track['id']}.vtt").exists())
+
+    def test_http_subtitle_error_does_not_prevent_subsequent_video_range_request(self):
+        track=web._save_subtitle_catalog(self.catalog(),self.file_id)[0]
+        server=web.app.ThreadingHTTPServer(('127.0.0.1',0),web.MiniAsyncHandler)
+        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        try:
+            with patch.object(web.app.requests,'get',return_value=self.Response(b'',status=403)):
+                c=http.client.HTTPConnection('127.0.0.1',server.server_port)
+                c.request('GET',f"/mini/subtitle?streamId={self.file_id}&trackId={track['id']}")
+                response=c.getresponse();self.assertEqual(response.status,502);response.read();c.close()
+                c=http.client.HTTPConnection('127.0.0.1',server.server_port)
+                c.request('GET',f'/mini/watch?streamId={self.file_id}',headers={'Range':'bytes=0-1'})
+                response=c.getresponse();self.assertEqual(response.status,206);self.assertEqual(response.read(),b'vi');c.close()
+        finally: server.shutdown();server.server_close();thread.join()
+
+    def test_catalog_is_bounded_and_metadata_is_not_mutated(self):
+        metadata=self.catalog();original=json.dumps(metadata,sort_keys=True)
+        web._save_subtitle_catalog(metadata,self.file_id)
+        self.assertEqual(json.dumps(metadata,sort_keys=True),original)
+        many={'id':self.video_id,'subtitles':{f'x{i}':[self.track()] for i in range(300)}}
+        self.assertEqual(len(web._save_subtitle_catalog(many,self.file_id)),200)
+
+
 if __name__ == '__main__':
     unittest.main()

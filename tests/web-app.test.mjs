@@ -22,11 +22,12 @@ function setup(){
     if(path==='/metadata')return Response.json({ok:true,videoId,title:'Fixture',qualities:[360,720],audioAvailable:true});
     if(path.endsWith('/start')){const body=await request.json(),id=body.streamId||body.fileId;
       const frames=['data: {"ok":true,"state":"preparing"}\n\n',': preparing\n\n',
-        'data: '+JSON.stringify({ok:true,state:'ready',fileId:id,title:'Fixture',quality:720,qualities:[360,720],fileName:'Fixture.mp4',size:8192,mime:'video/mp4'})+'\n\n'];
+        'data: '+JSON.stringify({ok:true,state:'ready',fileId:id,title:'Fixture',quality:720,qualities:[360,720],fileName:'Fixture.mp4',size:8192,mime:'video/mp4',subtitles:[{id:'a'.repeat(16),language:'en',label:'English',kind:'manual',url:'https://www.youtube.com/api/timedtext?secret=hidden'},{id:'b'.repeat(16),language:'fa',label:'Persian',kind:'translated'},{id:'../secret',language:'en',label:'invalid',kind:'manual'}]})+'\n\n'];
       // Split across JSON, UTF-8 decoder and event boundaries.
       const bytes=encoder.encode(frames.join(''));
       return new Response(new ReadableStream({start(c){for(let i=0;i<bytes.length;i+=7)c.enqueue(bytes.slice(i,i+7));c.close();}}),{headers:{'content-type':'text/event-stream'}});
     }
+    if(path==='/mini/subtitle')return new Response(request.method==='HEAD'?null:'WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n',{headers:{'content-type':'text/vtt'}});
     if(path==='/mini/watch'||path==='/mini/file')return new Response(request.method==='HEAD'?null:'abcd',{
       status:request.headers.get('range')==='bytes=999-'?416:206,
       headers:{'content-type':'video/mp4','content-range':request.headers.get('range')==='bytes=999-'?'bytes */8192':'bytes 0-3/8192','accept-ranges':'bytes','content-length':request.method==='HEAD'?'8192':'4'}});
@@ -118,4 +119,73 @@ test('browser event reader handles chunked completion without polling and UI scr
   const read=vm.runInNewContext(fn+';readApiResponse',{TextDecoder,Error});
   const response=new Response(new ReadableStream({start(c){for(const value of ['data: {"ok":true,"state":"preparing"}\n', '\n: alive\n\ndata: {"ok":true,', '"streamUrl":"/web/stream"}\n\n'])c.enqueue(encoder.encode(value));c.close();}}),{headers:{'content-type':'text/event-stream'}});
   assert.equal((await read(response)).streamUrl,'/web/stream');
+});
+
+
+test('subtitle URLs are signed per track, browser session and video, never exposing source URLs',async()=>{
+  const {env,calls}=setup(),cookie=await session(env);
+  const response=await route(api('/web/api/watch',{videoId},cookie),env);
+  const text=await response.text(),result=finalEvent(text);
+  assert.doesNotMatch(text,/secret=hidden/);
+  assert.equal(result.subtitles.length,2);
+  const subtitle=result.subtitles[0];assert.equal(subtitle.kind,'manual');
+  const loaded=await route(new Request(subtitle.url,{headers:{cookie}}),env);
+  assert.equal(loaded.status,200);assert.match(loaded.headers.get('content-type'),/^text\/vtt/);
+  assert.equal(loaded.headers.get('x-content-type-options'),'nosniff');
+  assert.match(await loaded.text(),/^WEBVTT/);
+  assert.match(calls.at(-1).url,/trackId=aaaaaaaaaaaaaaaa/);
+  const head=await route(new Request(subtitle.url,{method:'HEAD',headers:{cookie}}),env);
+  assert.equal(head.status,200);assert.equal(await head.text(),'');
+  const count=calls.length,secondCookie=await session(env);
+  assert.equal((await route(new Request(subtitle.url,{headers:{cookie:secondCookie}}),env)).status,403);
+  for(const [key,value] of [['track','b'.repeat(16)],['track','../secret'],['w','0'.repeat(32)],['e','1']]){
+    const tampered=new URL(subtitle.url);tampered.searchParams.set(key,value);
+    assert.equal((await route(new Request(tampered,{headers:{cookie}}),env)).status,403);
+  }
+  const wrongKind=new URL(result.streamUrl);wrongKind.pathname='/web/subtitle';wrongKind.searchParams.set('track','a'.repeat(16));
+  assert.equal((await route(new Request(wrongKind,{headers:{cookie}}),env)).status,403);
+  assert.equal(calls.length,count);
+});
+
+test('subtitle fetch failures stay separate from the video stream',async()=>{
+  const {env,stub}=setup(),cookie=await session(env);
+  const result=finalEvent(await (await route(api('/web/api/watch',{videoId},cookie),env)).text());
+  const original=stub.webRequest;
+  stub.webRequest=async request=>new URL(request.url).pathname==='/mini/subtitle'?new Response('<html>untrusted</html>',{status:502}):original(request);
+  const response=await route(new Request(result.subtitles[0].url,{headers:{cookie}}),env);
+  assert.equal(response.status,502);assert.doesNotMatch(await response.text(),/<html>/);
+  assert.equal((await route(new Request(result.streamUrl,{headers:{cookie}}),env)).status,206);
+});
+
+test('CC stays off by default, loads only the chosen track, preserves selection across quality changes and ignores stale events',async()=>{
+  const {outputFiles}=await build({entryPoints:['src/web-ui.ts'],bundle:true,write:false,format:'esm'});
+  const {WEB_APP_HTML:html}=await import('data:text/javascript;base64,'+Buffer.from(outputFiles[0].text).toString('base64'));
+  const script=html.match(/<script>([\s\S]*?)<\/script>/)[1];
+  const helpers=script.slice(script.indexOf('function subtitlesOpen()'),script.indexOf('function settingsOpen()'));
+  const classList=()=>{const values=new Set();return {contains:k=>values.has(k),remove:k=>values.delete(k),toggle:(k,on)=>on?values.add(k):values.delete(k)}};
+  const elements=[];
+  function element(tag){return {tag,attributes:{},children:[],track:{mode:'disabled'},events:{},classList:classList(),
+    setAttribute(k,v){this.attributes[k]=v},appendChild(e){this.children.push(e)},addEventListener(k,fn){this.events[k]=fn},
+    remove(){const i=elements.indexOf(this);if(i>=0)elements.splice(i,1)}};}
+  const context={URL,location:{href:origin+'/',origin},document:{createElement:element},subtitleTracks:[],selectedSubtitleId:'',subtitleVersion:0,
+    video:{querySelectorAll(){return [...elements]},appendChild(e){elements.push(e)}},playerShell:{classList:classList()},
+    subtitleButton:element('button'),subtitleMenu:element('div'),subtitleStatus:element('div'),playerSettings:element('button'),
+    controlsTimer:null,showControls(){},clearTimeout(){}};
+  vm.createContext(context);vm.runInContext(helpers,context);
+  const tracks=[{id:'a'.repeat(16),label:'English',language:'en-orig',kind:'automatic',url:origin+'/web/subtitle?track=a'},
+    {id:'b'.repeat(16),label:'فارسی <script>alert(1)</script>',language:'fa',kind:'translated',url:origin+'/web/subtitle?track=b'}];
+  context.setSubtitleTracks(tracks,false);assert.equal(elements.length,0);assert.equal(context.selectedSubtitleId,'');
+  context.selectSubtitle(tracks[0].id);assert.equal(elements.length,1);
+  const first=elements[0];assert.equal(first.default,true);assert.equal(first.kind,'subtitles');assert.equal(first.srclang,'en');assert.equal(first.track.mode,'showing');
+  context.selectSubtitle(tracks[1].id);assert.equal(first.track.mode,'disabled');assert.equal(elements.length,1);
+  const second=elements[0];assert.equal(second.label,tracks[1].label);assert.equal(second.srclang,'fa');
+  assert.match(context.subtitleStatus.textContent,/Loading/);
+  first.events.load();assert.match(context.subtitleStatus.textContent,/Loading/,'old load event must not change current track state');
+  second.events.load();assert.equal(context.subtitleStatus.textContent,'');
+  context.setSubtitleTracks(tracks.map(t=>({...t,url:t.url+'&new-video-file=1'})),true);
+  assert.equal(context.selectedSubtitleId,tracks[1].id);assert.equal(elements.length,1);assert.match(elements[0].src,/new-video-file/);
+  elements[0].events.error();assert.equal(elements.length,0);assert.equal(context.selectedSubtitleId,'');assert.match(context.subtitleStatus.textContent,/unaffected/);
+  context.selectSubtitle(tracks[0].id);context.selectSubtitle('');assert.equal(elements.length,0);assert.equal(context.subtitleButton.attributes['aria-pressed'],'false');
+  context.setSubtitleTracks([{...tracks[0],url:'https://evil.test/subtitles.vtt'}],false);
+  assert.equal(context.subtitleButton.disabled,true);assert.equal(elements.length,0);
 });
