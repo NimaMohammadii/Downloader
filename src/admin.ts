@@ -48,8 +48,9 @@ const telegramEmojiIds: Record<string, string> = {
   "🎼": "5253997827788385948", "🎬": "5427168083074628963", "⭐": "5438496463044752972",
   "🔴": "5264919878082509254", "⏹": "5260293700088511294", "👤": "5397866377367268054",
   "⚡": "5210956306952758910", "👇": "5231102735817918643",
+  "👑": "5217822164362739968", "👥": "5461117441612462242", "🔗": "5271604874419647061",
 };
-const telegramEmojiPattern = /(?:❌|✅|⚠|🔎|⬇|📤|⏳|🎵|🎧|🎼|🎬|⭐|🔴|⏹|👤|⚡|👇)\uFE0F?/gu;
+const telegramEmojiPattern = /(?:❌|✅|⚠|🔎|⬇|📤|⏳|🎵|🎧|🎼|🎬|⭐|🔴|⏹|👤|⚡|👇|👑|👥|🔗)\uFE0F?/gu;
 
 // Keep literal text and UTF-16 offsets intact; button icons use Telegram's own field.
 export function telegramCustomEmoji(method: string, payload: Record<string, unknown>, env: AdminAccessEnv = {}): Record<string, unknown> {
@@ -1217,13 +1218,13 @@ export function adminDashboardKeyboard(): Record<string, unknown> {
   return {
     inline_keyboard: [
       [{ text: "📤 پیام همگانی", callback_data: "admin:broadcast" }],
-      [{ text: "📊 مصرف، ترافیک و هزینه", callback_data: "admin:usage" }],
-      [{ text: "📥 آمار دانلود سرویس‌ها", callback_data: "admin:downloads" }],
+      [{ text: "مصرف، ترافیک و هزینه", icon_custom_emoji_id: "5231200819986047254", callback_data: "admin:usage" }],
+      [{ text: "آمار دانلود سرویس‌ها", icon_custom_emoji_id: "5443127283898405358", callback_data: "admin:downloads" }],
       [{ text: "👥 لیست کاربران", callback_data: "admin:users:0" },
         { text: "⏹ کاربران محدودشده", callback_data: "admin:restricted:0" }],
-      [{ text: "کاربران استفاده‌کننده", callback_data: "admin:used:0" }],
+      [{ text: "کاربران استفاده‌کننده", icon_custom_emoji_id: "5427168083074628963", callback_data: "admin:used:0" }],
       [{ text: "👤 فعالیت کاربران", callback_data: "admin:activity" }],
-      [{ text: "🔑 API اینستاگرام", callback_data: "admin:igapi" },
+      [{ text: "API اینستاگرام", icon_custom_emoji_id: "5278573677900752088", callback_data: "admin:igapi" },
         { text: "عضویت اجباری چنل", callback_data: "admin:membership" }],
       [{ text: "🔄 بروزرسانی آمار", callback_data: "admin:stats" }],
     ],
@@ -1350,7 +1351,7 @@ export function adminUserDetailKeyboard(detail: AdminUserDetail, usersPage: numb
   if (detail.page + 1 < detail.totalPages) nav.push({ text: "قدیمی‌تر ›", callback_data: callback(detail.page + 1) });
   return { inline_keyboard: [
     ...(nav.length ? [nav] : []),
-    [{ text: "📊 مصرف و هزینهٔ این کاربر", callback_data: `admin:usage:${detail.user.id}:${usersPage}:${detail.page}${usedOnly ? ":used" : ""}${periodSuffix}` },
+    [{ text: "مصرف و هزینهٔ این کاربر", icon_custom_emoji_id: "5231200819986047254", callback_data: `admin:usage:${detail.user.id}:${usersPage}:${detail.page}${usedOnly ? ":used" : ""}${periodSuffix}` },
       { text: "⏹ محدودیت دانلود", callback_data: callback(detail.page).replace("admin:user:", "admin:restriction:") }],
     [{ text: "🔄 بروزرسانی", callback_data: callback(detail.page) }],
     [{ text: usedOnly ? "بازگشت به استفاده‌کنندگان" : "👥 بازگشت به کاربران", callback_data: `admin:${usedOnly ? "used" : "users"}:${usersPage}${periodSuffix}` }, { text: "🏠 آمار", callback_data: "admin:stats" }],
