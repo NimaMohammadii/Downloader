@@ -365,7 +365,7 @@ test('period lists paginate and retain their filter throughout user detail navig
       await admin.worker.fetch(webhook(callback(admin.ADMIN_USER_ID, button.callback_data)), f.env, {});
       assert.ok(edit().reply_markup.inline_keyboard.flat().some(b => b.callback_data === `admin:${kind}:1:${period}`));
     }
-    const buttons = admin.adminDashboardKeyboard().inline_keyboard.flat();
+    const buttons = admin.adminActivityKeyboard().inline_keyboard.flat();
     for (const kind of ['users','used']) for (const period of ['day','week'])
       assert.ok(buttons.some(b => b.callback_data === `admin:${kind}:0:${period}`));
   } finally { globalThis.fetch = previousFetch; f.close(); }
@@ -934,4 +934,47 @@ test('restriction notices use bold sections and a live remaining duration per re
   }
   assert.match(admin.restrictionNotice({restricted:true,until:null}).text,/بدون زمان پایان/);
  }finally{globalThis.fetch=previous;f.close();}
+});
+
+test('admin menus group related buttons and activity submenu remains admin-only',async()=>{
+ const rows=admin.adminDashboardKeyboard().inline_keyboard;
+ const together=(a,b)=>rows.some(row=>row.some(x=>x.callback_data===a)&&row.some(x=>x.callback_data===b));
+ assert.ok(together('admin:users:0','admin:restricted:0'));
+ assert.ok(together('admin:igapi','admin:membership'));
+ assert.ok(rows.flat().some(b=>b.callback_data==='admin:activity'));
+ assert.ok(!rows.flat().some(b=>/admin:(users|used):0:(day|week)/.test(b.callback_data)));
+ const f=fixture(),previous=globalThis.fetch,calls=[];
+ globalThis.fetch=async(input,init)=>{calls.push(JSON.parse(init.body));return Response.json({ok:true,result:true});};
+ try{
+  const detailRows=admin.adminUserDetailKeyboard(await (async()=>{await f.record(9400);return f.detail();})(),0).inline_keyboard;
+  assert.ok(detailRows.some(row=>row.some(b=>b.callback_data.startsWith('admin:usage:42:'))&&row.some(b=>b.callback_data.startsWith('admin:restriction:42:'))));
+  const visit=id=>admin.worker.fetch(webhook({callback_query:{id:'activity',from:{id},data:'admin:activity',message:{message_id:7,chat:{id}}}}),f.env,{});
+  await visit(43);assert.equal(calls.length,0);
+  await visit(admin.ADMIN_USER_ID);
+  const panel=calls.filter(c=>c.reply_markup).at(-1);
+  for(const kind of ['users','used'])for(const period of ['day','week'])
+   assert.ok(panel.reply_markup.inline_keyboard.flat().some(b=>b.callback_data===`admin:${kind}:0:${period}`));
+ }finally{globalThis.fetch=previous;f.close();}
+});
+
+test('restriction motion uses native draft reveal, preserves final bold and custom emojis, and survives draft failure',async()=>{
+ const f=fixture(),previous=globalThis.fetch,previousTimeout=globalThis.setTimeout,calls=[];
+ try{
+  await f.record(9401);await f.request('/restriction?id=42',{actorId:admin.ADMIN_USER_ID,seconds:3600});
+  globalThis.setTimeout=(fn)=>previousTimeout(fn,0);
+  let fail=false;
+  globalThis.fetch=async(input,init)=>{
+   const method=String(input).split('/').at(-1);calls.push({method,body:JSON.parse(init.body)});
+   return method==='sendMessageDraft'&&fail ? Response.json({ok:false},{status:429}) : Response.json({ok:true,result:true});
+  };
+  const visit=token=>admin.enforceRestriction(webhook({message:{message_id:1,from:{id:42},chat:{id:42},text:'https://youtu.be/abcdefghijk'}}),{...f.env,BOT_TOKEN:token});
+  await visit('restriction-motion-first:fixture');
+  const drafts=calls.filter(c=>c.method==='sendMessageDraft'),final=calls.at(-1).body;
+  assert.equal(drafts.length,2);assert.ok(drafts[0].body.text.length<drafts[1].body.text.length);
+  assert.equal(drafts[1].body.text,final.text);
+  assert.ok(final.entities.some(e=>e.type==='bold'));
+  assert.equal(final.entities.at(-1).custom_emoji_id,'5442678635909621223');
+  fail=true;await visit('restriction-motion-failure:fixture');
+  assert.equal(calls.at(-1).method,'sendMessage');assert.match(calls.at(-1).body.text,/زمان باقی‌مانده/);
+ }finally{globalThis.fetch=previous;globalThis.setTimeout=previousTimeout;f.close();}
 });

@@ -1,4 +1,4 @@
-import { isAdmin, type AdminStatsEnv } from "./admin";
+import { telegramTextMotion, isAdmin, type AdminStatsEnv } from "./admin";
 
 type RestrictionEnv = Partial<AdminStatsEnv> & { BOT_TOKEN?: string; WEBHOOK_SECRET?: string };
 export type Restriction = { restricted: boolean; until: number | null };
@@ -164,6 +164,10 @@ export async function enforceRestriction(request: Request, env: RestrictionEnv):
   if (!state.restricted) return null;
   if (query?.id) await telegram(env, "answerCallbackQuery", { callback_query_id: query.id });
   const chat = query?.message?.chat?.id || update?.message?.chat?.id;
-  if (chat) await telegram(env, "sendMessage", { chat_id: chat, ...restrictionNotice(state) });
+  if (chat) {
+    const payload = { chat_id: chat, ...restrictionNotice(state) };
+    await telegramTextMotion(env.BOT_TOKEN, "sendMessage", payload, { adminEnv: env });
+    await telegram(env, "sendMessage", payload);
+  }
   return Response.json({ ok: true });
 }

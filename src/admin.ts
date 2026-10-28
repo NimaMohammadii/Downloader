@@ -1219,18 +1219,25 @@ export function adminDashboardKeyboard(): Record<string, unknown> {
       [{ text: "📤 پیام همگانی", callback_data: "admin:broadcast" }],
       [{ text: "📊 مصرف، ترافیک و هزینه", callback_data: "admin:usage" }],
       [{ text: "📥 آمار دانلود سرویس‌ها", callback_data: "admin:downloads" }],
-      [{ text: "👥 لیست کاربران", callback_data: "admin:users:0" }],
-      [{ text: "⏹ کاربران محدودشده", callback_data: "admin:restricted:0" }],
+      [{ text: "👥 لیست کاربران", callback_data: "admin:users:0" },
+        { text: "⏹ کاربران محدودشده", callback_data: "admin:restricted:0" }],
       [{ text: "کاربران استفاده‌کننده", callback_data: "admin:used:0" }],
-      [{ text: "فعال‌های ۲۴ ساعت", callback_data: "admin:users:0:day" },
-        { text: "فعال‌های ۷ روز", callback_data: "admin:users:0:week" }],
-      [{ text: "لینک‌فرستاده‌های ۲۴ ساعت", callback_data: "admin:used:0:day" },
-        { text: "لینک‌فرستاده‌های ۷ روز", callback_data: "admin:used:0:week" }],
-      [{ text: "🔑 API اینستاگرام", callback_data: "admin:igapi" }],
-      [{ text: "عضویت اجباری چنل", callback_data: "admin:membership" }],
+      [{ text: "👤 فعالیت کاربران", callback_data: "admin:activity" }],
+      [{ text: "🔑 API اینستاگرام", callback_data: "admin:igapi" },
+        { text: "عضویت اجباری چنل", callback_data: "admin:membership" }],
       [{ text: "🔄 بروزرسانی آمار", callback_data: "admin:stats" }],
     ],
   };
+}
+
+export function adminActivityKeyboard(): Record<string, unknown> {
+  return { inline_keyboard: [
+    [{ text: "فعال‌های ۲۴ ساعت", callback_data: "admin:users:0:day" },
+      { text: "فعال‌های ۷ روز", callback_data: "admin:users:0:week" }],
+    [{ text: "لینک‌فرستاده‌های ۲۴ ساعت", callback_data: "admin:used:0:day" },
+      { text: "لینک‌فرستاده‌های ۷ روز", callback_data: "admin:used:0:week" }],
+    [{ text: "بازگشت به پنل", callback_data: "admin:stats" }],
+  ] };
 }
 
 export function formatAdminUsers(page: AdminUsersPage): string {
@@ -1343,8 +1350,8 @@ export function adminUserDetailKeyboard(detail: AdminUserDetail, usersPage: numb
   if (detail.page + 1 < detail.totalPages) nav.push({ text: "قدیمی‌تر ›", callback_data: callback(detail.page + 1) });
   return { inline_keyboard: [
     ...(nav.length ? [nav] : []),
-    [{ text: "📊 مصرف و هزینهٔ این کاربر", callback_data: `admin:usage:${detail.user.id}:${usersPage}:${detail.page}${usedOnly ? ":used" : ""}${periodSuffix}` }],
-    [{ text: "⏹ محدودیت دانلود", callback_data: callback(detail.page).replace("admin:user:", "admin:restriction:") }],
+    [{ text: "📊 مصرف و هزینهٔ این کاربر", callback_data: `admin:usage:${detail.user.id}:${usersPage}:${detail.page}${usedOnly ? ":used" : ""}${periodSuffix}` },
+      { text: "⏹ محدودیت دانلود", callback_data: callback(detail.page).replace("admin:user:", "admin:restriction:") }],
     [{ text: "🔄 بروزرسانی", callback_data: callback(detail.page) }],
     [{ text: usedOnly ? "بازگشت به استفاده‌کنندگان" : "👥 بازگشت به کاربران", callback_data: `admin:${usedOnly ? "used" : "users"}:${usersPage}${periodSuffix}` }, { text: "🏠 آمار", callback_data: "admin:stats" }],
   ] };

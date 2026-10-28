@@ -14,6 +14,7 @@ import {
   type InstagramApiSecrets,
   AdminStatsStore,
   adminDashboardKeyboard,
+  adminActivityKeyboard,
   adminUsersKeyboard,
   adminUserDetailKeyboard,
   formatAdminUserDetail,
@@ -150,6 +151,19 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
   await safeTelegramCall(env, "answerCallbackQuery", { callback_query_id: query.id });
 
   try {
+    if (data === "admin:activity") {
+      try {
+        await telegramCall(env, "editMessageText", {
+          chat_id: message.chat.id, message_id: message.message_id,
+          text: "👤 فعالیت کاربران\n\nفهرست موردنظرت را انتخاب کن:",
+          reply_markup: adminActivityKeyboard(),
+        });
+      } catch (error) {
+        if (!(error instanceof Error) || !/message is not modified/i.test(error.message)) throw error;
+      }
+      return Response.json({ ok: true });
+    }
+
     if (data === "admin:downloads") {
       const stats = await getDownloadStatistics(env);
       await telegramCall(env, "editMessageText", {
