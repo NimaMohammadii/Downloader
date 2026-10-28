@@ -348,3 +348,9 @@ Instagram audio and song identification have separate deterministic job IDs, so 
 Local checks: `npm run check`; `node --test tests/*.test.mjs`; and `python -m unittest discover -s tests -p 'test_*.py' -q` in an environment with the Dockerfile's Python dependencies and FFmpeg installed. Tests use local media fixtures and simulated provider/Telegram responses. They do not establish live production-IP extraction, Instagram session validity, Shazam availability or an actual Telegram delivery.
 
 Only download content when you have permission to do so and comply with the source platform's applicable terms.
+
+## Bandcamp
+
+Send an artist's `https://artist.bandcamp.com/track/song` or `/album/name` link directly, or use `/bandcamp LINK`. Track/album routing lives in `src/bandcamp.ts`; extraction, validation and sending live in `container/bandcamp.py`. Only the existing completion-event queue, capacity pool and complete-file Telegram uploader are shared; other extractors are unchanged. No new secret is required.
+
+The first version accepts albums of up to 20 tracks and at most 2 GB total prepared audio. Larger albums fail explicitly rather than silently truncating. Available public MP3 streams and free-download formats are used; purchases, private tracks, custom domains and discography/profile links are not supported. MP3 sources are remuxed with track/artist/album tags; other supported audio is converted to MP3. Source quality is never claimed to improve. Unavailable album tracks are reported by their original positions, while available tracks retain their order. Confirmed sends are not replayed; an uncertain upload stops the batch. Temporary media is removed through the existing job cleanup.

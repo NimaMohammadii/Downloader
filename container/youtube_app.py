@@ -1864,6 +1864,10 @@ class InstagramCapture:
     def run(self) -> None:
         watchdog = wall_timer = None
         try:
+            if self.source.get("bandcamp"):
+                from bandcamp import prepare
+                prepare(self)
+                return
             if self.source.get("instagramPost"):
                 post = self.source["instagramPost"]
                 if post.get("storyId") and (not re.fullmatch(r"\d{1,24}", str(post["storyId"]))
@@ -2043,6 +2047,8 @@ class InstagramCapture:
             # Never print commands, signed stream URLs, bot tokens or account data.
             print(f"instagram capture failed: {type(exc).__name__}", flush=True)
             self.result = {"ok": False, "message": str(exc) if isinstance(exc, UserVisibleError) else "❌ دریافت یا آماده‌سازی لایو کامل نشد؛ لینک را دوباره بفرست."}
+            if self.source.get("bandcamp") and not isinstance(exc, UserVisibleError):
+                self.result["message"] = "❌ دریافت یا آماده‌سازی Bandcamp کامل نشد؛ دوباره لینک آهنگ را بفرست."
             if self.source.get("playlist") and not isinstance(exc, UserVisibleError):
                 self.result["message"] = "❌ پردازش پلی‌لیست کامل نشد؛ فایل‌های ارسال‌شده را قبل از درخواست دوباره بررسی کن."
             if self.source.get("social") and not isinstance(exc, UserVisibleError):
@@ -2142,6 +2148,8 @@ class InstagramCapture:
     def send(self) -> dict[str, Any]:
         with self.lock:
             if self.state == "sent":
+                if self.source.get("bandcamp"):
+                    return self.result
                 if self.source.get("instagramPost"):
                     return {"ok": True, "parts": self.post_sent}
                 return {"ok": True, "parts": self.social_sent} if self.source.get("social") else {"ok": True}
@@ -2157,6 +2165,9 @@ class InstagramCapture:
             self.state = "sending"
         uploading = False
         try:
+            if self.source.get("bandcamp"):
+                from bandcamp import send
+                return send(self)
             if self.source.get("instagramPost"):
                 return self.send_instagram_post()
             if self.source.get("musicSearch"):

@@ -1,3 +1,4 @@
+import { parseBandcampUrl } from "./bandcamp";
 import { isAdmin, telegramCustomEmoji, telegramTextMotion, type AdminStatsEnv } from "./admin";
 
 // The channel must be public and this bot must be a channel administrator.
@@ -45,6 +46,7 @@ function requiresMembership(state: MembershipState): boolean {
 // Only download links/commands activate first-link mode. Plain text and /start do not.
 function isDownloadRequest(message: any): boolean {
   const text = String(message?.text || message?.caption || "");
+  if (parseBandcampUrl(text) || /^\/bandcamp(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) return true;
   if (/^\/(?:music|live|replay|audio|playlist|instastory|instapost|findmusic|shazam)(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) return true;
   for (const raw of text.match(/https?:\/\/[^\s<>"']+/gi) || []) {
     try {

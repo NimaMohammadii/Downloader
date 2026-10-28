@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createHmac } from 'node:crypto';
+const bandcamp = await readFile(new URL('../src/bandcamp.ts', import.meta.url), 'utf8');
 const source = await readFile(new URL('../src/youtube-main.ts', import.meta.url), 'utf8');
 const story = await readFile(new URL('../src/story-main.ts', import.meta.url), 'utf8');
 const instagram = await readFile(new URL('../src/index.ts', import.meta.url), 'utf8');
@@ -12,6 +13,7 @@ const { outputFiles } = await build({
   plugins: [{ name: 'instagram-platform', setup(build) {
     build.onResolve({ filter: /.*/ }, a => ({ path: a.path, namespace: 'test' }));
     build.onLoad({ filter: /.*/, namespace: 'test' }, a => {
+      if (a.path === './bandcamp') return {contents:bandcamp,loader:'ts'};
       if (a.path === './story-main') return { contents: story, loader: 'ts' };
       if (a.path === './index') return { contents: instagram, loader: 'ts' };
       if (a.path === './main') return { contents: 'export default {fetch(){return Response.json({delegated:true})}};' };

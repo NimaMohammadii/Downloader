@@ -1,3 +1,4 @@
+import { parseBandcampUrl, type BandcampInput } from "./bandcamp";
 import { Container, getContainer } from "@cloudflare/containers";
 import {
   DurableObject,
@@ -45,7 +46,7 @@ type YoutubeAudioMode = "low" | "hq";
 type RecognitionInput = { fileId: string; fileSize?: number };
 type PlaylistInput = { url: string; start: number; end: number };
 type SocialInput = { platform: "x" | "pinterest" | "tiktok" | "soundcloud" | "aparat"; url: string; audioOnly?: boolean; itemIndex?: number };
-type MediaSource = InstagramVideoSource & { recognition?: RecognitionInput; playlist?: PlaylistInput; social?: SocialInput;
+type MediaSource = InstagramVideoSource & { bandcamp?: BandcampInput; recognition?: RecognitionInput; playlist?: PlaylistInput; social?: SocialInput;
   instagramPost?: Pick<InstagramPostUpload, "shortcode" | "storyId" | "media"> };
 const RECOGNITION_FILE_LIMIT = 20_000_000;
 
@@ -67,6 +68,7 @@ type YoutubeDownloadJob = {
   instagramApi?: InstagramApiSelection;
   instagramProfile?: { username: string; kind?: "posts" | "story"; target?: StoryTarget };
   instagramProfileParent?: { id: string; eventType: string };
+  bandcamp?: BandcampInput;
   recognition?: RecognitionInput;
   playlist?: PlaylistInput;
   social?: SocialInput;
@@ -481,21 +483,21 @@ function jobHistory(job: YoutubeDownloadJob): Omit<DownloadRecord, "status"> {
   if (job.instagramPost) return { key: `ig:${job.chatId}:${job.requestMessageId}:${job.userId}`,
     userId: job.userId, source: "Instagram post", request: job.instagramPost.url };
   const ig = job.instagram;
-  const source = job.social ? socialName(job.social.platform) : job.playlist ? "YouTube Playlist"
+  const source = job.bandcamp ? "Bandcamp" : job.social ? socialName(job.social.platform) : job.playlist ? "YouTube Playlist"
     : job.recognition ? "تشخیص آهنگ" : ig ? ig.kind === "music" ? "جست‌وجو و دانلود آهنگ" : `Instagram ${ig.kind}`
     : job.source === "pornhub" ? "Pornhub" : "YouTube";
-  const request = job.url || job.social?.url || (job.playlist ? `${job.playlist.url} • ${job.playlist.start}-${job.playlist.end}` : "")
+  const request = job.url || job.bandcamp?.url || job.social?.url || (job.playlist ? `${job.playlist.url} • ${job.playlist.start}-${job.playlist.end}` : "")
     || (job.recognition ? "فایل ارسالی برای تشخیص آهنگ" : ig?.musicVideoId ? `https://www.youtube.com/watch?v=${ig.musicVideoId}`
       : ig?.query || (ig?.shortcode ? `https://www.instagram.com/p/${ig.shortcode}/` : ig?.mediaId ? `Instagram Story ${ig.mediaId}`
         : ig?.username ? `Instagram @${ig.username}` : ig?.broadcastId ? `Instagram Live ${ig.broadcastId}` : source));
-  return { key: ig || job.social || job.recognition || job.playlist ? job.id : `youtube:${job.chatId}:${job.requestMessageId}:${job.userId}`,
+  return { key: ig || job.social || job.recognition || job.playlist || job.bandcamp ? job.id : `youtube:${job.chatId}:${job.requestMessageId}:${job.userId}`,
     userId: job.userId, source, request };
 }
 
 async function trackJob(env: Env, job: YoutubeDownloadJob, status: DownloadStatus, extra: Partial<DownloadRecord> = {}): Promise<void> {
   await recordDownload(env, { ...jobHistory(job),
     ...(job.instagramProfile ? { excludeFromStats: true } : {}),
-    ...(job.audioMode || job.playlist || job.recognition || job.social?.audioOnly || job.social?.platform === "soundcloud"
+    ...(job.audioMode || job.playlist || job.recognition || job.bandcamp || job.social?.audioOnly || job.social?.platform === "soundcloud"
       || job.instagram?.kind === "audio" || job.instagram?.kind === "music" ? { category: "music" as const } : {}),
     ...extra, status });
 }
@@ -519,11 +521,11 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
   async run(event: WorkflowEvent<YoutubeDownloadJob>, step: WorkflowStep) {
     const job: YoutubeDownloadJob = { ...event.payload };
     const inspect = !job.instagramProfile && !job.instagram && !job.instagramPost &&
-      !job.instagramPostRequest && !job.recognition && !job.playlist && !job.social && !job.quality && !job.audioMode && job.source !== "pornhub";
+      !job.instagramPostRequest && !job.bandcamp && !job.recognition && !job.playlist && !job.social && !job.quality && !job.audioMode && job.source !== "pornhub";
     await step.do("track download request", () => trackJob(this.env, job, inspect ? "pending" : "processing"));
     if (job.instagramProfile) return this.runInstagramProfile(job, step);
     if (job.instagramPostRequest) return this.runInstagramPostRequest(job, step);
-    if (job.instagram || job.instagramPost || job.recognition || job.playlist || job.social) {
+    if (job.bandcamp || job.instagram || job.instagramPost || job.recognition || job.playlist || job.social) {
       const result = await this.runInstagram(job, step).catch(error => {
         if (!job.instagramProfileParent) throw error;
         console.warn("instagram profile item interrupted", { jobId: job.id });
@@ -1079,7 +1081,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         if (job.instagramPost) return job.instagramPost.statusMessageId;
         const message = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
           chat_id: job.chatId, reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
-          text: job.social ? `⬇️ دارم ${job.social.audioOnly ? "صدای ویدیوی" : "فایل"} ${socialName(job.social.platform)} را دریافت می‌کنم…` : job.playlist ? `🎵 دارم آهنگ‌های ${job.playlist.start}-${job.playlist.end} پلی‌لیست را به‌صورت MP3 آماده می‌کنم…` : job.recognition || job.instagram?.recognizeMusic ? "🎧 دارم آهنگ داخل فایل را شناسایی می‌کنم…" : job.instagram?.kind === "music" ? "🔎 دارم آهنگ را پیدا می‌کنم…" : job.instagram?.kind === "audio" ? "🎵 دارم صدای ویدیوی اینستاگرام را آماده می‌کنم…" : "🔎 دارم لایو یا بازپخش اینستاگرام را بررسی می‌کنم…",
+          text: job.bandcamp ? "🎵 دارم آهنگ‌های Bandcamp را آماده می‌کنم…" : job.social ? `⬇️ دارم ${job.social.audioOnly ? "صدای ویدیوی" : "فایل"} ${socialName(job.social.platform)} را دریافت می‌کنم…` : job.playlist ? `🎵 دارم آهنگ‌های ${job.playlist.start}-${job.playlist.end} پلی‌لیست را به‌صورت MP3 آماده می‌کنم…` : job.recognition || job.instagram?.recognizeMusic ? "🎧 دارم آهنگ داخل فایل را شناسایی می‌کنم…" : job.instagram?.kind === "music" ? "🔎 دارم آهنگ را پیدا می‌کنم…" : job.instagram?.kind === "audio" ? "🎵 دارم صدای ویدیوی اینستاگرام را آماده می‌کنم…" : "🔎 دارم لایو یا بازپخش اینستاگرام را بررسی می‌کنم…",
         });
         return message.message_id;
       });
@@ -1099,6 +1101,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         try {
           const source: MediaSource = job.instagramPost ? { mode: "replay", title: "Instagram",
             instagramPost: { shortcode: job.instagramPost.shortcode, ...(job.instagramPost.storyId ? { storyId: job.instagramPost.storyId } : {}), media: job.instagramPost.media } }
+            : job.bandcamp ? { mode: "replay", title: "Bandcamp", audioOnly: true, bandcamp: job.bandcamp }
             : job.social ? { mode: "replay", title: socialName(job.social.platform), social: job.social } : job.playlist ? { mode: "replay", title: "YouTube Playlist", audioOnly: true, playlist: job.playlist } : job.recognition
             ? { mode: "replay", title: "Music recognition", audioOnly: true, recognition: job.recognition }
             : await resolveInstagramVideo(job.instagram!, this.env);
@@ -1188,7 +1191,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         if (!(job.instagram?.kind === "music" && !job.instagram.musicVideoId)) await step.do("record instagram video delivery", async () => {
           for (let i = 0; i < Math.min(20, result.parts || 1); i++) await recordSuccessfulDelivery(this.env, `instagram:${job.id}${i ? `:${i}` : ""}`);
         });
-      } else if ((job.social || job.instagramPost) && result.message) {
+      } else if ((job.bandcamp || job.social || job.instagramPost) && result.message) {
         await step.do("track partial media result", () => trackJob(this.env, job, result.parts ? "partial" : "failed", {
           title: result.title || source.title, delivered: result.parts || 0, detail: result.message,
         }));
@@ -1605,7 +1608,7 @@ async function handleQualityCallback(
   return Response.json({ ok: true });
 }
 
-async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target?: InstagramVideoTarget, recognition?: RecognitionInput, playlist?: PlaylistInput, social?: SocialInput): Promise<Response> {
+async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target?: InstagramVideoTarget, recognition?: RecognitionInput, playlist?: PlaylistInput, social?: SocialInput, bandcamp?: BandcampInput): Promise<Response> {
   const message = update.message!;
   const user = trackedUser(message);
   const userId = user?.id ?? message.chat.id;
@@ -1615,6 +1618,7 @@ async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target?
     ...(recognition ? { recognition } : {}),
     ...(playlist ? { playlist } : {}),
     ...(social ? { social } : {}),
+    ...(bandcamp ? { bandcamp } : {}),
   };
   await trackJob(env, job, "pending");
   try {
@@ -1847,7 +1851,7 @@ export default {
       if (actor && !isAdmin(env, actor.id) && !update?.callback_query?.data?.startsWith("admin:")
           && !/^\/admin(?:@[A-Za-z0-9_]+)?$/i.test(activityText)) {
         const linkSent = Boolean(parseInstagramProfileCommand(activityText) || isInstagramDownloadLink(activityText) || extractYouTubeUrl(activityText)
-          || extractPornhubUrl(activityText) || parseSocialUrl(activityText) || parsePlaylist(activityText));
+          || parseBandcampUrl(activityText) || extractPornhubUrl(activityText) || parseSocialUrl(activityText) || parsePlaylist(activityText));
         await recordUserActivity(env, { id: actor.id, username: actor.username, firstName: actor.first_name, lastName: actor.last_name },
           linkSent, update?.update_id, isStartCommand(activityText));
       }
@@ -1900,6 +1904,14 @@ export default {
           return Response.json({ ok: true });
         }
 
+        const bandcamp = parseBandcampUrl(text);
+        if (bandcamp) return createInstagramWorkflow(env, update, undefined, undefined, undefined, undefined, bandcamp);
+        if (/^\/bandcamp(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) {
+          await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id,
+            text: "لینک آهنگ یا آلبوم Bandcamp را بفرست؛ فعلاً آلبوم‌های حداکثر 20 آهنگی پشتیبانی می‌شوند." });
+          return Response.json({ ok: true });
+        }
+
         const social = parseSocialUrl(text);
         if (social) return createInstagramWorkflow(env, update, undefined, undefined, undefined, social);
         if (/^\/(?:x|twitter|pinterest|tiktok|soundcloud|aparat)(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) {
@@ -1927,6 +1939,7 @@ export default {
             "🔎 تشخیص آهنگ: ویس، صدا یا ویدیو؛ در گروه ریپلای + /shazam",
             "🔎 آهنگ اینستاگرام: «پیداکردن آهنگ» یا /findmusic لینک",
             "🎼 پلی‌لیست: /playlist لینک 1-20",
+            "🎵 Bandcamp: لینک آهنگ یا آلبوم • /bandcamp لینک",
             "🎧 فقط صدا: دکمهٔ «فقط صدا» یا /audio لینک",
             "",
             "ضبط لایو: /live username",
