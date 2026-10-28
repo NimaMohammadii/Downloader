@@ -1006,15 +1006,12 @@ test('Instagram membership button click delivers the page link and admin can hid
   const click=id=>admin.worker.fetch(webhook({callback_query:{id:'ig-click',from:{id},data:'membership:instagram',message:{message_id:5,chat:{id}}}}),f.env,{});
   await click(42);
   const visitUrl=calls.at(-1).body.reply_markup.inline_keyboard[0][0].url;
-  assert.match(visitUrl,/\/membership\/instagram\/visit/);
+  assert.equal(visitUrl,'https://www.instagram.com/vexa.order/');
   assert.equal((await (await f.request('/membership-instagram')).json()).total,0);
-  const visit=await admin.worker.fetch(new Request(visitUrl),f.env,{});
-  assert.equal(visit.status,302);assert.equal(visit.headers.get('location'),'https://www.instagram.com/vexa.order/');
-  assert.equal((await (await f.request('/membership-instagram')).json()).total,1);
   const panel=(data,id=admin.ADMIN_USER_ID)=>admin.worker.fetch(webhook({callback_query:{id:'ig-panel',from:{id},data,message:{message_id:5,chat:{id}}}}),f.env,{});
   await panel('admin:membership:instagram_off');
   assert.equal((await (await f.request('/membership-instagram')).json()).enabled,false);
-  assert.match(calls.at(-1).body.text,/کل: 1 نفر/);
+  assert.match(calls.at(-1).body.text,/کل: 0 نفر/);
   calls.length=0;await click(42);
   assert.doesNotMatch(JSON.stringify(calls),/membership:instagram|instagram.com|@Vexa.Order/);
   await panel('admin:membership:instagram_on',43);
@@ -1023,28 +1020,14 @@ test('Instagram membership button click delivers the page link and admin can hid
 });
 
 
-test('Instagram entry button directly redirects and counts only signed visits, refreshes rolling activity and respects hiding',async()=>{
+test('Instagram entry button uses the direct page URL without a callback or tracking intermediary',async()=>{
  const f=fixture(),previous=globalThis.fetch,calls=[];
  globalThis.fetch=async(input,init)=>{calls.push(JSON.parse(init.body));return Response.json({ok:true,result:{status:'left'}});};
  try{
-  const now=Date.now();Date.now=()=>now;
   await f.request('/membership',{mode:'start'});
   await admin.worker.fetch(webhook({message:{message_id:1,chat:{id:42},from:{id:42},text:'/start'}}),f.env,{});
-  const prompt=calls.at(-1),button=prompt.reply_markup.inline_keyboard.flat().find(b=>b.url?.includes('/membership/instagram/visit'));
+  const prompt=calls.at(-1),button=prompt.reply_markup.inline_keyboard.flat().find(b=>b.url==='https://www.instagram.com/vexa.order/');
   assert.ok(button);assert.ok(!button.callback_data);assert.doesNotMatch(prompt.text,/@Vexa\.Order/);
-  const state=async()=>(await f.request('/membership-instagram')).json();
-  assert.equal((await state()).total,0);
-  const visit=(url=button.url,method='GET')=>admin.worker.fetch(new Request(url,{method}),f.env,{});
-  assert.equal((await visit(button.url,'HEAD')).status,405);
-  const tampered=new URL(button.url);tampered.searchParams.set('user','43');
-  assert.equal((await visit(tampered.href)).status,403);assert.equal((await state()).total,0);
-  const response=await visit();assert.equal(response.status,302);
-  assert.equal(response.headers.get('location'),'https://www.instagram.com/vexa.order/');
-  assert.equal(response.headers.get('cache-control'),'no-store');
-  await visit();assert.equal((await state()).total,1);assert.equal((await state()).day,1);
-  Date.now=()=>now+2*86400000;
-  assert.equal((await state()).day,0);await visit();assert.equal((await state()).day,1);assert.equal((await state()).total,1);
-  await f.request('/membership-instagram',{actorId:admin.ADMIN_USER_ID,enabled:false});
-  assert.equal((await visit()).status,200);assert.equal((await visit()).headers.get('location'),null);
+  assert.doesNotMatch(JSON.stringify(prompt),/membership\/instagram\/visit/);
  }finally{globalThis.fetch=previous;f.close();}
 });

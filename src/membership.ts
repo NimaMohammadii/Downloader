@@ -110,26 +110,8 @@ export async function membershipInstagram(env: MembershipEnv, enabled?: boolean,
   if (!response.ok) throw new Error("MEMBERSHIP_INSTAGRAM_UNAVAILABLE");
   return response.json();
 }
-const rememberedOrigins = new WeakMap<object, string>();
-async function rememberMembershipOrigin(env: MembershipEnv, origin: string): Promise<void> {
-  if (!env.ADMIN_STATS || rememberedOrigins.get(env.ADMIN_STATS) === origin) return;
-  const response = await env.ADMIN_STATS.getByName("global").fetch("https://admin-stats/membership-instagram", {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ origin }),
-  });
-  if (!response.ok) throw new Error("MEMBERSHIP_INSTAGRAM_ORIGIN_UNAVAILABLE");
-  rememberedOrigins.set(env.ADMIN_STATS, origin);
-}
 async function instagramVisitKey(token: string): Promise<CryptoKey> {
   return crypto.subtle.importKey("raw", new TextEncoder().encode(token), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
-}
-async function instagramVisitUrl(env: MembershipEnv, userId: number, origin?: string): Promise<string | undefined> {
-  if (!origin || !env.BOT_TOKEN) return undefined;
-  const event = crypto.randomUUID();
-  const bytes = await crypto.subtle.sign("HMAC", await instagramVisitKey(env.BOT_TOKEN), new TextEncoder().encode(`${userId}:${event}`));
-  const signature = Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, "0")).join("");
-  const url = new URL("/membership/instagram/visit", origin);
-  url.search = new URLSearchParams({ user: String(userId), event, signature }).toString();
-  return url.href;
 }
 export async function handleInstagramVisit(request: Request, env: MembershipEnv): Promise<Response | null> {
   const url = new URL(request.url);
@@ -150,19 +132,18 @@ export async function handleInstagramVisit(request: Request, env: MembershipEnv)
   if (!response.ok) console.warn("Instagram visit measurement unavailable");
   return new Response(null, { status: 302, headers: { ...headers, location: "https://www.instagram.com/vexa.order/" } });
 }
-async function configuredMembershipPrompt(env: MembershipEnv, userId: number): Promise<Record<string, unknown>> {
+async function configuredMembershipPrompt(env: MembershipEnv): Promise<Record<string, unknown>> {
   const settings = await membershipInstagram(env);
-  return membershipPrompt(env.MEMBERSHIP_CHANNEL || MEMBERSHIP_CHANNEL, settings.enabled,
-    settings.enabled ? await instagramVisitUrl(env, userId, settings.origin) : undefined);
+  return membershipPrompt(env.MEMBERSHIP_CHANNEL || MEMBERSHIP_CHANNEL, settings.enabled);
 }
 
-export function membershipPrompt(channel = MEMBERSHIP_CHANNEL, instagramEnabled = true, instagramUrl?: string): Record<string, unknown> {
+export function membershipPrompt(channel = MEMBERSHIP_CHANNEL, instagramEnabled = true): Record<string, unknown> {
   const title = "ادامه با عضویت در چنل";
   const text = `⚡️ ${title}\n${instagramEnabled ? "عضو چنلمون شو و پیج اینستاگراممون رو هم فالو کن؛ خبرهای تازه اونجاست!" : "عضو چنلمون شو؛ ابزارها و قابلیت‌های جدید هم اونجاست!"}\nبعد از عضویت در چنل، «عضو شدم» رو بزن.`;
   return { text, entities: [{ type: "bold", offset: text.indexOf(title), length: title.length }],
     reply_markup: { inline_keyboard: [[
       { text: "ورود به چنل", icon_custom_emoji_id: "5260285114448891086", url: `https://t.me/${channel.replace(/^@/, "")}` },
-      ...(instagramEnabled ? [{ text: "ورود به پیج اینستاگرام", icon_custom_emoji_id: "5278573677900752088", ...(instagramUrl ? { url: instagramUrl } : { callback_data: "membership:instagram" }) }] : []),
+      ...(instagramEnabled ? [{ text: "ورود به پیج اینستاگرام", icon_custom_emoji_id: "5278573677900752088", url: "https://www.instagram.com/vexa.order/" }] : []),
     ], [
       { text: "✅ عضو شدم", callback_data: "membership:check" },
     ]] },
@@ -173,7 +154,7 @@ export async function notifyFirstDownload(env: MembershipEnv, userId: number): P
   if (!env.BOT_TOKEN || isAdmin(env, userId)) return;
   const state = await membershipState(env, userId);
   if (!state.enabled || state.mode !== "after_download" || !state.downloaded || await isChannelMember(env, userId)) return;
-  await telegram(env, "sendMessage", { chat_id: userId, ...await configuredMembershipPrompt(env, userId) });
+  await telegram(env, "sendMessage", { chat_id: userId, ...await configuredMembershipPrompt(env) });
 }
 
 // Run once at the production webhook boundary, before any delegated command or callback.
@@ -186,15 +167,13 @@ export async function enforceMembership(request: Request, env: MembershipEnv, ct
   const callback = update?.callback_query;
   const actor = callback?.from || update?.message?.from;
   if (!Number.isSafeInteger(actor?.id) || actor.id <= 0) return null;
-  await rememberMembershipOrigin(env, new URL(request.url).origin);
   if (callback?.data === "membership:instagram") {
     await telegram(env, "answerCallbackQuery", { callback_query_id: callback.id });
     const settings = await membershipInstagram(env);
     if (settings.enabled) {
-      const url = await instagramVisitUrl(env, actor.id, settings.origin);
       await telegram(env, "sendMessage", { chat_id: actor.id, text: "پیج اینستاگراممون منتظرته؛ وارد شو و فالو کن 💜",
-        reply_markup: { inline_keyboard: [[{ text: "باز کردن پیج اینستاگرام", icon_custom_emoji_id: "5278573677900752088", url: url! }]] } });
-    } else await telegram(env, "sendMessage", { chat_id: actor.id, ...await configuredMembershipPrompt(env, actor.id) });
+        reply_markup: { inline_keyboard: [[{ text: "باز کردن پیج اینستاگرام", icon_custom_emoji_id: "5278573677900752088", url: "https://www.instagram.com/vexa.order/" }]] } });
+    } else await telegram(env, "sendMessage", { chat_id: actor.id, ...await configuredMembershipPrompt(env) });
     return Response.json({ ok: true });
   }
   if (isAdmin(env, actor.id)) return null;
@@ -235,14 +214,14 @@ export async function enforceMembership(request: Request, env: MembershipEnv, ct
         } catch {
           console.warn("membership confirmation cleanup unavailable");
           // Keep the request pending until Telegram confirms the emoji is gone.
-          try { await telegram(env, "sendMessage", { chat_id: actor.id, ...await configuredMembershipPrompt(env, actor.id) }); } catch {}
+          try { await telegram(env, "sendMessage", { chat_id: actor.id, ...await configuredMembershipPrompt(env) }); } catch {}
           return;
         }
         if (!resume) return;
         try {
           const latest = await membershipState(env, actor.id);
           if (requiresMembership(latest) && !await isChannelMember(env, actor.id)) {
-            await telegram(env, "sendMessage", { chat_id: actor.id, ...await configuredMembershipPrompt(env, actor.id) });
+            await telegram(env, "sendMessage", { chat_id: actor.id, ...await configuredMembershipPrompt(env) });
             return;
           }
           const pending = await pendingRequest(env, actor.id, "take");
@@ -261,7 +240,7 @@ export async function enforceMembership(request: Request, env: MembershipEnv, ct
   if (!checking) await pendingRequest(env, actor.id, "save", update);
   if (callback?.id) await telegram(env, "answerCallbackQuery", { callback_query_id: callback.id, _errorUserId: callback.from?.id,
     text: checking ? "هنوز عضو چنل نیستی؛ اول عضو شو و دوباره بررسی کن." : "برای ادامه، اول عضو چنل شو.", show_alert: true });
-  const prompt = await configuredMembershipPrompt(env, actor.id);
+  const prompt = await configuredMembershipPrompt(env);
   if (checking && callback.message?.chat?.id === actor.id) {
     // Refresh old prompts too, so channel corrections fix their existing join button.
     await telegram(env, "editMessageText", {

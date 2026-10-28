@@ -107,7 +107,7 @@ test('first successful download sends one compact bold gate with original custom
     assert.ok(body.entities.some(e => e.type === 'custom_emoji' && e.custom_emoji_id === '5210956306952758910'));
     const buttons = body.reply_markup.inline_keyboard.flat();
     assert.equal(buttons.length, 3);
-    assert.ok(buttons.some(b => b.callback_data === 'membership:instagram'));
+    assert.ok(buttons.some(b => b.url === 'https://www.instagram.com/vexa.order/'));
     assert.doesNotMatch(body.text, /@Vexa\.Order/);
     assert.ok(buttons.some(b => b.url === 'https://t.me/fixture_channel'));
     assert.ok(buttons.some(b => b.callback_data === 'membership:check'));
