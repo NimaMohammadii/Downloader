@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createHmac } from 'node:crypto';
 
+const reddit = await readFile(new URL('../src/reddit.ts', import.meta.url), 'utf8');
 const bandcamp = await readFile(new URL('../src/bandcamp.ts', import.meta.url), 'utf8');
 const source = await readFile(new URL('../src/youtube-main.ts', import.meta.url), 'utf8');
 const instagram = await readFile(new URL('../src/index.ts', import.meta.url), 'utf8');
@@ -27,6 +28,7 @@ const { outputFiles } = await build({
         export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }
         export class WorkflowEntrypoint { constructor(ctx, env) { this.env = env; } }
       ` };
+      if (args.path === './reddit') return {contents:reddit,loader:'ts'};
       if (args.path === './bandcamp') return {contents:bandcamp,loader:'ts'};
       if (args.path === './story-main') return { contents: 'export default { fetch() {} }; export const resolveInstagramSessionPost = async () => {throw Error("Unexpected session fallback")}; export const instagramSessionFailure = () => ({code:"unexpected",message:"error"}); export const startInstagramStoryRun = async () => {throw Error("Unexpected Story start")}; export const readInstagramStoryRun = async () => {throw Error("Unexpected Story read")}; export const sendResolvedStory = async () => {throw Error("Unexpected Story send")}; export const instagramProfileStories = async () => []; export const parseStoryTarget = () => null; export const parseInstagramProfileCommand = () => null; export const parseInstagramVideoTarget = () => null; export const parseInstagramAudioTarget = () => null; export const resolveInstagramVideo = () => {}; export const instagramVideoErrorText = () => "error";' };
       if (args.path === './index') return { contents: instagram, loader: 'ts' };

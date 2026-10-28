@@ -1,4 +1,5 @@
 import { parseBandcampUrl, type BandcampInput } from "./bandcamp";
+import { parseRedditUrl, type RedditInput } from "./reddit";
 import { Container, getContainer } from "@cloudflare/containers";
 import {
   DurableObject,
@@ -46,7 +47,7 @@ type YoutubeAudioMode = "low" | "hq";
 type RecognitionInput = { fileId: string; fileSize?: number };
 type PlaylistInput = { url: string; start: number; end: number };
 type SocialInput = { platform: "x" | "pinterest" | "tiktok" | "soundcloud" | "aparat"; url: string; audioOnly?: boolean; itemIndex?: number };
-type MediaSource = InstagramVideoSource & { bandcamp?: BandcampInput; recognition?: RecognitionInput; playlist?: PlaylistInput; social?: SocialInput;
+type MediaSource = InstagramVideoSource & { reddit?: RedditInput; bandcamp?: BandcampInput; recognition?: RecognitionInput; playlist?: PlaylistInput; social?: SocialInput;
   instagramPost?: Pick<InstagramPostUpload, "shortcode" | "storyId" | "media"> };
 const RECOGNITION_FILE_LIMIT = 20_000_000;
 
@@ -69,6 +70,7 @@ type YoutubeDownloadJob = {
   instagramProfile?: { username: string; kind?: "posts" | "story"; target?: StoryTarget };
   instagramProfileParent?: { id: string; eventType: string };
   bandcamp?: BandcampInput;
+  reddit?: RedditInput;
   recognition?: RecognitionInput;
   playlist?: PlaylistInput;
   social?: SocialInput;
@@ -80,6 +82,7 @@ type Env = AdminStatsEnv & InstagramApiSecrets & {
   API_ID?: string;
   API_HASH?: string;
   PINTEREST_COOKIES?: string;
+  REDDIT_COOKIES?: string;
   YOUTUBE_DOWNLOAD_WORKFLOW: Workflow<YoutubeDownloadJob>;
   YOUTUBE_DOWNLOADER_CONTAINER: DurableObjectNamespace<YoutubeDownloaderContainer>;
   DOWNLOAD_POOL: DurableObjectNamespace<DownloadPool>;
@@ -308,7 +311,9 @@ export class YoutubeDownloaderContainer extends Container<Env> {
     const pinterest = action === "start" && (payload.source as MediaSource | undefined)?.social?.platform === "pinterest";
     // Read the current Worker secret for each job; a running Container keeps
     // its startup environment even after a secret is replaced or removed.
-    const requestPayload = pinterest ? { ...payload, pinterestCookies: this.env.PINTEREST_COOKIES || "" } : payload;
+    const reddit = action === "start" && Boolean((payload.source as MediaSource | undefined)?.reddit);
+    const requestPayload = reddit ? { ...payload, redditCookies: this.env.REDDIT_COOKIES || "" }
+      : pinterest ? { ...payload, pinterestCookies: this.env.PINTEREST_COOKIES || "" } : payload;
     if (pinterest) console.info("pinterest session supplied", { configured: Boolean(this.env.PINTEREST_COOKIES?.trim()) });
     const response = await this.containerFetch(`http://container/instagram/${action}`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(requestPayload),
@@ -483,14 +488,14 @@ function jobHistory(job: YoutubeDownloadJob): Omit<DownloadRecord, "status"> {
   if (job.instagramPost) return { key: `ig:${job.chatId}:${job.requestMessageId}:${job.userId}`,
     userId: job.userId, source: "Instagram post", request: job.instagramPost.url };
   const ig = job.instagram;
-  const source = job.bandcamp ? "Bandcamp" : job.social ? socialName(job.social.platform) : job.playlist ? "YouTube Playlist"
+  const source = job.reddit ? "Reddit" : job.bandcamp ? "Bandcamp" : job.social ? socialName(job.social.platform) : job.playlist ? "YouTube Playlist"
     : job.recognition ? "تشخیص آهنگ" : ig ? ig.kind === "music" ? "جست‌وجو و دانلود آهنگ" : `Instagram ${ig.kind}`
     : job.source === "pornhub" ? "Pornhub" : "YouTube";
-  const request = job.url || job.bandcamp?.url || job.social?.url || (job.playlist ? `${job.playlist.url} • ${job.playlist.start}-${job.playlist.end}` : "")
+  const request = job.url || job.reddit?.url || job.bandcamp?.url || job.social?.url || (job.playlist ? `${job.playlist.url} • ${job.playlist.start}-${job.playlist.end}` : "")
     || (job.recognition ? "فایل ارسالی برای تشخیص آهنگ" : ig?.musicVideoId ? `https://www.youtube.com/watch?v=${ig.musicVideoId}`
       : ig?.query || (ig?.shortcode ? `https://www.instagram.com/p/${ig.shortcode}/` : ig?.mediaId ? `Instagram Story ${ig.mediaId}`
         : ig?.username ? `Instagram @${ig.username}` : ig?.broadcastId ? `Instagram Live ${ig.broadcastId}` : source));
-  return { key: ig || job.social || job.recognition || job.playlist || job.bandcamp ? job.id : `youtube:${job.chatId}:${job.requestMessageId}:${job.userId}`,
+  return { key: ig || job.social || job.recognition || job.playlist || job.bandcamp || job.reddit ? job.id : `youtube:${job.chatId}:${job.requestMessageId}:${job.userId}`,
     userId: job.userId, source, request };
 }
 
@@ -521,11 +526,11 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
   async run(event: WorkflowEvent<YoutubeDownloadJob>, step: WorkflowStep) {
     const job: YoutubeDownloadJob = { ...event.payload };
     const inspect = !job.instagramProfile && !job.instagram && !job.instagramPost &&
-      !job.instagramPostRequest && !job.bandcamp && !job.recognition && !job.playlist && !job.social && !job.quality && !job.audioMode && job.source !== "pornhub";
+      !job.instagramPostRequest && !job.reddit && !job.bandcamp && !job.recognition && !job.playlist && !job.social && !job.quality && !job.audioMode && job.source !== "pornhub";
     await step.do("track download request", () => trackJob(this.env, job, inspect ? "pending" : "processing"));
     if (job.instagramProfile) return this.runInstagramProfile(job, step);
     if (job.instagramPostRequest) return this.runInstagramPostRequest(job, step);
-    if (job.bandcamp || job.instagram || job.instagramPost || job.recognition || job.playlist || job.social) {
+    if (job.reddit || job.bandcamp || job.instagram || job.instagramPost || job.recognition || job.playlist || job.social) {
       const result = await this.runInstagram(job, step).catch(error => {
         if (!job.instagramProfileParent) throw error;
         console.warn("instagram profile item interrupted", { jobId: job.id });
@@ -1081,7 +1086,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         if (job.instagramPost) return job.instagramPost.statusMessageId;
         const message = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
           chat_id: job.chatId, reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
-          text: job.bandcamp ? "🎵 دارم آهنگ‌های Bandcamp را آماده می‌کنم…" : job.social ? `⬇️ دارم ${job.social.audioOnly ? "صدای ویدیوی" : "فایل"} ${socialName(job.social.platform)} را دریافت می‌کنم…` : job.playlist ? `🎵 دارم آهنگ‌های ${job.playlist.start}-${job.playlist.end} پلی‌لیست را به‌صورت MP3 آماده می‌کنم…` : job.recognition || job.instagram?.recognizeMusic ? "🎧 دارم آهنگ داخل فایل را شناسایی می‌کنم…" : job.instagram?.kind === "music" ? "🔎 دارم آهنگ را پیدا می‌کنم…" : job.instagram?.kind === "audio" ? "🎵 دارم صدای ویدیوی اینستاگرام را آماده می‌کنم…" : "🔎 دارم لایو یا بازپخش اینستاگرام را بررسی می‌کنم…",
+          text: job.reddit ? "⬇️ دارم فایل‌های Reddit را آماده می‌کنم…" : job.bandcamp ? "🎵 دارم آهنگ‌های Bandcamp را آماده می‌کنم…" : job.social ? `⬇️ دارم ${job.social.audioOnly ? "صدای ویدیوی" : "فایل"} ${socialName(job.social.platform)} را دریافت می‌کنم…` : job.playlist ? `🎵 دارم آهنگ‌های ${job.playlist.start}-${job.playlist.end} پلی‌لیست را به‌صورت MP3 آماده می‌کنم…` : job.recognition || job.instagram?.recognizeMusic ? "🎧 دارم آهنگ داخل فایل را شناسایی می‌کنم…" : job.instagram?.kind === "music" ? "🔎 دارم آهنگ را پیدا می‌کنم…" : job.instagram?.kind === "audio" ? "🎵 دارم صدای ویدیوی اینستاگرام را آماده می‌کنم…" : "🔎 دارم لایو یا بازپخش اینستاگرام را بررسی می‌کنم…",
         });
         return message.message_id;
       });
@@ -1101,6 +1106,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         try {
           const source: MediaSource = job.instagramPost ? { mode: "replay", title: "Instagram",
             instagramPost: { shortcode: job.instagramPost.shortcode, ...(job.instagramPost.storyId ? { storyId: job.instagramPost.storyId } : {}), media: job.instagramPost.media } }
+            : job.reddit ? { mode: "replay", title: "Reddit", reddit: job.reddit }
             : job.bandcamp ? { mode: "replay", title: "Bandcamp", audioOnly: true, bandcamp: job.bandcamp }
             : job.social ? { mode: "replay", title: socialName(job.social.platform), social: job.social } : job.playlist ? { mode: "replay", title: "YouTube Playlist", audioOnly: true, playlist: job.playlist } : job.recognition
             ? { mode: "replay", title: "Music recognition", audioOnly: true, recognition: job.recognition }
@@ -1191,7 +1197,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         if (!(job.instagram?.kind === "music" && !job.instagram.musicVideoId)) await step.do("record instagram video delivery", async () => {
           for (let i = 0; i < Math.min(20, result.parts || 1); i++) await recordSuccessfulDelivery(this.env, `instagram:${job.id}${i ? `:${i}` : ""}`);
         });
-      } else if ((job.bandcamp || job.social || job.instagramPost) && result.message) {
+      } else if ((job.reddit || job.bandcamp || job.social || job.instagramPost) && result.message) {
         await step.do("track partial media result", () => trackJob(this.env, job, result.parts ? "partial" : "failed", {
           title: result.title || source.title, delivered: result.parts || 0, detail: result.message,
         }));
@@ -1221,6 +1227,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       await step.do("notify instagram video failure", async () => {
         const text = error instanceof Error && /YT_CONFIG|DOWNLOAD_POOL_FULL|max.*instance|provision/i.test(error.message)
           ? workflowFailureMessage(error.message, "startup")
+          : job.reddit ? "❌ دریافت یا ارسال Reddit کامل نشد؛ پیش از درخواست دوباره، فایل‌های دریافتی چت را بررسی کن."
           : job.instagramPost ? "❌ دریافت یا ارسال پست اینستاگرام کامل نشد؛ اگر فایلی دریافت کرده‌ای، پیش از درخواست دوباره بررسی کن."
           : job.social ? `❌ دریافت یا ارسال فایل ${socialName(job.social.platform)} کامل نشد؛ اگر فایلی دریافت کرده‌ای، پیش از درخواست دوباره بررسی کن.` : job.recognition || job.playlist || job.instagram?.kind === "music" || job.instagram?.kind === "audio" ? "❌ دریافت یا ارسال فایل صوتی کامل نشد؛ درخواست را دوباره بفرست." : "❌ ضبط یا ارسال لایو کامل نشد؛ لینک را دوباره بفرست. ممکن است سرور ری‌استارت شده باشد.";
         await safeTelegramCall(this.env.BOT_TOKEN, statusId ? "editMessageText" : "sendMessage", {
@@ -1608,7 +1615,7 @@ async function handleQualityCallback(
   return Response.json({ ok: true });
 }
 
-async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target?: InstagramVideoTarget, recognition?: RecognitionInput, playlist?: PlaylistInput, social?: SocialInput, bandcamp?: BandcampInput): Promise<Response> {
+async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target?: InstagramVideoTarget, recognition?: RecognitionInput, playlist?: PlaylistInput, social?: SocialInput, bandcamp?: BandcampInput, reddit?: RedditInput): Promise<Response> {
   const message = update.message!;
   const user = trackedUser(message);
   const userId = user?.id ?? message.chat.id;
@@ -1619,6 +1626,7 @@ async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target?
     ...(playlist ? { playlist } : {}),
     ...(social ? { social } : {}),
     ...(bandcamp ? { bandcamp } : {}),
+    ...(reddit ? { reddit } : {}),
   };
   await trackJob(env, job, "pending");
   try {
@@ -1851,7 +1859,7 @@ export default {
       if (actor && !isAdmin(env, actor.id) && !update?.callback_query?.data?.startsWith("admin:")
           && !/^\/admin(?:@[A-Za-z0-9_]+)?$/i.test(activityText)) {
         const linkSent = Boolean(parseInstagramProfileCommand(activityText) || isInstagramDownloadLink(activityText) || extractYouTubeUrl(activityText)
-          || parseBandcampUrl(activityText) || extractPornhubUrl(activityText) || parseSocialUrl(activityText) || parsePlaylist(activityText));
+          || parseRedditUrl(activityText) || parseBandcampUrl(activityText) || extractPornhubUrl(activityText) || parseSocialUrl(activityText) || parsePlaylist(activityText));
         await recordUserActivity(env, { id: actor.id, username: actor.username, firstName: actor.first_name, lastName: actor.last_name },
           linkSent, update?.update_id, isStartCommand(activityText));
       }
@@ -1904,6 +1912,13 @@ export default {
           return Response.json({ ok: true });
         }
 
+        if (/^\/reddit(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) {
+          const reddit = parseRedditUrl(text);
+          if (reddit) return createInstagramWorkflow(env, update, undefined, undefined, undefined, undefined, undefined, reddit);
+          await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id,
+            text: "لینک پست عمومی Reddit را بفرست؛ ویدیو، عکس و گالری حداکثر ۲۰ فایلی پشتیبانی می‌شود." });
+          return Response.json({ ok: true });
+        }
         const bandcamp = parseBandcampUrl(text);
         if (bandcamp) return createInstagramWorkflow(env, update, undefined, undefined, undefined, undefined, bandcamp);
         if (/^\/bandcamp(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) {
@@ -1911,6 +1926,9 @@ export default {
             text: "لینک آهنگ یا آلبوم Bandcamp را بفرست؛ فعلاً آلبوم‌های حداکثر 20 آهنگی پشتیبانی می‌شوند." });
           return Response.json({ ok: true });
         }
+
+        const reddit = parseRedditUrl(text);
+        if (reddit) return createInstagramWorkflow(env, update, undefined, undefined, undefined, undefined, undefined, reddit);
 
         const social = parseSocialUrl(text);
         if (social) return createInstagramWorkflow(env, update, undefined, undefined, undefined, social);
@@ -1940,6 +1958,7 @@ export default {
             "🔎 آهنگ اینستاگرام: «پیداکردن آهنگ» یا /findmusic لینک",
             "🎼 پلی‌لیست: /playlist لینک 1-20",
             "🎵 Bandcamp: لینک آهنگ یا آلبوم • /bandcamp لینک",
+            "⬇️ Reddit: ویدیو، عکس و گالری • /reddit لینک",
             "🎧 فقط صدا: دکمهٔ «فقط صدا» یا /audio لینک",
             "",
             "ضبط لایو: /live username",

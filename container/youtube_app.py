@@ -1864,6 +1864,10 @@ class InstagramCapture:
     def run(self) -> None:
         watchdog = wall_timer = None
         try:
+            if self.source.get("reddit"):
+                from reddit import prepare
+                prepare(self)
+                return
             if self.source.get("bandcamp"):
                 from bandcamp import prepare
                 prepare(self)
@@ -2047,6 +2051,8 @@ class InstagramCapture:
             # Never print commands, signed stream URLs, bot tokens or account data.
             print(f"instagram capture failed: {type(exc).__name__}", flush=True)
             self.result = {"ok": False, "message": str(exc) if isinstance(exc, UserVisibleError) else "❌ دریافت یا آماده‌سازی لایو کامل نشد؛ لینک را دوباره بفرست."}
+            if self.source.get("reddit") and not isinstance(exc, UserVisibleError):
+                self.result["message"] = "❌ دریافت یا آماده‌سازی Reddit کامل نشد؛ لینک عمومی پست را دوباره بفرست."
             if self.source.get("bandcamp") and not isinstance(exc, UserVisibleError):
                 self.result["message"] = "❌ دریافت یا آماده‌سازی Bandcamp کامل نشد؛ دوباره لینک آهنگ را بفرست."
             if self.source.get("playlist") and not isinstance(exc, UserVisibleError):
@@ -2148,6 +2154,8 @@ class InstagramCapture:
     def send(self) -> dict[str, Any]:
         with self.lock:
             if self.state == "sent":
+                if self.source.get("reddit"):
+                    return self.result
                 if self.source.get("bandcamp"):
                     return self.result
                 if self.source.get("instagramPost"):
@@ -2165,6 +2173,9 @@ class InstagramCapture:
             self.state = "sending"
         uploading = False
         try:
+            if self.source.get("reddit"):
+                from reddit import send
+                return send(self)
             if self.source.get("bandcamp"):
                 from bandcamp import send
                 return send(self)

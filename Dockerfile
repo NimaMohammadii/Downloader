@@ -25,6 +25,7 @@ COPY container/youtube_app.py /app/youtube_app.py
 COPY container/youtube_pipeline.py /app/youtube_pipeline.py
 COPY container/pornhub.py /app/pornhub.py
 COPY container/bandcamp.py /app/bandcamp.py
+COPY container/reddit.py /app/reddit.py
 COPY container/start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
