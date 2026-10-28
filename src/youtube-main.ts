@@ -175,7 +175,7 @@ type ParsedQualityCallback = {
   audioMode?: YoutubeAudioMode;
 };
 
-const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
+export const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
 
 const POOL_INSTANCES = 20;
 const JOBS_PER_CONTAINER = 5;

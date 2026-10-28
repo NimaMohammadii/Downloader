@@ -1,4 +1,5 @@
 import { telegramCustomEmoji, telegramTextMotion } from "./admin";
+import { BANDCAMP_FIX_VERSION } from "./bandcamp";
 import legacyWorker from "./index";
 
 type Env = {
@@ -752,6 +753,7 @@ export default {
         mode: "cloudflare-only",
         resolver: "instagram-v13-instagrapi-exact-public-session",
         downloadFixVersion: "pool-five-v1",
+        bandcampFixVersion: BANDCAMP_FIX_VERSION,
         botConfigured: Boolean(env.BOT_TOKEN),
         webhookSecretConfigured: Boolean(env.WEBHOOK_SECRET),
         instagramSessionConfigured: Boolean(env.INSTAGRAM_SESSIONID?.trim()),

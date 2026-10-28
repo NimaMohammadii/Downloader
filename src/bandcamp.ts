@@ -1,5 +1,6 @@
 // Bandcamp-only routing. Other platform parsers do not depend on this module.
 export type BandcampInput = { url: string };
+export const BANDCAMP_FIX_VERSION = "bandcamp-firefox-v3";
 
 export function bandcampFailureDiagnostic(error: unknown, env: object = {}) {
   const secrets = Object.entries(env).filter(([key, value]) =>
@@ -12,7 +13,8 @@ export function bandcampFailureDiagnostic(error: unknown, env: object = {}) {
       .replace(/\b(?:authorization|cookie|sessionid|token|secret|api_hash|api_key|password)\b["']?\s*[:=]\s*[^\r\n]+/gi, "[redacted]")
       .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, " ").slice(0, limit);
   };
-  return { source: "Bandcamp", detail: clean(error instanceof Error ? error.message : String(error), 1500),
+  return { source: "Bandcamp", bandcampFixVersion: BANDCAMP_FIX_VERSION,
+    detail: clean(error instanceof Error ? error.message : String(error), 1500),
     ...(error instanceof Error && error.stack ? { stack: clean(error.stack, 2500) } : {}) };
 }
 

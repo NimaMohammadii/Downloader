@@ -2,7 +2,7 @@ import {build} from 'esbuild';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 const parser = await build({entryPoints:['src/bandcamp.ts'],bundle:true,format:'esm',write:false});
-const {parseBandcampUrl,bandcampFailureDiagnostic} = await import(`data:text/javascript;base64,${Buffer.from(parser.outputFiles[0].text).toString('base64')}`);
+const {parseBandcampUrl,bandcampFailureDiagnostic,BANDCAMP_FIX_VERSION} = await import(`data:text/javascript;base64,${Buffer.from(parser.outputFiles[0].text).toString('base64')}`);
 const bundle = await build({entryPoints:['src/app-main.ts'],bundle:true,format:'esm',write:false,plugins:[{name:'runtime',setup(b){
  b.onResolve({filter:/^(cloudflare:workers|@cloudflare\/containers)$/},a=>({path:a.path,namespace:'runtime'}));
  b.onLoad({filter:/.*/,namespace:'runtime'},a=>({contents:a.path==='cloudflare:workers'?'export class DurableObject{}; export class WorkflowEntrypoint{constructor(ctx,env){this.env=env;}}':'export class Container{}; export const getContainer=()=>globalThis.container;'}));
@@ -81,4 +81,36 @@ test('Bandcamp webhook exceptions log a sanitized cause while other requests kee
   await worker.fetch(message('https://youtube.com/watch?v=abcdefghijk'),bindings,{});
   assert.deepEqual(logs[0],{message:'request failed',detail:{type:'Error'}});
  }finally{console.error=previous;}
+});
+
+test('Bandcamp failure diagnostics work with the deployed fallback configuration without changing other handlers',async()=>{
+ const logs=[],sent=[];const previous=console.error;let queued=0;
+ console.error=(message,detail)=>logs.push({message,detail});
+ globalThis.fetch=async(url,init)=>{sent.push(JSON.parse(init.body));return Response.json({ok:true,result:{message_id:9}});};
+ const bindings={...env,WEBHOOK_SECRET:undefined,YOUTUBE_DOWNLOAD_WORKFLOW:{async create(){queued++;}},ADMIN_STATS:{getByName(){throw new Error('storage request failed');}}};
+ const fallback='dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1';
+ const request=(text,key)=>new Request('https://worker/telegram/webhook',{method:'POST',headers:{'content-type':'application/json','x-telegram-bot-api-secret-token':key},body:JSON.stringify({message:{message_id:7,chat:{id:42,type:'private'},from:{id:42},text}})});
+ try{
+  const response=await worker.fetch(request('https://essence-music.bandcamp.com/track/munus',fallback),bindings,{});
+  assert.equal(response.status,200);assert.equal(logs[0].detail.source,'Bandcamp');assert.equal(logs[0].detail.bandcampFixVersion,BANDCAMP_FIX_VERSION);
+  assert.ok(logs[0].detail.detail.includes('storage request failed'));assert.equal(queued,0);assert.ok(sent.length>0);
+  logs.length=0;sent.length=0;
+  const other=await worker.fetch(request('https://youtube.com/watch?v=abcdefghijk',fallback),bindings,{});
+  assert.equal(other.status,500);assert.deepEqual(logs[0],{message:'request failed',detail:{type:'Error'}});assert.equal(sent.length,0);
+  logs.length=0;
+  for(const key of ['wrong',secret]){
+   const rejected=await worker.fetch(request('https://essence-music.bandcamp.com/track/munus',key),bindings,{});
+   assert.equal(rejected.status,403);assert.equal(logs.length,0);assert.equal(sent.length,0);
+  }
+  // A configured secret continues to reject the old fallback, including errors.
+  const rejected=await worker.fetch(request('https://essence-music.bandcamp.com/track/munus',fallback),{...bindings,WEBHOOK_SECRET:secret},{});
+  assert.equal(rejected.status,403);assert.equal(sent.length,0);assert.equal(queued,0);
+ }finally{console.error=previous;}
+});
+
+test('existing health route exposes the Bandcamp fix version without starting a Container',async()=>{
+ globalThis.container={async startShared(){throw new Error('unexpected startup');}};
+ const response=await worker.fetch(new Request('https://worker/health'),env,{});
+ assert.equal(response.status,200);const body=await response.json();assert.equal(body.bandcampFixVersion,BANDCAMP_FIX_VERSION);
+ assert.equal(body.downloadFixVersion,'pool-five-v1');
 });

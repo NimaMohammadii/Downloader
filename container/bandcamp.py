@@ -14,6 +14,7 @@ import youtube_app as app
 MAX_TRACKS = 20
 MAX_BYTES = 2_000_000_000
 MAX_SECONDS = 20 * 60
+BANDCAMP_FIX_VERSION = 'bandcamp-firefox-v3'
 
 
 def failure(phase: str, exc: Exception) -> app.UserVisibleError:
@@ -44,6 +45,8 @@ def failure(phase: str, exc: Exception) -> app.UserVisibleError:
         category, code = 'service_unavailable', 'SOURCE_UNAVAILABLE'
     elif isinstance(exc, FileNotFoundError):
         category, code = 'service_unavailable', 'DEPENDENCY_MISSING'
+    elif re.search(r'client challenge|impersonate target.*not available|no impersonate target', detail, re.I):
+        category, code = ('access_unavailable', 'CLIENT_CHALLENGE') if 'client challenge' in detail.lower() else ('service_unavailable', 'IMPERSONATION_UNAVAILABLE')
     elif isinstance(exc, app.requests.ConnectionError) or re.search(r'connection (?:reset|refused)|name.*resol|network is unreachable|unable to resolve', detail, re.I):
         category, code = 'network', 'CONNECTION_FAILED'
     elif re.search(r'(?:this (?:track|album|content) is private|private (?:track|album))\b', detail, re.I):
@@ -53,7 +56,8 @@ def failure(phase: str, exc: Exception) -> app.UserVisibleError:
     elif isinstance(exc, (ValueError, TypeError)):
         category, code = ('output_invalid', 'INVALID_OUTPUT') if phase in {'probe', 'remux'} else ('download_failed', 'INVALID_METADATA')
     diagnostic = {**app.upload_error_diagnostic(exc, ''), 'message': 'bandcamp request failed',
-                  'phase': phase, 'category': category, 'errorCode': f'BANDCAMP_{code}'}
+                  'phase': phase, 'category': category, 'errorCode': f'BANDCAMP_{code}',
+                  'bandcampFixVersion': BANDCAMP_FIX_VERSION}
     if isinstance(status, int):
         diagnostic['httpStatus'] = status
     if isinstance(getattr(exc, 'returncode', None), int):
@@ -92,9 +96,11 @@ def media_url(value: str) -> str:
 
 
 def metadata(url: str, *, album: bool = False) -> dict:
+    # Bandcamp's Client Challenge rejects the default Chrome fingerprint on
+    # some networks (yt-dlp #17822). Use one verified target for this provider.
     command = [app.REAL_YTDLP, '--ignore-config', '--force-ipv4', '--skip-download',
                '--dump-single-json', '--no-warnings', '--socket-timeout', '15',
-               '--retries', '1', '--extractor-retries', '1']
+               '--retries', '1', '--extractor-retries', '1', '--impersonate', 'firefox']
     command += ['--flat-playlist', '--playlist-end', str(MAX_TRACKS + 1)] if album else ['--no-playlist']
     try:
         result = subprocess.run(command + ['--', canonical_url(url)], capture_output=True, text=True, timeout=90, check=True)

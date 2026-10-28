@@ -38,6 +38,7 @@ class BandcampTests(unittest.TestCase):
         args=run.call_args.args[0]
         self.assertEqual(args[-2:],['--',ALBUM]);self.assertIn('--flat-playlist',args)
         self.assertEqual(args[args.index('--playlist-end')+1],'21')
+        self.assertEqual(args[args.index('--impersonate')+1],'firefox')
         self.assertNotIn('--cookies',args);self.assertNotIn('--extractor-args',args)
 
     def test_provider_errors_are_classified_without_guessing_private_content(self):
@@ -50,6 +51,8 @@ class BandcampTests(unittest.TestCase):
             (subprocess.CalledProcessError(1,['yt-dlp',URL],stderr='HTTP Error 503: Service unavailable'),'service_unavailable','BANDCAMP_SOURCE_UNAVAILABLE'),
             (subprocess.CalledProcessError(1,['yt-dlp',URL],stderr='This track is private'),'content_private','BANDCAMP_CONTENT_PRIVATE'),
             (subprocess.CalledProcessError(1,['yt-dlp',URL],stderr='No video formats found'),'content_unavailable','BANDCAMP_NO_PUBLIC_AUDIO'),
+            (subprocess.CalledProcessError(1,['yt-dlp',URL],stderr='Got client challenge webpage response with firefox-147:macos-15'),'access_unavailable','BANDCAMP_CLIENT_CHALLENGE'),
+            (subprocess.CalledProcessError(1,['yt-dlp',URL],stderr='No impersonate target is available'),'service_unavailable','BANDCAMP_IMPERSONATION_UNAVAILABLE'),
             (FileNotFoundError(2,'file not found'),'service_unavailable','BANDCAMP_DEPENDENCY_MISSING'),
             (subprocess.CalledProcessError(1,['yt-dlp',URL],stderr='unknown extraction failure'),'download_failed','BANDCAMP_SOURCE_FAILED'),
         ]
@@ -60,6 +63,15 @@ class BandcampTests(unittest.TestCase):
             # The public message remains stable through both Container and Worker filtering.
             self.assertEqual(app.private_error_payload('editMessageText',{'chat_id':42,'text':str(caught.exception)})['text'],str(caught.exception))
             event=json.loads(output.getvalue());self.assertEqual(event['errorCode'],code);self.assertEqual(event['phase'],'metadata')
+            self.assertEqual(event['bandcampFixVersion'],bc.BANDCAMP_FIX_VERSION)
+
+    def test_pinned_runtime_supports_firefox_and_revision_matches_worker(self):
+        from yt_dlp import YoutubeDL
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+        with YoutubeDL({'quiet':True}) as ydl:
+            self.assertTrue(ydl._impersonate_target_available(ImpersonateTarget('firefox')))
+        source=(Path(__file__).resolve().parents[1]/'src'/'bandcamp.ts').read_text()
+        self.assertIn('"'+bc.BANDCAMP_FIX_VERSION+'"',source)
 
     def test_metadata_log_never_prints_stderr_commands_or_signed_urls(self):
         sensitive='private-token-value'

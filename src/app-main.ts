@@ -4,7 +4,7 @@ import { publicError } from "./public-errors";
 import { handleBroadcastUpdate } from "./broadcast";
 import { enforceMembership } from "./membership";
 import { PUBLIC_ERROR_MESSAGE, telegramTextMotion, telegramCustomEmoji, type AdminStatsEnv } from "./admin";
-import youtubeWorker from "./youtube-main";
+import youtubeWorker, { WEBHOOK_SECRET } from "./youtube-main";
 export { AdminStatsStore, DownloadPool, YoutubeDownloaderContainer, YoutubeDownloadWorkflow } from "./youtube-main";
 import { MINI_APP_HTML } from "./mini-app-ui";
 import { WEB_APP_HTML } from "./web-ui";
@@ -118,7 +118,11 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const trustedWebhook = new URL(request.url).pathname === "/telegram/webhook" && env.WEBHOOK_SECRET &&
       request.headers.get("x-telegram-bot-api-secret-token") === env.WEBHOOK_SECRET;
-    const update = trustedWebhook ? await request.clone().json().catch(() => null) as any : null;
+    // Bandcamp diagnostics must also work with the existing fallback key.
+    // Keep other routes' error handling and all authentication rules unchanged.
+    const fallbackWebhook = !env.WEBHOOK_SECRET && new URL(request.url).pathname === "/telegram/webhook" &&
+      request.headers.get("x-telegram-bot-api-secret-token") === WEBHOOK_SECRET;
+    const update = trustedWebhook || fallbackWebhook ? await request.clone().json().catch(() => null) as any : null;
     try {
       return await appWorker.fetch(request, env, ctx);
     } catch (error) {
@@ -126,7 +130,7 @@ export default {
       console.error("request failed", { type: error instanceof Error ? error.name : "unknown",
         ...(bandcamp ? { phase: "webhook", ...bandcampFailureDiagnostic(error, env) } : {}) });
       // Only trusted webhook updates may select a Telegram destination.
-      if (trustedWebhook && update) {
+      if ((trustedWebhook || (fallbackWebhook && bandcamp)) && update) {
         try {
           const message = update.message || update.callback_query?.message;
           if (message?.chat?.id) {
