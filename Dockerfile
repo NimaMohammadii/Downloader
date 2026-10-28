@@ -26,6 +26,8 @@ COPY container/youtube_pipeline.py /app/youtube_pipeline.py
 COPY container/pornhub.py /app/pornhub.py
 COPY container/bandcamp.py /app/bandcamp.py
 COPY container/reddit.py /app/reddit.py
+COPY container/mini_pipeline.py /app/mini_pipeline.py
+COPY container/mini_async_entry.py /app/mini_async_entry.py
 COPY container/start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 

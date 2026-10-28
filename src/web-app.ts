@@ -1,9 +1,9 @@
-import { getContainer, type Container } from "@cloudflare/containers";
+import { getContainer, Container } from "@cloudflare/containers";
 import { WEB_APP_HTML } from "./web-ui";
 
 type WebAppEnv = {
   BOT_TOKEN: string;
-  YOUTUBE_DOWNLOADER_CONTAINER: DurableObjectNamespace<Container>;
+  WEB_APP_CONTAINER: DurableObjectNamespace<WebAppContainer>;
 };
 
 type MetadataResult = {
@@ -15,25 +15,26 @@ type MetadataResult = {
   audioAvailable?: boolean;
 };
 
-type JobResult = {
-  ok: boolean;
-  state?: "preparing" | "ready" | "error";
-  message?: string;
-  fileId?: string;
-  fileName?: string;
-  mime?: string;
-  size?: number;
-};
+// Web transport only. The bot's Container class, binding, pool and startup
+// command remain unchanged; both runtimes import the same Python engine.
+export class WebAppContainer extends Container {
+  defaultPort = 8080;
+  sleepAfter: string | number = "5m";
+  enableInternet = true;
+  entrypoint = ["/opt/venv/bin/python", "/app/mini_async_entry.py"];
 
-type WatchResult = {
-  ok: boolean;
-  message?: string;
-  streamId?: string;
-  title?: string;
-  mime?: string;
-  quality?: number;
-  qualities?: number[];
-};
+  async webRequest(request: Request): Promise<Response> {
+    await this.startAndWaitForPorts({
+      ports: [8080],
+      cancellationOptions: { instanceGetTimeoutMS: 45_000, portReadyTimeoutMS: 60_000 },
+    });
+    return this.containerFetch(request);
+  }
+
+  override async onActivityExpired(): Promise<void> {
+    await this.destroy();
+  }
+}
 
 type BrowserSession = { id: string; expires: number };
 type BrowserAuth = BrowserSession & { tabId: string };
@@ -41,11 +42,11 @@ type BrowserAuth = BrowserSession & { tabId: string };
 const COOKIE_NAME = "__Host-vexa_session";
 const SESSION_TTL_SECONDS = 7 * 24 * 60 * 60;
 const DOWNLOAD_TTL_SECONDS = 2 * 60 * 60;
-const WATCH_TTL_SECONDS = 30 * 60;
-const WATCH_QUALITY_VALUES = [144, 240, 360, 480, 720, 1080] as const;
+const WATCH_TTL_SECONDS = DOWNLOAD_TTL_SECONDS;
+const WATCH_QUALITY_VALUES = [360, 480, 720, 1080] as const;
 const SESSION_ID_RE = /^[a-f0-9]{32}$/;
 const TAB_ID_RE = /^[A-Za-z0-9_-]{12,64}$/;
-const VIDEO_ID_RE = /^[A-Za-z0-9_-]{6,20}$/;
+const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 const FILE_ID_RE = /^[A-Za-z0-9_-]{16,64}$/;
 const encoder = new TextEncoder();
 
@@ -262,8 +263,8 @@ async function handleMetadata(request: Request, env: WebAppEnv): Promise<Respons
   const source = youtubeUrlFromInput(String(body.url || ""));
   if (!source) return json({ ok: false, message: "Paste a valid YouTube link." }, 400);
 
-  const container = getContainer(env.YOUTUBE_DOWNLOADER_CONTAINER, containerId(auth));
-  const response = await container.fetch(
+  const container = getContainer(env.WEB_APP_CONTAINER, containerId(auth));
+  const response = await container.webRequest(
     new Request("http://container/metadata", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -286,142 +287,73 @@ async function handleMetadata(request: Request, env: WebAppEnv): Promise<Respons
   });
 }
 
-async function handleStart(request: Request, env: WebAppEnv): Promise<Response> {
+function eventResponse(source: Response, map: (value: Record<string, any>) => Promise<unknown>): Response {
+  const decoder = new TextDecoder();
+  let buffer = "", terminal = false;
+  const encode = (value: unknown) => encoder.encode(`data: ${JSON.stringify(value)}\n\n`);
+  const stream = source.body!.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    async transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true });
+      let end: number;
+      while ((end = buffer.indexOf("\n\n")) >= 0) {
+        const event = buffer.slice(0, end);
+        buffer = buffer.slice(end + 2);
+        if (terminal) continue;
+        if (event.startsWith(":")) { controller.enqueue(encoder.encode(event + "\n\n")); continue; }
+        if (!event.startsWith("data: ")) continue;
+        try {
+          const value = JSON.parse(event.slice(6));
+          if (value.state === "preparing") controller.enqueue(encode(value));
+          else { terminal = true; controller.enqueue(encode(await map(value))); }
+        } catch {
+          terminal = true;
+          controller.enqueue(encode({ ok: false, message: "Could not prepare this video." }));
+        }
+      }
+    },
+    flush(controller) {
+      if (!terminal) controller.enqueue(encode({ ok: false, message: "Video preparation was interrupted. Try again." }));
+    },
+  }));
+  return new Response(stream, { headers: {
+    "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+  } });
+}
+
+async function handlePrepare(request: Request, env: WebAppEnv, watch: boolean): Promise<Response> {
   const body = await readSmallJson(request);
   if (!body) return json({ ok: false, message: "Invalid request." }, 400);
   const auth = await authenticateBrowser(request, env, body);
   if (!auth) return json({ ok: false, message: "Your browser session expired. Reload the page." }, 401);
-
   const videoId = String(body.videoId || "");
   const quality = body.quality == null ? null : Number(body.quality);
   const audioMode = body.audioMode == null ? null : String(body.audioMode);
-  if (!VIDEO_ID_RE.test(videoId)) return json({ ok: false, message: "This download session is invalid." }, 400);
-  const validQuality = quality != null && [360, 480, 720, 1080].includes(quality);
+  const validQuality = quality != null && Number.isInteger(quality) && WATCH_QUALITY_VALUES.includes(quality as 360 | 480 | 720 | 1080);
   const validAudio = audioMode === "low" || audioMode === "hq";
-  if (validQuality === validAudio) return json({ ok: false, message: "Choose one download format." }, 400);
-
-  const fileId = crypto.randomUUID().replace(/-/g, "");
-  const container = getContainer(env.YOUTUBE_DOWNLOADER_CONTAINER, containerId(auth));
-  const response = await container.fetch(
-    new Request("http://container/mini/start", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        url: `https://www.youtube.com/watch?v=${videoId}`,
-        fileId,
-        quality: validQuality ? quality : undefined,
-        audioMode: validAudio ? audioMode : undefined,
-      }),
-    }),
-  );
-  const result = (await response.json().catch(() => ({
-    ok: false,
-    message: "Could not start this download.",
-  }))) as JobResult;
-  if (!response.ok && response.status !== 202) {
-    return json(
-      { ok: false, message: result.message || "Could not start this download." },
-      response.status === 409 ? 409 : 502,
-    );
+  if (!VIDEO_ID_RE.test(videoId) || (watch ? (quality != null && !validQuality) || audioMode != null : validQuality === validAudio)) {
+    return json({ ok: false, message: "Choose a valid video and format." }, 400);
   }
-  return json({ ok: true, state: "preparing", jobId: fileId });
-}
-
-async function handleStatus(request: Request, env: WebAppEnv): Promise<Response> {
-  const body = await readSmallJson(request);
-  if (!body) return json({ ok: false, message: "Invalid request." }, 400);
-  const auth = await authenticateBrowser(request, env, body);
-  if (!auth) return json({ ok: false, message: "Your browser session expired. Reload the page." }, 401);
-  const jobId = String(body.jobId || "");
-  if (!FILE_ID_RE.test(jobId)) return json({ ok: false, message: "Invalid download job." }, 400);
-
-  const container = getContainer(env.YOUTUBE_DOWNLOADER_CONTAINER, containerId(auth));
-  const response = await container.fetch(
-    new Request(`http://container/mini/status?fileId=${encodeURIComponent(jobId)}`),
-  );
-  const result = (await response.json().catch(() => ({
-    ok: false,
-    state: "error",
-    message: "Could not check this download.",
-  }))) as JobResult;
-  if (!result.ok || result.state === "error") {
-    return json({ ok: false, state: "error", message: result.message || "Could not prepare this file." });
+  const mediaId = crypto.randomUUID().replace(/-/g, "");
+  const container = getContainer(env.WEB_APP_CONTAINER, containerId(auth));
+  const response = await container.webRequest(new Request(`http://container/mini/${watch ? "watch/start" : "start"}`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ url: `https://www.youtube.com/watch?v=${videoId}`,
+      [watch ? "streamId" : "fileId"]: mediaId, quality: quality ?? undefined, audioMode: audioMode ?? undefined }),
+  }));
+  if (!response.ok || !response.body || !response.headers.get("content-type")?.includes("text/event-stream")) {
+    return json({ ok: false, message: response.status === 409 ? "A video is still being prepared." : "Could not prepare this video." }, response.status === 409 ? 409 : 502);
   }
-  if (result.state !== "ready" || !result.fileId || !result.fileName) {
-    return json({ ok: true, state: "preparing" });
-  }
-
-  const expires = Math.floor(Date.now() / 1000) + DOWNLOAD_TTL_SECONDS;
-  const sig = await signValue(
-    env.BOT_TOKEN,
-    downloadSignaturePayload(auth.id, auth.tabId, result.fileId, expires),
-  );
-  return json({
-    ok: true,
-    state: "ready",
-    fileName: result.fileName,
-    size: Number(result.size || 0),
-    mime: result.mime || "application/octet-stream",
-    downloadUrl: makeDownloadUrl(request, auth, result.fileId, expires, sig),
-  });
-}
-
-async function handleWatchStart(request: Request, env: WebAppEnv): Promise<Response> {
-  const body = await readSmallJson(request);
-  if (!body) return json({ ok: false, message: "Invalid request." }, 400);
-  const auth = await authenticateBrowser(request, env, body);
-  if (!auth) return json({ ok: false, message: "Your browser session expired. Reload the page." }, 401);
-
-  const videoId = String(body.videoId || "");
-  const rawQuality = body.quality;
-  const quality = rawQuality == null || rawQuality === "" ? null : Number(rawQuality);
-  if (!VIDEO_ID_RE.test(videoId)) return json({ ok: false, message: "This watch session is invalid." }, 400);
-  if (
-    quality != null &&
-    (!Number.isInteger(quality) || !WATCH_QUALITY_VALUES.includes(quality as (typeof WATCH_QUALITY_VALUES)[number]))
-  ) {
-    return json({ ok: false, message: "This watch quality is invalid." }, 400);
-  }
-
-  const streamId = crypto.randomUUID().replace(/-/g, "");
-  const container = getContainer(env.YOUTUBE_DOWNLOADER_CONTAINER, containerId(auth));
-  const response = await container.fetch(
-    new Request("http://container/mini/watch/start", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        url: `https://www.youtube.com/watch?v=${videoId}`,
-        streamId,
-        quality: quality ?? undefined,
-      }),
-    }),
-  );
-  const result = (await response.json().catch(() => ({
-    ok: false,
-    message: "Could not open this stream.",
-  }))) as WatchResult;
-  if (!response.ok || !result.ok || !result.streamId) {
-    return json(
-      { ok: false, message: result.message || "Could not open this stream." },
-      response.status >= 500 ? 502 : 200,
-    );
-  }
-
-  const expires = Math.floor(Date.now() / 1000) + WATCH_TTL_SECONDS;
-  const sig = await signValue(
-    env.BOT_TOKEN,
-    watchSignaturePayload(auth.id, auth.tabId, result.streamId, expires),
-  );
-  const resolvedQuality = Number(result.quality || 0);
-  return json({
-    ok: true,
-    title: result.title || "YouTube video",
-    mime: result.mime || "video/mp4",
-    quality: WATCH_QUALITY_VALUES.includes(resolvedQuality as (typeof WATCH_QUALITY_VALUES)[number])
-      ? resolvedQuality
-      : null,
-    qualities: normalizeWatchQualities(result.qualities),
-    streamUrl: makeWatchUrl(request, auth, result.streamId, expires, sig),
+  return eventResponse(response, async result => {
+    if (!result.ok || result.fileId !== mediaId) return { ok: false, message: result.message || "Could not prepare this video." };
+    const expires = Math.floor(Date.now() / 1000) + (watch ? WATCH_TTL_SECONDS : DOWNLOAD_TTL_SECONDS);
+    const payload = watch ? watchSignaturePayload(auth.id, auth.tabId, mediaId, expires)
+      : downloadSignaturePayload(auth.id, auth.tabId, mediaId, expires);
+    const sig = await signValue(env.BOT_TOKEN, payload);
+    return watch ? { ok: true, title: result.title, mime: "video/mp4", quality: result.quality,
+      qualities: normalizeWatchQualities(result.qualities), streamUrl: makeWatchUrl(request, auth, mediaId, expires, sig) }
+      : { ok: true, state: "ready", fileName: result.fileName, size: result.size, mime: result.mime,
+        downloadUrl: makeDownloadUrl(request, auth, mediaId, expires, sig) };
   });
 }
 
@@ -464,17 +396,17 @@ async function validateSignedMediaRequest(
 async function handleFile(request: Request, env: WebAppEnv): Promise<Response> {
   const verified = await validateSignedMediaRequest(request, env, "download");
   if (!verified) return new Response("Download link expired or invalid.", { status: 403 });
-  const container = getContainer(env.YOUTUBE_DOWNLOADER_CONTAINER, containerId(verified.auth));
+  const container = getContainer(env.WEB_APP_CONTAINER, containerId(verified.auth));
   const headers = new Headers();
   const range = request.headers.get("range");
   if (range) headers.set("range", range);
-  const source = await container.fetch(
+  const source = await container.webRequest(
     new Request(`http://container/mini/file?fileId=${encodeURIComponent(verified.mediaId)}`, {
       method: request.method === "HEAD" ? "HEAD" : "GET",
       headers,
     }),
   );
-  if (!source.ok && source.status !== 206) {
+  if (!source.ok && source.status !== 206 && source.status !== 416) {
     return new Response("File is no longer available. Prepare it again.", { status: 404 });
   }
   const outgoing = new Headers();
@@ -499,19 +431,19 @@ async function handleFile(request: Request, env: WebAppEnv): Promise<Response> {
 async function handleWatchStream(request: Request, env: WebAppEnv): Promise<Response> {
   const verified = await validateSignedMediaRequest(request, env, "watch");
   if (!verified) return new Response("Stream link expired or invalid.", { status: 403 });
-  const container = getContainer(env.YOUTUBE_DOWNLOADER_CONTAINER, containerId(verified.auth));
+  const container = getContainer(env.WEB_APP_CONTAINER, containerId(verified.auth));
   const headers = new Headers();
   const range = request.headers.get("range");
   if (range) headers.set("range", range);
   const ifRange = request.headers.get("if-range");
   if (ifRange) headers.set("if-range", ifRange);
-  const source = await container.fetch(
+  const source = await container.webRequest(
     new Request(`http://container/mini/watch?streamId=${encodeURIComponent(verified.mediaId)}`, {
       method: request.method === "HEAD" ? "HEAD" : "GET",
       headers,
     }),
   );
-  if (!source.ok && source.status !== 206) {
+  if (!source.ok && source.status !== 206 && source.status !== 416) {
     return new Response("Stream is no longer available.", { status: 404 });
   }
   const outgoing = new Headers();
@@ -575,9 +507,8 @@ export async function handleWebAppRequest(
     });
   }
   if (url.pathname === "/web/api/metadata" && request.method === "POST") return handleMetadata(request, env);
-  if (url.pathname === "/web/api/start" && request.method === "POST") return handleStart(request, env);
-  if (url.pathname === "/web/api/status" && request.method === "POST") return handleStatus(request, env);
-  if (url.pathname === "/web/api/watch" && request.method === "POST") return handleWatchStart(request, env);
+  if (url.pathname === "/web/api/start" && request.method === "POST") return handlePrepare(request, env, false);
+  if (url.pathname === "/web/api/watch" && request.method === "POST") return handlePrepare(request, env, true);
   if (url.pathname === "/web/file" && (request.method === "GET" || request.method === "HEAD")) return handleFile(request, env);
   if (url.pathname === "/web/stream" && (request.method === "GET" || request.method === "HEAD")) return handleWatchStream(request, env);
   if (url.pathname.startsWith("/web/")) return new Response("Not found", { status: 404 });

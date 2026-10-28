@@ -11,6 +11,10 @@
   "durable_objects": {
     "bindings": [
       {
+        "name": "WEB_APP_CONTAINER",
+        "class_name": "WebAppContainer"
+      },
+      {
         "name": "ADMIN_STATS",
         "class_name": "AdminStatsStore"
       },
@@ -52,9 +56,22 @@
     {
       "tag": "v7",
       "new_sqlite_classes": ["DownloadPool"]
+    },
+    {
+      "tag": "v8",
+      "new_sqlite_classes": ["WebAppContainer"]
     }
   ],
   "containers": [
+    {
+      "name": "downloader-web-player-v1",
+      "class_name": "WebAppContainer",
+      "image": "./Dockerfile",
+      "max_instances": 20,
+      "instance_type": "standard-2",
+      "constraints": { "regions": ["EEUR"] },
+      "rollout_step_percentage": [100]
+    },
     {
       "name": "downloader-youtube-chat-v6",
       "class_name": "YoutubeDownloaderContainer",

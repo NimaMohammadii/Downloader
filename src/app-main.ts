@@ -6,13 +6,15 @@ import { handleInstagramVisit, enforceMembership } from "./membership";
 import { PUBLIC_ERROR_MESSAGE, telegramTextMotion, telegramCustomEmoji, type AdminStatsEnv } from "./admin";
 import youtubeWorker, { WEBHOOK_SECRET } from "./youtube-main";
 export { AdminStatsStore, DownloadPool, YoutubeDownloaderContainer, YoutubeDownloadWorkflow } from "./youtube-main";
+export { WebAppContainer } from "./web-app";
+import { handleWebAppRequest, type WebAppContainer } from "./web-app";
 import { MINI_APP_HTML } from "./mini-app-ui";
-import { WEB_APP_HTML } from "./web-ui";
 import { applyWebBackground } from "./web-mesh-background";
 import { applyWebViewport } from "./web-viewport";
 
 type Env = Partial<AdminStatsEnv> & {
   BOT_TOKEN: string;
+  WEB_APP_CONTAINER: DurableObjectNamespace<WebAppContainer>;
   WEBHOOK_SECRET?: string;
   MEMBERSHIP_CHANNEL?: string;
   INSTAGRAM_SESSIONID?: string;
@@ -69,11 +71,10 @@ const appWorker = {
     const instagramVisit = await handleInstagramVisit(request, env);
     if (instagramVisit) return instagramVisit;
 
-    if (
-      (url.pathname === "/" || url.pathname === "/app" || url.pathname === "/app/") &&
-      (request.method === "GET" || request.method === "HEAD")
-    ) {
-      return htmlResponse(request, WEB_APP_HTML);
+    const webResponse = await handleWebAppRequest(request, env);
+    if (webResponse) {
+      return (webResponse.headers.get("content-type") || "").includes("text/html") && request.method !== "HEAD"
+        ? applyWebViewport(applyWebBackground(webResponse)) : webResponse;
     }
 
     if (
@@ -83,16 +84,7 @@ const appWorker = {
       return htmlResponse(request, MINI_APP_HTML);
     }
 
-    if (url.pathname === "/robots.txt" && request.method === "GET") {
-      return new Response("User-agent: *\nAllow: /\nDisallow: /web/\n", {
-        headers: {
-          "content-type": "text/plain; charset=utf-8",
-          "cache-control": "public, max-age=3600",
-        },
-      });
-    }
-
-    if (url.pathname.startsWith("/web/") || url.pathname.startsWith("/mini-app/")) {
+    if (url.pathname.startsWith("/mini-app/")) {
       return disabledContainerResponse(request);
     }
 

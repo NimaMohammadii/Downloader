@@ -1,4 +1,5 @@
 import json
+from contextlib import nullcontext
 import mimetypes
 import re
 import shutil
@@ -12,7 +13,7 @@ import youtube_pipeline as pipeline
 pipeline.install()
 
 MINI_ROOT = Path('/tmp/vexa-miniapp-downloads')
-MINI_FILE_TTL_SECONDS = 20 * 60
+MINI_FILE_TTL_SECONDS = 2 * 60 * 60
 FILE_ID_RE = re.compile(r'^[A-Za-z0-9_-]{16,64}$')
 
 
@@ -66,50 +67,53 @@ def _prepare_file(payload: dict[str, object]) -> dict[str, object]:
     shutil.rmtree(workdir, ignore_errors=True)
     workdir.mkdir(parents=True, exist_ok=True)
 
-    metadata = app.load_metadata_cache(url)
-    if metadata is None:
-        metadata = pipeline.fetch_metadata(url)
-        app.save_metadata_cache(metadata)
-    app.validate_video_metadata(metadata)
+    # Use exactly the bot's catalog, selected client, recovery and verification.
+    # The cache context belongs to this request, never another browser/video.
+    with app.request_cache(url) if app.REQUEST_CACHE.get() is None else nullcontext():
+        metadata = app.load_metadata_cache(url)
+        if metadata is None:
+            metadata = pipeline.fetch_metadata(url)
+            app.save_metadata_cache(metadata)
+        app.validate_video_metadata(metadata)
 
-    title = str(metadata.get('title') or 'YouTube video').strip()
-    safe_title = _clean_title(title)
+        title = str(metadata.get('title') or 'YouTube video').strip()
+        safe_title = _clean_title(title)
 
-    try:
-        if quality is not None:
-            if quality not in pipeline.available_qualities(metadata):
-                raise app.UserVisibleError(f'❌ کیفیت {quality}p برای این ویدیو موجود نیست.')
-            source = pipeline.download_video(url, workdir, quality, metadata)
-            target = workdir / f'Vexa - {safe_title} - {quality}p.mp4'
-            mime = 'video/mp4'
-        else:
-            assert audio_mode is not None
-            source = pipeline.download_audio(url, workdir, audio_mode)
-            mode_label = 'HQ' if audio_mode == 'hq' else 'Lite'
-            target = workdir / f'Vexa - {safe_title} - Audio {mode_label}.m4a'
-            mime = 'audio/mp4'
+        try:
+            if quality is not None:
+                if quality not in pipeline.available_qualities(metadata):
+                    raise app.UserVisibleError(f'❌ کیفیت {quality}p برای این ویدیو موجود نیست.')
+                source = pipeline.download_video(url, workdir, quality, metadata)
+                target = workdir / f'Vexa - {safe_title} - {quality}p.mp4'
+                mime = 'video/mp4'
+            else:
+                assert audio_mode is not None
+                source = pipeline.download_audio(url, workdir, audio_mode)
+                mode_label = 'HQ' if audio_mode == 'hq' else 'Lite'
+                target = workdir / f'Vexa - {safe_title} - Audio {mode_label}.m4a'
+                mime = 'audio/mp4'
 
-        if source.resolve() != target.resolve():
-            source.replace(target)
-        if not target.exists() or target.stat().st_size <= 0:
-            raise app.UserVisibleError('❌ فایل نهایی ساخته نشد.')
+            if source.resolve() != target.resolve():
+                source.replace(target)
+            if not target.exists() or target.stat().st_size <= 0:
+                raise app.UserVisibleError('❌ فایل نهایی ساخته نشد.')
 
-        manifest = {
-            'fileId': file_id,
-            'fileName': target.name,
-            'mime': mime,
-            'size': target.stat().st_size,
-            'title': title,
-        }
-        (workdir / 'manifest.json').write_text(
-            json.dumps(manifest, ensure_ascii=False),
-            encoding='utf-8',
-        )
-        return {'ok': True, **manifest}
-    except Exception:
-        if not (workdir / 'manifest.json').exists():
-            shutil.rmtree(workdir, ignore_errors=True)
-        raise
+            manifest = {
+                'fileId': file_id,
+                'fileName': target.name,
+                'mime': mime,
+                'size': target.stat().st_size,
+                'title': title,
+            }
+            (workdir / 'manifest.json').write_text(
+                json.dumps(manifest, ensure_ascii=False),
+                encoding='utf-8',
+            )
+            return {'ok': True, **manifest}
+        except Exception:
+            if not (workdir / 'manifest.json').exists():
+                shutil.rmtree(workdir, ignore_errors=True)
+            raise
 
 
 def _load_manifest(file_id: str) -> tuple[dict[str, object], Path] | None:
@@ -179,7 +183,7 @@ class MiniAppHandler(app.Handler):
         self.send_header('cache-control', 'private, no-store')
         self.send_header(
             'content-disposition',
-            f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}',
+            f'{getattr(self, "file_disposition", "attachment")}; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}',
         )
         if status == 206:
             self.send_header('content-range', f'bytes {start}-{end}/{size}')
@@ -195,6 +199,7 @@ class MiniAppHandler(app.Handler):
             return
 
         manifest, path = loaded
+        path.parent.touch()
         size = path.stat().st_size
         bounds = _range_bounds(self.headers.get('range'), size)
         if bounds is None:
