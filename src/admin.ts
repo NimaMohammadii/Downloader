@@ -474,6 +474,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
     super(ctx, env);
     this.broadcasts = new BroadcastManager(ctx, env);
     this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS membership_instagram_config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS membership_instagram_clicks (
         event_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, recorded_at INTEGER NOT NULL
       );
@@ -776,8 +777,13 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
     if (url.pathname === "/membership-instagram") {
       const sql = this.ctx.storage.sql;
       if (request.method === "POST") {
-        const body = await request.json() as { actorId?: number; enabled?: boolean; eventId?: string; userId?: number };
-        if (body.enabled !== undefined) {
+        const body = await request.json() as { actorId?: number; enabled?: boolean; eventId?: string; userId?: number; origin?: string };
+        if (body.origin !== undefined) {
+          let origin: URL;
+          try { origin = new URL(body.origin); } catch { return new Response("Invalid origin", { status: 400 }); }
+          if (origin.protocol !== "https:" || origin.origin !== body.origin) return new Response("Invalid origin", { status: 400 });
+          sql.exec("INSERT INTO membership_instagram_config(key,value) VALUES ('origin',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", body.origin);
+        } else if (body.enabled !== undefined) {
           if (!isAdmin(this.env, body.actorId)) return new Response("Forbidden", { status: 403 });
           if (typeof body.enabled !== "boolean") return new Response("Invalid setting", { status: 400 });
           sql.exec("UPDATE counters SET value=? WHERE key='membership_instagram_enabled'", body.enabled ? 1 : 0);
@@ -793,7 +799,8 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         COUNT(DISTINCT CASE WHEN recorded_at >= ? THEN user_id END) AS week
         FROM membership_instagram_clicks`, now - 86400_000, now - 7 * 86400_000).one();
       return Response.json({ enabled: asNumber(sql.exec("SELECT value FROM counters WHERE key='membership_instagram_enabled'").one().value) === 1,
-        total: asNumber(counts.total), day: asNumber(counts.day), week: asNumber(counts.week) });
+        total: asNumber(counts.total), day: asNumber(counts.day), week: asNumber(counts.week),
+        ...Object.fromEntries(sql.exec("SELECT key,value FROM membership_instagram_config WHERE key='origin'").toArray().map(row => [String(row.key),String(row.value)])) });
     }
 
     if (url.pathname === "/membership") {

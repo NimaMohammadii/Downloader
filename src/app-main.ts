@@ -2,7 +2,7 @@ import { enforceRestriction } from "./restrictions";
 import { parseBandcampUrl, bandcampFailureDiagnostic } from "./bandcamp";
 import { publicError } from "./public-errors";
 import { handleBroadcastUpdate } from "./broadcast";
-import { enforceMembership } from "./membership";
+import { handleInstagramVisit, enforceMembership } from "./membership";
 import { PUBLIC_ERROR_MESSAGE, telegramTextMotion, telegramCustomEmoji, type AdminStatsEnv } from "./admin";
 import youtubeWorker, { WEBHOOK_SECRET } from "./youtube-main";
 export { AdminStatsStore, DownloadPool, YoutubeDownloaderContainer, YoutubeDownloadWorkflow } from "./youtube-main";
@@ -66,6 +66,8 @@ function disabledContainerResponse(request: Request): Response {
 const appWorker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    const instagramVisit = await handleInstagramVisit(request, env);
+    if (instagramVisit) return instagramVisit;
 
     if (
       (url.pathname === "/" || url.pathname === "/app" || url.pathname === "/app/") &&

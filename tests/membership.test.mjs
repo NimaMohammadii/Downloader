@@ -108,7 +108,7 @@ test('first successful download sends one compact bold gate with original custom
     const buttons = body.reply_markup.inline_keyboard.flat();
     assert.equal(buttons.length, 3);
     assert.ok(buttons.some(b => b.callback_data === 'membership:instagram'));
-    assert.match(body.text, /@Vexa\.Order/);
+    assert.doesNotMatch(body.text, /@Vexa\.Order/);
     assert.ok(buttons.some(b => b.url === 'https://t.me/fixture_channel'));
     assert.ok(buttons.some(b => b.callback_data === 'membership:check'));
     // A member needs no extra prompt after their first download.
