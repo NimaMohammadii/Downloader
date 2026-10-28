@@ -1,0 +1,129 @@
+import { isAdmin, type AdminStatsEnv } from "./admin";
+
+type RestrictionEnv = Partial<AdminStatsEnv> & { BOT_TOKEN?: string; WEBHOOK_SECRET?: string };
+export type Restriction = { restricted: boolean; until: number | null };
+const EMOJI = "5260293700088511294";
+const durations = [[1800, "۳۰ دقیقه"], [3600, "۱ ساعت"], [21600, "۶ ساعت"], [86400, "۱ روز"], [604800, "۷ روز"], [-1, "دائمی"], [0, "رفع محدودیت"]] as const;
+
+export async function userRestriction(env: RestrictionEnv, id: number): Promise<Restriction> {
+  if (!env.ADMIN_STATS || isAdmin(env, id)) return { restricted: false, until: null };
+  const response = await env.ADMIN_STATS.getByName("global").fetch(`https://admin-stats/restriction?id=${id}`);
+  if (!response.ok) throw new Error("RESTRICTION_STATE_UNAVAILABLE");
+  return response.json();
+}
+
+export function parseRestrictionDuration(text: string): number | null {
+  const normalized = text.trim().replace(/[۰-۹]/g, digit => String("۰۱۲۳۴۵۶۷۸۹".indexOf(digit)))
+    .replace(/[٠-٩]/g, digit => String("٠١٢٣٤٥٦٧٨٩".indexOf(digit))).replace(/٫/g, ".");
+  const match = /^(\d+(?:\.\d+)?)\s*(دقیقه|ساعت|روز|هفته|minutes?|mins?|m|hours?|h|days?|d|weeks?|w)$/i.exec(normalized);
+  if (!match) return null;
+  const unit = match[2].toLowerCase();
+  const factor = /^(دقیقه|minutes?|mins?|m)$/.test(unit) ? 60
+    : /^(ساعت|hours?|h)$/.test(unit) ? 3600 : /^(روز|days?|d)$/.test(unit) ? 86400 : 604800;
+  const seconds = Number(match[1]) * factor;
+  return Number.isSafeInteger(seconds) && seconds > 0 && seconds <= 365 * 86400 ? seconds : null;
+}
+
+function date(value: number): string {
+  return new Intl.DateTimeFormat("fa-IR", { dateStyle: "short", timeStyle: "short", timeZone: "Asia/Tehran" }).format(value);
+}
+
+export function restrictionNotice(state: Restriction): { text: string; entities: Record<string, unknown>[] } {
+  return {
+    text: state.until === null
+      ? "⏹ دسترسی دانلودت فعلاً محدود شده.\nمی‌دونیم منتظر فایل‌های جذابی هستی؛ در حال حاضر امکان ثبت دانلود تازه برات فعال نیست. مرسی از همراهی و صبوری‌ات 💜"
+      : `⏹ یه مکث کوتاه توی دانلودها\nدسترسی دانلودت تا ${date(state.until)} (به وقت تهران) محدود شده. بعد از این زمان، خودکار می‌تونی دوباره دانلود کنی. مرسی که همراه مایی 💜`,
+    entities: [{ type: "custom_emoji", offset: 0, length: 1, custom_emoji_id: EMOJI }],
+  };
+}
+
+async function telegram(env: RestrictionEnv, method: string, payload: Record<string, unknown>): Promise<void> {
+  // Keep the friendly restriction notice and its explicit emoji intact.
+  const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload), signal: AbortSignal.timeout(8000),
+  });
+  const result = await response.json() as { ok: boolean; description?: string };
+  if (method === "editMessageText" && /message is not modified/i.test(result.description || "")) return;
+  if (!response.ok || !result.ok) throw new Error("RESTRICTION_TELEGRAM_UNAVAILABLE");
+}
+
+// Gate the trusted webhook before membership, caches, download commands and quality callbacks.
+export async function enforceRestriction(request: Request, env: RestrictionEnv): Promise<Response | null> {
+  if (!env.ADMIN_STATS || !env.BOT_TOKEN || request.method !== "POST" || new URL(request.url).pathname !== "/telegram/webhook"
+      || request.headers.get("x-telegram-bot-api-secret-token") !== (env.WEBHOOK_SECRET || "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1")) return null;
+  const update = await request.clone().json().catch(() => null) as any;
+  const query = update?.callback_query;
+  const actor = query?.from || update?.message?.from;
+  if (!Number.isSafeInteger(actor?.id) || actor.id <= 0) return null;
+  if (isAdmin(env, actor.id)) {
+    const message = update?.message;
+    const reply = message?.reply_to_message;
+    // Force-reply prompts carry their target, so restarts and parallel admin sessions
+    // cannot redirect a duration to a different user. Only replies to this bot count.
+    const target = reply?.from?.id === Number(env.BOT_TOKEN.split(":")[0]) && reply?.from?.is_bot
+      ? /^مدت محدودیت کاربر ([1-9]\d{0,15})\n/.exec(reply.text || "") : null;
+    if (target) {
+      const seconds = parseRestrictionDuration(String(message.text || ""));
+      if (seconds === null) {
+        await telegram(env, "sendMessage", { chat_id: message.chat.id,
+          text: "مدت را با عدد و واحد بفرست؛ مثلاً ۴۵ دقیقه، ۲ ساعت یا ۳ روز. بازهٔ مجاز بیشتر از صفر تا ۳۶۵ روز است. دوباره به پیام درخواست زمان پاسخ بده.",
+          reply_parameters: { message_id: reply.message_id } });
+        return Response.json({ ok: true });
+      }
+      const response = await env.ADMIN_STATS.getByName("global").fetch(`https://admin-stats/restriction?id=${target[1]}`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ actorId: actor.id, seconds }),
+      });
+      const state = response.ok ? await response.json() as Restriction : null;
+      await telegram(env, "sendMessage", { chat_id: message.chat.id,
+        text: state ? `محدودیت کاربر ${target[1]} تا ${date(state.until!)} (تهران) ثبت شد.` : "تنظیم محدودیت انجام نشد؛ کاربر باید در فهرست کاربران باشد و ادمین نباشد.",
+        reply_markup: { inline_keyboard: [[{ text: "بازگشت به محدودیت کاربر", callback_data: `admin:restriction:${target[1]}:0:0` }]] } });
+      return Response.json({ ok: true });
+    }
+    const custom = /^admin:customlimit:([1-9]\d{0,15})$/.exec(query?.data || "");
+    if (custom && query.message) {
+      await telegram(env, "answerCallbackQuery", { callback_query_id: query.id });
+      await telegram(env, "sendMessage", { chat_id: query.message.chat.id,
+        text: `مدت محدودیت کاربر ${custom[1]}\nبه همین پیام پاسخ بده و زمان دلخواهت را بنویس؛ مثلاً ۴۵ دقیقه، ۲ ساعت، ۱٫۵ ساعت یا ۳ روز.\nحداکثر ۳۶۵ روز. برای انصراف، پاسخ نده و به پنل برگرد.`,
+        reply_markup: { force_reply: true, selective: true, input_field_placeholder: "مثلاً ۲ ساعت یا ۳ روز" },
+        reply_parameters: { message_id: query.message.message_id } });
+      return Response.json({ ok: true });
+    }
+    const menu = /^admin:restriction:([1-9]\d{0,15}):(\d{1,8}):(\d{1,8})(:used)?(?::(day|week))?$/.exec(query?.data || "");
+    const action = /^admin:limit:([1-9]\d{0,15}):(-?\d{1,8})$/.exec(query?.data || "");
+    if ((!menu && !action) || !query.message) return null;
+    await telegram(env, "answerCallbackQuery", { callback_query_id: query.id });
+    const id = (menu || action)![1];
+    if (action) {
+      const seconds = Number(action[2]);
+      if (!durations.some(([value]) => value === seconds)) return Response.json({ ok: true });
+      const response = await env.ADMIN_STATS.getByName("global").fetch(`https://admin-stats/restriction?id=${id}`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ actorId: actor.id, seconds }),
+      });
+      if (!response.ok) {
+        await telegram(env, "sendMessage", { chat_id: query.message.chat.id, text: "تنظیم محدودیت انجام نشد؛ کاربر باید در فهرست کاربران باشد و ادمین نباشد." });
+        return Response.json({ ok: true });
+      }
+    }
+    const state = await userRestriction(env, Number(id));
+    const back = menu ? query.data.replace("admin:restriction:", "admin:user:") : `admin:user:${id}:0:0`;
+    await telegram(env, "editMessageText", {
+      chat_id: query.message.chat.id, message_id: query.message.message_id,
+      text: `محدودیت دانلود کاربر ${id}\nوضعیت: ${state.restricted ? state.until === null ? "محدودیت دائمی" : `محدود تا ${date(state.until)} (تهران)` : "بدون محدودیت"}\n\nمدت محدودیت را انتخاب کن؛ محدودیت موقت خودکار تمام می‌شود.`,
+      reply_markup: { inline_keyboard: [
+        [{ text: "زمان دلخواه ✍️", callback_data: `admin:customlimit:${id}` }],
+        ...durations.map(([seconds, label]) => [{ text: label, callback_data: `admin:limit:${id}:${seconds}` }]),
+        [{ text: "بازگشت به کاربر", callback_data: back }],
+      ] },
+    });
+    return Response.json({ ok: true });
+  }
+  // Leave onboarding/help available; all download inputs and callbacks are checked.
+  const text = String(update?.message?.text || "").trim();
+  if (/^\/(?:start|help)(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) return null;
+  const state = await userRestriction(env, actor.id);
+  if (!state.restricted) return null;
+  if (query?.id) await telegram(env, "answerCallbackQuery", { callback_query_id: query.id });
+  const chat = query?.message?.chat?.id || update?.message?.chat?.id;
+  if (chat) await telegram(env, "sendMessage", { chat_id: chat, ...restrictionNotice(state) });
+  return Response.json({ ok: true });
+}

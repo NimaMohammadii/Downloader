@@ -473,6 +473,9 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
     super(ctx, env);
     this.broadcasts = new BroadcastManager(ctx, env);
     this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS user_restrictions (
+        user_id TEXT PRIMARY KEY, until_ms INTEGER
+      );
       CREATE TABLE IF NOT EXISTS users (
         id TEXT PRIMARY KEY,
         username TEXT,
@@ -974,6 +977,24 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       return Response.json({ ok: true, inserted });
     }
 
+    if (url.pathname === "/restriction") {
+      const id = url.searchParams.get("id") || "";
+      if (!/^[1-9]\d{0,15}$/.test(id)) return new Response("Invalid user", { status: 400 });
+      const sql = this.ctx.storage.sql;
+      if (request.method === "POST") {
+        const body = await request.json() as { actorId?: number; seconds?: number };
+        if (!isAdmin(this.env, body.actorId) || isAdmin(this.env, Number(id))) return new Response("Forbidden", { status: 403 });
+        if (!Number.isSafeInteger(body.seconds) || body.seconds! < -1 || body.seconds! > 365 * 86400) return new Response("Invalid duration", { status: 400 });
+        if (!sql.exec("SELECT id FROM users WHERE id = ?", id).toArray().length) return new Response("User not found", { status: 404 });
+        if (body.seconds === 0) sql.exec("DELETE FROM user_restrictions WHERE user_id = ?", id);
+        else sql.exec("INSERT INTO user_restrictions(user_id,until_ms) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET until_ms=excluded.until_ms",
+          id, body.seconds === -1 ? null : Date.now() + body.seconds! * 1000);
+      } else if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
+      const row = sql.exec("SELECT until_ms FROM user_restrictions WHERE user_id = ?", id).toArray()[0];
+      const until = row?.until_ms == null ? null : Number(row.until_ms);
+      return Response.json({ restricted: !!row && (until === null || until > Date.now()), until });
+    }
+
     if (request.method === "GET" && url.pathname === "/summary") {
       const summary = this.ctx.storage.sql.exec(
         "SELECT COUNT(*) AS total_users, COALESCE(SUM(links_sent), 0) AS links_sent FROM users",
@@ -1303,6 +1324,7 @@ export function adminUserDetailKeyboard(detail: AdminUserDetail, usersPage: numb
   return { inline_keyboard: [
     ...(nav.length ? [nav] : []),
     [{ text: "📊 مصرف و هزینهٔ این کاربر", callback_data: `admin:usage:${detail.user.id}:${usersPage}:${detail.page}${usedOnly ? ":used" : ""}${periodSuffix}` }],
+    [{ text: "⏹ محدودیت دانلود", callback_data: callback(detail.page).replace("admin:user:", "admin:restriction:") }],
     [{ text: "🔄 بروزرسانی", callback_data: callback(detail.page) }],
     [{ text: usedOnly ? "بازگشت به استفاده‌کنندگان" : "👥 بازگشت به کاربران", callback_data: `admin:${usedOnly ? "used" : "users"}:${usersPage}${periodSuffix}` }, { text: "🏠 آمار", callback_data: "admin:stats" }],
   ] };

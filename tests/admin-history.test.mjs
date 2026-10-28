@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 const bundle = await build({
-  stdin: { contents: 'export {default as worker, YoutubeDownloadWorkflow} from "./src/app-main"; export * from "./src/admin";', resolveDir: process.cwd(), loader: 'ts' },
+  stdin: { contents: 'export {default as worker, YoutubeDownloadWorkflow} from "./src/app-main"; export * from "./src/admin"; export * from "./src/restrictions";', resolveDir: process.cwd(), loader: 'ts' },
   bundle: true, format: 'esm', write: false,
   plugins: [{ name: 'cloudflare-runtime', setup(b) {
     b.onResolve({ filter: /^(cloudflare:workers|@cloudflare\/containers)$/ }, a => ({ path: a.path, namespace: 'runtime' }));
@@ -763,5 +763,104 @@ test('download statistics panel is admin-only and uses HTML bold with refresh an
   assert.equal(panel.parse_mode,'HTML');assert.match(panel.text,/<b>📥 آمار/);
   assert.ok(panel.reply_markup.inline_keyboard.flat().some(x=>x.callback_data==='admin:downloads'));
   assert.ok(admin.adminDashboardKeyboard().inline_keyboard.flat().some(x=>x.callback_data==='admin:downloads'));
+ }finally{globalThis.fetch=previous;f.close();}
+});
+
+
+test('download restrictions persist, expire at the boundary, support permanent and manual removal, and require admin', async () => {
+ const f=fixture();
+ try {
+  await f.record(9001);
+  const set=(seconds,actorId=admin.ADMIN_USER_ID)=>f.request('/restriction?id=42',{actorId,seconds});
+  assert.equal((await set(3600,42)).status,403);
+  assert.equal((await set(-2)).status,400);
+  assert.equal((await f.request(`/restriction?id=${admin.ADMIN_USER_ID}`,{actorId:admin.ADMIN_USER_ID,seconds:-1})).status,403);
+  const now=Date.now(); Date.now=()=>now;
+  assert.equal((await set(3600)).status,200); f.restart();
+  assert.deepEqual(await admin.userRestriction(f.env,42),{restricted:true,until:now+3600000});
+  Date.now=()=>now+3600000;
+  assert.equal((await admin.userRestriction(f.env,42)).restricted,false);
+  await set(-1); f.restart(); Date.now=()=>now+365*86400000;
+  assert.deepEqual(await admin.userRestriction(f.env,42),{restricted:true,until:null});
+  await set(0); assert.equal((await admin.userRestriction(f.env,42)).restricted,false);
+  assert.equal((await f.request('/restriction?id=999',{actorId:admin.ADMIN_USER_ID,seconds:3600})).status,404);
+ } finally { f.close(); }
+});
+
+test('restricted webhook blocks links, music, media and old quality buttons before membership or downloads; notices keep the requested emoji',async()=>{
+ const f=fixture(),previous=globalThis.fetch,calls=[];
+ try {
+  await f.record(9002); await f.request('/restriction?id=42',{actorId:admin.ADMIN_USER_ID,seconds:3600});
+  globalThis.fetch=async(input,init)=>{calls.push({url:String(input),body:JSON.parse(init.body)});return Response.json({ok:true,result:true});};
+  const updates=[
+   {message:{message_id:1,from:{id:42},chat:{id:42},text:'https://youtu.be/abcdefghijk'}},
+   {message:{message_id:2,from:{id:42},chat:{id:42},text:'/music Hello'}},
+   {message:{message_id:3,from:{id:42},chat:{id:42},voice:{file_id:'clip'}}},
+   {callback_query:{id:'old',from:{id:42},data:'ytq|old-quality',message:{message_id:4,chat:{id:42}}}},
+   {callback_query:{id:'member',from:{id:42},data:'membership:check',message:{message_id:4,chat:{id:42}}}},
+  ];
+  for(const update of updates) assert.equal((await admin.worker.fetch(webhook(update),f.env,{})).status,200);
+  const notices=calls.filter(c=>c.url.endsWith('/sendMessage'));
+  assert.equal(notices.length,updates.length);
+  assert.ok(calls.every(c=>!/getChatMember/.test(c.url)));
+  for(const {body} of notices){
+   assert.match(body.text,/محدود شده/);assert.doesNotMatch(body.text,/ادمین/);
+   assert.deepEqual(body.entities,[{type:'custom_emoji',offset:0,length:1,custom_emoji_id:'5260293700088511294'}]);
+  }
+  assert.equal(await admin.enforceRestriction(webhook(updates[0],'wrong'),f.env),null);
+  assert.equal(await admin.enforceRestriction(webhook({message:{from:{id:42},chat:{id:42},text:'/start'}}),f.env),null);
+  assert.equal(await admin.enforceRestriction(webhook({message:{from:{id:43},chat:{id:43},text:'/music Hello'}}),f.env),null);
+  await f.request('/restriction?id=42',{actorId:admin.ADMIN_USER_ID,seconds:0});
+  assert.equal(await admin.enforceRestriction(webhook(updates[0]),f.env),null);
+ }finally{globalThis.fetch=previous;f.close();}
+});
+
+test('admin user restriction controls save temporary/permanent settings and lift them; forged callbacks cannot change settings',async()=>{
+ const f=fixture(),previous=globalThis.fetch,calls=[];
+ globalThis.fetch=async(input,init)=>{calls.push(JSON.parse(init.body));return Response.json({ok:true,result:true});};
+ try{
+  await f.record(9003);
+  const keyboard=admin.adminUserDetailKeyboard(await f.detail(),0);
+  assert.match(JSON.stringify(keyboard),/admin:restriction:42:0:0/);
+  const visit=(data,id=admin.ADMIN_USER_ID)=>admin.enforceRestriction(webhook({callback_query:{id:'limit',from:{id},data,message:{message_id:5,chat:{id}}}}),f.env);
+  await visit('admin:restriction:42:0:0');
+  assert.match(calls.at(-1).text,/بدون محدودیت/);
+  assert.match(JSON.stringify(calls.at(-1).reply_markup),/admin:limit:42:3600/);
+  await visit('admin:limit:42:3600');assert.equal((await admin.userRestriction(f.env,42)).restricted,true);
+  await visit('admin:limit:42:-1');assert.deepEqual(await admin.userRestriction(f.env,42),{restricted:true,until:null});
+  await visit('admin:limit:42:0',43);assert.equal((await admin.userRestriction(f.env,42)).restricted,true);
+  await visit('admin:limit:42:0');assert.equal((await admin.userRestriction(f.env,42)).restricted,false);
+ }finally{globalThis.fetch=previous;f.close();}
+});
+
+test('custom restriction duration accepts Persian/Arabic digits and units and rejects invalid ranges',()=>{
+ for(const [text,seconds] of [['۴۵ دقیقه',2700],['٢ ساعت',7200],['۱٫۵ ساعت',5400],['3 days',259200],['۲ هفته',1209600]])
+  assert.equal(admin.parseRestrictionDuration(text),seconds);
+ for(const text of ['0 ساعت','-1 روز','بی نهایت','400 روز','2','1e9 ساعت','0.001 دقیقه'])
+  assert.equal(admin.parseRestrictionDuration(text),null);
+});
+
+test('custom time is applied only by an admin replying to the bot prompt, with durable expiry and invalid-input feedback',async()=>{
+ const f=fixture(),previous=globalThis.fetch,calls=[];
+ const env={...f.env,BOT_TOKEN:'123:fictional'};
+ globalThis.fetch=async(input,init)=>{calls.push(JSON.parse(init.body));return Response.json({ok:true,result:true});};
+ try{
+  await f.record(9100);
+  await admin.enforceRestriction(webhook({callback_query:{id:'custom',from:{id:admin.ADMIN_USER_ID},data:'admin:customlimit:42',message:{message_id:5,chat:{id:admin.ADMIN_USER_ID}}}}),env);
+  const prompt=calls.at(-1);
+  assert.equal(prompt.reply_markup.force_reply,true);
+  const reply=(text,id=admin.ADMIN_USER_ID,bot=123)=>webhook({message:{message_id:7,chat:{id},from:{id},text,
+   reply_to_message:{message_id:6,from:{id:bot,is_bot:true},text:prompt.text}}});
+  assert.equal(await admin.enforceRestriction(reply('۲ ساعت',43),env),null);
+  assert.equal(await admin.enforceRestriction(reply('۲ ساعت',admin.ADMIN_USER_ID,999),env),null);
+  await admin.enforceRestriction(reply('400 روز'),env);
+  assert.match(calls.at(-1).text,/بازهٔ مجاز/);
+  assert.equal((await admin.userRestriction(env,42)).restricted,false);
+  const now=Date.now();Date.now=()=>now;
+  await admin.enforceRestriction(reply('۱٫۵ ساعت'),env);f.restart();
+  assert.deepEqual(await admin.userRestriction(env,42),{restricted:true,until:now+5400000});
+  assert.match(calls.at(-1).text,/ثبت شد/);
+  Date.now=()=>now+5400000;
+  assert.equal((await admin.userRestriction(env,42)).restricted,false);
  }finally{globalThis.fetch=previous;f.close();}
 });

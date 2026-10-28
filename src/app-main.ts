@@ -1,3 +1,4 @@
+import { enforceRestriction } from "./restrictions";
 import { handleBroadcastUpdate } from "./broadcast";
 import { enforceMembership } from "./membership";
 import { PUBLIC_ERROR_MESSAGE, telegramTextMotion, telegramCustomEmoji, type AdminStatsEnv } from "./admin";
@@ -91,14 +92,18 @@ const appWorker = {
       return disabledContainerResponse(request);
     }
 
+    const restrictionResponse = await enforceRestriction(request, env);
+    if (restrictionResponse) return restrictionResponse;
     const broadcastResponse = await handleBroadcastUpdate(request, env);
     if (broadcastResponse) return broadcastResponse;
     const membershipResponse = await enforceMembership(request, env, ctx, async update => {
       // Membership already accepted this request. Resume the original update only
       // after confirmation deletion, preserving message IDs and workflow identity.
-      const response = await youtubeWorker.fetch(new Request(request.url, {
+      const resumed = new Request(request.url, {
         method: "POST", headers: request.headers, body: JSON.stringify(update),
-      }), env as any, ctx);
+      });
+      if (await enforceRestriction(resumed, env)) return;
+      const response = await youtubeWorker.fetch(resumed, env as any, ctx);
       if (!response.ok) throw new Error("MEMBERSHIP_RESUME_FAILED");
     });
     if (membershipResponse) return membershipResponse;
