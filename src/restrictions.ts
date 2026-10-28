@@ -56,6 +56,28 @@ export async function enforceRestriction(request: Request, env: RestrictionEnv):
   const actor = query?.from || update?.message?.from;
   if (!Number.isSafeInteger(actor?.id) || actor.id <= 0) return null;
   if (isAdmin(env, actor.id)) {
+    const restrictedPage = /^admin:restricted:(\d{1,8})$/.exec(query?.data || "");
+    if (restrictedPage && query.message) {
+      await telegram(env, "answerCallbackQuery", { callback_query_id: query.id });
+      const response = await env.ADMIN_STATS.getByName("global").fetch(`https://admin-stats/restricted-users?page=${restrictedPage[1]}`);
+      if (!response.ok) throw new Error("RESTRICTED_USERS_UNAVAILABLE");
+      const list = await response.json() as { users: { id: string; name: string; until: number | null }[]; total: number; page: number; totalPages: number };
+      const nav = [];
+      if (list.page > 0) nav.push({ text: "‹ قبلی", callback_data: `admin:restricted:${list.page - 1}` });
+      if (list.page + 1 < list.totalPages) nav.push({ text: "بعدی ›", callback_data: `admin:restricted:${list.page + 1}` });
+      await telegram(env, "editMessageText", {
+        chat_id: query.message.chat.id, message_id: query.message.message_id,
+        text: `⏹ کاربران محدودشده (${list.total})\nصفحه ${list.page + 1}/${list.totalPages}\n\n` +
+          (list.users.length ? list.users.map(user => `${user.id} • ${user.until === null ? "دائمی" : `تا ${date(user.until)} (تهران)`}`).join("\n") + "\n\nبرای مشاهده و تغییر محدودیت، کاربر را انتخاب کن." : "هیچ کاربری محدودیت فعال ندارد."),
+        reply_markup: { inline_keyboard: [
+          ...list.users.map(user => [{ text: `${user.name.replace(/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g, " ").slice(0, 35)} • ${user.id}`, callback_data: `admin:restriction:${user.id}:0:0` }]),
+          ...(nav.length ? [nav] : []),
+          [{ text: "🔄 بروزرسانی", callback_data: `admin:restricted:${list.page}` }],
+          [{ text: "بازگشت به پنل", callback_data: "admin:stats" }],
+        ] },
+      });
+      return Response.json({ ok: true });
+    }
     const message = update?.message;
     const reply = message?.reply_to_message;
     // Force-reply prompts carry their target, so restarts and parallel admin sessions
@@ -113,6 +135,7 @@ export async function enforceRestriction(request: Request, env: RestrictionEnv):
         [{ text: "زمان دلخواه ✍️", callback_data: `admin:customlimit:${id}` }],
         ...durations.map(([seconds, label]) => [{ text: label, callback_data: `admin:limit:${id}:${seconds}` }]),
         [{ text: "بازگشت به کاربر", callback_data: back }],
+        [{ text: "کاربران محدودشده", callback_data: "admin:restricted:0" }],
       ] },
     });
     return Response.json({ ok: true });

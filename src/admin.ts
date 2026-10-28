@@ -977,6 +977,25 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       return Response.json({ ok: true, inserted });
     }
 
+    if (request.method === "GET" && url.pathname === "/restricted-users") {
+      const sql = this.ctx.storage.sql;
+      const rawPage = Number(url.searchParams.get("page") || 0);
+      const admins = getAdminIds(this.env).map(String);
+      const filter = `(r.until_ms IS NULL OR r.until_ms > ?) AND u.id NOT IN (${admins.map(() => "?").join(",")})`;
+      const params = [Date.now(), ...admins];
+      const total = asNumber(sql.exec(`SELECT COUNT(*) AS total FROM user_restrictions r JOIN users u ON u.id=r.user_id WHERE ${filter}`, ...params).one().total);
+      const totalPages = Math.max(1, Math.ceil(total / ADMIN_USERS_PAGE_SIZE));
+      const page = Math.min(Number.isSafeInteger(rawPage) && rawPage >= 0 ? rawPage : 0, totalPages - 1);
+      const users = sql.exec(`SELECT u.id, u.username, u.first_name, u.last_name, r.until_ms
+        FROM user_restrictions r JOIN users u ON u.id=r.user_id WHERE ${filter}
+        ORDER BY r.until_ms IS NOT NULL, r.until_ms, u.id LIMIT ? OFFSET ?`,
+        ...params, ADMIN_USERS_PAGE_SIZE, page * ADMIN_USERS_PAGE_SIZE).toArray().map(row => ({
+          id: String(row.id), name: [row.first_name, row.last_name].filter(Boolean).join(" ") || row.username || String(row.id),
+          until: row.until_ms === null ? null : asNumber(row.until_ms),
+        }));
+      return Response.json({ users, total, page, totalPages });
+    }
+
     if (url.pathname === "/restriction") {
       const id = url.searchParams.get("id") || "";
       if (!/^[1-9]\d{0,15}$/.test(id)) return new Response("Invalid user", { status: 400 });
@@ -1201,6 +1220,7 @@ export function adminDashboardKeyboard(): Record<string, unknown> {
       [{ text: "📊 مصرف، ترافیک و هزینه", callback_data: "admin:usage" }],
       [{ text: "📥 آمار دانلود سرویس‌ها", callback_data: "admin:downloads" }],
       [{ text: "👥 لیست کاربران", callback_data: "admin:users:0" }],
+      [{ text: "⏹ کاربران محدودشده", callback_data: "admin:restricted:0" }],
       [{ text: "کاربران استفاده‌کننده", callback_data: "admin:used:0" }],
       [{ text: "فعال‌های ۲۴ ساعت", callback_data: "admin:users:0:day" },
         { text: "فعال‌های ۷ روز", callback_data: "admin:users:0:week" }],

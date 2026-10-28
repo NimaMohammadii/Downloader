@@ -864,3 +864,47 @@ test('custom time is applied only by an admin replying to the bot prompt, with d
   assert.equal((await admin.userRestriction(env,42)).restricted,false);
  }finally{globalThis.fetch=previous;f.close();}
 });
+
+test('restricted user list paginates only active restrictions, excludes expired/lifted/admin accounts and clamps pages',async()=>{
+ const f=fixture();
+ try{
+  const now=Date.now();Date.now=()=>now;
+  const insert=f.db.prepare('INSERT INTO users VALUES (?,NULL,?,NULL,0,?,?)');
+  for(let id=1;id<=12;id++){
+   insert.run(String(id),`User ${id}`,now,now);
+   await f.request(`/restriction?id=${id}`,{actorId:admin.ADMIN_USER_ID,seconds:id===1?-1:id===2?1:3600});
+  }
+  await f.request('/restriction?id=12',{actorId:admin.ADMIN_USER_ID,seconds:0});
+  // A previously restricted user who has become an admin must not appear.
+  insert.run(String(admin.ADMIN_USER_ID),'Owner',now,now);
+  f.db.prepare('INSERT INTO user_restrictions VALUES (?,NULL)').run(String(admin.ADMIN_USER_ID));
+  Date.now=()=>now+1000;
+  const get=async page=>(await f.request(`/restricted-users?page=${page}`)).json();
+  const first=await get(0),second=await get(1);
+  assert.equal(first.total,10);assert.equal(first.totalPages,2);assert.equal(first.users.length,8);assert.equal(second.users.length,2);
+  assert.equal(first.users[0].id,'1');assert.equal(first.users[0].until,null);
+  assert.equal(new Set([...first.users,...second.users].map(u=>u.id)).size,10);
+  assert.ok([...first.users,...second.users].every(u=>!['2','12',String(admin.ADMIN_USER_ID)].includes(u.id)));
+  assert.equal((await get(999)).page,1);
+  await f.request('/restriction?id=1',{actorId:admin.ADMIN_USER_ID,seconds:0});
+  Date.now=()=>now+3600000;
+  assert.deepEqual(await get(0),{users:[],total:0,page:0,totalPages:1});
+ }finally{f.close();}
+});
+
+test('restricted-users panel is admin-only and links to restriction management with refresh and back controls',async()=>{
+ const f=fixture(),previous=globalThis.fetch,calls=[];
+ globalThis.fetch=async(input,init)=>{calls.push(JSON.parse(init.body));return Response.json({ok:true,result:true});};
+ try{
+  await f.record(9200);await f.request('/restriction?id=42',{actorId:admin.ADMIN_USER_ID,seconds:-1});
+  assert.match(JSON.stringify(admin.adminDashboardKeyboard()),/admin:restricted:0/);
+  const visit=id=>admin.enforceRestriction(webhook({callback_query:{id:'restricted',from:{id},data:'admin:restricted:0',message:{message_id:5,chat:{id}}}}),f.env);
+  assert.equal(await visit(43),null);assert.equal(calls.length,0);
+  await visit(admin.ADMIN_USER_ID);
+  assert.match(calls.at(-1).text,/کاربران محدودشده \(1\)/);assert.match(calls.at(-1).text,/دائمی/);
+  assert.match(JSON.stringify(calls.at(-1).reply_markup),/admin:restriction:42:0:0/);
+  assert.match(JSON.stringify(calls.at(-1).reply_markup),/admin:stats/);
+  await f.request('/restriction?id=42',{actorId:admin.ADMIN_USER_ID,seconds:0});
+  await visit(admin.ADMIN_USER_ID);assert.match(calls.at(-1).text,/هیچ کاربری محدودیت فعال ندارد/);
+ }finally{globalThis.fetch=previous;f.close();}
+});
