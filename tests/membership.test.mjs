@@ -93,7 +93,7 @@ test('only delivered media consumes the trial; settings and first-download state
   } finally { f.close(); }
 });
 
-test('first successful download sends one compact bold gate with original custom emoji and two working buttons', async () => {
+test('first successful download sends one compact bold gate with original custom emoji and channel, Instagram and verification buttons', async () => {
   const f = fixture();
   try {
     await api.recordDownload(f.env, download);
@@ -106,7 +106,9 @@ test('first successful download sends one compact bold gate with original custom
     assert.ok(body.entities.some(e => e.type === 'bold'));
     assert.ok(body.entities.some(e => e.type === 'custom_emoji' && e.custom_emoji_id === '5210956306952758910'));
     const buttons = body.reply_markup.inline_keyboard.flat();
-    assert.equal(buttons.length, 2);
+    assert.equal(buttons.length, 3);
+    assert.ok(buttons.some(b => b.url === 'https://www.instagram.com/vexa.order/'));
+    assert.match(body.text, /@Vexa\.Order/);
     assert.ok(buttons.some(b => b.url === 'https://t.me/fixture_channel'));
     assert.ok(buttons.some(b => b.callback_data === 'membership:check'));
     // A member needs no extra prompt after their first download.

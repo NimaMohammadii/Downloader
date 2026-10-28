@@ -103,10 +103,12 @@ export async function isChannelMember(env: MembershipEnv, userId: number): Promi
 
 export function membershipPrompt(channel = MEMBERSHIP_CHANNEL): Record<string, unknown> {
   const title = "ادامه با عضویت در چنل";
-  const text = `⚡️ ${title}\nعضو چنلمون شو؛ ابزارها و قابلیت‌های جدید هم اونجاست!\nبعد از عضویت، «عضو شدم» رو بزن.`;
+  const text = `⚡️ ${title}\nعضو چنلمون شو و پیج @Vexa.Order رو هم فالو کن؛ خبرهای تازه اونجاست!\nبعد از عضویت در چنل، «عضو شدم» رو بزن.`;
   return { text, entities: [{ type: "bold", offset: text.indexOf(title), length: title.length }],
     reply_markup: { inline_keyboard: [[
       { text: "ورود به چنل", icon_custom_emoji_id: "5260285114448891086", url: `https://t.me/${channel.replace(/^@/, "")}` },
+      { text: "ورود به پیج اینستاگرام", icon_custom_emoji_id: "5278573677900752088", url: "https://www.instagram.com/vexa.order/" },
+    ], [
       { text: "✅ عضو شدم", callback_data: "membership:check" },
     ]] },
   };
