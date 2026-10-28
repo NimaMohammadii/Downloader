@@ -1,4 +1,4 @@
-import { parseBandcampUrl, bandcampFailureDiagnostic, type BandcampInput } from "./bandcamp";
+import { parseBandcampUrl, bandcampFailureDiagnostic, bandcampOptions, type BandcampInput, type BandcampOption } from "./bandcamp";
 import { parseRedditUrl, type RedditInput } from "./reddit";
 import { Container, getContainer } from "@cloudflare/containers";
 import {
@@ -139,6 +139,8 @@ type TelegramApiResponse<T> = {
 
 type ContainerResult = {
   ok: boolean;
+  bandcampOptions?: BandcampOption[];
+  bandcampStage?: "options" | "prepared";
   partial?: boolean;
   message?: string;
   title?: string;
@@ -1157,7 +1159,33 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       });
       // A completion event may arrive before this call; Workflows buffers it.
       phase = "wait";
-      const ready = await step.waitForEvent<ContainerResult>("await instagram recording", { type: "instagram-ready", timeout: "150 minutes" });
+      let ready = await step.waitForEvent<ContainerResult>("await instagram recording", { type: "instagram-ready", timeout: "150 minutes" });
+      if (job.bandcamp && ready.payload.ok && ready.payload.bandcampOptions) {
+        phase = "quality";
+        const options = bandcampOptions(ready.payload.bandcampOptions);
+        if (!options) throw new Error("BANDCAMP_SELECTION_INVALID");
+        await step.do("show bandcamp audio qualities", { retries: { limit: 0, delay: "1 second" } }, async () => {
+          const expires = Math.floor(Date.now() / 1000) + 8 * 60;
+          const rows = await Promise.all(options.map(async (option, index) => {
+            const value = `bandcamp:${job.chatId}:${job.requestMessageId}:${job.userId}:${index}:${expires}`;
+            const signature = (await instagramSignature(this.env.BOT_TOKEN, value)).slice(0, 16);
+            return [{ text: option.label, callback_data: `bcq|${job.requestMessageId}|${job.userId}|${index}|${expires}|${signature}` }];
+          }));
+          await telegramCall(this.env.BOT_TOKEN, "editMessageText", { chat_id: job.chatId, message_id: statusId,
+            text: "🎵 کیفیت صدای Bandcamp را انتخاب کن:\nفقط فرمت‌های قابل‌دریافت نمایش داده می‌شوند. انتخاب تا ۸ دقیقه فعال است.",
+            reply_markup: { inline_keyboard: rows } });
+        });
+        const selection = await step.waitForEvent<{ index: number }>("await bandcamp quality", { type: "bandcamp-quality", timeout: "8 minutes" });
+        const index = selection.payload.index;
+        if (!Number.isInteger(index) || !options[index]) throw new Error("BANDCAMP_SELECTION_INVALID");
+        await step.do("apply bandcamp quality", { retries: { limit: 2, delay: "2 seconds" }, timeout: "1 minute" }, async () => {
+          const result = await pooledContainer(this.env, job).instagramRequest("start", { id: job.id, bandcampFormatId: options[index].id });
+          if (!result.ok) throw new Error("BANDCAMP_SELECTION_EXPIRED");
+          return true;
+        });
+        phase = "wait";
+        ready = await step.waitForEvent<ContainerResult>("await bandcamp audio preparation", { type: "bandcamp-prepared", timeout: "30 minutes" });
+      }
       if (!ready.payload.ok) {
         await step.do("track capture failure", () => trackJob(this.env, job, "failed", { title: source.title, detail: ready.payload.message || "دریافت محتوا کامل نشد." }));
         await step.do("show instagram capture failure", () => telegramCall<boolean>(this.env.BOT_TOKEN, "editMessageText", {
@@ -1227,6 +1255,8 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       await step.do("notify instagram video failure", async () => {
         const text = error instanceof Error && /YT_CONFIG|DOWNLOAD_POOL_FULL|max.*instance|provision/i.test(error.message)
           ? workflowFailureMessage(error.message, "startup")
+          : job.bandcamp ? phase === "quality" ? "❌ انتخاب کیفیت منقضی یا نامعتبر است؛ لینک Bandcamp را دوباره بفرست."
+            : "❌ دریافت یا آماده‌سازی فایل صوتی Bandcamp کامل نشد؛ دوباره لینک را بفرست."
           : job.reddit ? "❌ دریافت یا ارسال Reddit کامل نشد؛ پیش از درخواست دوباره، فایل‌های دریافتی چت را بررسی کن."
           : job.instagramPost ? "❌ دریافت یا ارسال پست اینستاگرام کامل نشد؛ اگر فایلی دریافت کرده‌ای، پیش از درخواست دوباره بررسی کن."
           : job.social ? `❌ دریافت یا ارسال فایل ${socialName(job.social.platform)} کامل نشد؛ اگر فایلی دریافت کرده‌ای، پیش از درخواست دوباره بررسی کن.` : job.recognition || job.playlist || job.instagram?.kind === "music" || job.instagram?.kind === "audio" ? "❌ دریافت یا ارسال فایل صوتی کامل نشد؛ درخواست را دوباره بفرست." : "❌ ضبط یا ارسال لایو کامل نشد؛ لینک را دوباره بفرست. ممکن است سرور ری‌استارت شده باشد.";
@@ -1625,7 +1655,7 @@ async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target?
     ...(recognition ? { recognition } : {}),
     ...(playlist ? { playlist } : {}),
     ...(social ? { social } : {}),
-    ...(bandcamp ? { bandcamp } : {}),
+    ...(bandcamp ? { bandcamp: { ...bandcamp, selectQuality: true } } : {}),
     ...(reddit ? { reddit } : {}),
   };
   await trackJob(env, job, "pending");
@@ -1637,6 +1667,31 @@ async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target?
       await trackJob(env, job, "failed", { detail: "شروع دریافت فایل ناموفق بود." });
       await safeTelegramCall(env.BOT_TOKEN, "sendMessage", { chat_id: message.chat.id, text: "❌ شروع دریافت فایل ناموفق بود؛ درخواست را دوباره بفرست." });
     }
+  }
+  return Response.json({ ok: true });
+}
+
+async function bandcampQualityCallback(env: Env, callback: TelegramCallbackQuery): Promise<Response> {
+  const match = /^bcq\|(\d{1,10})\|(\d{1,16})\|([0-9])\|(\d{10})\|([a-f0-9]{16})$/.exec(callback.data || "");
+  const chatId = callback.message?.chat.id;
+  if (!match || chatId === undefined || callback.from.id !== Number(match[2]) || Number(match[4]) < Math.floor(Date.now() / 1000)) {
+    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, _errorUserId: callback.from.id,
+      text: "این انتخاب منقضی شده یا برای شما نیست؛ لینک خودت را دوباره بفرست.", show_alert: true });
+    return Response.json({ ok: true });
+  }
+  const value = `bandcamp:${chatId}:${match[1]}:${match[2]}:${match[3]}:${match[4]}`;
+  const signature = (await instagramSignature(env.BOT_TOKEN, value)).slice(0, 16);
+  if (!equalSignature(match[5], signature)) {
+    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "انتخاب کیفیت معتبر نیست.", show_alert: true });
+    return Response.json({ ok: true });
+  }
+  try {
+    const workflow = await env.YOUTUBE_DOWNLOAD_WORKFLOW.get(`igdl-${chatId}-${match[1]}-${match[2]}`);
+    await workflow.sendEvent({ type: "bandcamp-quality", payload: { index: Number(match[3]) } });
+    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "🎵 کیفیت انتخاب شد؛ در حال آماده‌سازی…" });
+  } catch {
+    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id,
+      text: "این انتخاب منقضی شده است؛ لینک Bandcamp را دوباره بفرست.", show_alert: true });
   }
   return Response.json({ ok: true });
 }
@@ -1832,8 +1887,15 @@ export default {
       try {
         const payload = JSON.parse(body) as ContainerResult;
         if (typeof payload.ok !== "boolean") return new Response("Invalid event", { status: 400 });
+        const options = payload.bandcampOptions === undefined ? undefined : bandcampOptions(payload.bandcampOptions);
+        if (options === null) return new Response("Invalid Bandcamp options", { status: 400 });
+        const stage = payload.bandcampStage;
+        if (stage !== undefined && stage !== "options" && stage !== "prepared"
+            || stage === "prepared" && options || stage === "options" && payload.ok && !options)
+          return new Response("Invalid Bandcamp stage", { status: 400 });
         const instance = await env.YOUTUBE_DOWNLOAD_WORKFLOW.get(completion[1]);
-        await instance.sendEvent({ type: "instagram-ready", payload: { ok: payload.ok, message: payload.message?.slice(0, 500) } });
+        await instance.sendEvent({ type: stage === "prepared" ? "bandcamp-prepared" : "instagram-ready", payload: { ok: payload.ok, message: payload.message?.slice(0, 500),
+          ...(options ? { bandcampOptions: options } : {}) } });
         return Response.json({ ok: true });
       } catch { return new Response("Event delivery failed", { status: 503 }); }
     }
@@ -1873,6 +1935,7 @@ export default {
       if (update?.callback_query?.data?.startsWith("igm|")) return instagramAudioCallback(env, update, update.callback_query);
       if (update?.callback_query?.data?.startsWith("soa|")) return socialAudioCallback(env, update, update.callback_query);
       if (update?.callback_query?.data?.startsWith("msc|")) return musicSelection(env, update, update.callback_query);
+      if (update?.callback_query?.data?.startsWith("bcq|")) return bandcampQualityCallback(env, update.callback_query);
 
       const message = update?.message;
       if (update && message) {

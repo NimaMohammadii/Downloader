@@ -135,7 +135,7 @@ export async function enforceMembership(request: Request, env: MembershipEnv, ct
   try {
     state = await membershipState(env, actor.id);
     if (state.enabled && state.mode === "first_link" && !state.linkTriggered &&
-        (isDownloadRequest(update.message) || /^(?:ytq|msc|iga|igm|igs|soa)\|/.test(callback?.data || ""))) {
+        (isDownloadRequest(update.message) || /^(?:ytq|msc|iga|igm|igs|soa|bcq)\|/.test(callback?.data || ""))) {
       state = await membershipState(env, actor.id, true);
     }
     if (requiresMembership(state) || (checking && state.enabled)) member = await isChannelMember(env, actor.id);

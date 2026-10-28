@@ -1,6 +1,19 @@
 // Bandcamp-only routing. Other platform parsers do not depend on this module.
-export type BandcampInput = { url: string };
-export const BANDCAMP_FIX_VERSION = "bandcamp-firefox-v3";
+export type BandcampInput = { url: string; selectQuality?: boolean };
+export type BandcampOption = { id: string; label: string };
+export const BANDCAMP_FIX_VERSION = "bandcamp-quality-v4";
+
+export function bandcampOptions(value: unknown): BandcampOption[] | null {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 10) return null;
+  const options: BandcampOption[] = [];
+  for (const item of value) {
+    if (!item || typeof item.id !== "string" || !/^[A-Za-z0-9_-]{1,24}$/.test(item.id)
+        || typeof item.label !== "string" || !item.label.trim() || item.label.length > 80
+        || options.some(option => option.id === item.id)) return null;
+    options.push({ id: item.id, label: item.label });
+  }
+  return options;
+}
 
 export function bandcampFailureDiagnostic(error: unknown, env: object = {}) {
   const secrets = Object.entries(env).filter(([key, value]) =>

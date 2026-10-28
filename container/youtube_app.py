@@ -1848,7 +1848,11 @@ class InstagramCapture:
     def notify(self) -> None:
         for attempt in range(3):
             try:
-                response = requests.post(self.payload["completionUrl"], headers={"x-instagram-event-token": self.payload["completionToken"]}, json=self.result, timeout=(10, 20))
+                result = self.result
+                if (self.source.get("bandcamp") or {}).get("selectQuality"):
+                    stage = "options" if self.result.get("bandcampOptions") or not hasattr(self, "bandcamp_options") else "prepared"
+                    result = {**result, "bandcampStage": stage}
+                response = requests.post(self.payload["completionUrl"], headers={"x-instagram-event-token": self.payload["completionToken"]}, json=result, timeout=(10, 20))
                 if response.ok:
                     return
             except requests.RequestException:
@@ -2428,8 +2432,13 @@ def instagram_action(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         job = INSTAGRAM_JOBS.get(job_id)
         if action == "start":
             if job:
+                if payload.get("bandcampFormatId") is not None:
+                    from bandcamp import choose
+                    return choose(job, payload["bandcampFormatId"])
                 # Workflow start retries reuse the same process and file.
                 return {"ok": True}
+            if payload.get("bandcampFormatId") is not None:
+                return {"ok": False, "message": "انتخاب کیفیت Bandcamp منقضی شده است."}
             if not JOB_CAPACITY.acquire(job_id):
                 return {"ok": False, "message": "ظرفیت هم‌زمان این سرور پر است."}
             try:

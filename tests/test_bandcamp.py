@@ -168,3 +168,90 @@ class BandcampTests(unittest.TestCase):
             self.assertGreater(float(probe['format']['duration']),1.9)
             self.assertEqual(probe['format']['tags']['artist'],'Artist');self.assertEqual(probe['format']['tags']['album'],'Album')
             self.assertFalse((directory/'track'/'input').exists())
+
+    def formats(self, *ids):
+        return {'title':'Song','duration':2,'formats':[{'format_id':identifier,
+            'ext':'mp3' if identifier.startswith('mp3-') else identifier,'vcodec':'none',
+            'url':'https://t4.bcbits.com/'+identifier} for identifier in ids]}
+
+    def test_quality_menu_never_invents_a_higher_quality_or_downloads_before_selection(self):
+        job=self.job()
+        def notify():
+            self.assertEqual(job.state,'starting')
+            self.assertEqual(job.result['bandcampOptions'],[{'id':'mp3-128','label':'MP3 • 128 kbps'}])
+            self.assertFalse(bc.choose(job,'mp3-320')['ok'])
+            self.assertTrue(bc.choose(job,'mp3-128')['ok'])
+        with patch.object(bc,'metadata',return_value=self.formats('mp3-128')),patch.object(job,'notify',side_effect=notify),patch.object(bc,'download') as download:
+            self.assertEqual(bc.await_quality(job,URL,[{'url':URL}]),'mp3-128')
+            download.assert_not_called()
+        self.assertFalse(job.stop_event.is_set())
+
+    def test_album_menu_exposes_common_formats_and_best_available_per_track(self):
+        job=self.job()
+        def notify():
+            self.assertEqual([item['id'] for item in job.bandcamp_options],['best','mp3-128'])
+            bc.choose(job,'mp3-128')
+        with patch.object(bc,'metadata',side_effect=[self.formats('mp3-128','flac'),self.formats('mp3-128')]),patch.object(job,'notify',side_effect=notify):
+            self.assertEqual(bc.await_quality(job,ALBUM,[{'url':URL},{'url':URL+'2'}]),'mp3-128')
+
+    def test_selection_timeout_and_cleanup_never_start_a_download(self):
+        for cleanup in [False,True]:
+            job=self.job()
+            def notify():
+                if cleanup:
+                    job.cleanup_requested=True;job.stop_event.set()
+            with patch.object(bc,'metadata',return_value=self.formats('mp3-128')),patch.object(job,'notify',side_effect=notify),patch.object(job.stop_event,'wait',return_value=cleanup),patch.object(bc,'download') as download:
+                with self.assertRaises(app.UserVisibleError):bc.await_quality(job,URL,[{'url':URL}])
+                download.assert_not_called()
+
+    def test_selection_resumes_the_same_job_and_cannot_be_replaced_or_create_a_new_job(self):
+        job=self.job();job.bandcamp_options=[{'id':'flac','label':'FLAC'},{'id':'mp3-128','label':'128'}]
+        with patch.dict(app.INSTAGRAM_JOBS,{job.id:job},clear=True):
+            self.assertTrue(app.instagram_action('start',{'id':job.id,'bandcampFormatId':'flac'})['ok'])
+            self.assertTrue(app.instagram_action('start',{'id':job.id,'bandcampFormatId':'flac'})['ok'])
+            self.assertFalse(app.instagram_action('start',{'id':job.id,'bandcampFormatId':'mp3-128'})['ok'])
+            self.assertFalse(app.instagram_action('start',{'id':'igdl-42-99-42','bandcampFormatId':'flac'})['ok'])
+            self.assertEqual(list(app.INSTAGRAM_JOBS),[job.id])
+
+    def test_selected_quality_disappearing_never_falls_back_to_lower_quality(self):
+        with patch.object(bc,'metadata',return_value=self.formats('mp3-128')),patch.object(bc,'download') as download:
+            with self.assertRaises(app.UserVisibleError):bc.prepare_track(URL,Path('/tmp'),100,time.monotonic()+5,'flac')
+            download.assert_not_called()
+
+    @unittest.skipUnless(shutil.which('ffmpeg'),'FFmpeg required')
+    def test_real_flac_retains_lossless_audio_and_is_sent_as_original_document(self):
+        job=self.job();fixture=job.workdir/'fixture.flac'
+        subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','sine=duration=2','-y',str(fixture)],check=True)
+        with patch.object(bc,'metadata',return_value=self.formats('mp3-128','flac')),patch.object(bc,'download',side_effect=lambda url,path,*args:shutil.copyfile(fixture,path)):
+            item=bc.prepare_track(URL,job.workdir/'track',1_000_000,time.monotonic()+20,'flac')
+        self.assertEqual(item['path'].suffix,'.flac')
+        digest=lambda path:subprocess.check_output(['ffmpeg','-v','error','-i',str(path),'-map','0:a:0','-f','md5','-'])
+        self.assertEqual(digest(fixture),digest(item['path']))
+        job.bandcamp_items=[{**item,'index':1}];job.bandcamp_sent=0;job.bandcamp_title='Song';job.bandcamp_failed=[];job.state='ready'
+        with patch.object(app,'upload_complete_file',new=AsyncMock(return_value={'file_id':'confirmed'})) as upload,patch.object(app,'delete_status'):
+            result=job.send();self.assertEqual(job.send(),result)
+        self.assertEqual(upload.await_count,1);self.assertEqual(upload.call_args.args[1],'sendDocument')
+        self.assertEqual(upload.call_args.args[3][0],'Bandcamp.flac');self.assertEqual(upload.call_args.args[3][2],'audio/flac')
+
+    def test_current_preparation_waits_for_choice_then_prepares_only_the_selected_format(self):
+        job=self.job();job.source['bandcamp']['selectQuality']=True;events=[];prepared=[]
+        def notify():
+            events.append(dict(job.result))
+            if 'bandcampOptions' in job.result:
+                self.assertEqual(prepared,[]);bc.choose(job,'flac')
+        def prepare(url,directory,limit,deadline,identifier):
+            prepared.append(identifier);directory.mkdir();path=directory/'Bandcamp.flac';path.write_bytes(b'complete')
+            return {'path':path,'title':'Song','artist':'Artist','url':url,'size':8}
+        with patch.object(bc,'metadata',return_value=self.formats('mp3-128','flac')),patch.object(job,'notify',side_effect=notify),patch.object(job,'safe_status'),patch.object(bc,'prepare_track',side_effect=prepare):
+            job.run()
+        self.assertEqual(prepared,['flac']);self.assertEqual(job.state,'ready');self.assertEqual(events[-1],{'ok':True})
+
+    def test_notification_stages_keep_duplicate_options_separate_from_file_completion(self):
+        job=self.job();job.source['bandcamp']['selectQuality']=True
+        response=MagicMock();response.ok=True
+        with patch.object(app.requests,'post',return_value=response) as post:
+            job.result={'ok':False,'message':'metadata failed'};job.notify()
+            job.bandcamp_options=[{'id':'flac','label':'FLAC'}]
+            job.result={'ok':True,'bandcampOptions':job.bandcamp_options};job.notify();job.notify()
+            job.result={'ok':False,'message':'selected file failed'};job.notify()
+        self.assertEqual([call.kwargs['json']['bandcampStage'] for call in post.call_args_list],['options','options','options','prepared'])

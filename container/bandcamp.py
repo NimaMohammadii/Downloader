@@ -14,7 +14,111 @@ import youtube_app as app
 MAX_TRACKS = 20
 MAX_BYTES = 2_000_000_000
 MAX_SECONDS = 20 * 60
-BANDCAMP_FIX_VERSION = 'bandcamp-firefox-v3'
+BANDCAMP_FIX_VERSION = 'bandcamp-quality-v4'
+SELECTION_SECONDS = 10 * 60
+EXTENSIONS = {'mp3', 'm4a', 'aac', 'flac', 'wav', 'ogg', 'aiff'}
+
+
+def audio_formats(data: dict) -> list[dict]:
+    result = {}
+    for item in data.get('formats') or []:
+        if not isinstance(item, dict) or item.get('vcodec') != 'none' or not item.get('url'):
+            continue
+        ext = {'aif': 'aiff', 'alac': 'm4a'}.get(item.get('ext'), item.get('ext'))
+        identifier = str(item.get('format_id') or ext or '')
+        if ext not in EXTENSIONS or not re.fullmatch(r'[A-Za-z0-9_-]{1,24}', identifier):
+            continue
+        result[identifier] = {**item, 'ext': ext, 'format_id': identifier}
+    return list(result.values())
+
+
+def format_label(item: dict) -> str:
+    identifier, ext = item['format_id'], item['ext']
+    if ext in {'flac', 'wav', 'aiff'} or identifier in {'alac', 'falac'}:
+        return f'{"ALAC" if identifier in {"alac", "falac"} else ext.upper()} • بدون افت کیفیت'
+    if identifier == 'mp3-v0':
+        return 'MP3 V0 • بیت‌ریت متغیر'
+    rate = format_bitrate(item)
+    name = 'AAC (M4A)' if identifier.startswith('aac') and ext == 'm4a' else ext.upper()
+    return name + (f' • {round(rate)} kbps' if math.isfinite(rate) and rate > 0 else '')
+
+
+def format_bitrate(item: dict) -> float:
+    match = re.fullmatch(r'mp3-(\d+)', item['format_id'])
+    try:
+        value = float(item.get('abr') or (match[1] if match else 0))
+        return value if math.isfinite(value) and value > 0 else 0
+    except (ValueError, TypeError):
+        return 0
+
+
+def best_format(items: list[dict]) -> dict:
+    return max(items, key=lambda item: (item['ext'] in {'flac', 'wav', 'aiff'} or item['format_id'] in {'alac', 'falac'},
+               item['ext'] == 'flac',
+               format_bitrate(item) or (250 if item['format_id'] == 'mp3-v0' else 0),
+               item['format_id'] == 'mp3-v0', item['ext'] == 'mp3'))
+
+
+def choose(job, identifier: str) -> dict:
+    """Resume the current Bandcamp job; never create a second download."""
+    with job.lock:
+        options = getattr(job, 'bandcamp_options', [])
+        if (not isinstance(identifier, str) or not job.source.get('bandcamp') or job.cleanup_requested
+                or identifier not in {item['id'] for item in options}):
+            return {'ok': False, 'message': 'انتخاب کیفیت Bandcamp معتبر نیست یا منقضی شده است.'}
+        selected = getattr(job, 'bandcamp_format', None)
+        if selected:
+            return {'ok': selected == identifier}
+        if job.state != 'starting':
+            return {'ok': False, 'message': 'انتخاب کیفیت Bandcamp منقضی شده است.'}
+        job.bandcamp_format = identifier
+        # Reuse the job's cancellation event so cleanup also wakes this wait.
+        job.stop_event.set()
+        return {'ok': True}
+
+
+def await_quality(job, url: str, entries: list) -> str:
+    common, representatives = None, {}
+    deadline = time.monotonic() + MAX_SECONDS
+    for entry in entries:
+        if job.cleanup_requested or time.monotonic() >= deadline:
+            raise app.UserVisibleError('❌ بررسی کیفیت‌های Bandcamp متوقف شد یا به سقف زمان رسید.')
+        try:
+            if not isinstance(entry, dict):
+                raise app.UserVisibleError('❌ اطلاعات آهنگ آلبوم معتبر نیست.')
+            track = canonical_url(entry.get('webpage_url') or entry.get('url') or '')
+            if '/track/' not in track or urlparse(track).hostname != urlparse(url).hostname:
+                raise app.UserVisibleError('❌ لینک آهنگ آلبوم معتبر نیست.')
+            formats = audio_formats(metadata(track))
+            if not formats:
+                continue
+            ids = {item['format_id'] for item in formats}
+            common = ids if common is None else common & ids
+            representatives.update({item['format_id']: item for item in formats})
+        except app.UserVisibleError:
+            if '/album/' not in url:
+                raise
+            continue  # Existing album preparation reports unavailable tracks.
+    if not representatives:
+        raise app.UserVisibleError('❌ هیچ فایل عمومی قابل‌دریافتی از Bandcamp پیدا نشد.')
+    options = [{'id': identifier, 'label': format_label(representatives[identifier])}
+               for identifier in sorted(common or set())][:9]
+    if '/album/' in url:
+        options.insert(0, {'id': 'best', 'label': 'بهترین کیفیت موجودِ هر آهنگ'})
+    if not options:
+        raise app.UserVisibleError('❌ کیفیت عمومی قابل‌دریافتی پیدا نشد.')
+    with job.lock:
+        job.bandcamp_options, job.bandcamp_format = options, None
+        job.result = {'ok': True, 'bandcampOptions': options}
+    job.notify()
+    if not job.stop_event.wait(SELECTION_SECONDS):
+        raise app.UserVisibleError('❌ انتخاب کیفیت منقضی شد؛ لینک Bandcamp را دوباره بفرست.')
+    with job.lock:
+        if job.cleanup_requested or not job.bandcamp_format:
+            raise app.UserVisibleError('❌ انتخاب کیفیت Bandcamp متوقف شد.')
+        job.stop_event.clear()
+        job.result = {'ok': False}
+        return job.bandcamp_format
 
 
 def failure(phase: str, exc: Exception) -> app.UserVisibleError:
@@ -144,14 +248,14 @@ def _download(url: str, path: Path, limit: int, deadline: float) -> None:
     raise app.UserVisibleError('❌ تغییر مسیر فایل Bandcamp بیش از حد بود.')
 
 
-def prepare_track(url: str, directory: Path, limit: int, deadline: float) -> dict:
+def prepare_track(url: str, directory: Path, limit: int, deadline: float, identifier: str = 'best') -> dict:
     data = metadata(url)
-    candidates = [item for item in data.get('formats', []) if isinstance(item, dict)
-                  and item.get('url') and item.get('vcodec') == 'none' and item.get('ext') in {'mp3', 'm4a', 'aac', 'flac', 'wav', 'ogg'}]
+    candidates = audio_formats(data)
     if not candidates:
         raise failure('formats', ValueError('not available for streaming'))
-    # Prefer the available MP3, avoiding an unnecessary lossy re-encode.
-    chosen = max(candidates, key=lambda item: (item.get('ext') == 'mp3', float(item.get('abr') or 0)))
+    chosen = best_format(candidates) if identifier == 'best' else next((item for item in candidates if item['format_id'] == identifier), None)
+    if not chosen:
+        raise app.UserVisibleError('❌ کیفیت انتخاب‌شده دیگر در دسترس نیست؛ لینک را دوباره بفرست و کیفیت موجود را انتخاب کن.')
     directory.mkdir(parents=True, exist_ok=True)
     source = directory / 'input'
     download(chosen['url'], source, limit, deadline)
@@ -166,15 +270,16 @@ def prepare_track(url: str, directory: Path, limit: int, deadline: float) -> dic
             raise ValueError('incomplete audio')
         title = ' '.join(str(data.get('track') or data.get('title') or 'Bandcamp').split())[:180]
         artist = ' '.join(str(data.get('artist') or data.get('uploader') or '').split())[:120]
-        output = directory / 'Bandcamp.mp3'
-        codec = ['-c:a', 'copy'] if chosen['ext'] == 'mp3' else ['-c:a', 'libmp3lame', '-b:a', '192k']
+        output = directory / f'Bandcamp.{chosen["ext"]}'
         phase = 'remux'
-        subprocess.run(['ffmpeg', '-y', '-nostdin', '-v', 'error', '-i', str(source), '-map', '0:a:0', '-vn', *codec,
+        subprocess.run(['ffmpeg', '-y', '-nostdin', '-v', 'error', '-i', str(source), '-map', '0:a:0', '-vn', '-c:a', 'copy',
                         '-fs', str(limit + 1), '-metadata', f'title={title}', '-metadata', f'artist={artist}', '-metadata', f'album={str(data.get("album") or "")[:180]}',
                         str(output)], check=True, capture_output=True, timeout=max(1, min(300, deadline - time.monotonic())))
         if not 0 < output.stat().st_size <= limit:
             raise ValueError('output size')
-        return {'path': output, 'title': title, 'artist': artist, 'url': url, 'size': output.stat().st_size}
+        return {'path': output, 'title': title, 'artist': artist, 'url': url, 'size': output.stat().st_size,
+                'quality': format_label(chosen),
+                'method': 'sendAudio' if chosen['ext'] in {'mp3', 'm4a'} and chosen['format_id'] not in {'alac', 'falac'} else 'sendDocument'}
     except (subprocess.SubprocessError, ValueError, OSError) as exc:
         raise failure(phase, exc) from exc
     finally:
@@ -190,6 +295,7 @@ def prepare(job) -> None:
         raise app.UserVisibleError('❌ این آلبوم Bandcamp آهنگ عمومی قابل‌دریافت ندارد.')
     if len(entries) > MAX_TRACKS:
         raise app.UserVisibleError('❌ فعلاً آلبوم‌های حداکثر ۲۰ آهنگی پشتیبانی می‌شوند؛ لینک آهنگ‌ها را جدا بفرست.')
+    identifier = await_quality(job, url, entries) if job.source['bandcamp'].get('selectQuality') else 'best'
     job.bandcamp_items, job.bandcamp_failed, job.bandcamp_sent = [], [], 0
     deadline, size = time.monotonic() + MAX_SECONDS, 0
     for index, entry in enumerate(entries, 1):
@@ -202,7 +308,8 @@ def prepare(job) -> None:
             if '/track/' not in track_url or urlparse(track_url).hostname != urlparse(url).hostname:
                 raise app.UserVisibleError('❌ لینک آهنگ آلبوم معتبر نیست.')
             job.safe_status(f'🎵 Bandcamp؛ آماده‌سازی آهنگ {index} از {len(entries)}…')
-            item = prepare_track(track_url, job.workdir / f'bandcamp-{index}', MAX_BYTES - size, deadline)
+            args = (track_url, job.workdir / f'bandcamp-{index}', MAX_BYTES - size, deadline)
+            item = prepare_track(*args, identifier) if identifier != 'best' else prepare_track(*args)
             size += item['size']
             item['index'] = index
             job.bandcamp_items.append(item)
@@ -226,11 +333,15 @@ def send(job) -> dict:
             if job.cleanup_requested or time.monotonic() >= deadline:
                 raise app.UserVisibleError('❌ ارسال Bandcamp متوقف شد یا به سقف زمان رسید.')
             data = {'chat_id': str(job.payload['chatId']), 'title': item['title'], 'performer': item['artist'],
-                    'caption': f"🎵 {item['title']}\n👤 {item['artist']}\nBandcamp • {item['index']}\n{item['url']}"[:1024],
+                    'caption': f"🎵 {item['title']}\n👤 {item['artist']}\n{item.get('quality', '')}\nBandcamp • {item['index']}\n{item['url']}"[:1024],
                     'reply_parameters': json.dumps({'message_id': job.payload['requestMessageId'], 'allow_sending_without_reply': True})}
             with item['path'].open('rb') as handle:
-                asyncio.run(asyncio.wait_for(app.upload_complete_file(job.payload['botToken'], 'sendAudio', data,
-                            ('Bandcamp.mp3', handle, 'audio/mpeg')), timeout=max(1, min(10 * 60, deadline - time.monotonic()))))
+                ext = item['path'].suffix.lower()
+                method = item.get('method') or ('sendAudio' if ext in {'.mp3', '.m4a'} else 'sendDocument')
+                mime = {'.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.flac': 'audio/flac', '.wav': 'audio/wav',
+                        '.aiff': 'audio/aiff', '.ogg': 'audio/ogg', '.aac': 'audio/aac'}.get(ext, 'application/octet-stream')
+                asyncio.run(asyncio.wait_for(app.upload_complete_file(job.payload['botToken'], method, data,
+                            (item['path'].name, handle, mime)), timeout=max(1, min(10 * 60, deadline - time.monotonic()))))
             job.bandcamp_sent += 1
             item['path'].unlink(missing_ok=True)
         result = {'ok': True, 'parts': job.bandcamp_sent, 'title': job.bandcamp_title,

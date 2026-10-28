@@ -1,6 +1,7 @@
 import {build} from 'esbuild';
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import {createHmac} from 'node:crypto';
 const parser = await build({entryPoints:['src/bandcamp.ts'],bundle:true,format:'esm',write:false});
 const {parseBandcampUrl,bandcampFailureDiagnostic,BANDCAMP_FIX_VERSION} = await import(`data:text/javascript;base64,${Buffer.from(parser.outputFiles[0].text).toString('base64')}`);
 const bundle = await build({entryPoints:['src/app-main.ts'],bundle:true,format:'esm',write:false,plugins:[{name:'runtime',setup(b){
@@ -21,7 +22,7 @@ test('production webhook queues Bandcamp separately and keeps other job fields a
  const jobs=[];const bindings={...env,YOUTUBE_DOWNLOAD_WORKFLOW:{async create(job){jobs.push(job);}}};
  globalThis.fetch=async()=>Response.json({ok:true,result:{message_id:9}});
  await worker.fetch(message('https://artist.bandcamp.com/track/song'),bindings,{});
- assert.equal(jobs.length,1);assert.deepEqual(jobs[0].params.bandcamp,{url:'https://artist.bandcamp.com/track/song'});
+ assert.equal(jobs.length,1);assert.deepEqual(jobs[0].params.bandcamp,{url:'https://artist.bandcamp.com/track/song',selectQuality:true});
  for(const field of ['instagram','recognition','social','playlist','quality'])assert.equal(jobs[0].params[field],undefined);
 });
 
@@ -113,4 +114,62 @@ test('existing health route exposes the Bandcamp fix version without starting a 
  const response=await worker.fetch(new Request('https://worker/health'),env,{});
  assert.equal(response.status,200);const body=await response.json();assert.equal(body.bandcampFixVersion,BANDCAMP_FIX_VERSION);
  assert.equal(body.downloadFixVersion,'pool-five-v1');
+});
+
+test('Bandcamp workflow waits for a signed audio quality choice before preparing and sending',async()=>{
+ const calls=[],messages=[],options=[{id:'mp3-128',label:'MP3 • 128 kbps'},{id:'flac',label:'FLAC • بدون افت کیفیت'}];let reads=0;
+ globalThis.fetch=async(url,init)=>{messages.push(JSON.parse(init.body));return Response.json({ok:true,result:{message_id:10}});};
+ globalThis.container={async startShared(){},async instagramRequest(action,payload){calls.push({action,payload});return action==='send'?{ok:true,parts:1}:{ok:true};},async releaseInstagram(){}};
+ const step={async do(name,opts,fn){return (typeof opts==='function'?opts:fn)();},async waitForEvent(name,opts){
+  if(opts.type==='bandcamp-quality'){assert.ok(!calls.some(x=>x.action==='send'));return {payload:{index:1}};}
+  assert.equal(opts.type,reads===0?'instagram-ready':'bandcamp-prepared');
+  return {payload:++reads===1?{ok:true,bandcampOptions:options}:{ok:true}};
+ }};
+ await new YoutubeDownloadWorkflow({},env).run({payload:{id:'igdl-42-7-42',chatId:42,userId:42,requestMessageId:7,url:'',bandcamp:{url:'https://artist.bandcamp.com/track/song',selectQuality:true}}},step);
+ const selected=calls.find(x=>x.payload.bandcampFormatId);assert.equal(selected.payload.bandcampFormatId,'flac');
+ assert.equal(calls.filter(x=>x.action==='send').length,1);assert.equal(reads,2);
+ const menu=messages.find(x=>x.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data?.startsWith('bcq|'));
+ assert.deepEqual(menu.reply_markup.inline_keyboard.map(row=>row[0].text),options.map(x=>x.label));
+ for(const row of menu.reply_markup.inline_keyboard){
+  const data=row[0].callback_data;assert.ok(Buffer.byteLength(data)<=64);
+  const [,request,owner,index,expires,signature]=data.split('|');
+  assert.equal(signature,createHmac('sha256',env.BOT_TOKEN).update(`bandcamp:42:${request}:${owner}:${index}:${expires}`).digest('hex').slice(0,16));
+ }
+});
+
+const callbackRequest=(data,owner=42,chat=42)=>new Request('https://worker/telegram/webhook',{method:'POST',headers:{'content-type':'application/json','x-telegram-bot-api-secret-token':secret},body:JSON.stringify({callback_query:{id:'quality-click',from:{id:owner},data,message:{message_id:10,chat:{id:chat,type:'private'}}}})});
+const qualityData=(expires=Math.floor(Date.now()/1000)+60)=>{
+ const value=`bandcamp:42:7:42:0:${expires}`;
+ return `bcq|7|42|0|${expires}|${createHmac('sha256',env.BOT_TOKEN).update(value).digest('hex').slice(0,16)}`;
+};
+test('quality callback resumes the current workflow and rejects foreign, expired or modified choices',async()=>{
+ const events=[];let creates=0;globalThis.fetch=async()=>Response.json({ok:true});
+ const bindings={...env,YOUTUBE_DOWNLOAD_WORKFLOW:{async create(){creates++;},async get(id){assert.equal(id,'igdl-42-7-42');return {async sendEvent(event){events.push(event);}};}}};
+ await worker.fetch(callbackRequest(qualityData()),bindings,{});
+ assert.deepEqual(events,[{type:'bandcamp-quality',payload:{index:0}}]);
+ for(const request of [callbackRequest(qualityData(),99),callbackRequest(qualityData(),42,-10042),callbackRequest(qualityData(Math.floor(Date.now()/1000)-1)),callbackRequest(qualityData().replace('|0|','|1|'))])await worker.fetch(request,bindings,{});
+ assert.equal(events.length,1);assert.equal(creates,0);
+});
+
+test('completion events forward only validated public format choices without media URLs',async()=>{
+ const events=[];const id='igdl-42-7-42',token=createHmac('sha256',env.BOT_TOKEN).update('event:'+id).digest('hex');
+ const send=(options,stage)=>worker.fetch(new Request('https://worker/instagram/events/'+id,{method:'POST',headers:{'content-type':'application/json','x-instagram-event-token':token},body:JSON.stringify({ok:true,bandcampOptions:options,bandcampStage:stage})}),{...env,YOUTUBE_DOWNLOAD_WORKFLOW:{async get(){return {async sendEvent(event){events.push(event);}};}}},{});
+ assert.equal((await send([{id:'flac',label:'FLAC',url:'https://signed.example/private'}])).status,200);
+ assert.deepEqual(events[0].payload.bandcampOptions,[{id:'flac',label:'FLAC'}]);
+ assert.equal((await send([{id:'flac',label:'FLAC'},{id:'flac',label:'duplicate'}])).status,400);
+ assert.equal(events.length,1);
+ assert.equal((await send(undefined,'prepared')).status,200);
+ assert.equal(events[1].type,'bandcamp-prepared');assert.equal(events[0].type,'instagram-ready');
+ assert.equal((await send([{id:'flac',label:'FLAC'}],'prepared')).status,400);
+});
+
+test('membership gate covers Bandcamp quality callbacks before resuming a download',async()=>{
+ let resumed=0,triggered=false;const messages=[];
+ globalThis.fetch=async(url,init)=>{messages.push(JSON.parse(init.body));return Response.json({ok:true,result:{status:'left',message_id:9}});};
+ const bindings={...env,ADMIN_STATS:{getByName(){return {async fetch(url,init){
+  if(init?.body&&JSON.parse(init.body).triggerLink)triggered=true;
+  return Response.json(String(url).includes('/membership')?{enabled:true,mode:'first_link',downloaded:false,linkTriggered:triggered}:{ok:true,restricted:false});
+ }}}},YOUTUBE_DOWNLOAD_WORKFLOW:{async get(){resumed++;return {async sendEvent(){}};}}};
+ await worker.fetch(callbackRequest(qualityData()),bindings,{});
+ assert.equal(resumed,0);assert.equal(triggered,true);assert.ok(messages.some(x=>x.reply_markup?.inline_keyboard?.flat().some(b=>b.callback_data==='membership:check')));
 });
