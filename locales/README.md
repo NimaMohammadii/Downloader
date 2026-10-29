@@ -6,6 +6,7 @@ Each row keeps the existing Persian source (`fa`) and friendly English (`en`) an
 - `/lang` opens a language picker; `/lang fa`, `/lang en` and `/lang ru` select directly.
 - Persian remains the default. Existing Persian messages and download decisions stay unchanged.
 - Preferences use separate `language:<user-id>` keys in the existing durable store, with no SQL migration.
+- Language clicks and repeated `/lang` commands edit one saved menu with a short text reveal. Only known language menus and private `/lang` commands are cleaned up; download messages are never selected. Globe and confirmation icons use custom emoji entities.
 - Group buttons belong to the user who opened the picker. Other users cannot change that preference.
 - Worker async scopes and container context variables isolate concurrent users. Workflow/container payloads carry only an additional language setting.
 - Localize after public error sanitization. Never put raw diagnostics into translations.

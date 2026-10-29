@@ -94,8 +94,13 @@ export async function handleLanguageUpdate(request: Request, env: LanguageEnv): 
     const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
     });
-    const body = await response.json() as { ok?: boolean };
-    if (!response.ok || !body.ok) throw new Error('LANGUAGE_TELEGRAM_UNAVAILABLE');
+    const body = await response.json() as { ok?: boolean; result?: { message_id?: number }; description?: string };
+    if (method === 'editMessageText' && /message is not modified/i.test(body.description || '')) return body.result;
+    if (!response.ok || !body.ok) {
+      if (method === 'editMessageText' && /message to edit not found|message can't be edited/i.test(body.description || '')) throw new Error('LANGUAGE_MENU_MISSING');
+      throw new Error('LANGUAGE_TELEGRAM_UNAVAILABLE');
+    }
+    return body.result;
   };
   if (selection && Number(selection[2]) !== userId) {
     await send('answerCallbackQuery', { callback_query_id: query.id });
@@ -113,7 +118,56 @@ export async function handleLanguageUpdate(request: Request, env: LanguageEnv): 
   if (query) await send('answerCallbackQuery', { callback_query_id: query.id });
   const text = choice ? { fa: '✅ زبانت فارسی شد!', en: '✅ All set! Let’s chat in English.', ru: '✅ Готово! Теперь общаемся по-русски.' }[language]
     : { fa: '🌐 زبان دلخواهت رو انتخاب کن:', en: '🌐 Pick your language:', ru: '🌐 Выбери язык:' }[language];
-  await send('sendMessage', { chat_id: message.chat.id, text, entities: [{ type: 'bold', offset: 0, length: text.length }],
-    reply_markup: { inline_keyboard: [[['fa', 'فارسی 🇮🇷'], ['en', 'English 🇬🇧'], ['ru', 'Русский 🇷🇺']].map(([code, label]) => ({ text: label, callback_data: `lang:${code}:${userId}` }))] } });
+  const chatId = message.chat.id;
+  const menuUrl = `https://admin-stats/language-menu?user=${userId}&chat=${chatId}`;
+  const stub = env.ADMIN_STATS?.getByName('global');
+  const saved = stub ? await stub.fetch(menuUrl) : null;
+  const previous = saved?.ok ? await saved.json() as { messageId?: number } : {};
+  let messageId = previous.messageId || query?.message?.message_id;
+  if (!Number.isSafeInteger(messageId) || messageId! <= 0) messageId = undefined;
+  const keyboard = { inline_keyboard: [[['fa', 'فارسی 🇮🇷'], ['en', 'English 🇬🇧'], ['ru', 'Русский 🇷🇺']].map(([code, label]) => ({
+    text: label, callback_data: `lang:${code}:${userId}`,
+    ...(code === language ? { icon_custom_emoji_id: '5352871660024246779' } : {}),
+  }))] };
+  const chars = Array.from(new Intl.Segmenter(language, { granularity: 'grapheme' }).segment(text), part => part.segment);
+  const payload = (frame: string) => ({ chat_id: chatId, text: frame,
+    entities: [{ type: 'bold', offset: 0, length: frame.length },
+      { type: 'custom_emoji', offset: 0, length: chars[0].length,
+        custom_emoji_id: choice ? '5352871660024246779' : '5282843764451195532' }],
+    reply_markup: keyboard,
+  });
+  const remember = async () => {
+    if (stub && messageId) {
+      const response = await stub.fetch(menuUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ messageId }) });
+      if (!response.ok) throw new Error('LANGUAGE_MENU_SAVE_FAILED');
+    }
+  };
+  // Only this user's saved language menu is edited. Download messages are never candidates.
+  for (let frame = 0; frame < 4; frame++) {
+    const prefix = chars.slice(0, Math.max(1, Math.ceil(chars.length * (frame + 1) / 4))).join('');
+    if (messageId) {
+      try { await send('editMessageText', { ...payload(prefix), message_id: messageId }); }
+      catch (error) {
+        if (!(error instanceof Error) || error.message !== 'LANGUAGE_MENU_MISSING') throw error;
+        try { await send('deleteMessage', { chat_id: chatId, message_id: messageId }); } catch { /* The old menu may already be gone. */ }
+        messageId = undefined;
+      }
+    }
+    if (!messageId) {
+      messageId = (await send('sendMessage', payload(prefix)))?.message_id;
+      await remember();
+      // Telegram always returns a message ID on a successful send.
+      if (!messageId) break;
+    }
+    if (frame < 3) await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  await remember();
+  if (query?.message?.message_id && previous.messageId && query.message.message_id !== previous.messageId) {
+    try { await send('deleteMessage', { chat_id: chatId, message_id: query.message.message_id }); } catch { /* Old language-menu cleanup is optional. */ }
+  }
+  // Remove only the recognized /lang command in private chats, never a link or file.
+  if (command && chatId === userId && Number.isSafeInteger(message.message_id)) {
+    try { await send('deleteMessage', { chat_id: chatId, message_id: message.message_id }); } catch { /* Cosmetic cleanup is optional. */ }
+  }
   return Response.json({ ok: true });
 }

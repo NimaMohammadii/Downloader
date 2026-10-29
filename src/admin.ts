@@ -640,6 +640,19 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
 
   async fetch(request: Request): Promise<Response> {
     const languageUrl = new URL(request.url);
+    if (languageUrl.pathname === "/language-menu") {
+      const user = languageUrl.searchParams.get("user") || "";
+      const chat = languageUrl.searchParams.get("chat") || "";
+      if (!/^[1-9]\d{0,15}$/.test(user) || !/^-?[1-9]\d{0,15}$/.test(chat) ||
+          !Number.isSafeInteger(Number(user)) || !Number.isSafeInteger(Number(chat))) return new Response("Invalid destination", { status: 400 });
+      const key = `language-menu:${chat}:${user}`;
+      if (request.method === "POST") {
+        const body = await request.json() as { messageId?: number };
+        if (!Number.isSafeInteger(body.messageId) || body.messageId! <= 0) return new Response("Invalid menu", { status: 400 });
+        await this.ctx.storage.put(key, body.messageId);
+      } else if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
+      return Response.json({ messageId: await this.ctx.storage.get(key) });
+    }
     if (languageUrl.pathname === "/language") {
       const user = languageUrl.searchParams.get("user") || "";
       if (!/^[1-9]\d{0,15}$/.test(user) || !Number.isSafeInteger(Number(user))) return new Response("Invalid user", { status: 400 });
