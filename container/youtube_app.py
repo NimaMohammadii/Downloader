@@ -1410,6 +1410,10 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
     if (quality is None) == (audio_mode is None):
         raise ValueError("Choose exactly one YouTube download mode")
 
+    if payload.get("subtitle"):
+        from ai_subtitles import authorize
+        authorize(payload)
+
     workdir = Path(tempfile.mkdtemp(prefix="youtube-download-"))
     deadline_token = JOB_DEADLINE.set(time.monotonic() + YOUTUBE_JOB_SECONDS)
     phase = "cache"
@@ -1461,13 +1465,19 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
         status(f"⬇️ دارم ویدیو رو با کیفیت {quality}p دانلود می‌کنم…")
         video_path = download_video(url, workdir, quality, metadata)
         validate_file_size(video_path)
+        caption = f"{title}\n{quality}p"
+        if payload.get("subtitle"):
+            phase = "subtitle"
+            from ai_subtitles import prepare as prepare_subtitles
+            video_path = prepare_subtitles(video_path, payload, status)
+            caption += "\nزیرنویس فارسی"
         phase = "upload"
         status("📤 ویدیو کامل آماده شد؛ دارم می‌فرستم…")
         sent = send_media_file(
             token, chat_id, request_message_id, video_path,
-            f"{title}\n{quality}p", reply=True,
+            caption, reply=True,
         )
-        store_uploaded_file(payload, [payload.get("mediaCacheKey")], "sendVideo", {"caption": f"{title}\n{quality}p", "supports_streaming": True}, sent)
+        store_uploaded_file(payload, [payload.get("mediaCacheKey")], "sendVideo", {"caption": caption, "supports_streaming": True}, sent)
         delete_status(token, chat_id, status_message_id)
         return {"ok": True, "parts": 1, "title": title, "quality": quality}
 
@@ -1481,7 +1491,7 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         JOB_DEADLINE.set(None)
         diagnostic = upload_error_diagnostic(exc, token)
-        retry_safe = (phase == "upload" and diagnostic.get("rpcCode") == 420
+        retry_safe = (not payload.get("subtitle") and phase == "upload" and diagnostic.get("rpcCode") == 420
                       and diagnostic.get("errorCode") in {"FLOOD_WAIT", "SLOWMODE_WAIT"}
                       and type(diagnostic.get("retryAfterSeconds")) is int)
         if retry_safe:
@@ -2504,7 +2514,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_get(self) -> None:
         if self.path in {"/", "/health", "/ping"}:
-            self._send_json(200, {"ok": True, "service": "youtube-yt-dlp-container"})
+            self._send_json(200, {"ok": True, "service": "youtube-yt-dlp-container", "subtitleVersion": 1})
             return
         self._send_json(404, {"ok": False, "error": "not found"})
 

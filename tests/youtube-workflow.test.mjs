@@ -9,7 +9,7 @@ const bandcamp = await readFile(new URL('../src/bandcamp.ts', import.meta.url), 
 const source = await readFile(new URL('../src/youtube-main.ts', import.meta.url), 'utf8');
 const instagram = await readFile(new URL('../src/index.ts', import.meta.url), 'utf8');
 const { outputFiles } = await build({ external: ['node:async_hooks'],
-  stdin: { contents: source + '\nexport {extractPornhubUrl};', loader: 'ts', resolveDir: process.cwd() },
+  stdin: { contents: source + '\nexport {extractPornhubUrl,handleQualityCallback,parseQualityCallback,mediaCacheKey};', loader: 'ts', resolveDir: process.cwd() },
   bundle: true, format: 'esm', write: false,
   plugins: [{ name: 'cloudflare-test-bindings', setup(build) {
     build.onResolve({ filter: /.*/ }, args => ({ path: args.path, namespace: 'test' }));
@@ -55,7 +55,7 @@ const { outputFiles } = await build({ external: ['node:async_hooks'],
     });
   } }],
 });
-const { DownloadPool, YoutubeDownloaderContainer, YoutubeDownloadWorkflow, extractPornhubUrl, default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
+const { DownloadPool, YoutubeDownloaderContainer, YoutubeDownloadWorkflow, extractPornhubUrl, handleQualityCallback, parseQualityCallback, mediaCacheKey, default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
 
 function memoryStorage() {
   const values = new Map();
@@ -436,7 +436,7 @@ test('text and caption Pornhub links queue a deterministic direct-download job',
   assert.equal(jobs[0].params.quality, undefined);
 });
 
-async function run({ inspect = false, startupError, httpError, result, sizes, credentials = true, pornhub = false, pool = poolBinding(), results, onSleep, checkpoints = new Map() } = {}) {
+async function run({ inspect = false, startupError, httpError, result, sizes, credentials = true, pornhub = false, pool = poolBinding(), results, onSleep, checkpoints = new Map(), jobChanges = {}, aiSecrets = true, subtitleVersion = 1 } = {}) {
   const messages = [];
   const calls = [];
   const steps = [];
@@ -453,6 +453,8 @@ async function run({ inspect = false, startupError, httpError, result, sizes, cr
     },
     async fetch(request) {
       calls.push([new URL(request.url).pathname]);
+      if (new URL(request.url).pathname === '/health') return Response.json({ok:true,subtitleVersion});
+      if (new URL(request.url).pathname === '/download') globalThis.lastDownloadPayload=await request.clone().json();
       if (pornhub && new URL(request.url).pathname === '/download') {
         const body = await request.clone().json();
         assert.equal(Object.hasOwn(body, 'pornhubSessionTag'), false);
@@ -483,7 +485,9 @@ async function run({ inspect = false, startupError, httpError, result, sizes, cr
     url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
     ...(pornhub ? { source: 'pornhub', url: 'https://www.pornhub.com/view_video.php?viewkey=ph123' } : inspect ? {} : { quality: 720, statusMessageId: 10 }),
   };
+  Object.assign(job,jobChanges);
   await new YoutubeDownloadWorkflow({}, { BOT_TOKEN: 'secret-token', DOWNLOAD_POOL: pool, PORNHUB_COOKIES: 'obsolete-secret',
+    ...(aiSecrets?{ELEVEN_API:'private-eleven',GPT_API:'private-gpt'}:{}),
     ...(credentials ? { API_ID: '123', API_HASH: 'secret-hash' } : {}) }).run({ payload: job }, step);
   return { calls, messages, steps, delivered: globalThis.delivered };
 }
@@ -672,4 +676,84 @@ test('usage refresh never starts a sleeping container or renews activity; lifecy
     await container.onStart();
     assert.notEqual((await storage.get('adminUsageRun')).key, first.key);
   } finally { delete globalThis.usageTelemetry; }
+});
+
+
+async function subtitleChoice(data, actor=1, extra={}) {
+  const messages=[],jobs=[];
+  globalThis.fetch=async(_url,init)=>{const body=JSON.parse(init.body);messages.push(body);return Response.json({ok:true,result:{message_id:10}});};
+  const env={BOT_TOKEN:'secret-token',ELEVEN_API:'private-eleven',GPT_API:'private-gpt',
+    YOUTUBE_DOWNLOAD_WORKFLOW:{async create(job){jobs.push(job);}},...extra};
+  await handleQualityCallback(env,{}, {id:'callback',from:{id:actor},data,message:{message_id:10,chat:{id:actor}}});
+  return {messages,jobs};
+}
+
+test('only admins get a subtitle choice after video quality; normal users and audio keep the original path',async()=>{
+  const menu=await subtitleChoice('ytq|dQw4w9WgXcQ|720|7|1');
+  assert.equal(menu.jobs.length,0);
+  const buttons=menu.messages.find(m=>m.reply_markup).reply_markup.inline_keyboard.flat();
+  assert.equal(buttons.length,2);
+  assert.ok(buttons.every(b=>Buffer.byteLength(b.callback_data)<=64));
+  const withSubs=await subtitleChoice(buttons[0].callback_data);
+  assert.equal(withSubs.jobs.length,1);assert.equal(withSubs.jobs[0].params.subtitle,'fa');
+  assert.ok(!JSON.stringify(withSubs.jobs).includes('private-'),'API keys must not enter Workflow params');
+  const without=await subtitleChoice(buttons[1].callback_data);
+  assert.ok(!Object.hasOwn(without.jobs[0].params,'subtitle'));
+  const normal=await subtitleChoice('ytq|dQw4w9WgXcQ|720|7|42',42);
+  assert.equal(normal.jobs.length,1);assert.ok(!Object.hasOwn(normal.jobs[0].params,'subtitle'));
+  const audio=await subtitleChoice('ytq|dQw4w9WgXcQ|ah|7|1');
+  assert.equal(audio.jobs.length,1);assert.equal(audio.jobs[0].params.audioMode,'hq');
+});
+
+test('forged subtitle buttons, other users and missing API keys cannot start paid work',async()=>{
+  for(const [data,actor,extra] of [
+    ['yts|dQw4w9WgXcQ|720|7|42|1',42,{}],
+    ['yts|dQw4w9WgXcQ|720|7|1|1',42,{}],
+    ['yts|dQw4w9WgXcQ|720|7|1|1',1,{GPT_API:''}],
+    ['yts|dQw4w9WgXcQ|720|7|1|1',1,{ELEVEN_API:''}],
+    ['yts|dQw4w9WgXcQ|ah|7|1|1',1,{}],
+  ]) assert.equal((await subtitleChoice(data,actor,extra)).jobs.length,0);
+  for(const data of ['yts|dQw4w9WgXcQ|720|7|1|true','yts|dQw4w9WgXcQ|720|0|1|1','yts|dQw4w9WgXcQ|720|7|9007199254740992|1'])
+    assert.equal(parseQualityCallback(data),null);
+});
+
+test('subtitle Telegram cache keys are isolated from original quality and audio keys',async()=>{
+  const base={url:'https://www.youtube.com/watch?v=dQw4w9WgXcQ',quality:720};
+  assert.equal(await mediaCacheKey(base),'yt:dQw4w9WgXcQ:v720');
+  assert.equal(await mediaCacheKey({...base,subtitle:'fa'}),'yt:dQw4w9WgXcQ:v720:sub-fa-v1');
+  assert.equal(await mediaCacheKey({...base,audioMode:'hq'}),'yt:dQw4w9WgXcQ:ah');
+});
+
+
+test('subtitle authorization is checked in Workflow before cache, container boot or API work',async()=>{
+  for(const options of [{jobChanges:{subtitle:'fa',userId:42}},{jobChanges:{subtitle:'fa',userId:1},aiSecrets:false}]){
+    const result=await run(options);
+    assert.equal(result.calls.length,0);assert.equal(result.delivered,0);
+  }
+});
+
+test('ordinary jobs never receive AI credentials; signed admin subtitle payload stays on the same download endpoint',async()=>{
+  await run();
+  assert.ok(!Object.hasOwn(globalThis.lastDownloadPayload,'elevenApiKey'));
+  assert.ok(!Object.hasOwn(globalThis.lastDownloadPayload,'gptApiKey'));
+  const result=await run({jobChanges:{subtitle:'fa',userId:1}});
+  assert.equal(result.delivered,1);
+  const body=globalThis.lastDownloadPayload;
+  assert.equal(body.elevenApiKey,'private-eleven');assert.equal(body.gptApiKey,'private-gpt');
+  assert.equal(body.mediaCacheKey,'yt:dQw4w9WgXcQ:v720:sub-fa-v1');
+  const expected=createHmac('sha256','secret-token').update('subtitle-fa-v1|test-job|1|dQw4w9WgXcQ|720').digest('hex');
+  assert.equal(body.subtitleAuthorization,expected);
+  assert.deepEqual(result.calls.map(c=>c[0]),['start','/health','/download']);
+});
+
+test('old container images cannot silently return plain video for a subtitle request',async()=>{
+  const result=await run({jobChanges:{subtitle:'fa',userId:1},subtitleVersion:null});
+  assert.ok(!result.calls.some(c=>c[0]==='/download'));assert.equal(result.delivered,0);
+});
+
+test('subtitle jobs do not replay paid preparation automatically after Telegram flood waits',async()=>{
+  const result=await run({jobChanges:{subtitle:'fa',userId:1},result:{ok:false,retrySafe:true,phase:'upload',rpcCode:420,
+    errorCode:'FLOOD_WAIT',retryAfterSeconds:300},onSleep(){throw Error('paid work must not be replayed');}});
+  assert.equal(result.calls.filter(c=>c[0]==='/download').length,1);
+  assert.ok(!result.steps.some(([,config])=>config.sleep));
 });

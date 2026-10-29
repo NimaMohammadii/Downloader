@@ -62,6 +62,7 @@ type YoutubeDownloadJob = {
   source?: "pornhub";
   quality?: YoutubeQuality;
   audioMode?: YoutubeAudioMode;
+  subtitle?: "fa";
   statusMessageId?: number;
   instagram?: InstagramVideoTarget;
   instagramPost?: InstagramPostUpload;
@@ -82,6 +83,8 @@ type Env = AdminStatsEnv & InstagramApiSecrets & {
   WEBHOOK_SECRET?: string;
   API_ID?: string;
   API_HASH?: string;
+  ELEVEN_API?: string;
+  GPT_API?: string;
   PINTEREST_COOKIES?: string;
   REDDIT_COOKIES?: string;
   YOUTUBE_DOWNLOAD_WORKFLOW: Workflow<YoutubeDownloadJob>;
@@ -171,6 +174,7 @@ type YoutubeMetadataResult = {
 };
 
 type ParsedQualityCallback = {
+  subtitle?: boolean;
   videoId: string;
   requestMessageId: number;
   userId: number;
@@ -414,7 +418,7 @@ async function mediaCacheKey(job: YoutubeDownloadJob): Promise<string | undefine
   if (target && id && target.kind !== "live") return `ig:${job.userId}:${id}:${target.videoIndex ?? 0}:${target.recognizeMusic ? "song-v2" : target.kind}`;
   if (job.quality || job.audioMode) {
     const id = new URL(job.url).searchParams.get("v");
-    if (id && /^[A-Za-z0-9_-]{11}$/.test(id)) return `yt:${id}:${job.audioMode ? job.audioMode === "hq" ? "ah" : "al" : `v${job.quality}`}`;
+    if (id && /^[A-Za-z0-9_-]{11}$/.test(id)) return `yt:${id}:${job.audioMode ? job.audioMode === "hq" ? "ah" : "al" : `v${job.quality}`}${job.subtitle === "fa" ? ":sub-fa-v1" : ""}`;
   }
 }
 
@@ -441,7 +445,7 @@ async function sendCachedMedia(env: Env, job: YoutubeDownloadJob, statusId?: num
 }
 
 function redactDiagnostic(detail: string, env: Env): string {
-  const secrets = [env.BOT_TOKEN, env.API_HASH, env.INSTAGRAM_SESSIONID]
+  const secrets = [env.BOT_TOKEN, env.API_HASH, env.INSTAGRAM_SESSIONID, env.ELEVEN_API, env.GPT_API]
     .filter((secret): secret is string => Boolean(secret)).sort((a, b) => b.length - a.length);
   for (const secret of secrets) {
     detail = detail.split(secret).join("[redacted]");
@@ -451,6 +455,9 @@ function redactDiagnostic(detail: string, env: Env): string {
 }
 
 function workflowFailureMessage(detail: string, phase: string): string {
+  if (detail.includes("SUBTITLE_ADMIN_ONLY")) return "❌ زیرنویس فعلاً فقط برای ادمین فعال است.";
+  if (detail.includes("SUBTITLE_RUNTIME_NOT_READY")) return "❌ سرور زیرنویس هنوز نسخهٔ جدید را اجرا نمی‌کند؛ کمی بعد لینک را دوباره بفرست.";
+  if (detail.includes("SUBTITLE_CONFIG")) return "❌ برای زیرنویس، ELEVEN_API و GPT_API را در Secretهای Worker تنظیم کن.";
   if (detail.includes("YT_CONFIG")) {
     return "❌ تنظیمات ارسال فایل آماده نیست؛ API_ID و API_HASH باید در Secretهای همین Worker تنظیم شوند.";
   }
@@ -878,6 +885,11 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
     };
 
     try {
+      // Optional post-processing is authorized before cache access or downloads.
+      if (job.subtitle && (!isAdmin(this.env, job.userId) || job.subtitle !== "fa" || !job.quality || job.audioMode || job.source))
+        throw new Error("SUBTITLE_ADMIN_ONLY");
+      if (job.subtitle && (!this.env.ELEVEN_API?.trim() || !this.env.GPT_API?.trim()))
+        throw new Error("SUBTITLE_CONFIG");
       if (!job.quality && !job.audioMode && job.source !== "pornhub") {
         statusMessageId = await step.do(
           "show youtube quality status",
@@ -1005,17 +1017,28 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
             timeout: "30 minutes",
           },
           async () => {
+            if (job.subtitle === "fa") {
+              const capability = await containerResult<{ subtitleVersion?: number }>(this.env, job,
+                new Request("http://container/health"));
+              if (capability.subtitleVersion !== 1) throw new Error("SUBTITLE_RUNTIME_NOT_READY");
+            }
             return containerResult<ContainerResult>(this.env, job,
               new Request("http://container/download", {
                 method: "POST",
                 headers: { "content-type": "application/json" },
                 body: JSON.stringify({ ...job, language: await userLanguage(this.env, job.userId), statusMessageId, botToken: this.env.BOT_TOKEN,
-                  ...await mediaCacheContext(this.env, job) }),
+                  ...await mediaCacheContext(this.env, job),
+                  ...(job.subtitle === "fa" ? {
+                    elevenApiKey: this.env.ELEVEN_API, gptApiKey: this.env.GPT_API,
+                    subtitleAuthorization: await instagramSignature(this.env.BOT_TOKEN,
+                      `subtitle-fa-v1|${job.id}|${job.userId}|${new URL(job.url).searchParams.get("v")}|${job.quality}`),
+                  } : {}),
+                }),
               }),
             );
           },
         );
-        if (result.ok || !result.retrySafe || result.phase !== "upload" || result.rpcCode !== 420
+        if (result.ok || job.subtitle === "fa" || !result.retrySafe || result.phase !== "upload" || result.rpcCode !== 420
             || !["FLOOD_WAIT", "SLOWMODE_WAIT"].includes(result.errorCode || "")
             || !Number.isSafeInteger(result.retryAfterSeconds) || result.retryAfterSeconds! < 0) break;
         wait++;
@@ -1343,10 +1366,10 @@ function qualityLabel(quality: YoutubeQuality): string {
   return "1080p Full HD";
 }
 
-function formatSelection(job: Pick<YoutubeDownloadJob, "quality" | "audioMode">): string {
+function formatSelection(job: Pick<YoutubeDownloadJob, "quality" | "audioMode" | "subtitle">): string {
   if (job.audioMode === "low") return "🎵 Audio Low";
   if (job.audioMode === "hq") return "🎧 Audio HQ";
-  return qualityLabel(job.quality!);
+  return qualityLabel(job.quality!) + (job.subtitle === "fa" ? " • زیرنویس فارسی" : "");
 }
 
 function fileSizeLabel(size: YoutubeFileSize | undefined): string {
@@ -1391,6 +1414,11 @@ function buildQualityKeyboard(
 
 function parseQualityCallback(data: string | undefined): ParsedQualityCallback | null {
   if (!data) return null;
+  const subtitle = /^yts\|([A-Za-z0-9_-]{11})\|(360|480|720|1080)\|(\d+)\|(\d+)\|([01])$/.exec(data);
+  if (subtitle) {
+    const parsed = parseQualityCallback(`ytq|${subtitle[1]}|${subtitle[2]}|${subtitle[3]}|${subtitle[4]}`);
+    return parsed ? { ...parsed, subtitle: subtitle[5] === "1" } : null;
+  }
   const match = /^ytq\|([A-Za-z0-9_-]{6,20})\|(360|480|720|1080|al|ah)\|(\d+)\|(\d+)$/.exec(data);
   if (!match) return null;
 
@@ -1603,6 +1631,29 @@ async function handleQualityCallback(
     return Response.json({ ok: true });
   }
 
+  if (parsed.subtitle !== undefined && !isAdmin(env, callback.from.id)) {
+    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id,
+      text: "زیرنویس فعلاً فقط برای ادمین فعال است.", show_alert: true });
+    return Response.json({ ok: true });
+  }
+  if (parsed.quality && parsed.subtitle === undefined && isAdmin(env, callback.from.id)) {
+    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id });
+    await safeTelegramCall(env.BOT_TOKEN, "editMessageText", {
+      chat_id: callback.message.chat.id, message_id: callback.message.message_id,
+      text: `${qualityLabel(parsed.quality)}\n\nویدیو را با زیرنویس فارسی می‌خواهی یا بدون زیرنویس؟`,
+      reply_markup: { inline_keyboard: [[
+        { text: "با زیرنویس فارسی", callback_data: `yts|${parsed.videoId}|${parsed.quality}|${parsed.requestMessageId}|${parsed.userId}|1` },
+        { text: "بدون زیرنویس", callback_data: `yts|${parsed.videoId}|${parsed.quality}|${parsed.requestMessageId}|${parsed.userId}|0` },
+      ]] },
+    });
+    return Response.json({ ok: true });
+  }
+  if (parsed.subtitle && (!env.ELEVEN_API?.trim() || !env.GPT_API?.trim())) {
+    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id,
+      text: "ELEVEN_API و GPT_API در Secretهای Worker تنظیم نشده‌اند.", show_alert: true });
+    return Response.json({ ok: true });
+  }
+
   const job: YoutubeDownloadJob = {
     id: `ytdl-${callback.message.chat.id}-${parsed.requestMessageId}-${parsed.userId}`,
     chatId: callback.message.chat.id,
@@ -1611,6 +1662,7 @@ async function handleQualityCallback(
     url: `https://www.youtube.com/watch?v=${parsed.videoId}`,
     quality: parsed.quality,
     audioMode: parsed.audioMode,
+    ...(parsed.subtitle ? { subtitle: "fa" as const } : {}),
     statusMessageId: callback.message.message_id,
   };
   const selectionText = formatSelection(job);
@@ -1932,7 +1984,7 @@ export default {
           linkSent, update?.update_id, isStartCommand(activityText));
       }
 
-      if (update?.callback_query?.data?.startsWith("ytq|")) {
+      if (update?.callback_query?.data?.startsWith("ytq|") || update?.callback_query?.data?.startsWith("yts|")) {
         return handleQualityCallback(env, update, update.callback_query);
       }
       if (update?.callback_query?.data?.startsWith("igs|")) return stopInstagramRecording(env, update.callback_query);
