@@ -158,6 +158,9 @@ test('subtitle fetch failures stay separate from the video stream',async()=>{
   stub.webRequest=async()=>Response.json({message:'YouTube could not provide this subtitle track (HTTP 429).'},{status:502});
   const limited=await route(new Request(result.subtitles[0].url,{headers:{cookie}}),env);
   assert.match((await limited.json()).message,/HTTP 429/);
+  stub.webRequest=async()=>Response.json({message:'YouTube temporarily limited subtitles. Try again in 120 seconds.'},{status:502});
+  const cooldown=await route(new Request(result.subtitles[0].url,{headers:{cookie}}),env);
+  assert.match((await cooldown.json()).message,/120 seconds/);
   stub.webRequest=async()=>Response.json({message:'Cookie: private-secret https://private.example/token'},{status:502});
   const untrusted=await route(new Request(result.subtitles[0].url,{headers:{cookie}}),env);
   assert.doesNotMatch((await untrusted.json()).message,/private-secret|private.example/);

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import types
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'container'))
@@ -150,12 +151,14 @@ class SubtitleTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.patch = patch.object(web.mini_pipeline, 'MINI_ROOT', self.root)
         self.patch.start()
+        self.cooldown = patch.object(web, 'SUBTITLE_RETRY_AT', 0.0)
+        self.cooldown.start()
         directory = self.root / self.file_id; directory.mkdir()
         (directory / 'video.mp4').write_bytes(b'video')
         (directory / 'manifest.json').write_text(json.dumps({'fileId': self.file_id, 'fileName': 'video.mp4'}))
 
     def tearDown(self):
-        self.patch.stop(); self.temp.cleanup()
+        self.cooldown.stop(); self.patch.stop(); self.temp.cleanup()
 
     def track(self, language='en', **extra):
         return {'ext': 'vtt', 'name': language, 'url': f'https://www.youtube.com/api/timedtext?v={self.video_id}&lang=en&fmt=vtt', **extra}
@@ -199,18 +202,67 @@ class SubtitleTests(unittest.TestCase):
 
     def test_only_selected_track_is_fetched_once_and_cached_without_credentials_or_redirects(self):
         tracks=web._save_subtitle_catalog(self.catalog(), self.file_id)
-        with patch.object(web.app.requests, 'get', return_value=self.Response(self.vtt)) as fetch:
+        with patch.object(web, '_subtitle_request', return_value=self.Response(self.vtt)) as fetch:
             self.assertEqual(web._subtitle_bytes(self.file_id, tracks[0]['id']), self.vtt)
             self.assertEqual(web._subtitle_bytes(self.file_id, tracks[0]['id']), self.vtt)
         fetch.assert_called_once()
-        args=fetch.call_args.kwargs
-        self.assertFalse(args['allow_redirects']); self.assertEqual(args['timeout'], (5,15))
-        self.assertNotIn('Cookie',args['headers']); self.assertNotIn('Authorization',args['headers'])
-        self.assertEqual(args['headers']['User-Agent'],'fixture-agent')
+        item, headers=fetch.call_args.args
+        self.assertNotIn('Cookie',headers); self.assertNotIn('Authorization',headers)
+        self.assertEqual(headers['User-Agent'],'fixture-agent')
+
+    def test_existing_browser_transport_flag_is_preserved_and_request_is_restricted(self):
+        metadata=self.catalog()
+        metadata['subtitles']['en'][0]['impersonate']=True
+        track=web._save_subtitle_catalog(metadata,self.file_id)[0]
+        response=self.Response(self.vtt)
+        response.close=unittest.mock.Mock()
+        session=unittest.mock.MagicMock()
+        session.__enter__.return_value=session
+        session.get.return_value=response
+        module=types.ModuleType('curl_cffi')
+        module.requests=types.SimpleNamespace(Session=unittest.mock.Mock(return_value=session))
+        with patch.dict(sys.modules, {'curl_cffi':module}):
+            self.assertEqual(web._subtitle_bytes(self.file_id,track['id']),self.vtt)
+        session.get.assert_called_once()
+        options=session.get.call_args.kwargs
+        self.assertEqual(options['impersonate'],'chrome')
+        self.assertFalse(options['allow_redirects'])
+        self.assertTrue(options['verify'])
+        self.assertEqual(options['timeout'],(5,15))
+        self.assertNotIn('User-Agent',options['headers'])
+        self.assertNotIn('Cookie',options['headers'])
+        response.close.assert_called_once()
+
+    def test_translations_wait_once_for_extraction_age_original_captions_do_not(self):
+        with patch.object(web.time,'time',return_value=1000):
+            tracks=web._save_subtitle_catalog(self.catalog(),self.file_id,extracted_at=980)
+        with patch.object(web.time,'time',return_value=1000), \
+             patch.object(web.time,'sleep') as wait, \
+             patch.object(web,'_subtitle_request',return_value=self.Response(self.vtt)) as fetch:
+            self.assertEqual(web._subtitle_bytes(self.file_id,tracks[0]['id']),self.vtt)
+            wait.assert_not_called()
+            self.assertEqual(web._subtitle_bytes(self.file_id,tracks[2]['id']),self.vtt)
+            self.assertEqual(web._subtitle_bytes(self.file_id,tracks[2]['id']),self.vtt)
+            wait.assert_called_once_with(40)
+            self.assertEqual(fetch.call_count,2)
+
+    def test_429_cooldown_applies_across_languages_then_expires_without_retries(self):
+        tracks=web._save_subtitle_catalog(self.catalog(),self.file_id,extracted_at=0)
+        with patch.object(web.time,'monotonic',return_value=1000), \
+             patch.object(web,'_subtitle_request',return_value=self.Response(b'',429,{'retry-after':'120'})) as fetch:
+            with self.assertRaisesRegex(web.app.UserVisibleError,'120 seconds'):
+                web._subtitle_bytes(self.file_id,tracks[0]['id'])
+            with self.assertRaisesRegex(web.app.UserVisibleError,'120 seconds'):
+                web._subtitle_bytes(self.file_id,tracks[1]['id'])
+            fetch.assert_called_once()
+        with patch.object(web.time,'monotonic',return_value=1121), \
+             patch.object(web,'_subtitle_request',return_value=self.Response(self.vtt)) as fetch:
+            self.assertEqual(web._subtitle_bytes(self.file_id,tracks[1]['id']),self.vtt)
+            fetch.assert_called_once()
 
     def test_unknown_or_traversal_track_never_causes_a_network_request(self):
         web._save_subtitle_catalog(self.catalog(),self.file_id)
-        with patch.object(web.app.requests,'get') as fetch:
+        with patch.object(web,'_subtitle_request') as fetch:
             for file_id,track_id in [(self.file_id,'../secret'),('../secret','a'*16),(self.file_id,'0'*16)]:
                 with self.assertRaises(FileNotFoundError): web._subtitle_bytes(file_id,track_id)
         fetch.assert_not_called()
@@ -218,12 +270,12 @@ class SubtitleTests(unittest.TestCase):
     def test_http_errors_empty_html_oversized_and_invalid_utf8_are_not_cached_or_retried(self):
         track=web._save_subtitle_catalog(self.catalog(),self.file_id)[0]
         responses=[self.Response(self.vtt,status=302,headers={'location':'http://127.0.0.1/secret'}),
-                   self.Response(self.vtt,status=429), self.Response(b'<html>denied</html>'),
+                   self.Response(b'<html>denied</html>'),
                    self.Response(b''), self.Response(b'WEBVTT\n\xff'),
                    self.Response(self.vtt,headers={'content-length':str(web.SUBTITLE_MAX_BYTES+1)}),
                    self.Response(b'WEBVTT\n'+b'x'*web.SUBTITLE_MAX_BYTES)]
         for response in responses:
-            with patch.object(web.app.requests,'get',return_value=response) as fetch:
+            with patch.object(web,'_subtitle_request',return_value=response) as fetch:
                 with self.assertRaises((web.app.UserVisibleError, UnicodeError)):
                     web._subtitle_bytes(self.file_id,track['id'])
                 fetch.assert_called_once()
@@ -234,7 +286,7 @@ class SubtitleTests(unittest.TestCase):
         server=web.app.ThreadingHTTPServer(('127.0.0.1',0),web.MiniAsyncHandler)
         thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
         try:
-            with patch.object(web.app.requests,'get',return_value=self.Response(b'',status=403)):
+            with patch.object(web,'_subtitle_request',return_value=self.Response(b'',status=403)):
                 c=http.client.HTTPConnection('127.0.0.1',server.server_port)
                 c.request('GET',f"/mini/subtitle?streamId={self.file_id}&trackId={track['id']}")
                 response=c.getresponse();self.assertEqual(response.status,502);response.read();c.close()

@@ -2,6 +2,8 @@
 import hashlib
 import json
 import re
+import ssl
+from contextlib import contextmanager
 import time
 import threading
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -15,6 +17,8 @@ pipeline = mini_pipeline.pipeline
 SUBTITLE_ID_RE = re.compile(r"^[a-f0-9]{16}$")
 SUBTITLE_MAX_BYTES = 2 * 1024 * 1024
 SUBTITLE_LOCK = threading.Lock()
+SUBTITLE_RETRY_AT = 0.0
+SUBTITLE_TRANSLATION_DELAY = 60
 
 
 def _subtitle_url_allowed(value: str, video_id: str) -> bool:
@@ -30,7 +34,7 @@ def _subtitle_url_allowed(value: str, video_id: str) -> bool:
         return False
 
 
-def _save_subtitle_catalog(metadata: dict, file_id: str) -> list[dict]:
+def _save_subtitle_catalog(metadata: dict, file_id: str, extracted_at: float | None = None) -> list[dict]:
     """Use the existing engine's catalog; do not run another extractor."""
     catalog = {}
     video_id = str(metadata.get("id") or "")
@@ -57,7 +61,10 @@ def _save_subtitle_catalog(metadata: dict, file_id: str) -> list[dict]:
             headers = chosen.get("http_headers") or metadata.get("http_headers") or {}
             agent = headers.get("User-Agent") if isinstance(headers, dict) else None
             catalog[track_id] = {"id": track_id, "language": language, "label": label,
-                                 "kind": actual_kind, "url": chosen["url"], "videoId": video_id}
+                                 "kind": actual_kind, "url": chosen["url"], "videoId": video_id,
+                                 "impersonate": chosen.get("impersonate") is True,
+                                 "readyAt": (extracted_at if extracted_at is not None else time.time()) +
+                                            (SUBTITLE_TRANSLATION_DELAY if actual_kind == "translated" else 0)}
             if isinstance(agent, str) and len(agent) <= 1024 and "\r" not in agent and "\n" not in agent:
                 catalog[track_id]["userAgent"] = agent
             if len(catalog) >= 200:
@@ -69,7 +76,31 @@ def _save_subtitle_catalog(metadata: dict, file_id: str) -> list[dict]:
     return [{key: item[key] for key in ("id", "language", "label", "kind")} for item in catalog.values()]
 
 
+@contextmanager
+def _subtitle_request(item: dict, headers: dict):
+    # YouTube's yt-dlp subtitle entries explicitly request browser transport.
+    # Use the same already-installed curl-cffi backend; never re-extract or
+    # fall back to a second network path. Keep TLS verification and no redirects.
+    from curl_cffi import requests as curl_requests
+    with curl_requests.Session() as session:
+        response = session.get(item["url"], headers=headers, timeout=(5, 15),
+                               impersonate="chrome" if item.get("impersonate") else None,
+                               verify=ssl.get_default_verify_paths().cafile or True,
+                               allow_redirects=False, stream=True)
+        try:
+            yield response
+        finally:
+            response.close()
+
+
+def _subtitle_cooldown() -> None:
+    remaining = int(SUBTITLE_RETRY_AT - time.monotonic() + 0.999)
+    if remaining > 0:
+        raise app.UserVisibleError(f"YouTube temporarily limited subtitles. Try again in {remaining} seconds.")
+
+
 def _subtitle_bytes(file_id: str, track_id: str) -> bytes:
+    global SUBTITLE_RETRY_AT
     if not mini_pipeline.FILE_ID_RE.fullmatch(file_id) or not SUBTITLE_ID_RE.fullmatch(track_id):
         raise FileNotFoundError("Unknown subtitles")
     loaded = mini_pipeline._load_manifest(file_id)
@@ -86,13 +117,25 @@ def _subtitle_bytes(file_id: str, track_id: str) -> bytes:
         if path.is_file() and path.stat().st_size <= SUBTITLE_MAX_BYTES:
             directory.touch()
             return path.read_bytes()
-        headers = {"Accept": "text/vtt"}
-        if item.get("userAgent"):
+        _subtitle_cooldown()
+        # Upstream recommends allowing translated captions to become available
+        # for 60s after extraction. One selected request waits once, no polling.
+        delay = min(SUBTITLE_TRANSLATION_DELAY, max(0, float(item.get("readyAt") or 0) - time.time()))
+        if delay:
+            time.sleep(delay)
+        headers = {"Accept": "text/vtt", "Accept-Encoding": "identity"}
+        if item.get("userAgent") and not item.get("impersonate"):
             headers["User-Agent"] = item["userAgent"]
         # Restrict every fetch to the video's validated YouTube timed-text URL.
         # No redirects, arbitrary browser URL, cookies or automatic retries.
-        with app.requests.get(item["url"], headers=headers, timeout=(5, 15),
-                              allow_redirects=False, stream=True) as response:
+        with _subtitle_request(item, headers) as response:
+            if response.status_code == 429:
+                retry = str(response.headers.get("retry-after") or "")
+                # Honor the provider's cooldown, at least one minute. Requests
+                # for other languages in this session must not amplify a 429.
+                seconds = max(60, int(retry) if retry.isdecimal() else 60)
+                SUBTITLE_RETRY_AT = time.monotonic() + seconds
+                _subtitle_cooldown()
             if response.status_code != 200:
                 print(f"web subtitle source rejected status={response.status_code}", flush=True)
                 raise app.UserVisibleError(f"YouTube could not provide this subtitle track (HTTP {response.status_code}).")
@@ -147,6 +190,7 @@ class MiniAsyncHandler(mini_pipeline.MiniAppHandler):
             try:
                 with app.server_activity(), app.request_cache(url):
                     metadata = pipeline.fetch_metadata(url)
+                    extracted_at = time.time()
                     app.validate_video_metadata(metadata)
                     qualities = pipeline.available_qualities(metadata)
                     quality = payload.get("quality")
@@ -165,7 +209,7 @@ class MiniAsyncHandler(mini_pipeline.MiniAppHandler):
                     if watch:
                         result.update(streamId=file_id, quality=quality, qualities=qualities)
                         try:
-                            result["subtitles"] = _save_subtitle_catalog(metadata, file_id)
+                            result["subtitles"] = _save_subtitle_catalog(metadata, file_id, extracted_at)
                         except Exception as exc:
                             # Optional captions never invalidate a playable video.
                             print(f"web subtitle catalog unavailable: {type(exc).__name__}", flush=True)

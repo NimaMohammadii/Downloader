@@ -504,7 +504,7 @@ async function handleSubtitle(request: Request, env: WebAppEnv): Promise<Respons
   ));
   if (!source.ok || !source.headers.get("content-type")?.startsWith("text/vtt")) {
     const detail = await source.json().catch(() => null) as { message?: unknown } | null;
-    const reason = typeof detail?.message === "string" && /^YouTube (?:could not provide this subtitle track \(HTTP [345]\d{2}\)\.|returned an (?:empty|invalid) subtitle (?:track|file)\.)$/.test(detail.message)
+    const reason = typeof detail?.message === "string" && /^YouTube (?:temporarily limited subtitles\. Try again in \d+ seconds\.|could not provide this subtitle track \(HTTP [345]\d{2}\)\.|returned an (?:empty|invalid) subtitle (?:track|file)\.)$/.test(detail.message)
       ? detail.message : "Subtitles are unavailable. Video playback is unaffected.";
     return json({ ok: false, message: reason }, source.status === 404 ? 404 : 502);
   }
