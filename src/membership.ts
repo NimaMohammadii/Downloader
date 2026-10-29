@@ -144,9 +144,8 @@ export function membershipPrompt(channel = MEMBERSHIP_CHANNEL, instagramEnabled 
     reply_markup: { inline_keyboard: [[
       { text: "ورود به چنل", icon_custom_emoji_id: "5260285114448891086", url: `https://t.me/${channel.replace(/^@/, "")}` },
       ...(instagramEnabled ? [{ text: "ورود به پیج اینستاگرام", icon_custom_emoji_id: "5278573677900752088", url: "https://www.instagram.com/vexa.order/" }] : []),
-    ], [
-      { text: "✅ عضو شدم", callback_data: "membership:check" },
-    ]] },
+      ...(!instagramEnabled ? [{ text: "✅ عضو شدم", callback_data: "membership:check" }] : []),
+    ], ...(instagramEnabled ? [[{ text: "✅ عضو شدم", callback_data: "membership:check" }]] : [])] },
   };
 }
 
