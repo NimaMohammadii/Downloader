@@ -2,7 +2,7 @@ import { build } from 'esbuild';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-const { outputFiles } = await build({
+const { outputFiles } = await build({ external: ['node:async_hooks'],
   entryPoints: ['src/index.ts'], bundle: true, format: 'esm', write: false,
   plugins: [{ name: 'instagram-post-bindings', setup(build) {
     build.onResolve({ filter: /^\.\/admin$/ }, args => ({ path: args.path, namespace: 'test' }));
@@ -699,7 +699,7 @@ test('videos above the upload ceiling are rejected before creating a job with th
 });
 
 test('the production entry point queues the selected API before probing media or sending a status', async () => {
-  const bundle = await build({ entryPoints: ['src/app-main.ts'], bundle: true, format: 'esm', write: false,
+  const bundle = await build({ external: ['node:async_hooks'], entryPoints: ['src/app-main.ts'], bundle: true, format: 'esm', write: false,
     plugins: [{ name: 'large-post-runtime', setup(b) {
       b.onResolve({ filter: /^(cloudflare:workers|@cloudflare\/containers)$/ }, a => ({ path: a.path, namespace: 'runtime' }));
       b.onLoad({ filter: /.*/, namespace: 'runtime' }, a => ({ contents: a.path === 'cloudflare:workers'

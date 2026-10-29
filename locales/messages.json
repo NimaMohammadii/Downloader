@@ -1,0 +1,832 @@
+[
+  {
+    "fa": "⚠️ دسترسی شما به این قابلیت محدود شده است؛ برای پیگیری با پشتیبانی تماس بگیر.",
+    "en": "⚠️ Your access to this feature is limited. Get in touch with support for help.",
+    "ru": "⚠️ Доступ к этой функции ограничен. Напиши в поддержку — тебе помогут."
+  },
+  {
+    "fa": "⚠️ بررسی عضویت فعلاً ممکن نیست؛ کمی بعد دوباره دکمهٔ «عضو شدم» را بزن.",
+    "en": "⚠️ I can’t check your membership right now. Try “I’ve joined” again in a bit.",
+    "ru": "⚠️ Пока не получается проверить подписку. Чуть позже снова нажми «Я подписался»."
+  },
+  {
+    "fa": "⚠️ این دکمه برای درخواست شما نیست؛ لینک خودت را برای ربات بفرست.",
+    "en": "⚠️ This button belongs to another request. Send me your own link.",
+    "ru": "⚠️ Эта кнопка от другого запроса. Пришли свою ссылку."
+  },
+  {
+    "fa": "⚠️ این انتخاب دیگر معتبر نیست؛ لینک یا درخواست را دوباره بفرست و از دکمهٔ جدید استفاده کن.",
+    "en": "⚠️ This selection has expired. Send your link again and use the new buttons.",
+    "ru": "⚠️ Этот выбор уже устарел. Пришли ссылку ещё раз и используй новые кнопки."
+  },
+  {
+    "fa": "⚠️ این درخواست قبلاً شروع شده یا پایان یافته است؛ برای درخواست جدید، لینک را دوباره بفرست.",
+    "en": "⚠️ This request has already started or finished. Send the link again for a new download.",
+    "ru": "⚠️ Этот запрос уже запущен или завершён. Для новой загрузки пришли ссылку ещё раз."
+  },
+  {
+    "fa": "⚠️ ارسال موقتاً محدود شده است؛ درخواستت محفوظ است و ارسال خودکار ادامه پیدا می‌کند. نیازی به تکرار درخواست نیست.",
+    "en": "⚠️ Sending is paused for now. Your request is safe and will resume automatically — no need to send it again.",
+    "ru": "⚠️ Отправка пока приостановлена. Запрос сохранён и продолжится автоматически — повторять его не нужно."
+  },
+  {
+    "fa": "⚠️ ارسال کامل فایل تأیید نشد؛ قبل از تکرار درخواست، پیام‌ها و فایل‌های دریافتی را بررسی کن.",
+    "en": "⚠️ I couldn’t confirm the full upload. Check the files you’ve received before trying again.",
+    "ru": "⚠️ Не удалось подтвердить полную отправку. Перед повтором проверь уже полученные файлы."
+  },
+  {
+    "fa": "⚠️ دریافت یا ارسال همهٔ فایل‌ها کامل نشد؛ فایل‌های دریافتی را بررسی کن و فقط موارد باقی‌مانده را دوباره درخواست بده.",
+    "en": "⚠️ Some files didn’t make it through. Check what you’ve received and request only the missing ones.",
+    "ru": "⚠️ Не все файлы удалось получить или отправить. Проверь полученное и запроси только недостающее."
+  },
+  {
+    "fa": "⚠️ درخواست قبلی هنوز در حال پردازش است؛ کمی صبر کن و فعلاً لینک را دوباره نفرست.",
+    "en": "⚠️ Your previous request is still running. Give it a moment before sending the link again.",
+    "ru": "⚠️ Прошлый запрос ещё обрабатывается. Немного подожди, прежде чем отправлять ссылку снова."
+  },
+  {
+    "fa": "⚠️ این قابلیت موقتاً در دسترس نیست؛ مشکل سرویس در حال پیگیری است. کمی بعد دوباره تلاش کن.",
+    "en": "⚠️ This feature is taking a break while we look into a service issue. Try again in a bit.",
+    "ru": "⚠️ Эта функция пока недоступна — разбираемся с сервисом. Попробуй чуть позже."
+  },
+  {
+    "fa": "⚠️ ارسال در تلگرام موقتاً محدود شده است؛ کمی بعد دوباره تلاش کن.",
+    "en": "⚠️ Telegram is limiting uploads for now. Try again in a bit.",
+    "ru": "⚠️ Telegram пока ограничивает отправку. Попробуй чуть позже."
+  },
+  {
+    "fa": "⚠️ سرویس دریافت محتوا موقتاً درخواست‌ها را محدود کرده است؛ کمی بعد دوباره تلاش کن.",
+    "en": "⚠️ The source is limiting requests for now. Try again in a bit.",
+    "ru": "⚠️ Сервис пока ограничивает запросы. Попробуй чуть позже."
+  },
+  {
+    "fa": "⚠️ فایل دریافت‌شده با درخواستت مطابقت نداشت و ارسال نشد؛ لینک اصلی محتوا را دوباره بفرست.",
+    "en": "⚠️ The file didn’t match your request, so I didn’t send it. Send the original link again.",
+    "ru": "⚠️ Файл не совпал с запросом, поэтому я его не отправил. Пришли исходную ссылку ещё раз."
+  },
+  {
+    "fa": "⚠️ لینک کوتاه یا مسیر دریافت باز نشد؛ لینک کاملِ محتوای اصلی را بفرست.",
+    "en": "⚠️ I couldn’t open that short link. Send the full link to the original content.",
+    "ru": "⚠️ Не получилось открыть короткую ссылку. Пришли полную ссылку на оригинал."
+  },
+  {
+    "fa": "⚠️ این درخواست یا انتخاب معتبر نیست؛ لینک یا فایل را دوباره بفرست و از گزینه‌های جدید استفاده کن.",
+    "en": "⚠️ That request or selection isn’t valid. Send the link or file again and use the new options.",
+    "ru": "⚠️ Этот запрос или выбор не подходит. Пришли ссылку или файл снова и выбери новый вариант."
+  },
+  {
+    "fa": "⚠️ این لینک معتبر یا قابل پشتیبانی نیست؛ لینک کامل و مستقیمِ محتوای موردنظر را بفرست.",
+    "en": "⚠️ I can’t use that link. Send a full, direct link to the content.",
+    "ru": "⚠️ Эта ссылка не подходит. Пришли полную прямую ссылку на нужный контент."
+  },
+  {
+    "fa": "⚠️ حجم فایل از حد مجاز بیشتر است؛ کیفیت پایین‌تر یا یک فایل کوتاه‌تر انتخاب کن.",
+    "en": "⚠️ That file is too big. Pick a lower quality or a shorter file.",
+    "ru": "⚠️ Файл слишком большой. Выбери качество пониже или файл покороче."
+  },
+  {
+    "fa": "⚠️ این محتوا صدای قابل دریافت ندارد؛ برای دریافت یا تشخیص آهنگ، فایل صدادار بفرست.",
+    "en": "⚠️ There’s no audio I can use here. Send a file with sound to download or identify a song.",
+    "ru": "⚠️ Здесь нет доступного звука. Для скачивания или поиска песни пришли файл со звуком."
+  },
+  {
+    "fa": "⚠️ صدای ارسالی برای تشخیص کافی نیست؛ ۱۰ تا ۳۰ ثانیه از بخش واضح آهنگ را بفرست.",
+    "en": "⚠️ I need a bit more audio. Send 10–30 seconds of a clear part of the song.",
+    "ru": "⚠️ Нужно чуть больше звука. Пришли 10–30 секунд хорошо слышимого фрагмента песни."
+  },
+  {
+    "fa": "⚠️ آهنگ موردنظر پیدا نشد؛ نام دقیق خواننده و آهنگ یا یک نمونهٔ واضح‌تر را بفرست.",
+    "en": "⚠️ I couldn’t find that song. Send the exact artist and title, or a clearer sample.",
+    "ru": "⚠️ Не получилось найти песню. Пришли точное имя исполнителя и название или более чёткий фрагмент."
+  },
+  {
+    "fa": "⚠️ کیفیت یا فرمت انتخاب‌شده در دسترس نیست؛ یکی از گزینه‌های دیگر را انتخاب کن.",
+    "en": "⚠️ That quality or format isn’t available. Pick another option.",
+    "ru": "⚠️ Такое качество или формат недоступны. Выбери другой вариант."
+  },
+  {
+    "fa": "⚠️ این محتوا محدودیت سنی یا نیاز به تأیید دسترسی دارد؛ دریافت آن از این لینک ممکن نیست.",
+    "en": "⚠️ This content needs age or access verification. I can’t download it from this link.",
+    "ru": "⚠️ Для этого контента нужно подтвердить возраст или доступ. Скачать по этой ссылке не получается."
+  },
+  {
+    "fa": "⚠️ صاحب محتوا دسترسی به این فایل را محدود کرده است؛ لینک محتوای دیگری را امتحان کن.",
+    "en": "⚠️ The owner has restricted this file. Try a different link.",
+    "ru": "⚠️ Владелец ограничил доступ к файлу. Попробуй другую ссылку."
+  },
+  {
+    "fa": "⚠️ این محتوا در منطقهٔ سرویس قابل دریافت نیست؛ لینک محتوای دیگری را امتحان کن.",
+    "en": "⚠️ This content isn’t available in the service’s region. Try another link.",
+    "ru": "⚠️ Этот контент недоступен в регионе сервиса. Попробуй другую ссылку."
+  },
+  {
+    "fa": "⚠️ این محتوا خصوصی است یا دسترسی ویژه می‌خواهد؛ لینک محتوای عمومی و قابل مشاهده را بفرست.",
+    "en": "⚠️ This content is private or needs special access. Send a public link I can open.",
+    "ru": "⚠️ Это приватный контент или для него нужен особый доступ. Пришли открытую ссылку."
+  },
+  {
+    "fa": "⚠️ این محتوا یا لینک موقت آن دیگر قابل دریافت نیست؛ لینک تازهٔ محتوا را دوباره بفرست.",
+    "en": "⚠️ This content or its temporary link has expired. Send a fresh link.",
+    "ru": "⚠️ Контент или временная ссылка уже недоступны. Пришли свежую ссылку."
+  },
+  {
+    "fa": "⚠️ ضبط لایو این سرویس پشتیبانی نمی‌شود؛ لینک یک پست منتشرشده را بفرست.",
+    "en": "⚠️ Live recording isn’t supported for this service. Send a published post instead.",
+    "ru": "⚠️ Запись эфиров этого сервиса пока не поддерживается. Пришли ссылку на опубликованный пост."
+  },
+  {
+    "fa": "⚠️ لایو فعال یا بازپخش قابل دریافت پیدا نشد؛ زمان پخش یا لینک بازپخش منتشرشده را بررسی کن.",
+    "en": "⚠️ I couldn’t find an active live or a replay. Check the broadcast time or the published replay link.",
+    "ru": "⚠️ Не нашёл активный эфир или запись. Проверь время эфира или ссылку на опубликованную запись."
+  },
+  {
+    "fa": "⚠️ فقط پیش‌نمایش یا نسخهٔ محدود این محتوا در دسترس است؛ لینک نسخهٔ کامل و عمومی را بفرست.",
+    "en": "⚠️ Only a preview is available here. Send a link to the full public version.",
+    "ru": "⚠️ Здесь доступен только фрагмент. Пришли ссылку на полную открытую версию."
+  },
+  {
+    "fa": "⚠️ این محتوا در دسترس نیست یا فایل قابل دانلودی ندارد؛ لینک را در برنامهٔ اصلی بررسی کن و یک لینک قابل مشاهده بفرست.",
+    "en": "⚠️ This content is unavailable or has no downloadable files. Check it in the original app and send a working link.",
+    "ru": "⚠️ Контент недоступен или в нём нет файлов для скачивания. Проверь его в исходном приложении и пришли рабочую ссылку."
+  },
+  {
+    "fa": "⚠️ این لینک بازپخش آماده ندارد؛ برای ضبط لایو از دستور /live و برای دانلود بازپخش از لینک منتشرشده استفاده کن.",
+    "en": "⚠️ There’s no replay ready yet. Use /live to record a live, or send a published replay link.",
+    "ru": "⚠️ Запись пока не готова. Для записи эфира используй /live, а для скачивания пришли ссылку на опубликованную запись."
+  },
+  {
+    "fa": "⚠️ آماده‌سازی فایل بیشتر از زمان مجاز طول کشید؛ کمی بعد با کیفیت پایین‌تر یا فایل کوتاه‌تر امتحان کن.",
+    "en": "⚠️ Preparing that file took too long. Try a lower quality or a shorter file in a bit.",
+    "ru": "⚠️ Подготовка заняла слишком много времени. Чуть позже попробуй качество пониже или файл покороче."
+  },
+  {
+    "fa": "⚠️ ظرفیت پردازش ربات فعلاً پر است؛ چند دقیقه بعد دوباره درخواستت را بفرست.",
+    "en": "⚠️ I’m handling as much as I can right now. Send your request again in a few minutes.",
+    "ru": "⚠️ Сейчас все места для обработки заняты. Пришли запрос снова через несколько минут."
+  },
+  {
+    "fa": "⚠️ دسترسی به این محتوا از مسیر فعلی ممکن نیست؛ عمومی بودن لینک را بررسی کن یا کمی بعد دوباره امتحان کن.",
+    "en": "⚠️ I can’t access this content right now. Check that the link is public, or try again later.",
+    "ru": "⚠️ Пока не получается открыть контент. Проверь, что ссылка открытая, или попробуй позже."
+  },
+  {
+    "fa": "⚠️ ارتباط برای دریافت یا ارسال محتوا برقرار نشد؛ کمی بعد دوباره تلاش کن.",
+    "en": "⚠️ The connection dropped while getting or sending your file. Try again in a bit.",
+    "ru": "⚠️ Связь прервалась при получении или отправке файла. Попробуй чуть позже."
+  },
+  {
+    "fa": "⚠️ فایل سالم و قابل ارسال آماده نشد؛ یک کیفیت دیگر انتخاب کن یا بعداً دوباره تلاش کن.",
+    "en": "⚠️ I couldn’t prepare a working file. Pick another quality or try again later.",
+    "ru": "⚠️ Не получилось подготовить исправный файл. Выбери другое качество или попробуй позже."
+  },
+  {
+    "fa": "⚠️ فهرست یا بازهٔ انتخاب‌شده قابل دریافت نیست؛ لینک اصلی و یک بازهٔ معتبر بفرست.",
+    "en": "⚠️ I can’t get that playlist or range. Send the original link and a valid range.",
+    "ru": "⚠️ Не получается получить этот плейлист или диапазон. Пришли исходную ссылку и подходящий диапазон."
+  },
+  {
+    "fa": "⚠️ دریافت یا آماده‌سازی این فایل انجام نشد؛ لینک را بررسی کن و کمی بعد دوباره بفرست.",
+    "en": "⚠️ I couldn’t get that file ready. Check the link and send it again in a bit.",
+    "ru": "⚠️ Не получилось подготовить файл. Проверь ссылку и пришли её снова чуть позже."
+  },
+  {
+    "fa": "⚠️ مثل اینکه خطایی پیش اومده، در حال بررسی و پیگیری است، به زودی رفع می‌شود.",
+    "en": "⚠️ Something went wrong. We’re looking into it — try again in a bit.",
+    "ru": "⚠️ Что-то пошло не так. Уже разбираемся — попробуй чуть позже."
+  },
+  {
+    "fa": "لینک رو بفرست، فایلش رو همین‌جا بگیر ⚡️",
+    "en": "Send a link, get your file right here ⚡️",
+    "ru": "Пришли ссылку — получи файл прямо здесь ⚡️"
+  },
+  {
+    "fa": "⬇️ دانلود: YouTube، Pornhub، اینستاگرام، X،",
+    "en": "⬇️ Downloads: YouTube, Pornhub, Instagram, X,",
+    "ru": "⬇️ Скачать: YouTube, Pornhub, Instagram, X,"
+  },
+  {
+    "fa": "Pinterest، TikTok، SoundCloud و Aparat",
+    "en": "Pinterest, TikTok, SoundCloud and Aparat",
+    "ru": "Pinterest, TikTok, SoundCloud и Aparat"
+  },
+  {
+    "fa": "🎵 آهنگ: اسم آهنگ و خواننده یا /music",
+    "en": "🎵 Music: song and artist, or /music",
+    "ru": "🎵 Музыка: название и исполнитель или /music"
+  },
+  {
+    "fa": "🔎 تشخیص آهنگ: ویس، صدا یا ویدیو؛ در گروه ریپلای + /shazam",
+    "en": "🔎 Identify a song: send audio or video; in groups, reply + /shazam",
+    "ru": "🔎 Узнать песню: пришли аудио или видео; в группе — ответ + /shazam"
+  },
+  {
+    "fa": "🔎 آهنگ اینستاگرام: «پیداکردن آهنگ» یا /findmusic لینک",
+    "en": "🔎 Instagram songs: tap “Find song” or /findmusic link",
+    "ru": "🔎 Песни из Instagram: «Найти песню» или /findmusic ссылка"
+  },
+  {
+    "fa": "🎼 پلی‌لیست: /playlist لینک 1-20",
+    "en": "🎼 Playlist: /playlist link 1-20",
+    "ru": "🎼 Плейлист: /playlist ссылка 1-20"
+  },
+  {
+    "fa": "🎵 Bandcamp: لینک آهنگ یا آلبوم • /bandcamp لینک",
+    "en": "🎵 Bandcamp: song or album link • /bandcamp link",
+    "ru": "🎵 Bandcamp: ссылка на трек или альбом • /bandcamp ссылка"
+  },
+  {
+    "fa": "⬇️ Reddit: ویدیو، عکس و گالری • /reddit لینک",
+    "en": "⬇️ Reddit: videos, photos and galleries • /reddit link",
+    "ru": "⬇️ Reddit: видео, фото и галереи • /reddit ссылка"
+  },
+  {
+    "fa": "🎧 فقط صدا: دکمهٔ «فقط صدا» یا /audio لینک",
+    "en": "🎧 Audio only: tap “Audio only” or /audio link",
+    "ru": "🎧 Только звук: кнопка «Только звук» или /audio ссылка"
+  },
+  {
+    "fa": "ضبط لایو: /live username",
+    "en": "Record a live: /live username",
+    "ru": "Записать эфир: /live username"
+  },
+  {
+    "fa": "بازپخش: /replay لینک",
+    "en": "Replay: /replay link",
+    "ru": "Запись эфира: /replay ссылка"
+  },
+  {
+    "fa": "توقف ضبط: دکمهٔ زیر پیام",
+    "en": "Stop recording: use the button below\n\n🌐 Language: /lang",
+    "ru": "Остановить запись: кнопка под сообщением\n\n🌐 Язык: /lang"
+  },
+  {
+    "fa": "فقط صدا",
+    "en": "Audio only",
+    "ru": "Только звук"
+  },
+  {
+    "fa": "پیداکردن آهنگ",
+    "en": "Find song",
+    "ru": "Найти песню"
+  },
+  {
+    "fa": "کم‌حجم",
+    "en": "Small file",
+    "ru": "Компактный"
+  },
+  {
+    "fa": "ادامه با عضویت در چنل",
+    "en": "Join our channel to keep going",
+    "ru": "Подпишись на канал, чтобы продолжить"
+  },
+  {
+    "fa": "عضو چنلمون شو و پیج اینستاگراممون رو هم فالو کن؛ خبرهای تازه اونجاست!",
+    "en": "Join our channel and follow our Instagram — that’s where the news is!",
+    "ru": "Подпишись на наш канал и Instagram — все новости там!"
+  },
+  {
+    "fa": "عضو چنلمون شو؛ ابزارها و قابلیت‌های جدید هم اونجاست!",
+    "en": "Join our channel for new tools and features!",
+    "ru": "Подпишись на канал — там новые инструменты и функции!"
+  },
+  {
+    "fa": "بعد از عضویت در چنل، «عضو شدم» رو بزن.",
+    "en": "Once you’ve joined, tap “I’ve joined”.",
+    "ru": "После подписки нажми «Я подписался»."
+  },
+  {
+    "fa": "ورود به چنل",
+    "en": "Open channel",
+    "ru": "Открыть канал"
+  },
+  {
+    "fa": "ورود به پیج اینستاگرام",
+    "en": "Open Instagram",
+    "ru": "Открыть Instagram"
+  },
+  {
+    "fa": "باز کردن پیج اینستاگرام",
+    "en": "Open Instagram",
+    "ru": "Открыть Instagram"
+  },
+  {
+    "fa": "عضو شدم",
+    "en": "I’ve joined",
+    "ru": "Я подписался"
+  },
+  {
+    "fa": "پیج اینستاگراممون منتظرته؛ وارد شو و فالو کن 💜",
+    "en": "Come say hi on Instagram and follow us 💜",
+    "ru": "Загляни в наш Instagram и подпишись 💜"
+  },
+  {
+    "fa": "✅ دسترسی فعاله؛ درخواستت رو بفرست.",
+    "en": "✅ You’re all set — send your request!",
+    "ru": "✅ Всё готово — присылай запрос!"
+  },
+  {
+    "fa": "⏳ لینک اینستاگرام رو گرفتم، دارم فایل رو آماده می‌کنم…",
+    "en": "⏳ Got your Instagram link! Getting the file ready…",
+    "ru": "⏳ Ссылка на Instagram получена! Готовлю файл…"
+  },
+  {
+    "fa": "⏳ لینک Instagram رو گرفتم، دارم Story رو آماده می‌کنم…",
+    "en": "⏳ Got your Instagram link! Getting the story ready…",
+    "ru": "⏳ Ссылка на Instagram получена! Готовлю историю…"
+  },
+  {
+    "fa": "لینک Reel، پست ویدیویی یا Story اینستاگرام رو بفرست؛ فایلش رو همین‌جا می‌فرستم ⚡️",
+    "en": "Send an Instagram Reel, video post or story — I’ll send the file here ⚡️",
+    "ru": "Пришли ссылку на Reel, видеопост или историю Instagram — отправлю файл сюда ⚡️"
+  },
+  {
+    "fa": "یه لینک معتبر Instagram بفرست 👇",
+    "en": "Send me an Instagram link 👇",
+    "ru": "Пришли ссылку на Instagram 👇"
+  },
+  {
+    "fa": "🔎 دارم کیفیت‌های موجود این ویدیو رو بررسی می‌کنم…",
+    "en": "🔎 Checking the available qualities…",
+    "ru": "🔎 Проверяю доступное качество…"
+  },
+  {
+    "fa": "کیفیت یا حالت دانلود رو انتخاب کن:",
+    "en": "Pick a quality or download mode:",
+    "ru": "Выбери качество или режим скачивания:"
+  },
+  {
+    "fa": "انتخاب شد؛ دانلود شروع شد…",
+    "en": "selected — downloading now…",
+    "ru": "выбрано — начинаю скачивание…"
+  },
+  {
+    "fa": "انتخاب شد",
+    "en": "selected",
+    "ru": "выбрано"
+  },
+  {
+    "fa": "⬇️ دارم ویدیوی Pornhub را دانلود می‌کنم…",
+    "en": "⬇️ Downloading your Pornhub video…",
+    "ru": "⬇️ Скачиваю видео с Pornhub…"
+  },
+  {
+    "fa": "⬇️ دارم فایل‌های Reddit را آماده می‌کنم…",
+    "en": "⬇️ Getting your Reddit files ready…",
+    "ru": "⬇️ Готовлю файлы с Reddit…"
+  },
+  {
+    "fa": "🎵 دارم آهنگ‌های Bandcamp را آماده می‌کنم…",
+    "en": "🎵 Getting your Bandcamp tracks ready…",
+    "ru": "🎵 Готовлю треки с Bandcamp…"
+  },
+  {
+    "fa": "🎧 دارم آهنگ داخل فایل را شناسایی می‌کنم…",
+    "en": "🎧 Listening for the song in your file…",
+    "ru": "🎧 Пытаюсь узнать песню в файле…"
+  },
+  {
+    "fa": "🔎 دارم آهنگ را پیدا می‌کنم…",
+    "en": "🔎 Looking for your song…",
+    "ru": "🔎 Ищу песню…"
+  },
+  {
+    "fa": "🎵 دارم صدای ویدیوی اینستاگرام را آماده می‌کنم…",
+    "en": "🎵 Getting the Instagram audio ready…",
+    "ru": "🎵 Готовлю звук из Instagram…"
+  },
+  {
+    "fa": "🔎 دارم لایو یا بازپخش اینستاگرام را بررسی می‌کنم…",
+    "en": "🔎 Checking the Instagram live or replay…",
+    "ru": "🔎 Проверяю эфир или запись Instagram…"
+  },
+  {
+    "fa": "🎵 کیفیت انتخاب شد؛ در حال آماده‌سازی…",
+    "en": "🎵 Quality selected! Getting things ready…",
+    "ru": "🎵 Качество выбрано! Готовлю файл…"
+  },
+  {
+    "fa": "درخواست توقف ارسال شد…",
+    "en": "Stop requested…",
+    "ru": "Запрос на остановку отправлен…"
+  },
+  {
+    "fa": "آهنگ انتخاب شد؛ دانلود شروع می‌شود.",
+    "en": "Song selected! Starting the download.",
+    "ru": "Песня выбрана! Начинаю скачивание."
+  },
+  {
+    "fa": "در حال آماده‌سازی فایل صوتی…",
+    "en": "Getting your audio ready…",
+    "ru": "Готовлю аудио…"
+  },
+  {
+    "fa": "🔎 دارم اطلاعات ویدیو رو تازه می‌کنم…",
+    "en": "🔎 Refreshing the video details…",
+    "ru": "🔎 Обновляю данные видео…"
+  },
+  {
+    "fa": "📤 فایل صوتی آماده شد؛ دارم می‌فرستم…",
+    "en": "📤 Audio’s ready! Sending it over…",
+    "ru": "📤 Аудио готово! Отправляю…"
+  },
+  {
+    "fa": "📤 ویدیو کامل آماده شد؛ دارم می‌فرستم…",
+    "en": "📤 Video’s ready! Sending it over…",
+    "ru": "📤 Видео готово! Отправляю…"
+  },
+  {
+    "fa": "⏹ توقف پلی‌لیست",
+    "en": "⏹ Stop playlist",
+    "ru": "⏹ Остановить плейлист"
+  },
+  {
+    "fa": "⏹ توقف ضبط و ارسال",
+    "en": "⏹ Stop and send recording",
+    "ru": "⏹ Остановить и отправить запись"
+  },
+  {
+    "fa": "🎧 دارم صدای فایل را با Shazam بررسی می‌کنم…",
+    "en": "🎧 Checking the audio with Shazam…",
+    "ru": "🎧 Проверяю звук через Shazam…"
+  },
+  {
+    "fa": "✅ آهنگ شناسایی شد",
+    "en": "✅ Found the song!",
+    "ru": "✅ Песня найдена!"
+  },
+  {
+    "fa": "⬇️ دارم فایل کاملش را پیدا می‌کنم…",
+    "en": "⬇️ Looking for the full track…",
+    "ru": "⬇️ Ищу полный трек…"
+  },
+  {
+    "fa": "⬇️ دارم آهنگ انتخاب‌شده را دانلود می‌کنم…",
+    "en": "⬇️ Downloading your chosen song…",
+    "ru": "⬇️ Скачиваю выбранную песню…"
+  },
+  {
+    "fa": "📤 آهنگ پیدا شد؛ دارم فایل MP3 را آمادهٔ ارسال می‌کنم…",
+    "en": "📤 Found it! Getting the MP3 ready to send…",
+    "ru": "📤 Нашёл! Готовлю MP3 к отправке…"
+  },
+  {
+    "fa": "🎧 دارم صدا را از ویدیوی اینستاگرام جدا می‌کنم…",
+    "en": "🎧 Extracting the Instagram audio…",
+    "ru": "🎧 Извлекаю звук из видео Instagram…"
+  },
+  {
+    "fa": "⬇️ دارم بازپخش کامل لایو را دانلود می‌کنم…",
+    "en": "⬇️ Downloading the full replay…",
+    "ru": "⬇️ Скачиваю полную запись эфира…"
+  },
+  {
+    "fa": "📤 فایل آماده شد؛ در حال آماده‌سازی ارسال…",
+    "en": "📤 Your file’s ready! Preparing to send…",
+    "ru": "📤 Файл готов! Готовлю отправку…"
+  },
+  {
+    "fa": "ضبط با درخواست شما متوقف شد.",
+    "en": "Recording stopped at your request.",
+    "ru": "Запись остановлена по твоему запросу."
+  },
+  {
+    "fa": "ضبط به سقف زمانی رسید.",
+    "en": "Recording reached the time limit.",
+    "ru": "Запись достигла лимита времени."
+  },
+  {
+    "fa": "ضبط به سقف حجم رسید.",
+    "en": "Recording reached the size limit.",
+    "ru": "Запись достигла лимита размера."
+  },
+  {
+    "fa": "ارتباط پخش قطع شد؛ بخش دریافت‌شده ارسال شد.",
+    "en": "The stream disconnected. I sent the part I recorded.",
+    "ru": "Эфир прервался. Отправил записанную часть."
+  },
+  {
+    "fa": "📤 دارم فایل صوتی را کامل در تلگرام ارسال می‌کنم…",
+    "en": "📤 Sending the full audio file to Telegram…",
+    "ru": "📤 Отправляю полный аудиофайл в Telegram…"
+  },
+  {
+    "fa": "📤 دارم فایل ویدیو را کامل در تلگرام ارسال می‌کنم…",
+    "en": "📤 Sending the full video to Telegram…",
+    "ru": "📤 Отправляю полное видео в Telegram…"
+  },
+  {
+    "fa": "دسترسی دانلودت محدود شده",
+    "en": "Your downloads are on pause",
+    "ru": "Твои загрузки приостановлены"
+  },
+  {
+    "fa": "یه مکث توی دانلودها؛ هنوز اینجاییم و همراهتیم.",
+    "en": "A little pause in downloads — we’re still here for you.",
+    "ru": "Небольшая пауза в загрузках — мы всё ещё рядом."
+  },
+  {
+    "fa": "بدون زمان پایان",
+    "en": "No end date",
+    "ru": "Без срока окончания"
+  },
+  {
+    "fa": "مدت محدودیت:",
+    "en": "Pause duration:",
+    "ru": "Длительность паузы:"
+  },
+  {
+    "fa": "زمان باقی‌مانده:",
+    "en": "Time left:",
+    "ru": "Осталось:"
+  },
+  {
+    "fa": "فعلاً امکان ثبت دانلود تازه برات فعال نیست.",
+    "en": "New downloads aren’t available for you right now.",
+    "ru": "Новые загрузки пока недоступны."
+  },
+  {
+    "fa": "بعد از پایان این زمان، دسترسی دانلودت خودکار فعال می‌شه.",
+    "en": "Your downloads will turn back on automatically when the timer ends.",
+    "ru": "Загрузки включатся автоматически, когда время закончится."
+  },
+  {
+    "fa": "مرسی از همراهی و صبوری‌ات 💜",
+    "en": "Thanks for sticking around and being patient 💜",
+    "ru": "Спасибо, что остаёшься с нами и ждёшь 💜"
+  },
+  {
+    "fa": "یک ویس، فایل صوتی یا ویدیو بفرست؛ یا روی فایل ریپلای کن و /shazam بنویس. برای اینستاگرام: /findmusic و لینک Reel یا Story.",
+    "en": "Send a voice note, audio or video, or reply to a file with /shazam. For Instagram, use /findmusic with a Reel or story link.",
+    "ru": "Пришли голосовое, аудио или видео либо ответь на файл командой /shazam. Для Instagram: /findmusic и ссылка на Reel или историю."
+  },
+  {
+    "fa": "لینک پست عمومی Reddit را بفرست؛ ویدیو، عکس و گالری حداکثر ۲۰ فایلی پشتیبانی می‌شود.",
+    "en": "Send a public Reddit post — videos, photos and galleries of up to 20 files work!",
+    "ru": "Пришли открытый пост Reddit — подойдут видео, фото и галереи до 20 файлов!"
+  },
+  {
+    "fa": "لینک آهنگ یا آلبوم Bandcamp را بفرست؛ فعلاً آلبوم‌های حداکثر 20 آهنگی پشتیبانی می‌شوند.",
+    "en": "Send a Bandcamp track or album link. Albums can have up to 20 tracks for now.",
+    "ru": "Пришли ссылку на трек или альбом Bandcamp. Пока поддерживаются альбомы до 20 треков."
+  },
+  {
+    "fa": "لینک یک پست X، یک Pin پینترست، ویدیو یا پست عکسی TikTok، یک آهنگ SoundCloud یا ویدیوی آپارات را بفرست. لینک پروفایل، بورد و پلی‌لیست پشتیبانی نمی‌شود.",
+    "en": "Send an X post, Pinterest Pin, TikTok video or photo post, SoundCloud track or Aparat video. Profiles, boards and playlists aren’t supported here.",
+    "ru": "Пришли пост X, пин Pinterest, видео или фотопост TikTok, трек SoundCloud или видео Aparat. Профили, доски и плейлисты здесь не поддерживаются."
+  },
+  {
+    "fa": "بعد از /audio لینک ویدیوی اینستاگرام، X، TikTok، Pinterest یا آپارات را بفرست.",
+    "en": "After /audio, add an Instagram, X, TikTok, Pinterest or Aparat video link.",
+    "ru": "После /audio добавь ссылку на видео Instagram, X, TikTok, Pinterest или Aparat."
+  },
+  {
+    "fa": "اسم آهنگ و خواننده را بعد از /music بنویس؛ مثلاً /music Adele Hello",
+    "en": "Add the artist and song after /music, like /music Adele Hello",
+    "ru": "Напиши исполнителя и песню после /music, например /music Adele Hello"
+  },
+  {
+    "fa": "برای تشخیص آهنگ یک تکهٔ صوتی یا ویدیویی با حجم حداکثر 20 MB بفرست؛ 10 تا 30 ثانیه از بخش واضح آهنگ کافی است.",
+    "en": "Send an audio or video clip up to 20 MB. 10–30 seconds of a clear part of the song is plenty!",
+    "ru": "Пришли аудио или видео до 20 MB. Хватит 10–30 секунд хорошо слышимого фрагмента песни!"
+  },
+  {
+    "fa": "⬇️ دارم صدای ویدیو رو با حالت {0} دانلود می‌کنم…",
+    "en": "⬇️ Downloading the audio in {0} mode…",
+    "ru": "⬇️ Скачиваю звук в режиме {0}…"
+  },
+  {
+    "fa": "⬇️ دارم ویدیو رو با کیفیت {0}p دانلود می‌کنم…",
+    "en": "⬇️ Downloading your video in {0}p…",
+    "ru": "⬇️ Скачиваю видео в {0}p…"
+  },
+  {
+    "fa": "📤 {0} فایل آمادهٔ ارسال است…",
+    "en": "📤 {0} files ready to send…",
+    "ru": "📤 Готово к отправке: {0} файлов…"
+  },
+  {
+    "fa": "آهنگ {0} از بازهٔ {1}-{2}",
+    "en": "Track {0} from range {1}–{2}",
+    "ru": "Трек {0} из диапазона {1}–{2}"
+  },
+  {
+    "fa": "ارسال‌شده: {0} از {1}",
+    "en": "Sent: {0} of {1}",
+    "ru": "Отправлено: {0} из {1}"
+  },
+  {
+    "fa": "ارسال‌شده: {0}",
+    "en": "Sent: {0}",
+    "ru": "Отправлено: {0}"
+  },
+  {
+    "fa": "❌ دریافت نشد: {0}",
+    "en": "❌ Couldn’t download: {0}",
+    "ru": "❌ Не удалось скачать: {0}"
+  },
+  {
+    "fa": "⚠️ ارسال مورد {0} تأیید نشد؛ برای جلوگیری از تکرار، صف متوقف شد.",
+    "en": "⚠️ Couldn’t confirm item {0}. I paused the queue to avoid duplicates.",
+    "ru": "⚠️ Не удалось подтвердить файл {0}. Очередь остановлена, чтобы не отправить его дважды."
+  },
+  {
+    "fa": "صف متوقف شد؛ فایل‌های باقی‌مانده ارسال نشدند.",
+    "en": "Queue stopped. The remaining files weren’t sent.",
+    "ru": "Очередь остановлена. Остальные файлы не отправлены."
+  },
+  {
+    "fa": "ادامه: /playlist {0}",
+    "en": "Continue: /playlist {0}",
+    "ru": "Продолжить: /playlist {0}"
+  },
+  {
+    "fa": "⬇️ در حال دریافت فایل {0}/{1} اینستاگرام…",
+    "en": "⬇️ Getting Instagram file {0}/{1}…",
+    "ru": "⬇️ Получаю файл Instagram {0}/{1}…"
+  },
+  {
+    "fa": "📤 در حال ارسال فایل {0}/{1} اینستاگرام…",
+    "en": "📤 Sending Instagram file {0}/{1}…",
+    "ru": "📤 Отправляю файл Instagram {0}/{1}…"
+  },
+  {
+    "fa": "📤 در حال ارسال فایل {0}/{1}…",
+    "en": "📤 Sending file {0}/{1}…",
+    "ru": "📤 Отправляю файл {0}/{1}…"
+  },
+  {
+    "fa": "⬇️ دارم {0} {1} را دریافت می‌کنم…",
+    "en": "⬇️ Getting {0} from {1}…",
+    "ru": "⬇️ Получаю {0} из {1}…"
+  },
+  {
+    "fa": "🎵 دارم آهنگ‌های {0}-{1} پلی‌لیست را به‌صورت MP3 آماده می‌کنم…",
+    "en": "🎵 Preparing playlist tracks {0}–{1} as MP3…",
+    "ru": "🎵 Готовлю треки плейлиста {0}–{1} в MP3…"
+  },
+  {
+    "fa": "⏳ دارم {0} را آماده می‌کنم…",
+    "en": "⏳ Getting your {0} ready…",
+    "ru": "⏳ Готовлю: {0}…"
+  },
+  {
+    "fa": "⏳ دارم {0}‌های @{1} را دریافت می‌کنم…",
+    "en": "⏳ Getting {0} from @{1}…",
+    "ru": "⏳ Получаю {0} от @{1}…"
+  },
+  {
+    "fa": "⬇️ در حال دریافت {0} {1} از @{2}…",
+    "en": "⬇️ Getting {0} {1} from @{2}…",
+    "ru": "⬇️ Получаю {0} {1} от @{2}…"
+  },
+  {
+    "fa": "✅ دریافت {0} {1} از @{2} تمام شد؛ {3} فایل ارسال شد.",
+    "en": "✅ Finished getting {0} {1} from @{2}. Sent {3} files!",
+    "ru": "✅ Готово: {0} {1} от @{2}. Отправлено файлов: {3}!"
+  },
+  {
+    "fa": "این حساب {0} قابل دسترسی برای نشست متصل ندارد.",
+    "en": "There are no accessible {0} on this account for the connected session.",
+    "ru": "В этом аккаунте нет доступных {0} для подключённой сессии."
+  },
+  {
+    "fa": "صدای ویدیوی",
+    "en": "video audio",
+    "ru": "звук видео"
+  },
+  {
+    "fa": "هایلایت",
+    "en": "highlights",
+    "ru": "актуальное"
+  },
+  {
+    "fa": "استوری",
+    "en": "stories",
+    "ru": "истории"
+  },
+  {
+    "fa": "پست",
+    "en": "posts",
+    "ru": "посты"
+  },
+  {
+    "fa": "فایل",
+    "en": "files",
+    "ru": "файлы"
+  },
+  {
+    "fa": "روز",
+    "en": "days",
+    "ru": "дн."
+  },
+  {
+    "fa": "ساعت",
+    "en": "hours",
+    "ru": "ч."
+  },
+  {
+    "fa": "دقیقه",
+    "en": "minutes",
+    "ru": "мин."
+  },
+  {
+    "fa": "ثانیه",
+    "en": "seconds",
+    "ru": "сек."
+  },
+  {
+    "fa": " و ",
+    "en": " and ",
+    "ru": " и "
+  },
+  {
+    "fa": "دانلود:",
+    "en": "Downloads:",
+    "ru": "Скачать:"
+  },
+  {
+    "fa": "آهنگ:",
+    "en": "Music:",
+    "ru": "Музыка:"
+  },
+  {
+    "fa": "تشخیص آهنگ:",
+    "en": "Identify a song:",
+    "ru": "Узнать песню:"
+  },
+  {
+    "fa": "آهنگ اینستاگرام:",
+    "en": "Instagram songs:",
+    "ru": "Песни из Instagram:"
+  },
+  {
+    "fa": "پلی‌لیست:",
+    "en": "Playlist:",
+    "ru": "Плейлист:"
+  },
+  {
+    "fa": "فقط صدا:",
+    "en": "Audio only:",
+    "ru": "Только звук:"
+  },
+  {
+    "fa": "ضبط لایو:",
+    "en": "Record a live:",
+    "ru": "Записать эфир:"
+  },
+  {
+    "fa": "بازپخش:",
+    "en": "Replay:",
+    "ru": "Запись эфира:"
+  },
+  {
+    "fa": "⬇️ Reddit؛ آماده‌سازی فایل {0} از {1}…",
+    "en": "⬇️ Reddit: preparing file {0} of {1}…",
+    "ru": "⬇️ Reddit: готовлю файл {0} из {1}…"
+  },
+  {
+    "fa": "🎵 Bandcamp؛ آماده‌سازی آهنگ {0} از {1}…",
+    "en": "🎵 Bandcamp: preparing track {0} of {1}…",
+    "ru": "🎵 Bandcamp: готовлю трек {0} из {1}…"
+  },
+  {
+    "fa": "📤 ویدیوی Pornhub آماده شد؛ دارم می‌فرستم…",
+    "en": "📤 Your Pornhub video is ready! Sending it over…",
+    "ru": "📤 Видео с Pornhub готово! Отправляю…"
+  },
+  {
+    "fa": "این لینک فعلاً فعال نیست؛ به ربات برگرد.",
+    "en": "This link is taking a break. Head back to the bot.",
+    "ru": "Эта ссылка пока неактивна. Вернись в бота."
+  },
+  {
+    "fa": "🎵 کیفیت صدای Bandcamp را انتخاب کن:\nفقط فرمت‌های قابل‌دریافت نمایش داده می‌شوند. انتخاب تا ۸ دقیقه فعال است.",
+    "en": "🎵 Pick your Bandcamp audio quality:\nThese formats are available to download. You’ve got 8 minutes to choose.",
+    "ru": "🎵 Выбери качество звука Bandcamp:\nЗдесь только доступные форматы. На выбор есть 8 минут."
+  },
+  {
+    "fa": "🔴 ضبط Live شروع شد.\nاز این لحظه تا پایان پخش یا توقف ضبط ذخیره می‌شود.\nسقف هر ضبط: 2 ساعت یا 1.9 GB.",
+    "en": "🔴 Recording started!\nI’ll keep recording until the live ends or you stop it.\nLimit: 2 hours or 1.9 GB.",
+    "ru": "🔴 Запись началась!\nЗаписываю до конца эфира или нажатия кнопки остановки.\nЛимит: 2 часа или 1.9 GB."
+  },
+  {
+    "fa": "🎵 نتیجه‌های جست‌وجو\nآهنگ موردنظرت را انتخاب کن:",
+    "en": "🎵 Search results\nPick your song:",
+    "ru": "🎵 Результаты поиска\nВыбери песню:"
+  },
+  {
+    "fa": "دستور را همراه یوزرنیم بفرست:\n/instastory username\n/instapost username\nاینستاگرام استوری username\nاینستاگرام پست username",
+    "en": "Add a username after the command:\n/instastory username\n/instapost username",
+    "ru": "Добавь имя пользователя после команды:\n/instastory username\n/instapost username"
+  },
+  {
+    "fa": "لینک پلی‌لیست YouTube را بفرست؛ هر درخواست تا 20 آهنگ MP3 می‌فرستد.\nبرای ادامه: /playlist لینک 21-40",
+    "en": "Send a YouTube playlist — I’ll send up to 20 MP3 tracks per request.\nNext batch: /playlist link 21-40",
+    "ru": "Пришли плейлист YouTube — отправлю до 20 треков MP3 за запрос.\nСледующая часть: /playlist ссылка 21-40"
+  },
+  {
+    "fa": "ضبط لایو: /live username\nبازپخش: /replay و لینک پست، Reel یا TV\nهمچنین می‌توانی لینک مستقیم Live را بفرستی.",
+    "en": "Record a live: /live username\nReplay: /replay with a post, Reel or TV link\nYou can also send a direct live link.",
+    "ru": "Записать эфир: /live username\nСкачать запись: /replay и ссылка на пост, Reel или TV\nМожно также прислать прямую ссылку на эфир."
+  }
+]

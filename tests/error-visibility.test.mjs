@@ -1,7 +1,7 @@
 import { build } from 'esbuild';
 import assert from 'node:assert/strict';
 import test from 'node:test';
-const result = await build({entryPoints:['src/admin.ts'], bundle:true,format:'esm',write:false,
+const result = await build({ external: ['node:async_hooks'],entryPoints:['src/admin.ts'], bundle:true,format:'esm',write:false,
   plugins:[{name:'runtime',setup(b){
     b.onResolve({filter:/^cloudflare:workers$/},a=>({path:a.path,namespace:'runtime'}));
     b.onLoad({filter:/.*/,namespace:'runtime'},()=>({contents:'export class DurableObject {}'}));

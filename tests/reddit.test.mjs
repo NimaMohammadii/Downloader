@@ -1,9 +1,9 @@
 import {build} from 'esbuild';
 import assert from 'node:assert/strict';
 import test from 'node:test';
-const parser = await build({entryPoints:['src/reddit.ts'],bundle:true,format:'esm',write:false});
+const parser = await build({ external: ['node:async_hooks'],entryPoints:['src/reddit.ts'],bundle:true,format:'esm',write:false});
 const {parseRedditUrl} = await import(`data:text/javascript;base64,${Buffer.from(parser.outputFiles[0].text).toString('base64')}`);
-const bundle = await build({entryPoints:['src/app-main.ts'],bundle:true,format:'esm',write:false,plugins:[{name:'runtime',setup(b){
+const bundle = await build({ external: ['node:async_hooks'],entryPoints:['src/app-main.ts'],bundle:true,format:'esm',write:false,plugins:[{name:'runtime',setup(b){
  b.onResolve({filter:/^(cloudflare:workers|@cloudflare\/containers)$/},a=>({path:a.path,namespace:'runtime'}));
  b.onLoad({filter:/.*/,namespace:'runtime'},a=>({contents:a.path==='cloudflare:workers'?'export class DurableObject{constructor(ctx,env){this.ctx=ctx;this.env=env;}}; export class WorkflowEntrypoint{constructor(ctx,env){this.env=env;}}':'export class Container{constructor(ctx,env){this.ctx=ctx;this.env=env;} renewActivityTimeout(){}}; export const getContainer=()=>globalThis.container;'}));
 }}]});

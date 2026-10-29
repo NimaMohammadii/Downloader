@@ -21,6 +21,8 @@ RUN python3 -m venv --system-site-packages /opt/venv \
 
 WORKDIR /app
 COPY container/public_errors.json /app/public_errors.json
+COPY locales/messages.json /app/messages.json
+COPY container/localization.py /app/localization.py
 COPY container/youtube_app.py /app/youtube_app.py
 COPY container/youtube_pipeline.py /app/youtube_pipeline.py
 COPY container/pornhub.py /app/pornhub.py

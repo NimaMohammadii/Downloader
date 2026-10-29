@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 const source = await readFile(new URL('../src/story-main.ts', import.meta.url), 'utf8');
-const { outputFiles } = await build({
+const { outputFiles } = await build({ external: ['node:async_hooks'],
   stdin: { contents: source, loader: 'ts' }, bundle: true, format: 'esm', write: false,
   plugins: [{ name: 'test-story-bindings', setup(build) {
     build.onResolve({ filter: /.*/ }, a => ({ path: a.path, namespace: 'test' }));

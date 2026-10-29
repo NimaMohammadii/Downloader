@@ -1,3 +1,4 @@
+import { localizePayload, isTranslatedError, isTranslatedErrorFrame, isLanguage } from "./localization";
 import { PUBLIC_ERROR_MESSAGE, isPublicErrorMessage, isPublicErrorFrame, publicError } from "./public-errors";
 export { PUBLIC_ERROR_MESSAGE } from "./public-errors";
 import { BroadcastManager } from "./broadcast";
@@ -12,6 +13,7 @@ export function privateErrorPayload(method: string, payload: Record<string, unkn
   delete result._errorUserId;
   delete result._errorDetail;
   delete result._publicErrorFrame;
+  if (isTranslatedError(payload.text) || (payload._publicErrorFrame === true && isTranslatedErrorFrame(payload.text))) return result;
   if (payload._publicErrorFrame === true && /^(sendMessageDraft|editMessageText)$/.test(method) &&
       typeof payload.text === "string" && isPublicErrorFrame(payload.text)) return result;
   if (!/^(sendMessage|sendMessageDraft|editMessageText|answerCallbackQuery)$/.test(method) ||
@@ -37,7 +39,7 @@ function prepareErrorNotice(method: string, payload: Record<string, unknown>, en
   const actor = payload._errorUserId;
   const safe = privateErrorPayload(method, payload, env);
   for (const key of Object.keys(payload)) delete payload[key];
-  Object.assign(payload, safe);
+  Object.assign(payload, localizePayload(safe));
   if (method === "answerCallbackQuery" && actor !== undefined) payload._errorUserId = actor;
 }
 
@@ -54,7 +56,7 @@ const telegramEmojiPattern = /(?:❌|✅|⚠|🔎|⬇|📤|⏳|🎵|🎧|🎼|�
 
 // Keep literal text and UTF-16 offsets intact; button icons use Telegram's own field.
 export function telegramCustomEmoji(method: string, payload: Record<string, unknown>, env: AdminAccessEnv = {}): Record<string, unknown> {
-  payload = privateErrorPayload(method, payload, env);
+  payload = localizePayload(privateErrorPayload(method, payload, env));
   if (!/^(sendMessage|sendMessageDraft|editMessageText|editMessageCaption|editMessageReplyMarkup|sendVideo|sendAudio|sendDocument|sendPhoto|sendAnimation|sendMediaGroup)$/.test(method)) return payload;
   const decorate = (body: Record<string, unknown>): Record<string, unknown> => {
     const result = { ...body };
@@ -637,6 +639,19 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
   async alarm(): Promise<void> { await this.broadcasts.alarm(); }
 
   async fetch(request: Request): Promise<Response> {
+    const languageUrl = new URL(request.url);
+    if (languageUrl.pathname === "/language") {
+      const user = languageUrl.searchParams.get("user") || "";
+      if (!/^[1-9]\d{0,15}$/.test(user) || !Number.isSafeInteger(Number(user))) return new Response("Invalid user", { status: 400 });
+      const key = `language:${user}`;
+      if (request.method === "POST") {
+        const body = await request.json() as { language?: unknown };
+        if (!isLanguage(body.language)) return new Response("Invalid language", { status: 400 });
+        await this.ctx.storage.put(key, body.language);
+      } else if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
+      return Response.json({ language: await this.ctx.storage.get(key) || "fa" });
+    }
+
     const url = new URL(request.url);
     if (url.pathname === "/broadcast") return this.broadcasts.fetch(request);
 

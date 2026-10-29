@@ -8,12 +8,13 @@ const bandcamp = await readFile(new URL('../src/bandcamp.ts', import.meta.url), 
 const source = await readFile(new URL('../src/youtube-main.ts', import.meta.url), 'utf8');
 const story = await readFile(new URL('../src/story-main.ts', import.meta.url), 'utf8');
 const instagram = await readFile(new URL('../src/index.ts', import.meta.url), 'utf8');
-const { outputFiles } = await build({
+const { outputFiles } = await build({ external: ['node:async_hooks'],
   stdin: { contents: source + '\nexport {parseInstagramVideoTarget,parseInstagramAudioTarget,resolveInstagramVideo,instagramVideoErrorText,parsePlaylist,mediaCacheKey,parseSocialUrl,extractYouTubeUrl};', loader: 'ts' },
   bundle: true, format: 'esm', write: false,
   plugins: [{ name: 'instagram-platform', setup(build) {
     build.onResolve({ filter: /.*/ }, a => ({ path: a.path, namespace: 'test' }));
     build.onLoad({ filter: /.*/, namespace: 'test' }, a => {
+      if (a.path === './localization') return {contents:'export const withUserLanguage=async(_env,_id,action)=>action(); export const userLanguage=async()=>"fa";'};
       if (a.path === './reddit') return {contents:reddit,loader:'ts'};
       if (a.path === './bandcamp') return {contents:bandcamp,loader:'ts'};
       if (a.path === './story-main') return { contents: story, loader: 'ts' };
@@ -530,7 +531,7 @@ test('music buttons bind chat, owner, exact video and expiry before creating an 
 
 test('native text motion is bounded, preserves formatting and final delivery survives preview failures',async()=>{
   const text=await readFile(new URL('../src/admin.ts',import.meta.url),'utf8');
-  const result=await build({stdin:{contents:text,loader:'ts',resolveDir:new URL('../src',import.meta.url).pathname},bundle:true,format:'esm',write:false,
+  const result=await build({ external: ['node:async_hooks'],stdin:{contents:text,loader:'ts',resolveDir:new URL('../src',import.meta.url).pathname},bundle:true,format:'esm',write:false,
     plugins:[{name:'motion-runtime',setup(b){b.onResolve({filter:/^cloudflare:workers$/},a=>({path:a.path,namespace:'runtime'}));
       b.onLoad({filter:/.*/,namespace:'runtime'},()=>({contents:'export class DurableObject {}'}));}}]});
   const {telegramTextMotion,telegramCustomEmoji}=await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString('base64')}`);
@@ -893,7 +894,7 @@ test('persistent Telegram cache sanitizes context, expires entries, bounds stora
     return {toArray:()=>rows,one:()=>rows[0],rowsWritten:changes};
   }};
   const adminSource=await readFile(new URL('../src/admin.ts',import.meta.url),'utf8');
-  const result=await build({stdin:{contents:adminSource,loader:'ts',resolveDir:new URL('../src',import.meta.url).pathname},bundle:true,format:'esm',write:false,
+  const result=await build({ external: ['node:async_hooks'],stdin:{contents:adminSource,loader:'ts',resolveDir:new URL('../src',import.meta.url).pathname},bundle:true,format:'esm',write:false,
     plugins:[{name:'durable-object',setup(b){b.onResolve({filter:/cloudflare:workers/},a=>({path:a.path,namespace:'stub'}));b.onLoad({filter:/.*/,namespace:'stub'},()=>({contents:'export class DurableObject {constructor(ctx,env){this.ctx=ctx;this.env=env;}}'}));}}]});
   const admin=await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString('base64')}`);
   const instance=new admin.AdminStatsStore({storage:{sql,transactionSync(fn){db.exec('BEGIN');try{const result=fn();db.exec('COMMIT');return result;}catch(error){db.exec('ROLLBACK');throw error;}}}},{});
