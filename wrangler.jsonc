@@ -77,7 +77,7 @@
       "class_name": "YoutubeDownloaderContainer",
       "image": "./Dockerfile",
       "max_instances": 20,
-      "instance_type": "standard-4",
+      "instance_type": "standard-2",
       "constraints": {
         "regions": ["EEUR"]
       },
