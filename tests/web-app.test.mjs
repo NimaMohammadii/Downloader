@@ -5,7 +5,7 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 const source = await readFile('src/web-app.ts', 'utf8');
-const bundle = await build({stdin:{contents:source,resolveDir:process.cwd()+'/src',loader:'ts'},
+const bundle = await build({ external: ['node:async_hooks'],stdin:{contents:source,resolveDir:process.cwd()+'/src',loader:'ts'},
   bundle:true,write:false,format:'esm',plugins:[{name:'runtime',setup(b){
     b.onResolve({filter:/^(cloudflare:workers|@cloudflare\/containers)$/},a=>({path:a.path,namespace:'runtime'}));
     b.onLoad({filter:/.*/,namespace:'runtime'},a=>({contents:a.path==='cloudflare:workers'
@@ -110,7 +110,7 @@ test('incomplete preparation fails explicitly and never exposes an unsigned stre
 });
 
 test('browser event reader handles chunked completion without polling and UI scripts parse',async()=>{
-  const {outputFiles}=await build({entryPoints:['src/web-ui.ts'],bundle:true,write:false,format:'esm'});
+  const {outputFiles}=await build({ external: ['node:async_hooks'],entryPoints:['src/web-ui.ts'],bundle:true,write:false,format:'esm'});
   const {WEB_APP_HTML:html}=await import('data:text/javascript;base64,'+Buffer.from(outputFiles[0].text).toString('base64'));
   const script=html.match(/<script>([\s\S]*?)<\/script>/)[1];new vm.Script(script);
   assert.doesNotMatch(script,/api\/status|function poll\(|setInterval\(/);
@@ -167,7 +167,7 @@ test('subtitle fetch failures stay separate from the video stream',async()=>{
 });
 
 test('CC stays off by default, loads only the chosen track, preserves selection across quality changes and ignores stale events',async()=>{
-  const {outputFiles}=await build({entryPoints:['src/web-ui.ts'],bundle:true,write:false,format:'esm'});
+  const {outputFiles}=await build({ external: ['node:async_hooks'],entryPoints:['src/web-ui.ts'],bundle:true,write:false,format:'esm'});
   const {WEB_APP_HTML:html}=await import('data:text/javascript;base64,'+Buffer.from(outputFiles[0].text).toString('base64'));
   const script=html.match(/<script>([\s\S]*?)<\/script>/)[1];
   const helpers=script.slice(script.indexOf('function subtitlesOpen()'),script.indexOf('function settingsOpen()'));

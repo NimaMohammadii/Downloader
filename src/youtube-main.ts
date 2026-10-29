@@ -1,3 +1,4 @@
+import { withUserLanguage, userLanguage } from "./localization";
 import { parseBandcampUrl, bandcampFailureDiagnostic, bandcampOptions, type BandcampInput, type BandcampOption } from "./bandcamp";
 import { parseRedditUrl, type RedditInput } from "./reddit";
 import { Container, getContainer } from "@cloudflare/containers";
@@ -526,6 +527,10 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
   }
 
   async run(event: WorkflowEvent<YoutubeDownloadJob>, step: WorkflowStep) {
+    return withUserLanguage(this.env, event.payload.userId, () => this.runLocalized(event, step));
+  }
+
+  private async runLocalized(event: WorkflowEvent<YoutubeDownloadJob>, step: WorkflowStep) {
     const job: YoutubeDownloadJob = { ...event.payload };
     const inspect = !job.instagramProfile && !job.instagram && !job.instagramPost &&
       !job.instagramPostRequest && !job.reddit && !job.bandcamp && !job.recognition && !job.playlist && !job.social && !job.quality && !job.audioMode && job.source !== "pornhub";
@@ -1004,7 +1009,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
               new Request("http://container/download", {
                 method: "POST",
                 headers: { "content-type": "application/json" },
-                body: JSON.stringify({ ...job, statusMessageId, botToken: this.env.BOT_TOKEN,
+                body: JSON.stringify({ ...job, language: await userLanguage(this.env, job.userId), statusMessageId, botToken: this.env.BOT_TOKEN,
                   ...await mediaCacheContext(this.env, job) }),
               }),
             );
@@ -1147,7 +1152,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       await step.do("begin instagram capture", { retries: { limit: 2, delay: "3 seconds" }, timeout: "1 minute" }, async () => {
         const signature = (await instagramSignature(this.env.BOT_TOKEN, `stop:${job.chatId}:${job.requestMessageId}:${job.userId}`)).slice(0, 16);
         const result = await pooledContainer(this.env, job).instagramRequest("start", {
-          id: job.id, source, botToken: this.env.BOT_TOKEN, chatId: job.chatId, requestMessageId: job.requestMessageId, userId: job.userId,
+          id: job.id, source, language: await userLanguage(this.env, job.userId), botToken: this.env.BOT_TOKEN, chatId: job.chatId, requestMessageId: job.requestMessageId, userId: job.userId,
           statusMessageId: statusId,
           stopData: `igs|${job.requestMessageId}|${job.userId}|${signature}`,
           completionUrl: `https://downloader.vexaagent.workers.dev/instagram/events/${job.id}`,

@@ -3,7 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-const bundle = await build({
+const bundle = await build({ external: ['node:async_hooks'],
   stdin: { contents: 'export {default as worker} from "./src/app-main"; export * from "./src/admin"; export * from "./src/membership";', resolveDir: process.cwd(), loader: 'ts' },
   bundle: true, format: 'esm', write: false,
   plugins: [{ name: 'cloudflare-runtime', setup(b) {

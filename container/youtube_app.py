@@ -1,4 +1,6 @@
 import asyncio
+from localization import localize_payload, localized_job, TRANSLATED_ERRORS
+
 import concurrent.futures
 import hashlib
 import hmac
@@ -420,6 +422,8 @@ ERROR_NOTICE_PATTERN = re.compile(r"(?:^|\n)\s*(?:❌|⚠)|ناموفق|ممکن
 
 def private_error_payload(method: str, payload: dict[str, Any]) -> dict[str, Any]:
     result = dict(payload)
+    if (isinstance(payload.get("text"), str) and payload["text"] in TRANSLATED_ERRORS) or (payload.get("_publicErrorFrame") is True and isinstance(payload.get("text"), str) and any(text.startswith(payload["text"]) for text in TRANSLATED_ERRORS)):
+        return result
     result.pop("_publicErrorFrame", None)
     text = payload.get("text")
     if (payload.get("_publicErrorFrame") is True and method in {"sendMessageDraft", "editMessageText"}
@@ -458,7 +462,7 @@ TELEGRAM_EMOJI_PATTERN = re.compile("(?:" + "|".join(map(re.escape, TELEGRAM_EMO
 
 
 def telegram_custom_emoji(method: str, payload: dict[str, Any], *, form: bool = False) -> dict[str, Any]:
-    payload = private_error_payload(method, payload)
+    payload = localize_payload(private_error_payload(method, payload))
     if method not in {"sendMessage", "sendMessageDraft", "editMessageText", "editMessageCaption", "editMessageReplyMarkup",
                       "sendVideo", "sendAudio", "sendDocument", "sendPhoto", "sendAnimation", "sendMediaGroup"}:
         return payload
@@ -601,9 +605,9 @@ def telegram_call(
     timeout: int = 900,
 ) -> Any:
     if json_payload is not None:
-        json_payload = private_error_payload(method, telegram_reply_payload(json_payload))
+        json_payload = localize_payload(private_error_payload(method, telegram_reply_payload(json_payload)))
     if data is not None:
-        data = private_error_payload(method, telegram_reply_payload(data, form=True))
+        data = localize_payload(private_error_payload(method, telegram_reply_payload(data, form=True)))
     if files:
         upload_timeout = job_timeout(timeout)
         return asyncio.run(asyncio.wait_for(
@@ -1381,6 +1385,7 @@ def send_audio_file(
         )
 
 
+@localized_job
 def process_job(payload: dict[str, Any]) -> dict[str, Any]:
     if payload.get("source") == "pornhub":
         from pornhub import process_job as process_pornhub_job
@@ -1865,6 +1870,7 @@ class InstagramCapture:
         with server_activity(), request_cache(), USAGE.scope(getattr(self, "payload", {}).get("userId")):
             self.run()
 
+    @localized_job
     def run(self) -> None:
         watchdog = wall_timer = None
         try:
@@ -2155,6 +2161,7 @@ class InstagramCapture:
         with self.lock:
             self.state = "ready" if sent else "failed"
 
+    @localized_job
     def send(self) -> dict[str, Any]:
         with self.lock:
             if self.state == "sent":

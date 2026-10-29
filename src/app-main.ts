@@ -1,3 +1,4 @@
+import { handleLanguageUpdate, withUserLanguage } from "./localization";
 import { enforceRestriction } from "./restrictions";
 import { parseBandcampUrl, bandcampFailureDiagnostic } from "./bandcamp";
 import { publicError } from "./public-errors";
@@ -88,6 +89,9 @@ const appWorker = {
       return disabledContainerResponse(request);
     }
 
+    const languageResponse = await handleLanguageUpdate(request, env);
+    if (languageResponse) return languageResponse;
+
     const restrictionResponse = await enforceRestriction(request, env);
     if (restrictionResponse) return restrictionResponse;
     const broadcastResponse = await handleBroadcastUpdate(request, env);
@@ -118,7 +122,8 @@ export default {
       request.headers.get("x-telegram-bot-api-secret-token") === WEBHOOK_SECRET;
     const update = trustedWebhook || fallbackWebhook ? await request.clone().json().catch(() => null) as any : null;
     try {
-      return await appWorker.fetch(request, env, ctx);
+      const actorId = update?.callback_query?.from?.id || update?.message?.from?.id;
+      return await withUserLanguage(env, actorId, () => appWorker.fetch(request, env, ctx));
     } catch (error) {
       const bandcamp = update && parseBandcampUrl(String(update.message?.text || update.message?.caption || ""));
       console.error("request failed", { type: error instanceof Error ? error.name : "unknown",
@@ -130,10 +135,12 @@ export default {
           if (message?.chat?.id) {
             const payload: Record<string, unknown> = { chat_id: message.chat.id,
               text: bandcamp ? publicError("❌ پردازش درخواست کامل نشد.").message : "❌ پردازش درخواست کامل نشد.", _errorDetail: String(error) };
-            await telegramTextMotion(env.BOT_TOKEN, "sendMessage", payload);
-            await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
-              method: "POST", headers: { "content-type": "application/json" },
-              body: JSON.stringify(telegramCustomEmoji("sendMessage", payload)), signal: AbortSignal.timeout(5000),
+            await withUserLanguage(env, update.callback_query?.from?.id || update.message?.from?.id, async () => {
+              await telegramTextMotion(env.BOT_TOKEN, "sendMessage", payload);
+              await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
+                method: "POST", headers: { "content-type": "application/json" },
+                body: JSON.stringify(telegramCustomEmoji("sendMessage", payload)), signal: AbortSignal.timeout(5000),
+              });
             });
             return Response.json({ ok: true });
           }

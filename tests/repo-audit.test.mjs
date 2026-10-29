@@ -4,7 +4,7 @@ import test from 'node:test';
 import { createHmac } from 'node:crypto';
 import { setWebhook } from '../scripts/set-webhook.mjs';
 
-const result=await build({entryPoints:['src/app-main.ts'],bundle:true,format:'esm',write:false,
+const result=await build({ external: ['node:async_hooks'],entryPoints:['src/app-main.ts'],bundle:true,format:'esm',write:false,
   plugins:[{name:'cloudflare-runtime',setup(b){
     b.onResolve({filter:/^(cloudflare:workers|@cloudflare\/containers)$/},a=>({path:a.path,namespace:'runtime'}));
     b.onLoad({filter:/.*/,namespace:'runtime'},a=>({contents:a.path==='cloudflare:workers'

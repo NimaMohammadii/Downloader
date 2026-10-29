@@ -2,7 +2,7 @@ import {build} from 'esbuild';
 import {readFile} from 'node:fs/promises';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-const {outputFiles}=await build({entryPoints:['src/public-errors.ts'],bundle:true,format:'esm',write:false});
+const {outputFiles}=await build({ external: ['node:async_hooks'],entryPoints:['src/public-errors.ts'],bundle:true,format:'esm',write:false});
 const api=await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
 const cases=JSON.parse(await readFile(new URL('./public-error-cases.json',import.meta.url),'utf8'));
 for(const example of cases) test(`public category ${example.category}: ${example.input}`,()=>{
