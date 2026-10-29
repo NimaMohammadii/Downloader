@@ -138,6 +138,59 @@ class SubtitleTests(unittest.TestCase):
                       [{'type': 'word', 'text': 'x', 'start': 0, 'end': 100}]):
             with self.assertRaises(app.UserVisibleError): subs._source_cues({'words': words}, 4)
 
+    def test_coincident_sentence_boundaries_preserve_all_words_and_renderable_times(self):
+        for second_start in (0.2, 0.201):
+            with self.subTest(second_start=second_start):
+                words = [
+                    {'type': 'word', 'text': 'Hello!', 'start': 0.2, 'end': 1.7},
+                    {'type': 'word', 'text': 'Yes.', 'start': second_start, 'end': 0.5},
+                    {'type': 'word', 'text': 'Welcome.', 'start': 2, 'end': 3.8},
+                ]
+                cues = subs._source_cues({'words': words}, 4)
+                self.assertEqual([c['text'] for c in cues], ['Hello! Yes.', 'Welcome.'])
+                self.assertEqual([c['id'] for c in cues], [0, 1])
+                self.assertEqual(cues[0]['end'], 1.7)
+                for cue in cues:
+                    self.assertLess(round(cue['start'] * 100), round(cue['end'] * 100))
+                self.assertLessEqual(cues[0]['end'], cues[1]['start'])
+
+    def test_overlapping_words_keep_longest_end_without_shifting_later_speech(self):
+        words = [
+            {'type': 'word', 'text': 'Hello', 'start': 0.2, 'end': 1.7},
+            {'type': 'word', 'text': 'world.', 'start': 0.3, 'end': 0.5},
+            {'type': 'word', 'text': 'Next.', 'start': 2, 'end': 3},
+        ]
+        cues = subs._source_cues({'words': words}, 4)
+        self.assertEqual(cues[0]['end'], 1.7)
+        self.assertEqual(cues[1]['start'], 2)
+
+    def test_cached_paid_transcript_can_recover_timing_without_another_scribe_charge(self):
+        transcript = self.transcript()
+        transcript['words'][1]['start'] = 0.2
+        directory = subs.CACHE_ROOT / hashlib.sha256(b'abcdefghijk').hexdigest()
+        directory.mkdir(parents=True)
+        subs._atomic_json(directory / 'transcribe.json', transcript)
+        translated = self.translation()
+        translated['output'][0]['content'][0]['text'] = json.dumps(
+            {'cues': [{'id': 0, 'text': 'سلام! خوش آمدی.'}]})
+        with patch.object(app.requests, 'post', return_value=self.Response(translated)) as post:
+            output = subs.prepare(self.path, self.payload, lambda text: None)
+        self.assertTrue(output.is_file())
+        post.assert_called_once()
+        self.assertEqual(post.call_args.args[0], 'https://api.openai.com/v1/responses')
+
+    def test_terminal_timestamp_rounding_keeps_trailing_words_inside_the_video(self):
+        for start in (3.999, 4, 4.05):
+            with self.subTest(start=start):
+                cues = subs._source_cues({'words': [
+                    {'type': 'word', 'text': 'Good', 'start': 3, 'end': 3.8},
+                    {'type': 'word', 'text': 'bye.', 'start': start, 'end': 4.1},
+                ]}, 4)
+                self.assertEqual(cues, [{'id': 0, 'start': 3.0, 'end': 4, 'text': 'Good bye.'}])
+        with self.assertRaises(app.UserVisibleError):
+            subs._source_cues({'words': [
+                {'type': 'word', 'text': 'Outside.', 'start': 4, 'end': 4.1}]}, 4)
+
     def test_ass_cannot_execute_commands_or_load_external_resources(self):
         path = self.directory / 'safe.ass'
         subs._ass([{'start': 0, 'end': 2, 'text': r'{\pos(0,0)} سلام <b>دنیا</b>'}], path)

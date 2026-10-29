@@ -89,8 +89,18 @@ def _source_cues(transcript: dict, duration: float) -> list[dict]:
 
     def finish():
         if current:
-            cues.append({'id': len(cues), 'start': current[0][0], 'end': current[-1][1],
-                         'text': _clean(' '.join(word[2] for word in current))})
+            cue = {'id': len(cues), 'start': current[0][0], 'end': max(word[1] for word in current),
+                   'text': _clean(' '.join(word[2] for word in current))}
+            # Word timestamps may coincide across sentence/length boundaries.
+            # ASS has centisecond precision: merge those cues before clipping
+            # against the next start, preserving every word and its longest end.
+            # Keep tolerated end-of-file timestamp drift in the last visible cue.
+            if cues and (round(cues[-1]['start'] * 100) == round(cue['start'] * 100)
+                         or round(cue['start'] * 100) >= round(duration * 100)):
+                cues[-1]['text'] += ' ' + cue['text']
+                cues[-1]['end'] = max(cues[-1]['end'], cue['end'])
+            else:
+                cues.append(cue)
             current.clear()
 
     for word in words:
@@ -117,7 +127,7 @@ def _source_cues(transcript: dict, duration: float) -> list[dict]:
     for i, cue in enumerate(cues):
         next_start = cues[i + 1]['start'] if i + 1 < len(cues) else duration
         cue['end'] = min(duration, next_start, max(cue['end'], cue['start'] + 0.8))
-        if cue['end'] <= cue['start']:
+        if round(cue['end'] * 100) <= round(cue['start'] * 100):
             raise app.UserVisibleError('❌ زمان‌بندی زیرنویس هم‌پوشانی نامعتبر دارد.')
     return cues
 
