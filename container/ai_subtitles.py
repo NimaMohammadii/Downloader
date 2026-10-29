@@ -197,12 +197,28 @@ def _ass(cues: list[dict], path: Path) -> None:
 
 
 def _ffmpeg(args: list[str], timeout: int = 900) -> None:
+    started = time.monotonic()
+    budget = app.job_timeout(timeout)
+    stage = 'render' if '-vf' in args else 'audio'
+    print(json.dumps({'message': 'subtitle ffmpeg started', 'stage': stage,
+                      'timeoutSeconds': round(budget, 2)}), flush=True)
     try:
         subprocess.run(['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error', '-nostdin', *args],
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True,
-                       timeout=app.job_timeout(timeout))
-    except Exception:
+                       timeout=budget)
+    except subprocess.TimeoutExpired:
+        print(json.dumps({'message': 'subtitle ffmpeg failed', 'stage': stage, 'reason': 'timeout',
+                          'elapsedSeconds': round(time.monotonic() - started, 2)}), flush=True)
+        raise app.UserVisibleError('❌ زمان آماده‌سازی ویدیوی زیرنویس‌دار تمام شد؛ فایل ناقص ارسال نشد.') from None
+    except Exception as exc:
+        # Do not log command arguments, paths, stderr, credentials or dialogue.
+        print(json.dumps({'message': 'subtitle ffmpeg failed', 'stage': stage,
+                          'reason': type(exc).__name__,
+                          'returnCode': exc.returncode if isinstance(exc, subprocess.CalledProcessError) else None,
+                          'elapsedSeconds': round(time.monotonic() - started, 2)}), flush=True)
         raise app.UserVisibleError('❌ آماده‌سازی ویدیوی زیرنویس‌دار کامل نشد؛ فایل ناقص ارسال نشد.') from None
+    print(json.dumps({'message': 'subtitle ffmpeg completed', 'stage': stage,
+                      'elapsedSeconds': round(time.monotonic() - started, 2)}), flush=True)
 
 
 def prepare(video_path: Path, payload: dict, status) -> Path:
@@ -253,10 +269,15 @@ def prepare(video_path: Path, payload: dict, status) -> Path:
             raise app.UserVisibleError('❌ مسیر فایل زیرنویس معتبر نیست.')
         output = video_path.parent / 'video-subtitle-fa.mp4'
         status('🎬 دارم زیرنویس فارسی را روی ویدیو قرار می‌دهم…')
+        # Use the existing job deadline, reserving three minutes for validation
+        # and Telegram upload. No retry of paid transcription or translation.
+        render_budget = app.job_timeout(app.YOUTUBE_JOB_SECONDS) - 180
+        if render_budget <= 0:
+            raise app.UserVisibleError('❌ زمان کافی برای آماده‌سازی و ارسال ویدیوی زیرنویس‌دار باقی نمانده است.')
         _ffmpeg(['-i', str(video_path), '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
-                 '-vf', f'ass={subtitle}', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+                 '-vf', f'ass={subtitle}', '-c:v', 'libx264', '-preset', 'superfast', '-crf', '23',
                  '-threads', '2', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-fs', str(app.DIRECT_TELEGRAM_LIMIT + 1),
-                 '-movflags', '+faststart', str(output)])
+                 '-movflags', '+faststart', str(output)], render_budget)
         app.validate_file_size(output)
         actual = app.probe_duration(output)
         if actual <= 0 or abs(actual - duration) > 1:

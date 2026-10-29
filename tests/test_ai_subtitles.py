@@ -138,6 +138,35 @@ class SubtitleTests(unittest.TestCase):
                       [{'type': 'word', 'text': 'x', 'start': 0, 'end': 100}]):
             with self.assertRaises(app.UserVisibleError): subs._source_cues({'words': words}, 4)
 
+    def test_ffmpeg_timeout_and_encoder_failure_are_distinct_without_exposing_output(self):
+        for error, reason, text in (
+            (subprocess.TimeoutExpired(['private-command'], 1, stderr=b'private-key'), 'timeout', 'زمان آماده'),
+            (subprocess.CalledProcessError(1, ['private-command'], stderr=b'private-key'), 'CalledProcessError', 'کامل نشد'),
+        ):
+            with self.subTest(reason=reason), patch.object(subprocess, 'run', side_effect=error) as run, \
+                 patch('builtins.print') as log:
+                with self.assertRaisesRegex(app.UserVisibleError, text):
+                    subs._ffmpeg(['-vf', 'ass=private-path'], 1)
+                run.assert_called_once()
+                entries = [json.loads(c.args[0]) for c in log.call_args_list]
+                self.assertEqual(entries[-1]['reason'], reason)
+                self.assertNotIn('private-', str(log.call_args_list))
+
+    def test_render_uses_remaining_job_budget_and_reserves_upload_time(self):
+        saved = subs.CACHE_ROOT / hashlib.sha256(b'abcdefghijk').hexdigest()
+        saved.mkdir(parents=True)
+        subs._atomic_json(saved / 'transcript.json', {'language': 'fa', 'cues': [
+            {'id': 0, 'start': 0, 'end': 3, 'text': 'سلام'}]})
+        def render(args, timeout):
+            self.assertEqual(timeout, 420)
+            self.assertEqual(args[args.index('-preset') + 1], 'superfast')
+            self.assertEqual(args[args.index('-crf') + 1], '23')
+            shutil.copyfile(self.path, args[-1])
+        with patch.object(app, 'job_timeout', return_value=600), patch.object(subs, '_ffmpeg', side_effect=render), \
+             patch.object(app.requests, 'post') as post:
+            subs.prepare(self.path, self.payload, lambda text: None)
+        post.assert_not_called()
+
     def test_coincident_sentence_boundaries_preserve_all_words_and_renderable_times(self):
         for second_start in (0.2, 0.201):
             with self.subTest(second_start=second_start):
