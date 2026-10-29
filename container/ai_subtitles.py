@@ -276,7 +276,7 @@ def prepare(video_path: Path, payload: dict, status) -> Path:
             raise app.UserVisibleError('❌ زمان کافی برای آماده‌سازی و ارسال ویدیوی زیرنویس‌دار باقی نمانده است.')
         _ffmpeg(['-i', str(video_path), '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
                  '-vf', f'ass={subtitle}', '-c:v', 'libx264', '-preset', 'superfast', '-crf', '23',
-                 '-threads', '2', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-fs', str(app.DIRECT_TELEGRAM_LIMIT + 1),
+                 '-threads', '4', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-fs', str(app.DIRECT_TELEGRAM_LIMIT + 1),
                  '-movflags', '+faststart', str(output)], render_budget)
         app.validate_file_size(output)
         actual = app.probe_duration(output)
