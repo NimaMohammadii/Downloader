@@ -33,5 +33,17 @@ class LocalizationTests(unittest.TestCase):
         self.assertEqual(button['text'], '🎵 Только звук')
         self.assertEqual(button['callback_data'], 'iga|p|code|0|42')
 
+class EmojiPresentationTests(unittest.TestCase):
+    def test_requested_custom_emoji_are_used_in_container_text_and_buttons(self):
+        import youtube_app
+        result = youtube_app.telegram_custom_emoji('sendMessage', {
+            'text': '🌐 ✅',
+            'reply_markup': {'inline_keyboard': [[{'text': '🌐 Languages', 'callback_data': 'lang'}, {'text': '✅ Done', 'callback_data': 'done'}]]},
+        })
+        self.assertEqual([(e['offset'], e['length'], e['custom_emoji_id']) for e in result['entities']],
+                         [(0, 2, '5282843764451195532'), (3, 1, '5352871660024246779')])
+        self.assertEqual([b['icon_custom_emoji_id'] for b in result['reply_markup']['inline_keyboard'][0]],
+                         ['5282843764451195532', '5352871660024246779'])
+
 if __name__ == '__main__':
     unittest.main()

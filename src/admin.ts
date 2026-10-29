@@ -44,7 +44,7 @@ function prepareErrorNotice(method: string, payload: Record<string, unknown>, en
 }
 
 const telegramEmojiIds: Record<string, string> = {
-  "❌": "5210952531676504517", "✅": "5352871660024246779", "⚠": "5447644880824181073",
+  "🌐": "5282843764451195532", "❌": "5210952531676504517", "✅": "5352871660024246779", "⚠": "5447644880824181073",
   "🔎": "5231012545799666522", "⬇": "5271604874419647061", "📤": "5445355530111437729",
   "⏳": "5386367538735104399", "🎵": "5463107823946717464", "🎧": "5424818078833715060",
   "🎼": "5253997827788385948", "🎬": "5427168083074628963", "⭐": "5438496463044752972",
@@ -52,7 +52,7 @@ const telegramEmojiIds: Record<string, string> = {
   "⚡": "5210956306952758910", "👇": "5231102735817918643",
   "👑": "5217822164362739968", "👥": "5461117441612462242", "🔗": "5271604874419647061",
 };
-const telegramEmojiPattern = /(?:❌|✅|⚠|🔎|⬇|📤|⏳|🎵|🎧|🎼|🎬|⭐|🔴|⏹|👤|⚡|👇|👑|👥|🔗)\uFE0F?/gu;
+const telegramEmojiPattern = /(?:🌐|❌|✅|⚠|🔎|⬇|📤|⏳|🎵|🎧|🎼|🎬|⭐|🔴|⏹|👤|⚡|👇|👑|👥|🔗)\uFE0F?/gu;
 
 // Keep literal text and UTF-16 offsets intact; button icons use Telegram's own field.
 export function telegramCustomEmoji(method: string, payload: Record<string, unknown>, env: AdminAccessEnv = {}): Record<string, unknown> {

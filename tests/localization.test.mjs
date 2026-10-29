@@ -115,54 +115,101 @@ test('multiline prompts, bold help labels and restriction durations translate co
  }
 });
 
-test('language clicks and repeated commands animate one saved menu with custom emoji',async()=>{
- const f=fixture(),previous=globalThis.fetch,calls=[];
- globalThis.fetch=async(url,init)=>{
-  const method=url.split('/').at(-1),body=JSON.parse(init.body);
+
+function telegramSimulator({ failDrafts = false, failPreview = false, failFinalSend = false, stickerEmoji = '🌐' } = {}) {
+ const messages = new Map([[40, {text:'https://example.org/download',document:{file_id:'download'}}]]);
+ const calls = []; let next = 900, editCalls = 0;
+ return { messages, calls, async fetch(url, init) {
+  const method = url.split('/').at(-1), body = JSON.parse(init.body);
   calls.push({method,...body});
-  return Response.json({ok:true,result:{message_id:900}});
- };
+  const ok = result => Response.json({ok:true,result});
+  const fail = description => Response.json({ok:false,description},{status:400});
+  if (method === 'getCustomEmojiStickers') return ok([{custom_emoji_id:body.custom_emoji_ids[0],emoji:body.custom_emoji_ids[0]==='5282843764451195532'?stickerEmoji:'✅'}]);
+  if (method === 'sendMessageDraft') return failDrafts ? fail('drafts unavailable') : ok(true);
+  if (method === 'answerCallbackQuery') return ok(true);
+  if (method === 'deleteMessage') { messages.delete(body.message_id);return ok(true); }
+  if (method === 'sendMessage') {
+   if(failFinalSend)return fail('send failed');
+   const message_id = next++; messages.set(message_id,body); return ok({message_id});
+  }
+  if (method === 'editMessageText') {
+   editCalls++;
+   if(failPreview && editCalls===1)return fail('temporary edit failure');
+   if(!messages.has(body.message_id))return fail('message to edit not found');
+   messages.set(body.message_id,body);return ok({message_id:body.message_id});
+  }
+  throw Error('unexpected method '+method);
+ }};
+}
+const privateCommand=(f,id=100)=>f.request({message:{message_id:id,chat:{id:42},from:{id:42},text:'/lang'}});
+const selection=(f,id,code='ru')=>f.request({callback_query:{id:'cb',from:{id:42},message:{message_id:id,chat:{id:42}},data:`lang:${code}:42`}});
+test('reopening /lang delivers a fresh full menu before removing the old one and the command',async()=>{
+ const f=fixture(),tg=telegramSimulator(),previous=globalThis.fetch;
+ globalThis.fetch=tg.fetch;
  try{
-  const command=id=>f.request({message:{message_id:id,chat:{id:42},from:{id:42},text:'/lang'}});
-  await api.handleLanguageUpdate(command(100),f.env);
-  assert.equal(calls.filter(c=>c.method==='sendMessage').length,1);
-  const first=calls.filter(c=>c.method==='sendMessage'||c.method==='editMessageText');
-  assert.equal(first.length,4);
-  assert.ok(first[0].text.length<first.at(-1).text.length);
-  assert.equal(first.at(-1).entities.find(e=>e.type==='custom_emoji').custom_emoji_id,'5282843764451195532');
-  await api.handleLanguageUpdate(f.request({callback_query:{id:'cb',from:{id:42},message:{message_id:900,chat:{id:42}},data:'lang:ru:42'}}),f.env);
-  const last=calls.filter(c=>c.method==='editMessageText').at(-1);
-  assert.equal(last.message_id,900);assert.match(last.text,/Готово/);
-  assert.equal(last.entities.find(e=>e.type==='custom_emoji').custom_emoji_id,'5352871660024246779');
-  await api.handleLanguageUpdate(command(101),f.env);
-  assert.equal(calls.filter(c=>c.method==='sendMessage').length,1);
-  assert.deepEqual(calls.filter(c=>c.method==='deleteMessage').map(c=>c.message_id),[100,101]);
-  assert.ok(calls.filter(c=>c.method==='editMessageText').every(c=>c.message_id===900));
+  tg.messages.set(100,{text:'/lang'});
+  await api.handleLanguageUpdate(privateCommand(f),f.env);
+  const first=tg.calls.find(c=>c.method==='sendMessage');
+  assert.match(first.text,/زبان دلخواهت/); // first persistent message is complete, never a prefix
+  tg.messages.set(101,{text:'/lang'});
+  await api.handleLanguageUpdate(privateCommand(f,101),f.env);
+  assert.equal(tg.calls.filter(c=>c.method==='sendMessage').length,2);
+  assert.deepEqual([...tg.messages.keys()],[40,901]); // newest menu stays at the current chat position
+  const sends=tg.calls.map((c,i)=>c.method==='sendMessage'?i:-1).filter(i=>i>=0);
+  const deletion=tg.calls.findIndex(c=>c.method==='deleteMessage'&&c.message_id===900);
+  assert.ok(deletion>sends[1]);
+  assert.deepEqual(tg.messages.get(40),{text:'https://example.org/download',document:{file_id:'download'}});
  }finally{globalThis.fetch=previous;}
 });
-test('deleted language menus are recreated, but temporary edit failures never duplicate them',async()=>{
- const f=fixture(),previous=globalThis.fetch,calls=[];
- let failure='';
- globalThis.fetch=async(url,init)=>{
-  const method=url.split('/').at(-1),body=JSON.parse(init.body);calls.push({method,...body});
-  if(method==='editMessageText'&&failure)return Response.json({ok:false,description:failure},{status:400});
-  return Response.json({ok:true,result:{message_id:901}});
- };
- const command=()=>f.request({message:{chat:{id:42},from:{id:42},text:'/lang'}});
+test('language buttons edit the visible menu; failed motion still delivers complete text',async()=>{
+ const f=fixture(),tg=telegramSimulator({failPreview:true}),previous=globalThis.fetch;
+ globalThis.fetch=tg.fetch;
  try{
-  await api.handleLanguageUpdate(command(),f.env);
-  failure='Too Many Requests';
-  await assert.rejects(api.handleLanguageUpdate(command(),f.env));
-  assert.equal(calls.filter(c=>c.method==='sendMessage').length,1);
-  failure='message to edit not found';
-  // Let the replacement menu animate normally once Telegram returns its new ID.
-  const mock=globalThis.fetch;
-  globalThis.fetch=async(url,init)=>{
-   if(url.endsWith('/sendMessage')){const result=await mock(url,init);failure='';return result;}
-   return mock(url,init);
-  };
-  await api.handleLanguageUpdate(command(),f.env);
-  assert.equal(calls.filter(c=>c.method==='sendMessage').length,2);
-  assert.deepEqual(calls.filter(c=>c.method==='deleteMessage').map(c=>c.message_id),[901]);
+  await api.handleLanguageUpdate(privateCommand(f),f.env);
+  await api.handleLanguageUpdate(selection(f,900),f.env);
+  assert.equal(tg.calls.filter(c=>c.method==='sendMessage').length,1);
+  assert.match(tg.messages.get(900).text,/Готово/);
+  assert.equal(tg.calls.filter(c=>c.method==='editMessageText').length,2); // failed preview then complete final
+  assert.equal(tg.messages.get(900).entities.find(e=>e.type==='custom_emoji').custom_emoji_id,'5352871660024246779');
  }finally{globalThis.fetch=previous;}
+});
+test('draft failures cannot hide the full menu; emoji text matches Telegram metadata with valid UTF-16 entities',async()=>{
+ const f=fixture(),tg=telegramSimulator({failDrafts:true,stickerEmoji:'🗺️'}),previous=globalThis.fetch;
+ globalThis.fetch=tg.fetch;
+ try{
+  await api.handleLanguageUpdate(privateCommand(f),f.env);
+  const menu=tg.messages.get(900);
+  assert.match(menu.text,/زبان دلخواهت/);
+  const entity=menu.entities.find(e=>e.type==='custom_emoji');
+  assert.equal(menu.text.slice(entity.offset,entity.offset+entity.length),'🗺️');
+  assert.equal(entity.custom_emoji_id,'5282843764451195532');
+  assert.ok(menu.entities.every(e=>e.offset+e.length<=menu.text.length));
+  const bold=menu.entities.find(e=>e.type==='bold');
+  assert.ok(bold.offset>=entity.length); // no overlapping emoji and bold entities
+  assert.equal(menu.reply_markup.inline_keyboard[0][0].icon_custom_emoji_id,'5352871660024246779');
+ }finally{globalThis.fetch=previous;}
+});
+test('a failed final send preserves both the command and the existing menu',async()=>{
+ const f=fixture(),tg=telegramSimulator({failFinalSend:true}),previous=globalThis.fetch;
+ await f.env.ADMIN_STATS.getByName('global').fetch('https://admin-stats/language-menu?user=42&chat=42',{method:'POST',body:JSON.stringify({messageId:850})});
+ tg.messages.set(850,{text:'old language menu'});tg.messages.set(100,{text:'/lang'});
+ globalThis.fetch=tg.fetch;
+ try{
+  await assert.rejects(api.handleLanguageUpdate(privateCommand(f),f.env));
+  assert.equal(tg.calls.filter(c=>c.method==='deleteMessage').length,0);
+  assert.deepEqual([...tg.messages.keys()],[40,850,100]);
+ }finally{globalThis.fetch=previous;}
+});
+test('a deleted callback menu is replaced only after Telegram confirms it is missing',async()=>{
+ const f=fixture(),tg=telegramSimulator(),previous=globalThis.fetch;globalThis.fetch=tg.fetch;
+ try{
+  await api.handleLanguageUpdate(selection(f,800),f.env);
+  assert.match(tg.messages.get(900).text,/Готово/);
+  assert.deepEqual([...tg.messages.keys()],[40,900]);
+ }finally{globalThis.fetch=previous;}
+});
+test('both requested emoji are fully converted in general text and buttons',()=>{
+ const out=api.telegramCustomEmoji('sendMessage',{text:'🌐 ✅',reply_markup:{inline_keyboard:[[{text:'🌐 Languages',callback_data:'lang'}, {text:'✅ Done',callback_data:'done'}]]}});
+ assert.deepEqual(out.entities.map(e=>[e.offset,e.length,e.custom_emoji_id]),[[0,2,'5282843764451195532'],[3,1,'5352871660024246779']]);
+ assert.deepEqual(out.reply_markup.inline_keyboard[0].map(b=>[b.text,b.icon_custom_emoji_id]),[['Languages','5282843764451195532'],['Done','5352871660024246779']]);
 });
