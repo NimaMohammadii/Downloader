@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 const bundle = await build({ external: ['node:async_hooks'],
-  stdin: { contents: 'export {default as worker, YoutubeDownloadWorkflow} from "./src/app-main"; export * from "./src/admin"; export * from "./src/restrictions";', resolveDir: process.cwd(), loader: 'ts' },
+  stdin: { contents: 'export {default as worker, YoutubeDownloadWorkflow} from "./src/app-main"; export * from "./src/admin"; export * from "./src/restrictions"; export * from "./src/subtitle-usage";', resolveDir: process.cwd(), loader: 'ts' },
   bundle: true, format: 'esm', write: false,
   plugins: [{ name: 'cloudflare-runtime', setup(b) {
     b.onResolve({ filter: /^(cloudflare:workers|@cloudflare\/containers)$/ }, a => ({ path: a.path, namespace: 'runtime' }));
@@ -17,6 +17,90 @@ const admin = await import(`data:text/javascript;base64,${Buffer.from(bundle.out
 const user = { id: 42, firstName: 'کاربر نمونه', username: 'example' };
 const base = { key: 'youtube:42:7:42', userId: 42, source: 'YouTube', request: 'https://youtube.com/watch?v=abcdefghijk' };
 const realNow = Date.now;
+
+const charge = (extra={}) => ({key:'sub:test',downloadKey:base.key,userId:42,at:Date.now(),language:'fa',
+  provider:'openai',model:'gpt-6-luna',state:'measured',serviceTier:'default',
+  inputTokens:10000,cachedInputTokens:2000,cacheWriteTokens:4000,outputTokens:3000,...extra});
+
+test('subtitle public prices use measured units, cache writes and actual service tier without guessing unknown usage',()=>{
+  assert.equal(admin.subtitleChargeNano(charge()),2420000);
+  assert.equal(admin.subtitleChargeNano(charge({serviceTier:'flex'})),1210000);
+  assert.equal(admin.subtitleChargeNano(charge({serviceTier:'priority'})),4840000);
+  assert.equal(admin.subtitleChargeNano(charge({provider:'elevenlabs',model:'scribe_v2',audioSeconds:3600})),220000000);
+  for(const extra of [{state:'unknown'},{state:'pending'},{model:'other-model'},{serviceTier:undefined},
+      {cacheWriteTokens:undefined},{cachedInputTokens:9000},{provider:'elevenlabs',model:'scribe_v2'}])
+    assert.equal(admin.subtitleChargeNano(charge(extra)),null);
+  assert.equal(admin.subtitleChargeNano(charge({state:'rejected'})),0);
+});
+
+test('subtitle ledger persists failed-job costs, rejects malformed batches, deduplicates and never regresses final events',async()=>{
+  const f=fixture();
+  try{
+    const at=Date.now();Date.now=()=>at;
+    const stt=charge({key:'sub:stt',provider:'elevenlabs',model:'scribe_v2',audioSeconds:3600});
+    const post=events=>f.request('/usage',{samples:[],deliveries:[],subtitleCharges:events});
+    await post([charge({state:'pending'}),stt]);await post([charge()]);
+    await post([charge(),stt,charge({state:'pending'})]);
+    await post([charge({key:'sub:unknown',state:'unknown',userId:43})]);
+    const all=await admin.getAdminUsage(f.env),own=await admin.getAdminUsage(f.env,'42');
+    assert.deepEqual(own.all.subtitles,{transcriptionNano:220000000,translationNano:2420000,calls:2,unknown:0});
+    assert.equal(all.all.subtitles.unknown,1);
+    await post([charge({userId:99})]);
+    assert.equal((await admin.getAdminUsage(f.env,'99')).all.subtitles.calls,0);
+    assert.equal((await post([charge({key:'sub:bad',inputTokens:-1})])).status,400);
+    f.restart();assert.equal((await admin.getAdminUsage(f.env,'42')).all.subtitles.translationNano,2420000);
+    const text=admin.formatAdminUsage(await admin.getAdminUsage(f.env));
+    assert.match(text,/\$0\.222420/);assert.match(text,/نامشخص/);assert.ok(text.length<4096);
+  }finally{f.close();}
+});
+
+test('YouTube subtitle choice, language and API cost appear in per-user history with exact custom status emojis',async()=>{
+  const f=fixture();
+  try{
+    await f.record(1);
+    await f.request('/download',{...base,status:'pending',subtitleLanguage:'de'});
+    await f.request('/download',{...base,status:'failed',subtitleLanguage:'de'});
+    await f.request('/usage',{samples:[],deliveries:[],subtitleCharges:[charge({language:'de'})]});
+    await f.request('/download',{...base,key:'no-subtitle',status:'success',delivered:1,subtitleLanguage:null});
+    await f.request('/download',{...base,key:'legacy',status:'success',delivered:1});
+    // A stale replay must not change the originally selected language.
+    await f.request('/download',{...base,status:'pending',subtitleLanguage:'ru'});
+    const d=await f.detail(),text=admin.formatAdminUserDetail(d);
+    assert.equal(d.downloads.find(v=>v.key===base.key).subtitleLanguage,'de');
+    assert.match(text,/زیرنویس: فعال • Deutsch/);assert.match(text,/زیرنویس: غیرفعال/);
+    assert.match(text,/قدیمی ثبت نشده/);assert.match(text,/\$0\.002420/);assert.ok(text.length<4096);
+    const decorated=admin.telegramCustomEmoji('editMessageText',{text,chat_id:admin.ADMIN_USER_ID});
+    const subtitleEntities=decorated.entities.filter(e=>text.slice(e.offset,e.offset+e.length+10).includes('زیرنویس:'));
+    assert.ok(subtitleEntities.some(e=>e.custom_emoji_id==='5206607081334906820'));
+    assert.ok(subtitleEntities.some(e=>e.custom_emoji_id==='5210952531676504517'));
+  }finally{f.close();}
+});
+
+test('admin-only YouTube subtitle requests are visible without enabling unrelated admin activity tracking',async()=>{
+  const f=fixture();
+  try{
+    await admin.recordDownload(f.env,{...base,userId:admin.ADMIN_USER_ID,status:'success',delivered:1});
+    assert.equal((await f.request(`/user?id=${admin.ADMIN_USER_ID}`)).status,404);
+    await admin.recordDownload(f.env,{...base,userId:admin.ADMIN_USER_ID,status:'success',delivered:1,subtitleLanguage:'fa'});
+    const d=await f.detail(String(admin.ADMIN_USER_ID));assert.equal(d.downloads[0].subtitleLanguage,'fa');
+    assert.equal(d.activity,null);
+  }finally{f.close();}
+});
+
+test('subtitle costs respect rolling time windows and remain attributed to the original user',async()=>{
+  const f=fixture();
+  try{
+    const now=Date.now();Date.now=()=>now;
+    const events=[charge({key:'sub:today',at:now-1000}),charge({key:'sub:week',at:now-2*86400000}),
+      charge({key:'sub:old',at:now-8*86400000,userId:43})];
+    await f.request('/usage',{samples:[],deliveries:[],subtitleCharges:events});
+    const all=await admin.getAdminUsage(f.env),own=await admin.getAdminUsage(f.env,'42');
+    assert.equal(all.day.subtitles.translationNano,2420000);
+    assert.equal(all.week.subtitles.translationNano,4840000);
+    assert.equal(all.all.subtitles.translationNano,7260000);
+    assert.equal(own.all.subtitles.translationNano,4840000);
+  }finally{f.close();}
+});
 
 function fixture(legacy = false) {
   const db = new DatabaseSync(':memory:');

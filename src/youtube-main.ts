@@ -1,5 +1,6 @@
 import { withUserLanguage, userLanguage } from "./localization";
 import { isSubtitleLanguage, subtitleName, subtitleButtons, type SubtitleLanguage, type SubtitleMenu, type SubtitleButton } from "./youtube-subtitles";
+import type { SubtitleCharge } from "./subtitle-usage";
 import { parseBandcampUrl, bandcampFailureDiagnostic, bandcampOptions, type BandcampInput, type BandcampOption } from "./bandcamp";
 import { parseRedditUrl, type RedditInput } from "./reddit";
 import { Container, getContainer } from "@cloudflare/containers";
@@ -268,8 +269,8 @@ export class YoutubeDownloaderContainer extends Container<Env> {
     try {
       const response = await this.ctx.container.getTcpPort(8080).fetch("http://container/admin-usage", { signal: AbortSignal.timeout(1500) });
       if (!response.ok) return;
-      const body = await response.json() as { samples: UsageSample[]; deliveries: MediaUsage[] };
-      await recordUsage(this.env, body.samples, body.deliveries);
+      const body = await response.json() as { samples: UsageSample[]; deliveries: MediaUsage[]; subtitleCharges?: SubtitleCharge[] };
+      await recordUsage(this.env, body.samples, body.deliveries, [], body.subtitleCharges);
     } catch { /* Last persisted samples remain available during a restart. */ }
   }
 
@@ -510,7 +511,9 @@ function jobHistory(job: YoutubeDownloadJob): Omit<DownloadRecord, "status"> {
 }
 
 async function trackJob(env: Env, job: YoutubeDownloadJob, status: DownloadStatus, extra: Partial<DownloadRecord> = {}): Promise<void> {
-  await recordDownload(env, { ...jobHistory(job),
+  const history = jobHistory(job);
+  await recordDownload(env, { ...history,
+    ...(history.source === 'YouTube' && (job.quality || job.audioMode) ? { subtitleLanguage: job.subtitle || null } : {}),
     ...(job.instagramProfile ? { excludeFromStats: true } : {}),
     ...(job.audioMode || job.playlist || job.recognition || job.bandcamp || job.social?.audioOnly || job.social?.platform === "soundcloud"
       || job.instagram?.kind === "audio" || job.instagram?.kind === "music" ? { category: "music" as const } : {}),
@@ -1943,8 +1946,8 @@ export default {
         const bytes = new Uint8Array(size);
         let offset = 0;
         for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-        const body = JSON.parse(new TextDecoder().decode(bytes)) as { samples: UsageSample[]; deliveries: MediaUsage[] };
-        const ok = await recordUsage(env, body.samples, body.deliveries);
+        const body = JSON.parse(new TextDecoder().decode(bytes)) as { samples: UsageSample[]; deliveries: MediaUsage[]; subtitleCharges?: SubtitleCharge[] };
+        const ok = await recordUsage(env, body.samples, body.deliveries, [], body.subtitleCharges);
         return Response.json({ ok }, { status: ok ? 200 : 503 });
       } catch { return new Response("Invalid usage", { status: 400 }); }
     }

@@ -48,6 +48,7 @@ class UsageMeter:
         self.active: dict[int, int] = {}
         self.samples: dict[str, dict] = {}
         self.deliveries: dict[str, dict] = {}
+        self.subtitle_charges: dict[str, dict] = {}
         self.reporting = False
         self.last_clock = time.monotonic()
         self.last_at = time.time() * 1000
@@ -136,10 +137,11 @@ class UsageMeter:
                 with self.lock:
                     samples = list(self.samples.values())[:250]
                     deliveries = list(self.deliveries.values())[:250]
-                if not samples and not deliveries:
+                    subtitle_charges = list(self.subtitle_charges.values())[:100]
+                if not samples and not deliveries and not subtitle_charges:
                     return
                 response = requests.post(self.url, headers={"x-admin-usage-token": self.token},
-                    json={"samples": samples, "deliveries": deliveries}, timeout=(1, 2), allow_redirects=False)
+                    json={"samples": samples, "deliveries": deliveries, "subtitleCharges": subtitle_charges}, timeout=(1, 2), allow_redirects=False)
                 if not response.ok:
                     return
                 with self.lock:
@@ -147,6 +149,11 @@ class UsageMeter:
                         self.samples.pop(item["key"], None)
                     for item in deliveries:
                         self.deliveries.pop(item["key"], None)
+                    for item in subtitle_charges:
+                        # A pending upload may be acknowledged after completion
+                        # replaces it. Never discard that newer final version.
+                        if self.subtitle_charges.get(item['key']) == item:
+                            self.subtitle_charges.pop(item['key'], None)
         except Exception:
             pass  # The next work event or idle exit retries the same keys.
 
@@ -186,6 +193,16 @@ class UsageMeter:
                 return
             self.deliveries[key] = {"key": key, "userId": USAGE_USER.get(), "at": int(time.time() * 1000),
                                     "bytes": size, "cached": cached}
+        self.report()
+
+    def subtitle_charge(self, value):
+        if not self.enabled:
+            return
+        with self.lock:
+            if len(self.subtitle_charges) >= 10000 and value['key'] not in self.subtitle_charges:
+                print('subtitle accounting queue full: local receipt retained', flush=True)
+                return
+            self.subtitle_charges[value['key']] = dict(value)
         self.report()
 
 
@@ -2510,7 +2527,8 @@ class Handler(BaseHTTPRequestHandler):
             USAGE.sample()
             with USAGE.lock:
                 payload = {"samples": list(USAGE.samples.values())[-250:],
-                           "deliveries": list(USAGE.deliveries.values())[-250:]}
+                           "deliveries": list(USAGE.deliveries.values())[-250:],
+                           "subtitleCharges": list(USAGE.subtitle_charges.values())[-100:]}
             self._send_json(200, payload)
             USAGE.report()
             return

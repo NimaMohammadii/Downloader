@@ -106,6 +106,23 @@ class UsageTests(unittest.TestCase):
                     asyncio.run(app.upload_complete_file('123:secret', 'sendVideo', {'chat_id': '-5'}, ('x', source, 'video/mp4')))
             self.assertEqual(len(meter.deliveries), 1)
 
+    def test_acknowledging_pending_charge_cannot_drop_a_newer_completion(self):
+        meter=self.meter()
+        pending={'key':'sub:race','state':'pending'}
+        finished={**pending,'state':'measured'}
+        meter.subtitle_charge(pending)
+        calls=[]
+        def response(*args,**kwargs):
+            calls.append(kwargs['json'])
+            if len(calls)==1:
+                meter.subtitle_charge(finished)
+            return type('Response',(),{'ok':len(calls)==1})()
+        with patch.object(app.requests,'post',side_effect=response):
+            meter.flush()
+        self.assertEqual(calls[0]['subtitleCharges'],[pending])
+        self.assertEqual(calls[1]['subtitleCharges'],[finished])
+        self.assertEqual(meter.subtitle_charges['sub:race'],finished)
+
     def test_idle_exit_is_cancelled_if_new_work_arrives_during_final_stats_flush(self):
         meter = self.meter()
         exits = []

@@ -3,7 +3,9 @@ import { PUBLIC_ERROR_MESSAGE, isPublicErrorMessage, isPublicErrorFrame, publicE
 export { PUBLIC_ERROR_MESSAGE } from "./public-errors";
 import { BroadcastManager } from "./broadcast";
 import { DurableObject } from "cloudflare:workers";
-import { subtitleSettings } from "./youtube-subtitles";
+import { subtitleSettings, isSubtitleLanguage, type SubtitleLanguage } from "./youtube-subtitles";
+import { createSubtitleLedger, saveSubtitleCharge, subtitleCosts, subtitleCostLines, subtitleDollars, subtitleChoiceLabel,
+  validSubtitleCharge, type SubtitleCharge, type SubtitleCosts } from "./subtitle-usage";
 
 // Error visibility is enforced before both drafts and final Telegram messages.
 export function isErrorNotice(text: string): boolean {
@@ -69,7 +71,8 @@ export function telegramCustomEmoji(method: string, payload: Record<string, unkn
         if (entities.some(e => ["code", "pre", "url", "custom_emoji"].includes(String(e.type)) &&
             Number(e.offset) < offset + match[0].length && Number(e.offset) + Number(e.length) > offset)) continue;
         entities.push({ type: "custom_emoji", offset, length: match[0].length,
-          custom_emoji_id: telegramEmojiIds[match[0].replace(/\uFE0F/g, "")] });
+          custom_emoji_id: match[0] === "✅" && (body[field] as string).startsWith("✅ زیرنویس:", offset)
+            ? "5206607081334906820" : telegramEmojiIds[match[0].replace(/\uFE0F/g, "")] });
       }
       if (entities.length) result[entityField] = entities.sort((a, b) => Number(a.offset) - Number(b.offset));
     }
@@ -210,8 +213,9 @@ export type DownloadRecord = {
   delivered?: number;
   category?: DownloadCategory;
   excludeFromStats?: boolean;
+  subtitleLanguage?: SubtitleLanguage | null;
 };
-export type AdminDownload = DownloadRecord & { createdAt: number; updatedAt: number; stale: boolean };
+export type AdminDownload = DownloadRecord & { createdAt: number; updatedAt: number; stale: boolean; subtitleCosts?: SubtitleCosts };
 export type AdminUserDetail = {
   user: AdminUserRow;
   usage?: UsageTotals;
@@ -234,10 +238,12 @@ export type UsageTotals = {
   downloads: number; bytes: number; unknownSizes: number; cached: number;
   runtimeMs: number; cpuSeconds: number; ingressBytes: number; egressBytes: number;
   cpuMeasuredMs: number; networkMeasuredMs: number;
+  subtitles?: SubtitleCosts;
 };
 export type AdminUsage = {
   trackingSince: number; now: number; lastMeasured: number | null; userId?: string;
   all: UsageTotals; day: UsageTotals; week: UsageTotals;
+  subtitleTrackingSince?: number;
 };
 
 type StoreEnv = AdminAccessEnv & { BOT_TOKEN?: string };
@@ -582,6 +588,8 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       CREATE INDEX IF NOT EXISTS idx_media_usage_time ON media_usage(recorded_at);
     `);
     this.ctx.storage.sql.exec("INSERT OR IGNORE INTO counters(key,value) VALUES ('usage_tracking_since',?)", Date.now());
+    createSubtitleLedger(this.ctx.storage.sql);
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO counters(key,value) VALUES ('subtitle_tracking_since',?)", Date.now());
     // One-time, set-based import. No timer or polling and no repeated full scan.
     if (!this.ctx.storage.sql.exec("SELECT value FROM counters WHERE key = 'download_stats_since'").toArray().length) {
       this.ctx.storage.transactionSync(() => {
@@ -634,7 +642,8 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       COALESCE(SUM(bytes IS NULL),0) AS unknownSizes, COALESCE(SUM(cached),0) AS cached
       FROM media_usage WHERE recorded_at >= ? AND recorded_at <= ? ${userId ? "AND user_id = ?" : ""}`,
       since, until, ...(userId ? [userId] : [])).one();
-    return Object.fromEntries(Object.entries({ ...resource, ...media }).map(([key, value]) => [key, asNumber(value)])) as UsageTotals;
+    return { ...Object.fromEntries(Object.entries({ ...resource, ...media }).map(([key, value]) => [key, asNumber(value)])),
+      subtitles: subtitleCosts(sql, since, until, userId) } as UsageTotals;
   }
 
   async alarm(): Promise<void> { await this.broadcasts.alarm(); }
@@ -671,13 +680,16 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
     if (url.pathname === "/broadcast") return this.broadcasts.fetch(request);
 
     if (request.method === "POST" && url.pathname === "/usage") {
-      const body = await request.json() as { samples?: UsageSample[]; deliveries?: MediaUsage[]; runs?: ContainerRun[] };
+      const body = await request.json() as { samples?: UsageSample[]; deliveries?: MediaUsage[]; runs?: ContainerRun[]; subtitleCharges?: SubtitleCharge[] };
       const runs = body.runs ?? [];
+      const charges = body.subtitleCharges ?? [];
       const validId = (id: number) => Number.isSafeInteger(id) && id >= 0;
       const metric = (n: unknown) => n === null || (typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 1e15);
       const validKey = (key: string) => typeof key === "string" && /^[A-Za-z0-9:_-]{1,180}$/.test(key);
       const now = Date.now();
-      if (!Array.isArray(body.samples) || !Array.isArray(body.deliveries) || !Array.isArray(runs) || runs.length > 250 || body.samples.length > 250 || body.deliveries.length > 250
+      if (!Array.isArray(body.samples) || !Array.isArray(body.deliveries) || !Array.isArray(runs) || !Array.isArray(charges)
+        || charges.length > 100 || charges.some(v => !validSubtitleCharge(v, now))
+        || runs.length > 250 || body.samples.length > 250 || body.deliveries.length > 250
         || runs.some(v => !v || !validKey(v.key) || !Number.isFinite(v.start) || v.start < 0 || v.start > now + 60000
           || !(v.end === null || (Number.isFinite(v.end) && v.end >= v.start && v.end <= now + 60000)))
         || body.samples.some(v => !v || !validKey(v.key) || !validId(v.userId)
@@ -690,6 +702,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         return new Response("Invalid usage", { status: 400 });
       }
       this.ctx.storage.transactionSync(() => {
+        for (const v of charges) saveSubtitleCharge(this.ctx.storage.sql, v);
         for (const v of runs) this.ctx.storage.sql.exec(`INSERT INTO container_runs VALUES (?,?,?)
           ON CONFLICT(key) DO UPDATE SET end_at = COALESCE(container_runs.end_at, excluded.end_at)
           WHERE container_runs.start_at = excluded.start_at`, v.key, v.start, v.end);
@@ -709,6 +722,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       const tracking = this.ctx.storage.sql.exec("SELECT value FROM counters WHERE key = 'usage_tracking_since'").one();
       const latest = this.ctx.storage.sql.exec("SELECT MAX(end_at) AS at FROM usage_samples WHERE user_id = ?", id || "0").one();
       return Response.json({ trackingSince: asNumber(tracking.value), now,
+        subtitleTrackingSince: asNumber(this.ctx.storage.sql.exec("SELECT value FROM counters WHERE key='subtitle_tracking_since'").one().value),
         lastMeasured: latest.at === null ? null : asNumber(latest.at), userId: id,
         all: this.usageTotals(0, now, id), day: this.usageTotals(now - 86400_000, now, id),
         week: this.usageTotals(now - 7 * 86400_000, now, id),
@@ -936,10 +950,19 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       const payload = await request.json() as DownloadRecord;
       const statuses: DownloadStatus[] = ["pending", "awaiting_selection", "processing", "success", "failed", "partial", "results"];
       if (!/^[A-Za-z0-9:_-]{1,180}$/.test(payload.key || "") || !Number.isSafeInteger(payload.userId)
-          || payload.userId <= 0 || !statuses.includes(payload.status)) return new Response("Invalid download", { status: 400 });
+          || payload.userId <= 0 || !statuses.includes(payload.status)
+          || (Object.hasOwn(payload, 'subtitleLanguage') && (payload.source !== 'YouTube'
+            || payload.subtitleLanguage !== null && !isSubtitleLanguage(payload.subtitleLanguage)))) return new Response("Invalid download", { status: 400 });
       const now = Date.now();
       const terminal = ["success", "failed", "partial", "results"].includes(payload.status);
       this.ctx.storage.transactionSync(() => {
+      if (Object.hasOwn(payload, 'subtitleLanguage')) {
+        this.ctx.storage.sql.exec(`INSERT OR IGNORE INTO users(id,first_seen,last_seen) VALUES (?,?,?)`,
+          String(payload.userId),now,now);
+        this.ctx.storage.sql.exec(`INSERT OR IGNORE INTO youtube_subtitle_choices
+          SELECT ?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM download_history WHERE key=? AND user_id!=?)`,
+          payload.key,String(payload.userId),payload.subtitleLanguage ?? null,now,payload.key,String(payload.userId));
+      }
       this.ctx.storage.sql.exec(
         `INSERT INTO download_history(key,user_id,source,request,status,title,detail,delivered,created_at,updated_at)
          VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET
@@ -998,13 +1021,17 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       const totalPages = Math.max(1, Math.ceil(asNumber(counts.total) / ADMIN_DOWNLOADS_PAGE_SIZE));
       const rawPage = Number(url.searchParams.get("page") || 0);
       const page = Math.min(Number.isSafeInteger(rawPage) && rawPage >= 0 ? rawPage : 0, totalPages - 1);
-      const downloads = sql.exec("SELECT * FROM download_history WHERE user_id = ? ORDER BY created_at DESC, key DESC LIMIT ? OFFSET ?",
+      const downloads = sql.exec(`SELECT h.*, s.download_key AS subtitle_recorded, s.language AS subtitle_language
+        FROM download_history h LEFT JOIN youtube_subtitle_choices s ON s.download_key=h.key AND s.user_id=h.user_id
+        WHERE h.user_id = ? ORDER BY h.created_at DESC, h.key DESC LIMIT ? OFFSET ?`,
         id, ADMIN_DOWNLOADS_PAGE_SIZE, page * ADMIN_DOWNLOADS_PAGE_SIZE).toArray().map(row => ({
           key: String(row.key), userId: Number(id), source: String(row.source), request: String(row.request),
           status: row.status as DownloadStatus, title: row.title ? String(row.title) : undefined,
           detail: row.detail ? String(row.detail) : undefined, delivered: asNumber(row.delivered),
           createdAt: asNumber(row.created_at), updatedAt: asNumber(row.updated_at),
           stale: ["pending", "processing"].includes(String(row.status)) && asNumber(row.updated_at) < staleBefore,
+          ...(row.subtitle_recorded ? { subtitleLanguage: row.subtitle_language as SubtitleLanguage | null,
+            subtitleCosts: subtitleCosts(sql,0,Date.now(),id,String(row.key)) } : {}),
         }));
       return Response.json({
         user: { id, username: rawUser.username, firstName: rawUser.first_name, lastName: rawUser.last_name,
@@ -1342,7 +1369,9 @@ function displayText(value: unknown, limit: number): string | null {
 }
 
 export async function recordDownload(env: Partial<AdminStatsEnv> & { BOT_TOKEN?: string }, record: DownloadRecord): Promise<void> {
-  if (!env.ADMIN_STATS || isAdmin(env, record.userId)) return;
+  // The admin-only subtitle feature also needs visible history and costs for
+  // its administrator. Preserve exclusions for every other admin activity.
+  if (!env.ADMIN_STATS || isAdmin(env, record.userId) && !Object.hasOwn(record, 'subtitleLanguage')) return;
   try {
     const response = await statsStub(env as AdminStatsEnv).fetch("https://admin-stats/download", {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(record),
@@ -1350,7 +1379,7 @@ export async function recordDownload(env: Partial<AdminStatsEnv> & { BOT_TOKEN?:
     if (!response.ok) console.warn("download history rejected", { status: response.status });
     else {
       const result = await response.json() as { firstDownload?: boolean };
-      if (result.firstDownload && env.BOT_TOKEN) {
+      if (result.firstDownload && env.BOT_TOKEN && !isAdmin(env, record.userId)) {
         try {
           const { notifyFirstDownload } = await import("./membership");
           await notifyFirstDownload(env, record.userId);
@@ -1392,7 +1421,8 @@ export function formatAdminUserDetail(detail: AdminUserDetail): string {
     `⏳ باز: ${counts.active} • ❔ نتیجه نامشخص: ${counts.stale} • 🔎 جست‌وجو: ${counts.results}`, "",
     ...(detail.usage ? [`📦 حجم تحویل ثبت‌شده: ${bytesLabel(detail.usage.bytes)} • سهم تخمینی زمان کانتینر: ${durationLabel(detail.usage.runtimeMs)}`,
       `سهم ترافیک ↓ ${bytesLabel(detail.usage.ingressBytes)} • ↑ ${bytesLabel(detail.usage.egressBytes)}`,
-      `هزینهٔ تخمینی ناخالص: ${usageCostLabel(detail.usage)}`, ""] : []),
+      `هزینهٔ تخمینی ناخالص کانتینر: ${usageCostLabel(detail.usage)}`,
+      ...(detail.usage.subtitles ? subtitleCostLines(detail.usage.subtitles) : []), ""] : []),
     `📋 سابقه • صفحه ${detail.page + 1}/${detail.totalPages}`,
     "سابقه و تعداد برگشت‌های پیش از فعال‌شدن ثبت جدید در دسترس نیست.",
   ];
@@ -1401,6 +1431,10 @@ export function formatAdminUserDetail(detail: AdminUserDetail): string {
     lines.push("", `${detail.page * ADMIN_DOWNLOADS_PAGE_SIZE + index + 1}. ${displayText(item.source, 32)} • ${dateLabel(item.createdAt)}`,
       item.stale ? "❔ نتیجه نهایی ثبت نشده (بیش از ۴ ساعت)" : STATUS_LABELS[item.status],
       ...(item.title ? [`عنوان: ${displayText(item.title, 90)}`] : []),
+      ...(item.source === 'YouTube' ? [subtitleChoiceLabel(item.subtitleLanguage),
+        ...(item.subtitleLanguage !== undefined && item.subtitleCosts ? [
+          `API زیرنویس این دانلود: ${subtitleDollars(item.subtitleCosts.transcriptionNano + item.subtitleCosts.translationNano)}${item.subtitleCosts.unknown ? ' + هزینهٔ نامشخص' : ''}`,
+        ] : [])] : []),
       `درخواست: ${displayText(item.request, 180)}`,
       ...(item.delivered ? [`فایل تحویل‌شده: ${item.delivered}`] : []),
       ...(item.detail ? [`توضیح: ${displayText(item.detail, 100)}`] : []));
@@ -1424,11 +1458,11 @@ export function adminUserDetailKeyboard(detail: AdminUserDetail, usersPage: numb
 }
 
 // Telemetry failures must never reject a download or replay a Telegram send.
-export async function recordUsage(env: Partial<AdminStatsEnv>, samples: UsageSample[] = [], deliveries: MediaUsage[] = [], runs: ContainerRun[] = []): Promise<boolean> {
+export async function recordUsage(env: Partial<AdminStatsEnv>, samples: UsageSample[] = [], deliveries: MediaUsage[] = [], runs: ContainerRun[] = [], subtitleCharges: SubtitleCharge[] = []): Promise<boolean> {
   if (!env.ADMIN_STATS) return false;
   try {
     const response = await statsStub(env as AdminStatsEnv).fetch("https://admin-stats/usage", {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ samples, deliveries, runs }),
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ samples, deliveries, runs, subtitleCharges }),
       signal: AbortSignal.timeout(1500),
     });
     return response.ok;
@@ -1458,10 +1492,10 @@ function durationLabel(ms: number): string {
   return `${(ms / 3600000).toFixed(3)} ساعت`;
 }
 
-function usageCostLabel(value: UsageTotals): string {
+function usageCostLabel(value: UsageTotals, subtitleNano = 0): string {
   // standard-2: 6 GiB RAM, 12 GB disk. CPU is measured from the container
   // cgroup, never inferred from elapsed time. Gross rates verified 2026-10-20.
-  const fixed = value.runtimeMs / 1000 * (6 * 0.0000025 + 12 * 0.00000007);
+  const fixed = value.runtimeMs / 1000 * (6 * 0.0000025 + 12 * 0.00000007) + subtitleNano / 1e9;
   const cpu = value.cpuSeconds * 0.000020;
   const low = fixed + cpu + value.egressBytes / 1e9 * 0.025;
   const high = fixed + cpu + value.egressBytes / 1e9 * 0.05;
@@ -1477,11 +1511,15 @@ export function formatAdminUsage(usage: AdminUsage): string {
       `${usage.userId ? "سهم تخمینی زمان کانتینر" : "زمان روشن ثبت‌شدهٔ کانتینرها"}: ${durationLabel(value.runtimeMs)}`,
       `CPU ثبت‌شده: ${value.cpuSeconds.toFixed(3)} vCPU-s`,
       `ترافیک کانتینر ↓ ${bytesLabel(value.ingressBytes)} • ↑ ${bytesLabel(value.egressBytes)}`,
-      `هزینهٔ تخمینی ناخالص: ${usageCostLabel(value)}`,
+      `هزینهٔ تخمینی ناخالص کانتینر: ${usageCostLabel(value)}`,
+      ...(value.subtitles ? [...subtitleCostLines(value.subtitles),
+        `جمع کانتینر و API ثبت‌شده: ${usageCostLabel(value,value.subtitles.transcriptionNano + value.subtitles.translationNano)}`] : []),
       ...(value.cpuMeasuredMs + 1 < value.runtimeMs || value.networkMeasuredMs + 1 < value.runtimeMs
         ? ["⚠️ بخشی از اندازه‌گیری CPU یا شبکه در دسترس نیست؛ برآورد ناقص است."] : []), "");
   }
   lines.push("نوع فعلی: standard-2؛ تعرفه‌ها: ۲۰ اکتبر ۲۰۲۶.",
+    ...(usage.subtitleTrackingSince ? [`ثبت هزینهٔ زیرنویس از ${dateLabel(usage.subtitleTrackingSince)}؛ سوابق قبل از آن هزینهٔ قابل بازیابی ندارند.`,
+      "API: مدت صدای ارسال‌شده و توکن واقعی پاسخ؛ تعرفهٔ عمومی 2026-10-29، پیش از مالیات، تخفیف و سهمیه. استفاده از کش هزینهٔ API جدید ندارد. هزینهٔ نامشخص در جمع نیست."] : []),
     "هزینه تخمینی است؛ سهمیهٔ رایگان/ماهانه و هزینهٔ Workers، DO، لاگ و پلن لحاظ نشده. ترافیک شبکه الزاماً برابر ترافیک قابل‌صورتحساب نیست.",
     usage.userId ? "مصرف هم‌زمان بر اساس تعداد کارهای فعال تقسیم می‌شود؛ بیکاری و کارهای بدون شناسه فقط در آمار کل است." : "آمار کل شامل بیکاری و کارهای بدون شناسه است؛ جمع سهم کاربران ممکن است کمتر باشد.",
     "نمونه‌برداری در رویدادهای کار است؛ سهم هر بازه بین نمونه‌ها تقریبی است. توقف ناگهانی ممکن است آخرین نمونه را از دست بدهد.",

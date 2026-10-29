@@ -34,6 +34,7 @@ COPY locales/messages.json /app/messages.json
 COPY locales/subtitle-languages.json /app/subtitle-languages.json
 COPY container/localization.py /app/localization.py
 COPY container/ai_subtitles.py /app/ai_subtitles.py
+COPY container/subtitle_usage.py /app/subtitle_usage.py
 COPY container/youtube_app.py /app/youtube_app.py
 COPY container/youtube_pipeline.py /app/youtube_pipeline.py
 COPY container/pornhub.py /app/pornhub.py

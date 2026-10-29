@@ -29,7 +29,7 @@ export function subtitleButtons(menu: SubtitleMenu, picker = false): SubtitleBut
   }
   const row: SubtitleButton[] = [{ text: `زیرنویس: ${p.enabled ? 'فعال' : 'غیرفعال'}`,
     icon_custom_emoji_id: p.enabled ? ON : OFF, callback_data: `ytst|${suffix}|${p.enabled ? 0 : 1}` }];
-  if (p.language) row.push({ text: subtitleName(p.language), callback_data: `ytsp|${suffix}|open` });
+  if (p.language) row.unshift({ text: subtitleName(p.language), callback_data: `ytsp|${suffix}|open` });
   return [row];
 }
 

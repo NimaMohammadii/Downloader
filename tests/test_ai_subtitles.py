@@ -177,6 +177,39 @@ class SubtitleTests(unittest.TestCase):
                 self.assertNotIn('private-', str(failure.exception))
             post.assert_called_once()
 
+    def test_accounting_measures_only_new_calls_and_keeps_original_owner_on_cache_replay(self):
+        from subtitle_usage import replay_charges
+        response=self.translation()
+        response.update({'model':'gpt-6-luna','service_tier':'default','usage':{'input_tokens':200,
+            'input_tokens_details':{'cached_tokens':50,'cache_write_tokens':100},'output_tokens':80}})
+        billing={'downloadKey':'youtube:42:7:42','userId':42,'language':'fa'}
+        receipt=self.directory/'translate.pending'
+        with patch.object(app.USAGE,'subtitle_charge') as publish, patch.object(app.requests,'post',return_value=self.Response(response)) as post:
+            first=subs._paid_post('OpenAI','https://api.openai.com/v1/responses',{},receipt,billing=billing,json={'model':'gpt-6-luna'})
+            second=subs._paid_post('OpenAI','https://api.openai.com/v1/responses',{},receipt,billing={**billing,'userId':99},json={'model':'gpt-6-luna'})
+            post.assert_called_once();self.assertEqual(first,second)
+            replay_charges(self.directory)
+        events=[c.args[0] for c in publish.call_args_list]
+        self.assertEqual([e['state'] for e in events],['pending','measured','measured'])
+        self.assertEqual(len({e['key'] for e in events}),1)
+        self.assertTrue(all(e['userId']==42 for e in events))
+        self.assertEqual(events[-1]['cachedInputTokens'],50)
+        self.assertEqual(events[-1]['cacheWriteTokens'],100)
+        self.assertNotIn('cues',json.dumps(events))
+
+    def test_accounting_reports_unknown_failure_and_does_not_block_success(self):
+        billing={'downloadKey':'youtube:42:7:42','userId':42,'language':'fa'}
+        with patch.object(app.USAGE,'subtitle_charge') as publish, patch.object(app.requests,'post',side_effect=OSError('private-key')) as post:
+            for _ in range(2):
+                with self.assertRaises(app.UserVisibleError):
+                    subs._paid_post('OpenAI','https://api.openai.com/v1/responses',{},self.directory/'bad.pending',billing=billing,json={'model':'gpt-6-luna'})
+            post.assert_called_once()
+            self.assertEqual(publish.call_args.args[0]['state'],'unknown')
+            self.assertNotIn('private-key',json.dumps(publish.call_args.args[0]))
+        with patch.object(app.USAGE,'subtitle_charge',side_effect=RuntimeError('telemetry unavailable')), \
+             patch.object(app.requests,'post',return_value=self.Response({'ok':True})):
+            self.assertEqual(subs._paid_post('OpenAI','https://api.openai.com/v1/responses',{},self.directory/'good.pending',billing=billing,json={'model':'gpt-6-luna'}),{'ok':True})
+
     def test_http_error_reports_only_status_no_provider_body_and_does_not_retry(self):
         for status in (401, 429, 500):
             with self.subTest(status=status), patch.object(app.requests, 'post', return_value=self.Response({'secret': 'private-gpt'}, status)) as post:

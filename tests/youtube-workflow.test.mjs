@@ -735,8 +735,8 @@ test('first enable opens twelve languages in four rows; selection persists and e
   const selected=await subtitleChoice('ytsl|dQw4w9WgXcQ|7|1|de',1,{ADMIN_STATS:binding});
   const restored=selected.messages.find(m=>m.reply_markup);
   assert.equal(restored.message_id,10);
-  assert.equal(restored.reply_markup.inline_keyboard.at(-1)[0].icon_custom_emoji_id,'5206607081334906820');
-  assert.equal(restored.reply_markup.inline_keyboard.at(-1)[1].text,'Deutsch');
+  assert.equal(restored.reply_markup.inline_keyboard.at(-1)[1].icon_custom_emoji_id,'5206607081334906820');
+  assert.equal(restored.reply_markup.inline_keyboard.at(-1)[0].text,'Deutsch');
   const reopened=await subtitleChoice('ytsp|dQw4w9WgXcQ|7|1|open',1,{ADMIN_STATS:binding});
   assert.equal(reopened.messages.find(m=>m.reply_markup).reply_markup.inline_keyboard.slice(0,4).flat().length,12);
   const next=menuFixture({messageId:11,requestMessageId:8});
@@ -818,6 +818,13 @@ test('subtitle authorization is checked in Workflow before cache, container boot
     const result=await run(options);
     assert.equal(result.calls.length,0);assert.equal(result.delivered,0);
   }
+});
+
+test('YouTube history carries explicit subtitle mode and language while other source history stays unchanged',async()=>{
+  await run();assert.equal(globalThis.downloadHistory.at(-1).subtitleLanguage,null);
+  await run({jobChanges:{subtitle:'hi',userId:1},subtitleVersion:2});
+  assert.equal(globalThis.downloadHistory.at(-1).subtitleLanguage,'hi');
+  await run({pornhub:true});assert.ok(!Object.hasOwn(globalThis.downloadHistory.at(-1),'subtitleLanguage'));
 });
 
 test('ordinary jobs never receive AI credentials; signed admin subtitle payload stays on the same download endpoint',async()=>{
