@@ -46,7 +46,7 @@ class SubtitleTests(unittest.TestCase):
 
     def sign(self):
         p = self.payload
-        message = f"subtitle-fa-v1|{p['id']}|{p['userId']}|abcdefghijk|{p['quality']}"
+        message = f"subtitle-{p['subtitle']}-v1|{p['id']}|{p['userId']}|abcdefghijk|{p['quality']}"
         p['subtitleAuthorization'] = hmac.new(p['botToken'].encode(), message.encode(), hashlib.sha256).hexdigest()
 
     def tearDown(self):
@@ -107,6 +107,66 @@ class SubtitleTests(unittest.TestCase):
                 with self.assertRaises(app.UserVisibleError):
                     subs.prepare(self.path, {**self.payload, **changed}, lambda text, **kwargs: None)
                 post.assert_not_called()
+
+    def test_all_twelve_languages_have_distinct_authorized_cache_keys(self):
+        self.assertEqual(len(subs.LANGUAGES), 12)
+        keys = set()
+        for language in subs.LANGUAGES:
+            self.payload['subtitle'] = language
+            self.payload['mediaCacheKey'] = f'yt:abcdefghijk:v360:sub-{language}-v1'
+            self.sign()
+            subs.authorize(self.payload)
+            keys.add(self.payload['mediaCacheKey'])
+            with self.assertRaises(app.UserVisibleError):
+                subs.authorize({**self.payload, 'subtitle': 'de' if language != 'de' else 'fa'})
+        self.assertEqual(len(keys), 12)
+
+    def test_translation_target_and_paid_receipts_are_isolated_by_language(self):
+        cues = subs._source_cues(self.transcript(), 4)
+        receipts = set()
+        for language, details in subs.LANGUAGES.items():
+            with patch.object(subs, '_paid_post', return_value=self.translation()) as paid:
+                translated = subs._translate(cues, 'key', self.directory, lambda text: None, language)
+            call = paid.call_args
+            self.assertIn(f"concise {details['target']}.", call.kwargs['json']['instructions'])
+            receipts.add(call.args[3])
+            self.assertEqual([(c['start'], c['end']) for c in translated], [(c['start'], c['end']) for c in cues])
+        self.assertEqual(len(receipts), 12)
+        self.assertIn(self.directory / 'translate-0.pending', receipts)
+
+    def test_switching_target_reuses_transcript_but_not_translation(self):
+        with patch.object(app.requests, 'post', side_effect=[self.Response(self.transcript()),
+                self.Response(self.translation()), self.Response(self.translation())]) as post:
+            outputs = []
+            for language in ('de', 'hi', 'en'):
+                self.payload['subtitle'] = language
+                self.payload['mediaCacheKey'] = f'yt:abcdefghijk:v360:sub-{language}-v1'
+                self.sign()
+                outputs.append(subs.prepare(self.path, self.payload, lambda text, **kwargs: None))
+        self.assertEqual(post.call_count, 3, 'One transcript, two translations; English source needs no translation')
+        self.assertEqual(len(set(outputs)), 3)
+        self.assertEqual(sum('speech-to-text' in c.args[0] for c in post.call_args_list), 1)
+
+    def test_chinese_and_hindi_fonts_render_without_missing_glyphs(self):
+        for language, family, text in [('zh', 'CJK', '你好，欢迎观看视频。'),
+                                       ('hi', 'Devanagari', 'नमस्ते आपका स्वागत है')]:
+            matched = subprocess.check_output(['fc-list', f':lang={language}', 'family'], text=True)
+            if family not in matched:
+                self.skipTest('Noto fonts are verified by the production image build')
+            subtitle = self.directory / f'{language}.ass'
+            subs._ass([{'start': 0, 'end': 3, 'text': text}], subtitle, language)
+            result = subprocess.run(['ffmpeg', '-v', 'info', '-i', str(self.path), '-vf', f'ass={subtitle}',
+                                     '-frames:v', '1', '-f', 'null', '-'], capture_output=True, text=True, check=True)
+            self.assertNotIn('not found', result.stderr)
+            self.assertIn(family, result.stderr)
+
+    def test_chinese_without_spaces_wraps_within_video_width(self):
+        subtitle = self.directory / 'zh.ass'
+        subs._ass([{'start': 0, 'end': 3, 'text': '这是一个没有空格的中文字幕测试。' * 4}], subtitle, 'zh')
+        line = next(line for line in subtitle.read_text().splitlines() if line.startswith('Dialogue:'))
+        text = line.split(',', 9)[-1]
+        self.assertGreater(len(text.split(r'\N')), 1)
+        self.assertTrue(all(len(part) <= 24 for part in text.split(r'\N')))
 
     def test_ambiguous_paid_failure_is_not_retried_and_keys_are_not_exposed(self):
         receipt = self.directory / 'request.pending'

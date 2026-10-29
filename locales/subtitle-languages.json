@@ -1,0 +1,14 @@
+{
+  "fa": {"name": "فارسی", "target": "Persian", "aliases": ["fa", "fas", "per"]},
+  "en": {"name": "English", "target": "English", "aliases": ["en", "eng"]},
+  "ar": {"name": "العربية", "target": "Arabic", "aliases": ["ar", "ara"]},
+  "tr": {"name": "Türkçe", "target": "Turkish", "aliases": ["tr", "tur"]},
+  "de": {"name": "Deutsch", "target": "German", "aliases": ["de", "deu", "ger"]},
+  "fr": {"name": "Français", "target": "French", "aliases": ["fr", "fra", "fre"]},
+  "es": {"name": "Español", "target": "Spanish", "aliases": ["es", "spa"]},
+  "it": {"name": "Italiano", "target": "Italian", "aliases": ["it", "ita"]},
+  "pt": {"name": "Português", "target": "Portuguese", "aliases": ["pt", "por"]},
+  "ru": {"name": "Русский", "target": "Russian", "aliases": ["ru", "rus"]},
+  "zh": {"name": "中文", "target": "Simplified Chinese", "aliases": ["zh", "zho", "chi", "cmn"]},
+  "hi": {"name": "हिन्दी", "target": "Hindi", "aliases": ["hi", "hin"]}
+}

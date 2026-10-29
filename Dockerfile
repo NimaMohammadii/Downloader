@@ -19,16 +19,19 @@ RUN python3 -m venv --system-site-packages /opt/venv \
     && ffmpeg -version >/dev/null \
     && /opt/venv/bin/python -c 'import requests, telethon, cryptg, shazamio, shazamio_core, gallery_dl, yt_dlp, yt_dlp_ejs; from yt_dlp.networking._curlcffi import CurlCFFIRH; assert CurlCFFIRH._SUPPORTED_IMPERSONATE_TARGET_MAP, "Browser impersonation unavailable"'
 
-# Fonts and libass are required only for the optional burned-in Persian captions.
+# Fonts and libass are required only for the optional multilingual captions.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends fonts-dejavu-core fontconfig \
+    && apt-get install -y --no-install-recommends fonts-dejavu-core fonts-noto-core fonts-noto-cjk fontconfig \
     && rm -rf /var/lib/apt/lists/* \
     && fc-match 'DejaVu Sans' \
+    && fc-list ':lang=zh-cn' family | grep -q 'Noto.*CJK' \
+    && fc-list ':lang=hi' family | grep -q 'Noto.*Devanagari' \
     && ffmpeg -hide_banner -filters 2>/dev/null | grep -q 'Render ASS subtitles'
 
 WORKDIR /app
 COPY container/public_errors.json /app/public_errors.json
 COPY locales/messages.json /app/messages.json
+COPY locales/subtitle-languages.json /app/subtitle-languages.json
 COPY container/localization.py /app/localization.py
 COPY container/ai_subtitles.py /app/ai_subtitles.py
 COPY container/youtube_app.py /app/youtube_app.py

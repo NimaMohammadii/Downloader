@@ -3,6 +3,7 @@ import { PUBLIC_ERROR_MESSAGE, isPublicErrorMessage, isPublicErrorFrame, publicE
 export { PUBLIC_ERROR_MESSAGE } from "./public-errors";
 import { BroadcastManager } from "./broadcast";
 import { DurableObject } from "cloudflare:workers";
+import { subtitleSettings } from "./youtube-subtitles";
 
 // Error visibility is enforced before both drafts and final Telegram messages.
 export function isErrorNotice(text: string): boolean {
@@ -639,6 +640,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
   async alarm(): Promise<void> { await this.broadcasts.alarm(); }
 
   async fetch(request: Request): Promise<Response> {
+    if (new URL(request.url).pathname === "/youtube-subtitles") return subtitleSettings(request, this.ctx.storage);
     const languageUrl = new URL(request.url);
     if (languageUrl.pathname === "/language-menu") {
       const user = languageUrl.searchParams.get("user") || "";

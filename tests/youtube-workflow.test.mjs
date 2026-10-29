@@ -7,13 +7,17 @@ import { createHmac } from 'node:crypto';
 const reddit = await readFile(new URL('../src/reddit.ts', import.meta.url), 'utf8');
 const bandcamp = await readFile(new URL('../src/bandcamp.ts', import.meta.url), 'utf8');
 const source = await readFile(new URL('../src/youtube-main.ts', import.meta.url), 'utf8');
+const subtitleSource = await readFile(new URL('../src/youtube-subtitles.ts', import.meta.url), 'utf8');
+const subtitleLanguages = await readFile(new URL('../locales/subtitle-languages.json', import.meta.url), 'utf8');
 const instagram = await readFile(new URL('../src/index.ts', import.meta.url), 'utf8');
 const { outputFiles } = await build({ external: ['node:async_hooks'],
-  stdin: { contents: source + '\nexport {extractPornhubUrl,handleQualityCallback,parseQualityCallback,mediaCacheKey};', loader: 'ts', resolveDir: process.cwd() },
+  stdin: { contents: source + '\nexport {extractPornhubUrl,handleQualityCallback,handleSubtitleCallback,parseQualityCallback,mediaCacheKey,subtitleButtons}; export {subtitleSettings} from "./youtube-subtitles";', loader: 'ts', resolveDir: process.cwd() },
   bundle: true, format: 'esm', write: false,
   plugins: [{ name: 'cloudflare-test-bindings', setup(build) {
     build.onResolve({ filter: /.*/ }, args => ({ path: args.path, namespace: 'test' }));
     build.onLoad({ filter: /.*/, namespace: 'test' }, args => {
+      if (args.path === './youtube-subtitles') return { contents: subtitleSource, loader: 'ts' };
+      if (args.path === '../locales/subtitle-languages.json') return { contents: subtitleLanguages, loader: 'json' };
       if (args.path === '@cloudflare/containers') return { contents: `
         export class Container {
           constructor(ctx, env) { this.ctx = ctx; this.env = env; }
@@ -55,7 +59,21 @@ const { outputFiles } = await build({ external: ['node:async_hooks'],
     });
   } }],
 });
-const { DownloadPool, YoutubeDownloaderContainer, YoutubeDownloadWorkflow, extractPornhubUrl, handleQualityCallback, parseQualityCallback, mediaCacheKey, default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
+const { DownloadPool, YoutubeDownloaderContainer, YoutubeDownloadWorkflow, extractPornhubUrl, handleQualityCallback, handleSubtitleCallback, parseQualityCallback, mediaCacheKey, subtitleButtons, subtitleSettings, default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
+
+function subtitleBinding(storage = memoryStorage()) {
+  return { getByName() { return { fetch: (url, init) => subtitleSettings(new Request(url, init), storage) }; } };
+}
+function menuFixture(changes={}) {
+  return {videoId:'dQw4w9WgXcQ',requestMessageId:7,userId:1,chatId:1,messageId:10,
+    title:'Fixture',qualities:[360,480,720,1080],audioAvailable:true,
+    preference:{enabled:false},createdAt:Date.now(),...changes};
+}
+async function settings(binding, op, extra={}) {
+  const menu=menuFixture();
+  return binding.getByName('global').fetch('https://admin-stats/youtube-subtitles', {method:'POST',
+    body:JSON.stringify({...menu,op,...(op==='open'?{menu}:{}),...extra})});
+}
 
 function memoryStorage() {
   const values = new Map();
@@ -486,7 +504,7 @@ async function run({ inspect = false, startupError, httpError, result, sizes, cr
     ...(pornhub ? { source: 'pornhub', url: 'https://www.pornhub.com/view_video.php?viewkey=ph123' } : inspect ? {} : { quality: 720, statusMessageId: 10 }),
   };
   Object.assign(job,jobChanges);
-  await new YoutubeDownloadWorkflow({}, { BOT_TOKEN: 'secret-token', DOWNLOAD_POOL: pool, PORNHUB_COOKIES: 'obsolete-secret',
+  await new YoutubeDownloadWorkflow({}, { BOT_TOKEN: 'secret-token', ADMIN_STATS: subtitleBinding(), DOWNLOAD_POOL: pool, PORNHUB_COOKIES: 'obsolete-secret',
     ...(aiSecrets?{ELEVEN_API:'private-eleven',GPT_API:'private-gpt'}:{}),
     ...(credentials ? { API_ID: '123', API_HASH: 'secret-hash' } : {}) }).run({ payload: job }, step);
   return { calls, messages, steps, delivered: globalThis.delivered };
@@ -683,26 +701,91 @@ async function subtitleChoice(data, actor=1, extra={}) {
   const messages=[],jobs=[];
   globalThis.fetch=async(_url,init)=>{const body=JSON.parse(init.body);messages.push(body);return Response.json({ok:true,result:{message_id:10}});};
   const env={BOT_TOKEN:'secret-token',ELEVEN_API:'private-eleven',GPT_API:'private-gpt',
-    YOUTUBE_DOWNLOAD_WORKFLOW:{async create(job){jobs.push(job);}},...extra};
-  await handleQualityCallback(env,{}, {id:'callback',from:{id:actor},data,message:{message_id:10,chat:{id:actor}}});
-  return {messages,jobs};
+    ADMIN_STATS:subtitleBinding(),YOUTUBE_DOWNLOAD_WORKFLOW:{async create(job){jobs.push(job);}},...extra};
+  await settings(env.ADMIN_STATS,'open');
+  const callback={id:'callback',from:{id:actor},data,message:{message_id:10,chat:{id:actor}}};
+  if (/^(ytst|ytsl|ytsp)\|/.test(data)) await handleSubtitleCallback(env,callback);
+  else await handleQualityCallback(env,{},callback);
+  return {messages,jobs,env};
 }
 
-test('only admins get a subtitle choice after video quality; normal users and audio keep the original path',async()=>{
-  const menu=await subtitleChoice('ytq|dQw4w9WgXcQ|720|7|1');
-  assert.equal(menu.jobs.length,0);
-  const buttons=menu.messages.find(m=>m.reply_markup).reply_markup.inline_keyboard.flat();
-  assert.equal(buttons.length,2);
-  assert.ok(buttons.every(b=>Buffer.byteLength(b.callback_data)<=64));
-  const withSubs=await subtitleChoice(buttons[0].callback_data);
-  assert.equal(withSubs.jobs.length,1);assert.equal(withSubs.jobs[0].params.subtitle,'fa');
-  assert.ok(!JSON.stringify(withSubs.jobs).includes('private-'),'API keys must not enter Workflow params');
-  const without=await subtitleChoice(buttons[1].callback_data);
-  assert.ok(!Object.hasOwn(without.jobs[0].params,'subtitle'));
+test('quality selection starts immediately and only admin quality menus have subtitle controls',async()=>{
+  const displayed=await run({inspect:true,jobChanges:{userId:1,chatId:1}});
+  const rows=displayed.messages.find(m=>m.reply_markup?.inline_keyboard).reply_markup.inline_keyboard;
+  assert.equal(rows.at(-1)[0].icon_custom_emoji_id,'5210952531676504517');
+  assert.ok(rows.at(-1)[0].callback_data.startsWith('ytst|'));
+  const noAdmin=await run({inspect:true});
+  assert.ok(!JSON.stringify(noAdmin.messages).includes('ytst|'));
+  const disabled=await subtitleChoice('ytq|dQw4w9WgXcQ|720|7|1');
+  assert.equal(disabled.jobs.length,1);assert.ok(!disabled.jobs[0].params.subtitle);
+  assert.ok(!disabled.messages.some(m=>String(m.text).includes('می‌خواهی')));
   const normal=await subtitleChoice('ytq|dQw4w9WgXcQ|720|7|42',42);
   assert.equal(normal.jobs.length,1);assert.ok(!Object.hasOwn(normal.jobs[0].params,'subtitle'));
   const audio=await subtitleChoice('ytq|dQw4w9WgXcQ|ah|7|1');
   assert.equal(audio.jobs.length,1);assert.equal(audio.jobs[0].params.audioMode,'hq');
+});
+
+test('first enable opens twelve languages in four rows; selection persists and edits the same menu',async()=>{
+  const on=await subtitleChoice('ytst|dQw4w9WgXcQ|7|1|1');
+  const rows=on.messages.find(m=>m.reply_markup).reply_markup.inline_keyboard;
+  assert.deepEqual(rows.slice(0,4).map(r=>r.length),[3,3,3,3]);
+  assert.equal(rows.flat().filter(b=>b.callback_data.startsWith('ytsl|')).length,12);
+  assert.ok(rows.flat().every(b=>Buffer.byteLength(b.callback_data)<=64));
+  const binding=on.env.ADMIN_STATS;
+  const selected=await subtitleChoice('ytsl|dQw4w9WgXcQ|7|1|de',1,{ADMIN_STATS:binding});
+  const restored=selected.messages.find(m=>m.reply_markup);
+  assert.equal(restored.message_id,10);
+  assert.equal(restored.reply_markup.inline_keyboard.at(-1)[0].icon_custom_emoji_id,'5206607081334906820');
+  assert.equal(restored.reply_markup.inline_keyboard.at(-1)[1].text,'Deutsch');
+  const reopened=await subtitleChoice('ytsp|dQw4w9WgXcQ|7|1|open',1,{ADMIN_STATS:binding});
+  assert.equal(reopened.messages.find(m=>m.reply_markup).reply_markup.inline_keyboard.slice(0,4).flat().length,12);
+  const next=menuFixture({messageId:11,requestMessageId:8});
+  const response=await settings(binding,'open',{messageId:11,menu:next});
+  assert.deepEqual((await response.json()).preference,{enabled:true,language:'de'});
+  const job=await subtitleChoice('ytq|dQw4w9WgXcQ|720|7|1',1,{ADMIN_STATS:binding});
+  assert.equal(job.jobs[0].params.subtitle,'de');
+  assert.ok(!JSON.stringify(job.jobs).includes('private-'));
+  const stale=await subtitleChoice('ytst|dQw4w9WgXcQ|7|1|0',1,{ADMIN_STATS:binding});
+  assert.ok(!stale.messages.some(m=>m.reply_markup));
+});
+
+test('disabling retains default language; first-time back cancels enabling and users are isolated',async()=>{
+  const binding=subtitleBinding();await settings(binding,'open');
+  await settings(binding,'language',{language:'fr'});
+  await settings(binding,'enable',{enabled:false});
+  const menu=await (await settings(binding,'get')).json();
+  assert.deepEqual(menu.preference,{enabled:false,language:'fr'});
+  const other=menuFixture({userId:2,chatId:2});
+  const response=await settings(binding,'open',{userId:2,chatId:2,menu:other});
+  assert.deepEqual((await response.json()).preference,{enabled:false});
+  const first=await subtitleChoice('ytst|dQw4w9WgXcQ|7|1|1');
+  await subtitleChoice('ytsp|dQw4w9WgXcQ|7|1|back',1,{ADMIN_STATS:first.env.ADMIN_STATS});
+  assert.deepEqual((await (await settings(first.env.ADMIN_STATS,'get')).json()).preference,{enabled:false});
+});
+
+test('menu storage rejects invalid values, stale preferences and duplicate takes atomically',async()=>{
+  const binding=subtitleBinding();await settings(binding,'open');
+  assert.equal((await settings(binding,'language',{language:'__proto__'})).status,400);
+  await settings(binding,'language',{language:'en'});
+  assert.equal((await settings(binding,'take',{expected:{enabled:false}})).status,412);
+  const results=await Promise.all([settings(binding,'take'),settings(binding,'take')]);
+  assert.deepEqual(results.map(r=>r.status).sort(),[200,409]);
+  assert.equal((await settings(binding,'language',{language:'ru'})).status,409);
+  assert.equal((await settings(binding,'get',{videoId:'abcdefghijk'})).status,410);
+});
+
+test('expired menus cannot start downloads; callbacks fit Telegram limits with maximum safe IDs',async()=>{
+  const storage=memoryStorage(),binding=subtitleBinding(storage);
+  await settings(binding,'open');
+  const key='youtube-subtitle-menu:1:1:10';
+  const old=await storage.get(key);old.createdAt-=24*60*60*1000+1;await storage.put(key,old);
+  assert.equal((await settings(binding,'take')).status,410);
+  assert.equal(await storage.get(key),undefined);
+  const max=Number.MAX_SAFE_INTEGER;
+  for(const picker of [true,false]){
+    const rows=subtitleButtons(menuFixture({userId:max,requestMessageId:max,preference:{enabled:true,language:'zh'}}),picker);
+    assert.ok(rows.flat().every(b=>Buffer.byteLength(b.callback_data)<=64));
+  }
 });
 
 test('forged subtitle buttons, other users and missing API keys cannot start paid work',async()=>{
@@ -713,6 +796,10 @@ test('forged subtitle buttons, other users and missing API keys cannot start pai
     ['yts|dQw4w9WgXcQ|720|7|1|1',1,{ELEVEN_API:''}],
     ['yts|dQw4w9WgXcQ|ah|7|1|1',1,{}],
   ]) assert.equal((await subtitleChoice(data,actor,extra)).jobs.length,0);
+  for(const data of ['ytst|dQw4w9WgXcQ|7|1|1','ytsl|dQw4w9WgXcQ|7|1|de'])
+    assert.equal((await subtitleChoice(data,42)).jobs.length,0);
+  const binding=subtitleBinding();await settings(binding,'open');await settings(binding,'language',{language:'hi'});
+  assert.equal((await subtitleChoice('ytq|dQw4w9WgXcQ|720|7|1',1,{ADMIN_STATS:binding,GPT_API:''})).jobs.length,0);
   for(const data of ['yts|dQw4w9WgXcQ|720|7|1|true','yts|dQw4w9WgXcQ|720|0|1|1','yts|dQw4w9WgXcQ|720|7|9007199254740992|1'])
     assert.equal(parseQualityCallback(data),null);
 });
@@ -721,6 +808,7 @@ test('subtitle Telegram cache keys are isolated from original quality and audio 
   const base={url:'https://www.youtube.com/watch?v=dQw4w9WgXcQ',quality:720};
   assert.equal(await mediaCacheKey(base),'yt:dQw4w9WgXcQ:v720');
   assert.equal(await mediaCacheKey({...base,subtitle:'fa'}),'yt:dQw4w9WgXcQ:v720:sub-fa-v1');
+  assert.equal(await mediaCacheKey({...base,subtitle:'de'}),'yt:dQw4w9WgXcQ:v720:sub-de-v1');
   assert.equal(await mediaCacheKey({...base,audioMode:'hq'}),'yt:dQw4w9WgXcQ:ah');
 });
 
@@ -749,6 +837,20 @@ test('ordinary jobs never receive AI credentials; signed admin subtitle payload 
 test('old container images cannot silently return plain video for a subtitle request',async()=>{
   const result=await run({jobChanges:{subtitle:'fa',userId:1},subtitleVersion:null});
   assert.ok(!result.calls.some(c=>c[0]==='/download'));assert.equal(result.delivered,0);
+});
+
+test('all twelve targets use the existing transfer with language-bound signatures and modern runtime checks',async()=>{
+  for(const language of Object.keys(JSON.parse(subtitleLanguages))){
+    const result=await run({jobChanges:{subtitle:language,userId:1},subtitleVersion:2});
+    assert.equal(result.delivered,1,language);
+    const body=globalThis.lastDownloadPayload;
+    assert.equal(body.mediaCacheKey,`yt:dQw4w9WgXcQ:v720:sub-${language}-v1`);
+    assert.equal(body.subtitleAuthorization,createHmac('sha256','secret-token')
+      .update(`subtitle-${language}-v1|test-job|1|dQw4w9WgXcQ|720`).digest('hex'));
+    assert.deepEqual(result.calls.map(c=>c[0]),['start','/health','/download']);
+  }
+  const old=await run({jobChanges:{subtitle:'hi',userId:1},subtitleVersion:1});
+  assert.equal(old.delivered,0);assert.ok(!old.calls.some(c=>c[0]==='/download'));
 });
 
 test('subtitle jobs do not replay paid preparation automatically after Telegram flood waits',async()=>{

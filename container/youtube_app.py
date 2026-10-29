@@ -1473,9 +1473,9 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
         caption = f"{title}\n{quality}p"
         if payload.get("subtitle"):
             phase = "subtitle"
-            from ai_subtitles import prepare as prepare_subtitles
+            from ai_subtitles import prepare as prepare_subtitles, LANGUAGES
             video_path = prepare_subtitles(video_path, payload, status)
-            caption += "\nزیرنویس فارسی"
+            caption += f"\nزیرنویس {LANGUAGES[payload['subtitle']]['name']}"
         phase = "upload"
         status("📤 ویدیو کامل آماده شد؛ دارم می‌فرستم…")
         sent = send_media_file(
@@ -2519,7 +2519,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_get(self) -> None:
         if self.path in {"/", "/health", "/ping"}:
-            self._send_json(200, {"ok": True, "service": "youtube-yt-dlp-container", "subtitleVersion": 1})
+            self._send_json(200, {"ok": True, "service": "youtube-yt-dlp-container", "subtitleVersion": 2})
             return
         self._send_json(404, {"ok": False, "error": "not found"})
 
