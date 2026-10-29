@@ -503,9 +503,10 @@ async function handleSubtitle(request: Request, env: WebAppEnv): Promise<Respons
     { method: request.method === "HEAD" ? "HEAD" : "GET" },
   ));
   if (!source.ok || !source.headers.get("content-type")?.startsWith("text/vtt")) {
-    await source.body?.cancel();
-    return new Response("Subtitles are unavailable. Video playback is unaffected.", { status: source.status === 404 ? 404 : 502,
-      headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff" } });
+    const detail = await source.json().catch(() => null) as { message?: unknown } | null;
+    const reason = typeof detail?.message === "string" && /^YouTube (?:could not provide this subtitle track \(HTTP [345]\d{2}\)\.|returned an (?:empty|invalid) subtitle (?:track|file)\.)$/.test(detail.message)
+      ? detail.message : "Subtitles are unavailable. Video playback is unaffected.";
+    return json({ ok: false, message: reason }, source.status === 404 ? 404 : 502);
   }
   const headers = new Headers({ "content-type": "text/vtt; charset=utf-8", "cache-control": "private, no-store",
     "x-content-type-options": "nosniff", "content-security-policy": "default-src 'none'; sandbox" });

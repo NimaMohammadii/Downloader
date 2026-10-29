@@ -155,6 +155,12 @@ test('subtitle fetch failures stay separate from the video stream',async()=>{
   const response=await route(new Request(result.subtitles[0].url,{headers:{cookie}}),env);
   assert.equal(response.status,502);assert.doesNotMatch(await response.text(),/<html>/);
   assert.equal((await route(new Request(result.streamUrl,{headers:{cookie}}),env)).status,206);
+  stub.webRequest=async()=>Response.json({message:'YouTube could not provide this subtitle track (HTTP 429).'},{status:502});
+  const limited=await route(new Request(result.subtitles[0].url,{headers:{cookie}}),env);
+  assert.match((await limited.json()).message,/HTTP 429/);
+  stub.webRequest=async()=>Response.json({message:'Cookie: private-secret https://private.example/token'},{status:502});
+  const untrusted=await route(new Request(result.subtitles[0].url,{headers:{cookie}}),env);
+  assert.doesNotMatch((await untrusted.json()).message,/private-secret|private.example/);
 });
 
 test('CC stays off by default, loads only the chosen track, preserves selection across quality changes and ignores stale events',async()=>{
@@ -167,25 +173,29 @@ test('CC stays off by default, loads only the chosen track, preserves selection 
   function element(tag){return {tag,attributes:{},children:[],track:{mode:'disabled'},events:{},classList:classList(),
     setAttribute(k,v){this.attributes[k]=v},appendChild(e){this.children.push(e)},addEventListener(k,fn){this.events[k]=fn},
     remove(){const i=elements.indexOf(this);if(i>=0)elements.splice(i,1)}};}
-  const context={URL,location:{href:origin+'/',origin},document:{createElement:element},subtitleTracks:[],selectedSubtitleId:'',subtitleVersion:0,
+  const subtitleRequests=[];
+  const context={URL,Blob,AbortController,subtitleObjectUrl:null,subtitleFetchController:null,fetch:async(url,options)=>{subtitleRequests.push({url,options});return new Response('WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nFixture\n',{headers:{'content-type':'text/vtt'}});},location:{href:origin+'/',origin},document:{createElement:element},subtitleTracks:[],selectedSubtitleId:'',subtitleVersion:0,
     video:{querySelectorAll(){return [...elements]},appendChild(e){elements.push(e)}},playerShell:{classList:classList()},
     subtitleButton:element('button'),subtitleMenu:element('div'),subtitleStatus:element('div'),playerSettings:element('button'),
     controlsTimer:null,showControls(){},clearTimeout(){}};
   vm.createContext(context);vm.runInContext(helpers,context);
   const tracks=[{id:'a'.repeat(16),label:'English',language:'en-orig',kind:'automatic',url:origin+'/web/subtitle?track=a'},
     {id:'b'.repeat(16),label:'فارسی <script>alert(1)</script>',language:'fa',kind:'translated',url:origin+'/web/subtitle?track=b'}];
-  context.setSubtitleTracks(tracks,false);assert.equal(elements.length,0);assert.equal(context.selectedSubtitleId,'');
-  context.selectSubtitle(tracks[0].id);assert.equal(elements.length,1);
+  await context.setSubtitleTracks(tracks,false);assert.equal(elements.length,0);assert.equal(context.selectedSubtitleId,'');
+  await context.selectSubtitle(tracks[0].id);assert.equal(elements.length,1);
   const first=elements[0];assert.equal(first.default,true);assert.equal(first.kind,'subtitles');assert.equal(first.srclang,'en');assert.equal(first.track.mode,'showing');
-  context.selectSubtitle(tracks[1].id);assert.equal(first.track.mode,'disabled');assert.equal(elements.length,1);
+  await context.selectSubtitle(tracks[1].id);assert.equal(first.track.mode,'disabled');assert.equal(elements.length,1);
   const second=elements[0];assert.equal(second.label,tracks[1].label);assert.equal(second.srclang,'fa');
   assert.match(context.subtitleStatus.textContent,/Loading/);
   first.events.load();assert.match(context.subtitleStatus.textContent,/Loading/,'old load event must not change current track state');
   second.events.load();assert.equal(context.subtitleStatus.textContent,'');
-  context.setSubtitleTracks(tracks.map(t=>({...t,url:t.url+'&new-video-file=1'})),true);
-  assert.equal(context.selectedSubtitleId,tracks[1].id);assert.equal(elements.length,1);assert.match(elements[0].src,/new-video-file/);
+  await context.setSubtitleTracks(tracks.map(t=>({...t,url:t.url+'&new-video-file=1'})),true);
+  assert.equal(context.selectedSubtitleId,tracks[1].id);assert.equal(elements.length,1);assert.match(elements[0].src,/^blob:/);assert.match(subtitleRequests.at(-1).url,/new-video-file/);assert.equal(subtitleRequests.at(-1).options.credentials,'same-origin');
   elements[0].events.error();assert.equal(elements.length,0);assert.equal(context.selectedSubtitleId,'');assert.match(context.subtitleStatus.textContent,/unaffected/);
-  context.selectSubtitle(tracks[0].id);context.selectSubtitle('');assert.equal(elements.length,0);assert.equal(context.subtitleButton.attributes['aria-pressed'],'false');
-  context.setSubtitleTracks([{...tracks[0],url:'https://evil.test/subtitles.vtt'}],false);
+  await context.selectSubtitle(tracks[0].id);await context.selectSubtitle('');assert.equal(elements.length,0);assert.equal(context.subtitleButton.attributes['aria-pressed'],'false');
+  await context.setSubtitleTracks([{...tracks[0],url:'https://evil.test/subtitles.vtt'}],false);
   assert.equal(context.subtitleButton.disabled,true);assert.equal(elements.length,0);
+  context.fetch=async()=>Response.json({ok:false,message:'YouTube returned an empty subtitle track.'},{status:502});
+  await context.setSubtitleTracks(tracks,false);await context.selectSubtitle(tracks[0].id);assert.equal(elements.length,0);assert.equal(context.selectedSubtitleId,'');assert.match(context.subtitleStatus.textContent,/empty subtitle/);
+  let complete;context.fetch=()=>new Promise(resolve=>{complete=resolve;});const pending=context.selectSubtitle(tracks[0].id),signal=context.subtitleFetchController.signal;await context.selectSubtitle('');assert.equal(signal.aborted,true);complete(new Response('WEBVTT\n\n',{headers:{'content-type':'text/vtt'}}));await pending;assert.equal(elements.length,0);assert.equal(context.selectedSubtitleId,'');
 });

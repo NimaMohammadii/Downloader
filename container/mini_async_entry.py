@@ -95,7 +95,7 @@ def _subtitle_bytes(file_id: str, track_id: str) -> bytes:
                               allow_redirects=False, stream=True) as response:
             if response.status_code != 200:
                 print(f"web subtitle source rejected status={response.status_code}", flush=True)
-                raise app.UserVisibleError("YouTube did not provide this subtitle track.")
+                raise app.UserVisibleError(f"YouTube could not provide this subtitle track (HTTP {response.status_code}).")
             if int(response.headers.get("content-length") or 0) > SUBTITLE_MAX_BYTES:
                 raise app.UserVisibleError("Subtitle file is too large.")
             content = bytearray()
@@ -104,6 +104,8 @@ def _subtitle_bytes(file_id: str, track_id: str) -> bytes:
                 content.extend(chunk)
                 if len(content) > SUBTITLE_MAX_BYTES or time.monotonic() > deadline:
                     raise app.UserVisibleError("Subtitle response exceeded its limit.")
+        if not content:
+            raise app.UserVisibleError("YouTube returned an empty subtitle track.")
         text = bytes(content).decode("utf-8-sig")
         if not re.match(r"^WEBVTT(?:[ \t][^\r\n]*)?(?:\r?\n|$)", text) or "\x00" in text:
             raise app.UserVisibleError("YouTube returned an invalid subtitle file.")
@@ -222,6 +224,9 @@ class MiniAsyncHandler(mini_pipeline.MiniAppHandler):
             data = _subtitle_bytes(file_id, track_id)
         except (FileNotFoundError, KeyError):
             self._send_json(404, {"ok": False, "message": "Subtitles are no longer available."})
+            return
+        except app.UserVisibleError as exc:
+            self._send_json(502, {"ok": False, "message": str(exc)})
             return
         except Exception as exc:
             print(f"web subtitle fetch failed: {type(exc).__name__}", flush=True)
