@@ -1417,9 +1417,14 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
     workdir = Path(tempfile.mkdtemp(prefix="youtube-download-"))
     deadline_token = JOB_DEADLINE.set(time.monotonic() + YOUTUBE_JOB_SECONDS)
     phase = "cache"
-    def status(text: str) -> None:
+    def status(text: str, *, entities=None) -> None:
         try:
-            edit_status(token, chat_id, status_message_id, text)
+            if entities is None:
+                edit_status(token, chat_id, status_message_id, text)
+            elif status_message_id:
+                telegram_call(token, 'editMessageText', json_payload={
+                    'chat_id': chat_id, 'message_id': status_message_id, 'text': text,
+                    'entities': entities}, timeout=5)
         except Exception as exc:
             print(json.dumps({"message": "youtube status update failed", "jobId": payload.get("id"),
                               "phase": phase, **upload_error_diagnostic(exc, token)}, ensure_ascii=False), flush=True)

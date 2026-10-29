@@ -6,8 +6,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'container'))
 import youtube_pipeline as pipeline
@@ -73,8 +74,8 @@ class SubtitleTests(unittest.TestCase):
     def test_real_video_burns_persian_keeps_original_geometry_duration_audio_and_caches_apis(self):
         original = self.path.read_bytes()
         with patch.object(app.requests, 'post', side_effect=[self.Response(self.transcript()), self.Response(self.translation())]) as post:
-            output = subs.prepare(self.path, self.payload, lambda text: None)
-            second = subs.prepare(self.path, self.payload, lambda text: None)
+            output = subs.prepare(self.path, self.payload, lambda text, **kwargs: None)
+            second = subs.prepare(self.path, self.payload, lambda text, **kwargs: None)
         self.assertEqual(output, second)
         self.assertEqual(post.call_count, 2)
         calls = post.call_args_list
@@ -104,7 +105,7 @@ class SubtitleTests(unittest.TestCase):
                         {'mediaCacheKey': 'yt:abcdefghijk:v360'}, {'gptApiKey': ''}):
             with self.subTest(changed=changed), patch.object(app.requests, 'post') as post:
                 with self.assertRaises(app.UserVisibleError):
-                    subs.prepare(self.path, {**self.payload, **changed}, lambda text: None)
+                    subs.prepare(self.path, {**self.payload, **changed}, lambda text, **kwargs: None)
                 post.assert_not_called()
 
     def test_ambiguous_paid_failure_is_not_retried_and_keys_are_not_exposed(self):
@@ -130,13 +131,89 @@ class SubtitleTests(unittest.TestCase):
                          {'status': 'completed', 'output': [{'type': 'message', 'content': [
                              {'type': 'output_text', 'text': json.dumps({'cues': [{'id': 1, 'text': 'متن'}, {'id': 0, 'text': 'متن'}]})}]}]}):
             with patch.object(subs, '_paid_post', return_value=response):
-                with self.assertRaises(app.UserVisibleError): subs._translate(cues, 'key', self.directory, lambda text: None)
+                with self.assertRaises(app.UserVisibleError): subs._translate(cues, 'key', self.directory, lambda text, **kwargs: None)
 
     def test_invalid_timestamps_silence_and_nonfinite_values_are_rejected(self):
         for words in ([], [{'type': 'word', 'text': 'x', 'start': -1, 'end': 2}],
                       [{'type': 'word', 'text': 'x', 'start': 0, 'end': float('nan')}],
                       [{'type': 'word', 'text': 'x', 'start': 0, 'end': 100}]):
             with self.assertRaises(app.UserVisibleError): subs._source_cues({'words': words}, 4)
+
+    def test_progress_uses_measured_speed_every_15_seconds_and_exact_entities(self):
+        status = Mock()
+        with patch.object(subs.time, 'monotonic', return_value=100) as clock:
+            report = subs._RenderProgress(600, status)
+            clock.return_value = 101
+            report({'out_time_us': '0'})
+            clock.return_value = 114
+            report({'out_time_us': '14000000'})
+            status.assert_not_called()
+            clock.return_value = 115
+            report({'out_time_us': '15000000'})
+            self.assertEqual(status.call_count, 1)
+            text = status.call_args.args[0]
+            self.assertTrue(text.endswith('⏳ ~10 min • 2%'))
+            for e in status.call_args.kwargs['entities']:
+                part = text.encode('utf-16-le')[e['offset'] * 2:(e['offset'] + e['length']) * 2].decode('utf-16-le')
+                if e['type'] == 'bold': self.assertEqual(part, '~10 min • 2%')
+                else:
+                    self.assertEqual(part, '⏳')
+                    self.assertEqual(e['custom_emoji_id'], '5386367538735104399')
+            clock.return_value = 129
+            report({'out_time_us': '29000000'})
+            self.assertEqual(status.call_count, 1)
+            clock.return_value = 130
+            report({'out_time_us': '30000000'})
+            self.assertEqual(status.call_count, 2)
+            # Slower processing revises the estimate, rather than counting down.
+            clock.return_value = 190
+            report({'out_time_us': '31000000'})
+            self.assertNotIn('~10 min', status.call_args.args[0])
+            clock.return_value = 205
+            report({'out_time_us': '600000000', 'progress': 'end'})
+            self.assertIn('99%', status.call_args.args[0])
+            self.assertNotIn('100%', status.call_args.args[0])
+            count = status.call_count
+            for value in ('nan', 'inf', '-1', 'bad', '1000'):
+                report({'out_time_us': value})
+            self.assertEqual(status.call_count, count)
+
+    def test_native_progress_preserves_job_context_and_edit_errors_do_not_stop_encoding(self):
+        seen = []
+        token = app.JOB_DEADLINE.set(12345)
+        try:
+            def progress(record):
+                seen.append((record['out_time_us'], app.JOB_DEADLINE.get()))
+                raise RuntimeError('status failure')
+            with patch('builtins.print'):
+                subs._run_progress([sys.executable, '-c',
+                    "import time; print('out_time_us=1000000\\nprogress=continue', flush=True); time.sleep(.1)"], 2, progress)
+            self.assertEqual(seen, [('1000000', 12345)])
+        finally:
+            app.JOB_DEADLINE.reset(token)
+
+    def test_native_progress_timeout_kills_and_reaps_child(self):
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            subs._run_progress([sys.executable, '-c', 'import time; time.sleep(30)'], .1, lambda record: None)
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_real_ffmpeg_emits_native_media_timestamps(self):
+        records = []
+        subs._ffmpeg(['-re', '-i', str(self.path), '-t', '0.5', '-vf', 'null',
+                      '-f', 'null', '-'], 5, progress=records.append)
+        self.assertTrue(any('out_time_us' in record for record in records))
+
+    def test_analysis_message_has_requested_custom_emoji_and_no_provider_branding(self):
+        status = Mock()
+        with patch.object(app.requests, 'post', side_effect=[self.Response(self.transcript()), self.Response(self.translation())]):
+            subs.prepare(self.path, self.payload, status)
+        texts = [c.args[0] for c in status.call_args_list]
+        self.assertFalse(any('Eleven' in text or 'تبدیل می‌کنم' in text for text in texts))
+        first = status.call_args_list[0]
+        self.assertIn('تحلیل', first.args[0])
+        self.assertEqual(first.kwargs['entities'][0]['custom_emoji_id'], '5271604874419647061')
+        self.assertIn('در حال محاسبه', next(t for t in texts if 'محاسبه' in t))
 
     def test_ffmpeg_timeout_and_encoder_failure_are_distinct_without_exposing_output(self):
         for error, reason, text in (
@@ -157,14 +234,14 @@ class SubtitleTests(unittest.TestCase):
         saved.mkdir(parents=True)
         subs._atomic_json(saved / 'transcript.json', {'language': 'fa', 'cues': [
             {'id': 0, 'start': 0, 'end': 3, 'text': 'سلام'}]})
-        def render(args, timeout):
+        def render(args, timeout, **kwargs):
             self.assertEqual(timeout, 420)
             self.assertEqual(args[args.index('-preset') + 1], 'superfast')
             self.assertEqual(args[args.index('-crf') + 1], '23')
             shutil.copyfile(self.path, args[-1])
         with patch.object(app, 'job_timeout', return_value=600), patch.object(subs, '_ffmpeg', side_effect=render), \
              patch.object(app.requests, 'post') as post:
-            subs.prepare(self.path, self.payload, lambda text: None)
+            subs.prepare(self.path, self.payload, lambda text, **kwargs: None)
         post.assert_not_called()
 
     def test_coincident_sentence_boundaries_preserve_all_words_and_renderable_times(self):
@@ -203,7 +280,7 @@ class SubtitleTests(unittest.TestCase):
         translated['output'][0]['content'][0]['text'] = json.dumps(
             {'cues': [{'id': 0, 'text': 'سلام! خوش آمدی.'}]})
         with patch.object(app.requests, 'post', return_value=self.Response(translated)) as post:
-            output = subs.prepare(self.path, self.payload, lambda text: None)
+            output = subs.prepare(self.path, self.payload, lambda text, **kwargs: None)
         self.assertTrue(output.is_file())
         post.assert_called_once()
         self.assertEqual(post.call_args.args[0], 'https://api.openai.com/v1/responses')
@@ -252,20 +329,34 @@ class SubtitleTests(unittest.TestCase):
     def _process(self, payload, expect_subtitles):
         events = []
         def download(*args): events.append('download'); return self.path
-        def prepare(path, request, status): events.append('subtitle'); return self.path
+        def prepare(path, request, status):
+            events.append('subtitle')
+            status('⏳ ~8 min • 42%', entities=[{'type': 'custom_emoji', 'offset': 0, 'length': 1,
+                                               'custom_emoji_id': subs.RENDER_EMOJI}])
+            return self.path
         def send(*args, **kwargs): events.append('upload'); return {'video': {'file_id': 'final'}}
         with patch.object(app, 'reuse_cached_file', return_value=False), \
              patch.object(app, 'load_metadata_cache', return_value={'title': 'Fixture'}), \
              patch.object(app, 'validate_video_metadata'), patch.object(app, 'available_qualities', return_value=[360]), \
              patch.object(app, 'download_video', side_effect=download) as existing_download, \
              patch.object(subs, 'prepare', side_effect=prepare), patch.object(app, 'send_media_file', side_effect=send) as upload, \
-             patch.object(app, 'edit_status'), patch.object(app, 'delete_status'), patch.object(app, 'store_uploaded_file') as cache:
+             patch.object(app, 'edit_status'), patch.object(app, 'delete_status'), \
+             patch.object(app, 'telegram_call') as formatted_status, patch.object(app, 'store_uploaded_file') as cache:
             result = app.process_job(payload)
         self.assertTrue(result['ok'])
         self.assertEqual(events, ['download', 'subtitle', 'upload'] if expect_subtitles else ['download', 'upload'])
         existing_download.assert_called_once()
         self.assertEqual('زیرنویس فارسی' in upload.call_args.args[4], expect_subtitles)
         self.assertEqual(cache.call_args.args[1], [payload['mediaCacheKey']])
+        if expect_subtitles:
+            formatted_status.assert_called_once()
+            self.assertEqual(formatted_status.call_args.args[1], 'editMessageText')
+            self.assertEqual(formatted_status.call_args.kwargs['timeout'], 5)
+            body = formatted_status.call_args.kwargs['json_payload']
+            self.assertEqual(body['message_id'], payload['statusMessageId'])
+            self.assertEqual(body['entities'][0]['custom_emoji_id'], subs.RENDER_EMOJI)
+        else:
+            formatted_status.assert_not_called()
 
 
 if __name__ == '__main__': unittest.main()

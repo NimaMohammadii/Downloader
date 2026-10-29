@@ -1,11 +1,13 @@
 """Optional Persian captions after the existing download, before its normal upload."""
 import hashlib
+import contextvars
 import hmac
 import json
 import math
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import textwrap
 import threading
 import time
@@ -16,6 +18,87 @@ CACHE_ROOT = Path('/tmp/vexa-ai-subtitles-v1')
 CACHE_SECONDS = 24 * 60 * 60
 LOCK = threading.Lock()
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+ANALYSIS_EMOJI = '5271604874419647061'
+RENDER_EMOJI = '5386367538735104399'
+RENDER_TEXT = '🎬 دارم زیرنویس فارسی رو روی ویدیو قرار می‌دم…'
+
+
+def _caption_status(status, text: str, emoji: str, emoji_id: str, bold: str = '') -> None:
+    entities = [{'type': 'custom_emoji', 'offset': len(text[:text.index(emoji)].encode('utf-16-le')) // 2,
+                 'length': len(emoji.encode('utf-16-le')) // 2, 'custom_emoji_id': emoji_id}]
+    if bold:
+        entities.append({'type': 'bold', 'offset': len(text[:text.index(bold)].encode('utf-16-le')) // 2,
+                         'length': len(bold.encode('utf-16-le')) // 2})
+    status(text, entities=entities)
+
+
+class _RenderProgress:
+    def __init__(self, duration: float, status):
+        self.duration, self.status = duration, status
+        self.started = self.last_update = time.monotonic()
+        self.media = self.wall = self.speed = 0.0
+
+    def __call__(self, record: dict) -> None:
+        now = time.monotonic()
+        try:
+            media = float(record['out_time_us']) / 1_000_000
+        except (KeyError, ValueError, TypeError):
+            return
+        if not math.isfinite(media) or media < self.media or media < 0:
+            return
+        elapsed = now - self.started
+        delta = elapsed - self.wall
+        if delta > 0:
+            observed = (media - self.media) / delta
+            # A 30-second time-weighted moving average responds to CPU load
+            # changes without making the estimate jump at every progress event.
+            weight = 1 - math.exp(-delta / 30)
+            self.speed = observed if self.speed <= 0 else self.speed + weight * (observed - self.speed)
+        self.media, self.wall = media, elapsed
+        # FFmpeg emits every 15 seconds; tolerate delivery jitter so a slightly
+        # early event is not accidentally skipped until the following interval.
+        if now - self.last_update < 14.5 or elapsed < 5 or self.speed <= 0:
+            return
+        self.last_update = now
+        percent = min(99, int(min(media, self.duration) * 100 / self.duration))
+        minutes = max(1, math.ceil(max(0, self.duration - media) / self.speed / 60))
+        value = f'~{minutes} min • {percent}%'
+        _caption_status(self.status, f'{RENDER_TEXT}\n\n⏳ {value}', '⏳', RENDER_EMOJI, value)
+
+
+def _run_progress(command: list[str], timeout: float, progress) -> None:
+    # Consume FFmpeg's native events; no timer polling or download requests.
+    context = contextvars.copy_context()
+    stopped = threading.Event()
+    with tempfile.TemporaryFile() as errors:
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, text=True,
+                              encoding='utf-8', errors='replace', bufsize=1) as process:
+            def consume():
+                record = {}
+                for line in process.stdout:
+                    key, separator, value = line.strip().partition('=')
+                    if separator:
+                        record[key] = value
+                    if key == 'progress':
+                        if not stopped.is_set():
+                            try:
+                                progress(record)
+                            except Exception:
+                                print('subtitle progress update unavailable', flush=True)
+                        record = {}
+            reader = threading.Thread(target=lambda: context.run(consume), daemon=True)
+            reader.start()
+            try:
+                code = process.wait(timeout=timeout)
+                if code:
+                    raise subprocess.CalledProcessError(code, command)
+            finally:
+                stopped.set()
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                # A final status edit cannot race the subsequent upload/error.
+                reader.join()
 
 
 def authorize(payload: dict) -> None:
@@ -196,16 +279,19 @@ def _ass(cues: list[dict], path: Path) -> None:
     path.write_text(header + ''.join(lines), encoding='utf-8')
 
 
-def _ffmpeg(args: list[str], timeout: int = 900) -> None:
+def _ffmpeg(args: list[str], timeout: int = 900, *, progress=None) -> None:
     started = time.monotonic()
     budget = app.job_timeout(timeout)
     stage = 'render' if '-vf' in args else 'audio'
     print(json.dumps({'message': 'subtitle ffmpeg started', 'stage': stage,
                       'timeoutSeconds': round(budget, 2)}), flush=True)
     try:
-        subprocess.run(['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error', '-nostdin', *args],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True,
-                       timeout=budget)
+        command = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error', '-nostdin']
+        if progress is None:
+            subprocess.run([*command, *args], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                           check=True, timeout=budget)
+        else:
+            _run_progress([*command, '-nostats', '-stats_period', '15', '-progress', 'pipe:1', *args], budget, progress)
     except subprocess.TimeoutExpired:
         print(json.dumps({'message': 'subtitle ffmpeg failed', 'stage': stage, 'reason': 'timeout',
                           'elapsedSeconds': round(time.monotonic() - started, 2)}), flush=True)
@@ -241,14 +327,13 @@ def prepare(video_path: Path, payload: dict, status) -> Path:
         directory.touch()
         transcript_file = directory / 'transcript.json'
         if not transcript_file.exists():
-            status('🎧 دارم صدای ویدیو را برای ساخت زیرنویس آماده می‌کنم…')
+            _caption_status(status, '🔎 دارم محتوای ویدیو رو تحلیل می‌کنم…', '🔎', ANALYSIS_EMOJI)
             audio = video_path.parent / 'subtitle-audio.m4a'
             _ffmpeg(['-i', str(video_path), '-map', '0:a:0', '-vn', '-ac', '1', '-ar', '16000',
                      '-c:a', 'aac', '-b:a', '48k', str(audio)], 180)
             try:
-                status('📝 دارم گفتار ویدیو را با ElevenLabs به متن تبدیل می‌کنم…')
                 with audio.open('rb') as handle:
-                    transcript = _paid_post('ElevenLabs', 'https://api.elevenlabs.io/v1/speech-to-text',
+                    transcript = _paid_post('تحلیل گفتار', 'https://api.elevenlabs.io/v1/speech-to-text',
                         {'xi-api-key': payload['elevenApiKey']}, directory / 'transcribe.pending',
                         data={'model_id': 'scribe_v2', 'timestamps_granularity': 'word',
                               'tag_audio_events': 'false', 'diarize': 'false'},
@@ -268,7 +353,7 @@ def prepare(video_path: Path, payload: dict, status) -> Path:
         if not re.fullmatch(r'[A-Za-z0-9_./-]+', str(subtitle)):
             raise app.UserVisibleError('❌ مسیر فایل زیرنویس معتبر نیست.')
         output = video_path.parent / 'video-subtitle-fa.mp4'
-        status('🎬 دارم زیرنویس فارسی را روی ویدیو قرار می‌دهم…')
+        _caption_status(status, f'{RENDER_TEXT}\n\n⏳ در حال محاسبه…', '⏳', RENDER_EMOJI)
         # Use the existing job deadline, reserving three minutes for validation
         # and Telegram upload. No retry of paid transcription or translation.
         render_budget = app.job_timeout(app.YOUTUBE_JOB_SECONDS) - 180
@@ -277,7 +362,8 @@ def prepare(video_path: Path, payload: dict, status) -> Path:
         _ffmpeg(['-i', str(video_path), '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
                  '-vf', f'ass={subtitle}', '-c:v', 'libx264', '-preset', 'superfast', '-crf', '23',
                  '-threads', '4', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-fs', str(app.DIRECT_TELEGRAM_LIMIT + 1),
-                 '-movflags', '+faststart', str(output)], render_budget)
+                 '-movflags', '+faststart', str(output)], render_budget,
+                progress=_RenderProgress(duration, status))
         app.validate_file_size(output)
         actual = app.probe_duration(output)
         if actual <= 0 or abs(actual - duration) > 1:
