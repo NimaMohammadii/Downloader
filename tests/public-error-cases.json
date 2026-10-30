@@ -258,5 +258,9 @@
   {
     "input": "❌ unknown decoder failure token=private https://secret.example/members-only",
     "category": "fallback"
+  },
+  {
+    "category": "subtitle_translation",
+    "input": "❌ ترجمهٔ کامل و معتبر دریافت نشد؛ ترجمهٔ ناقص یا فایل بدون زیرنویس ارسال نشد."
   }
 ]

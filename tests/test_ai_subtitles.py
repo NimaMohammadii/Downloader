@@ -226,6 +226,24 @@ class SubtitleTests(unittest.TestCase):
             with patch.object(subs, '_paid_post', return_value=response):
                 with self.assertRaises(app.UserVisibleError): subs._translate(cues, 'key', self.directory, lambda text, **kwargs: None)
 
+    def test_translation_failure_diagnostics_identify_reason_without_logging_dialogue_or_keys(self):
+        cues = subs._source_cues(self.transcript(), 4)
+        def output(items):
+            return {'status':'completed','output':[{'type':'message','content':[{'type':'output_text','text':json.dumps({'cues':items})}]}]}
+        cases=[({'status':'incomplete'},'response_not_completed'),
+            ({'status':'completed','output':[]},'missing_output_text'),
+            ({'status':'completed','output':[{'type':'message','content':[{'type':'refusal','refusal':'PRIVATE-DIALOGUE'}]}]},'refusal'),
+            (output([]),'cue_count'),(output([{'id':1,'text':'PRIVATE-DIALOGUE'},{'id':0,'text':'x'}]),'cue_id'),
+            (output([{'id':0,'text':''},{'id':1,'text':'PRIVATE-DIALOGUE'}]),'cue_text')]
+        for response,reason in cases:
+            with self.subTest(reason=reason),patch.object(subs,'_paid_post',return_value=response),patch('builtins.print') as log:
+                with self.assertRaises(app.UserVisibleError):
+                    subs._translate(cues,'PRIVATE-API-KEY',self.directory,lambda text:None)
+                event=json.loads(log.call_args.args[0])
+                self.assertEqual(event['reason'],reason)
+                self.assertEqual(event['expectedCues'],len(cues))
+                self.assertNotIn('PRIVATE',json.dumps(event))
+
     def test_invalid_timestamps_silence_and_nonfinite_values_are_rejected(self):
         for words in ([], [{'type': 'word', 'text': 'x', 'start': -1, 'end': 2}],
                       [{'type': 'word', 'text': 'x', 'start': 0, 'end': float('nan')}],

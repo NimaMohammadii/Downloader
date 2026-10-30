@@ -828,5 +828,10 @@
     "fa": "ضبط لایو: /live username\nبازپخش: /replay و لینک پست، Reel یا TV\nهمچنین می‌توانی لینک مستقیم Live را بفرستی.",
     "en": "Record a live: /live username\nReplay: /replay with a post, Reel or TV link\nYou can also send a direct live link.",
     "ru": "Записать эфир: /live username\nСкачать запись: /replay и ссылка на пост, Reel или TV\nМожно также прислать прямую ссылку на эфир."
+  },
+  {
+    "fa": "⚠️ ترجمهٔ زیرنویس کامل و معتبر نبود؛ ویدیوی زیرنویس‌دار ارسال نشد.",
+    "en": "⚠️ The subtitle translation was incomplete or invalid; the subtitled video was not sent.",
+    "ru": "⚠️ Перевод субтитров оказался неполным или некорректным; видео с субтитрами не отправлено."
   }
 ]
