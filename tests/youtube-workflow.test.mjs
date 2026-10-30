@@ -11,7 +11,7 @@ const subtitleSource = await readFile(new URL('../src/youtube-subtitles.ts', imp
 const subtitleLanguages = await readFile(new URL('../locales/subtitle-languages.json', import.meta.url), 'utf8');
 const instagram = await readFile(new URL('../src/index.ts', import.meta.url), 'utf8');
 const { outputFiles } = await build({ external: ['node:async_hooks'],
-  stdin: { contents: source + '\nexport {extractPornhubUrl,handleQualityCallback,handleSubtitleCallback,parseQualityCallback,mediaCacheKey,subtitleButtons}; export {subtitleSettings} from "./youtube-subtitles";', loader: 'ts', resolveDir: process.cwd() },
+  stdin: { contents: source + '\nexport {extractPornhubUrl,handleQualityCallback,handleSubtitleCallback,parseQualityCallback,mediaCacheKey,subtitleButtons}; export {subtitleSettings,subtitleAccessSettings} from "./youtube-subtitles";', loader: 'ts', resolveDir: process.cwd() },
   bundle: true, format: 'esm', write: false,
   plugins: [{ name: 'cloudflare-test-bindings', setup(build) {
     build.onResolve({ filter: /.*/ }, args => ({ path: args.path, namespace: 'test' }));
@@ -59,10 +59,12 @@ const { outputFiles } = await build({ external: ['node:async_hooks'],
     });
   } }],
 });
-const { DownloadPool, YoutubeDownloaderContainer, YoutubeDownloadWorkflow, extractPornhubUrl, handleQualityCallback, handleSubtitleCallback, parseQualityCallback, mediaCacheKey, subtitleButtons, subtitleSettings, default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
+const { DownloadPool, YoutubeDownloaderContainer, YoutubeDownloadWorkflow, extractPornhubUrl, handleQualityCallback, handleSubtitleCallback, parseQualityCallback, mediaCacheKey, subtitleButtons, subtitleSettings, subtitleAccessSettings, default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
 
 function subtitleBinding(storage = memoryStorage()) {
-  return { getByName() { return { fetch: (url, init) => subtitleSettings(new Request(url, init), storage) }; } };
+  return { getByName() { return { fetch: (url, init) => new URL(url).pathname === '/youtube-subtitle-access'
+    ? subtitleAccessSettings(new Request(url, init), storage, id => id === 1)
+    : subtitleSettings(new Request(url, init), storage) }; } };
 }
 function menuFixture(changes={}) {
   return {videoId:'dQw4w9WgXcQ',requestMessageId:7,userId:1,chatId:1,messageId:10,
@@ -73,6 +75,10 @@ async function settings(binding, op, extra={}) {
   const menu=menuFixture();
   return binding.getByName('global').fetch('https://admin-stats/youtube-subtitles', {method:'POST',
     body:JSON.stringify({...menu,op,...(op==='open'?{menu}:{}),...extra})});
+}
+function setSubtitleAccess(binding, values={}) {
+  return binding.getByName('global').fetch('https://admin-stats/youtube-subtitle-access', {method:'POST',
+    body:JSON.stringify({actorId:1,...values})});
 }
 
 function memoryStorage() {
@@ -748,6 +754,76 @@ test('first enable opens twelve languages in four rows; selection persists and e
   assert.ok(!JSON.stringify(job.jobs).includes('private-'));
   const stale=await subtitleChoice('ytst|dQw4w9WgXcQ|7|1|0',1,{ADMIN_STATS:binding});
   assert.ok(!stale.messages.some(m=>m.reply_markup));
+});
+
+test('subtitle locks are durable, independent, admin-only and preserve the stored language and enabled preference',async()=>{
+  const storage=memoryStorage(),binding=subtitleBinding(storage);
+  assert.equal((await setSubtitleAccess(binding,{actorId:42,locked:true})).status,403);
+  assert.equal((await setSubtitleAccess(binding,{userId:0,locked:true})).status,400);
+  assert.equal((await setSubtitleAccess(binding,{locked:'true'})).status,400);
+  await settings(binding,'open');await settings(binding,'language',{language:'fr'});
+  await setSubtitleAccess(binding,{userId:1,locked:true});
+  await setSubtitleAccess(binding,{locked:true});
+  await setSubtitleAccess(binding,{locked:false});
+  const restarted=subtitleBinding(storage);
+  assert.deepEqual(await (await setSubtitleAccess(restarted,{userId:1})).json(),{globalLocked:false,userLocked:true,locked:true});
+  const locked=await (await settings(restarted,'get')).json();
+  assert.equal(locked.locked,true);assert.deepEqual(locked.preference,{enabled:false,language:'fr'});
+  assert.deepEqual(await storage.get('youtube-subtitles:1'),{enabled:true,language:'fr'});
+  const rows=subtitleButtons(locked,true);
+  assert.equal(rows.flat().length,1);assert.equal(rows[0][0].icon_custom_emoji_id,'5296369303661067030');
+  assert.equal((await settings(restarted,'language',{language:'de'})).status,423);
+  assert.equal((await settings(restarted,'enable',{enabled:true})).status,423);
+  const other=menuFixture({userId:2,chatId:2});
+  assert.equal((await (await settings(restarted,'open',{userId:2,chatId:2,menu:other})).json()).locked,false);
+  await setSubtitleAccess(restarted,{userId:1,locked:false});
+  assert.deepEqual((await (await settings(restarted,'get')).json()).preference,{enabled:true,language:'fr'});
+});
+
+test('all old subtitle controls show a modal and refresh the same locked menu without sending chat messages',async()=>{
+  for(const data of ['ytst|dQw4w9WgXcQ|7|1|1','ytst|dQw4w9WgXcQ|7|1|0',
+    'ytsl|dQw4w9WgXcQ|7|1|de','ytsp|dQw4w9WgXcQ|7|1|open','ytsp|dQw4w9WgXcQ|7|1|back']) {
+    const binding=subtitleBinding();await settings(binding,'open');await setSubtitleAccess(binding,{locked:true});
+    const result=await subtitleChoice(data,1,{ADMIN_STATS:binding});
+    assert.equal(result.jobs.length,0);
+    const alert=result.messages.find(m=>m.callback_query_id);
+    assert.equal(alert.show_alert,true);assert.match(alert.text,/از طرف مدیریت/);assert.ok(alert.text.length<=200);
+    assert.ok(!result.messages.some(m=>m.chat_id&&!m.message_id));
+    const edit=result.messages.find(m=>m.reply_markup);
+    assert.equal(edit.message_id,10);
+    assert.equal(edit.reply_markup.inline_keyboard.at(-1)[0].icon_custom_emoji_id,'5296369303661067030');
+    assert.ok(!JSON.stringify(edit).includes('ytsl|'));
+  }
+});
+
+test('locking between preference read and take blocks paid work atomically and does not consume the menu',async()=>{
+  const binding=subtitleBinding();await settings(binding,'open');await settings(binding,'language',{language:'de'});
+  const race={getByName(){const stub=binding.getByName('global');return {async fetch(url,init){
+    if(JSON.parse(init.body).op==='take') await setSubtitleAccess(binding,{locked:true});
+    return stub.fetch(url,init);
+  }};}};
+  const blocked=await subtitleChoice('ytq|dQw4w9WgXcQ|720|7|1',1,{ADMIN_STATS:race});
+  assert.equal(blocked.jobs.length,0);
+  assert.ok(blocked.messages.some(m=>m.show_alert&&m.text.includes('از طرف مدیریت')));
+  assert.equal((await settings(binding,'get')).status,200);
+  // Plain video and audio keep the current download path, with no subtitle capability.
+  const plain=await subtitleChoice('ytq|dQw4w9WgXcQ|720|7|1',1,{ADMIN_STATS:binding});
+  assert.equal(plain.jobs.length,1);assert.equal(plain.jobs[0].params.subtitle,undefined);
+  const audio=await subtitleChoice('ytq|dQw4w9WgXcQ|ah|7|1',1,{ADMIN_STATS:binding});
+  assert.equal(audio.jobs.length,1);assert.equal(audio.jobs[0].params.audioMode,'hq');
+});
+
+test('failure to refresh a locked menu never replaces the modal with a new chat message or starts a download',async()=>{
+  const binding=subtitleBinding(),calls=[];
+  await settings(binding,'open');await setSubtitleAccess(binding,{locked:true});
+  globalThis.fetch=async(url,init)=>{calls.push({method:String(url).split('/').at(-1),body:JSON.parse(init.body)});
+    if(String(url).endsWith('/editMessageText')) throw Error('Telegram unavailable');
+    return Response.json({ok:true,result:true});};
+  await handleSubtitleCallback({BOT_TOKEN:'fictional-token',ADMIN_STATS:binding},{id:'locked-offline',from:{id:1},
+    data:'ytst|dQw4w9WgXcQ|7|1|1',message:{message_id:10,chat:{id:1}}});
+  assert.equal(calls.filter(c=>c.method==='answerCallbackQuery').length,1);
+  assert.equal(calls.find(c=>c.method==='answerCallbackQuery').body.show_alert,true);
+  assert.ok(!calls.some(c=>c.method==='sendMessage'));
 });
 
 test('disabling retains default language; first-time back cancels enabling and users are isolated',async()=>{

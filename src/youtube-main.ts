@@ -1,5 +1,5 @@
 import { withUserLanguage, userLanguage } from "./localization";
-import { isSubtitleLanguage, subtitleName, subtitleButtons, type SubtitleLanguage, type SubtitleMenu, type SubtitleButton } from "./youtube-subtitles";
+import { isSubtitleLanguage, subtitleName, subtitleButtons, SUBTITLE_LOCK_NOTICE, type SubtitleLanguage, type SubtitleMenu, type SubtitleButton } from "./youtube-subtitles";
 import type { SubtitleCharge } from "./subtitle-usage";
 import { parseBandcampUrl, bandcampFailureDiagnostic, bandcampOptions, type BandcampInput, type BandcampOption } from "./bandcamp";
 import { parseRedditUrl, type RedditInput } from "./reddit";
@@ -1617,11 +1617,12 @@ async function subtitleMenuRequest(env: Env, body: Record<string, unknown>): Pro
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
   });
   if (!response.ok) throw new Error(response.status === 409 ? "SUBTITLE_MENU_CONSUMED" : response.status === 410 ? "SUBTITLE_MENU_EXPIRED"
-    : response.status === 412 ? "SUBTITLE_MENU_CHANGED" : "SUBTITLE_SETTINGS_UNAVAILABLE");
+    : response.status === 412 ? "SUBTITLE_MENU_CHANGED" : response.status === 423 ? "SUBTITLE_LOCKED" : "SUBTITLE_SETTINGS_UNAVAILABLE");
   return response.json() as Promise<SubtitleMenu>;
 }
 
 async function editSubtitleMenu(env: Env, menu: SubtitleMenu, picker = false): Promise<void> {
+  picker = picker && !menu.locked;
   const keyboard: SubtitleButton[][] = picker ? subtitleButtons(menu, true) : [
     ...buildQualityKeyboard(normalizeQualities(menu.qualities), menu.audioAvailable, menu.videoId,
       menu.requestMessageId, menu.userId, menu.sizes), ...subtitleButtons(menu),
@@ -1639,9 +1640,15 @@ async function editSubtitleMenu(env: Env, menu: SubtitleMenu, picker = false): P
 function subtitleMenuError(error: unknown): string {
   const code = error instanceof Error ? error.message : "";
   return code === "SUBTITLE_MENU_CONSUMED" ? "دانلود این درخواست قبلاً شروع شده؛ دوباره لینک را بفرست."
+    : code === "SUBTITLE_LOCKED" ? SUBTITLE_LOCK_NOTICE
     : code === "SUBTITLE_MENU_EXPIRED" ? "این منو منقضی شده؛ دوباره لینک را بفرست."
     : code === "SUBTITLE_MENU_CHANGED" ? "تنظیمات تغییر کرده؛ دوباره کیفیت را انتخاب کن."
     : "تنظیمات زیرنویس دریافت نشد؛ دوباره امتحان کن.";
+}
+
+async function refreshLockedSubtitleMenu(env: Env, base: Record<string, unknown>): Promise<void> {
+  try { await editSubtitleMenu(env, await subtitleMenuRequest(env, { ...base, op: "get" })); }
+  catch { console.warn("locked subtitle menu refresh failed"); }
 }
 
 async function handleSubtitleCallback(env: Env, callback: TelegramCallbackQuery): Promise<Response> {
@@ -1657,7 +1664,14 @@ async function handleSubtitleCallback(env: Env, callback: TelegramCallbackQuery)
     videoId: owner.videoId, requestMessageId: owner.requestMessageId };
   try {
     const action = match![1], value = match![5];
-    let menu = await subtitleMenuRequest(env, { ...base, op: action === "ytst" ? "enable" : action === "ytsl" ? "language" : "get",
+    const current = await subtitleMenuRequest(env, { ...base, op: "get" });
+    if (current.locked) {
+      await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id,
+        text: SUBTITLE_LOCK_NOTICE, show_alert: true });
+      await editSubtitleMenu(env, current).catch(() => { console.warn("locked subtitle menu refresh failed"); });
+      return Response.json({ ok: true });
+    }
+    let menu = action === "ytsp" ? current : await subtitleMenuRequest(env, { ...base, op: action === "ytst" ? "enable" : "language",
       ...(action === "ytst" ? { enabled: value === "1" } : action === "ytsl" ? { language: value } : {}) });
     if (action === "ytsp" && value === "back" && !menu.preference.language)
       menu = await subtitleMenuRequest(env, { ...base, op: "enable", enabled: false });
@@ -1667,6 +1681,8 @@ async function handleSubtitleCallback(env: Env, callback: TelegramCallbackQuery)
   } catch (error) {
     await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id,
       text: subtitleMenuError(error), show_alert: true });
+    if (error instanceof Error && error.message === "SUBTITLE_LOCKED")
+      await refreshLockedSubtitleMenu(env, base);
   }
   return Response.json({ ok: true });
 }
@@ -1717,6 +1733,8 @@ async function handleQualityCallback(
     } catch (error) {
       await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id,
         text: subtitleMenuError(error), show_alert: true });
+      if (error instanceof Error && error.message === "SUBTITLE_LOCKED")
+        await refreshLockedSubtitleMenu(env, base);
       return Response.json({ ok: true });
     }
   }

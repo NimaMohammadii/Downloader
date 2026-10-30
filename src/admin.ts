@@ -3,7 +3,7 @@ import { PUBLIC_ERROR_MESSAGE, isPublicErrorMessage, isPublicErrorFrame, publicE
 export { PUBLIC_ERROR_MESSAGE } from "./public-errors";
 import { BroadcastManager } from "./broadcast";
 import { DurableObject } from "cloudflare:workers";
-import { subtitleSettings, isSubtitleLanguage, type SubtitleLanguage } from "./youtube-subtitles";
+import { subtitleSettings, subtitleAccessSettings, isSubtitleLanguage, type SubtitleLanguage } from "./youtube-subtitles";
 import { createSubtitleLedger, saveSubtitleCharge, subtitleCosts, subtitleCostLines, subtitleDollars, subtitleChoiceLabel,
   validSubtitleCharge, type SubtitleCharge, type SubtitleCosts } from "./subtitle-usage";
 
@@ -224,6 +224,11 @@ export type AdminUserDetail = {
   downloads: AdminDownload[];
   page: number;
   totalPages: number;
+};
+export type AdminSubtitleUsers = {
+  users: { id: string; name: string; username: string | null; requests: number; delivered: number; lastAt: number }[];
+  totalUsers: number; requests: number; delivered: number; failed: number;
+  page: number; totalPages: number; trackingSince: number;
 };
 
 // Container measurements are event-driven. User resource shares are estimates
@@ -650,6 +655,8 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
 
   async fetch(request: Request): Promise<Response> {
     if (new URL(request.url).pathname === "/youtube-subtitles") return subtitleSettings(request, this.ctx.storage);
+    if (new URL(request.url).pathname === "/youtube-subtitle-access")
+      return subtitleAccessSettings(request, this.ctx.storage, id => isAdmin(this.env, id));
     const languageUrl = new URL(request.url);
     if (languageUrl.pathname === "/language-menu") {
       const user = languageUrl.searchParams.get("user") || "";
@@ -1012,18 +1019,21 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       const activityRows = sql.exec("SELECT * FROM user_activity WHERE user_id = ?", id).toArray();
       const activity = activityRows[0];
       const staleBefore = Date.now() - 4 * 3600_000;
+      const subtitleFilter = url.searchParams.get("subtitles") === "1"
+        ? "AND source='YouTube' AND EXISTS (SELECT 1 FROM youtube_subtitle_choices s WHERE s.download_key=download_history.key AND s.user_id=download_history.user_id AND s.language IS NOT NULL)" : "";
       const counts = sql.exec(`SELECT COUNT(*) AS total,
         COALESCE(SUM(status = 'success'),0) AS success, COALESCE(SUM(status = 'failed'),0) AS failed,
         COALESCE(SUM(status = 'partial'),0) AS partial, COALESCE(SUM(status = 'results'),0) AS results,
         COALESCE(SUM(status = 'awaiting_selection' OR (status IN ('pending','processing') AND updated_at >= ?)),0) AS active,
         COALESCE(SUM(status IN ('pending','processing') AND updated_at < ?),0) AS stale,
-        COALESCE(SUM(delivered),0) AS delivered FROM download_history WHERE user_id = ?`, staleBefore, staleBefore, id).one();
+        COALESCE(SUM(delivered),0) AS delivered FROM download_history WHERE user_id = ? ${subtitleFilter}`, staleBefore, staleBefore, id).one();
       const totalPages = Math.max(1, Math.ceil(asNumber(counts.total) / ADMIN_DOWNLOADS_PAGE_SIZE));
       const rawPage = Number(url.searchParams.get("page") || 0);
       const page = Math.min(Number.isSafeInteger(rawPage) && rawPage >= 0 ? rawPage : 0, totalPages - 1);
       const downloads = sql.exec(`SELECT h.*, s.download_key AS subtitle_recorded, s.language AS subtitle_language
         FROM download_history h LEFT JOIN youtube_subtitle_choices s ON s.download_key=h.key AND s.user_id=h.user_id
-        WHERE h.user_id = ? ORDER BY h.created_at DESC, h.key DESC LIMIT ? OFFSET ?`,
+        WHERE h.user_id = ? ${subtitleFilter ? "AND h.source='YouTube' AND s.language IS NOT NULL" : ""}
+        ORDER BY h.created_at DESC, h.key DESC LIMIT ? OFFSET ?`,
         id, ADMIN_DOWNLOADS_PAGE_SIZE, page * ADMIN_DOWNLOADS_PAGE_SIZE).toArray().map(row => ({
           key: String(row.key), userId: Number(id), source: String(row.source), request: String(row.request),
           status: row.status as DownloadStatus, title: row.title ? String(row.title) : undefined,
@@ -1133,6 +1143,28 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         linksSent: asNumber(summary.links_sent),
         successfulDownloads: asNumber(success.value),
       } satisfies AdminSummary);
+    }
+
+    if (request.method === "GET" && url.pathname === "/subtitle-users") {
+      const sql = this.ctx.storage.sql;
+      const from = `FROM download_history h JOIN youtube_subtitle_choices s ON s.download_key=h.key AND s.user_id=h.user_id
+        WHERE h.source='YouTube' AND s.language IS NOT NULL`;
+      const totals = sql.exec(`SELECT COUNT(DISTINCT h.user_id) AS totalUsers, COUNT(*) AS requests,
+        COALESCE(SUM(h.delivered>0),0) AS delivered, COALESCE(SUM(h.status='failed'),0) AS failed ${from}`).one();
+      const totalPages = Math.max(1, Math.ceil(asNumber(totals.totalUsers) / ADMIN_USERS_PAGE_SIZE));
+      const requested = Number(url.searchParams.get("page") || 0);
+      const page = Math.min(Number.isSafeInteger(requested) && requested >= 0 ? requested : 0, totalPages - 1);
+      const users = sql.exec(`SELECT h.user_id AS id, COUNT(*) AS requests, SUM(h.delivered>0) AS delivered,
+        MAX(h.created_at) AS lastAt ${from} GROUP BY h.user_id
+        ORDER BY lastAt DESC, h.user_id ASC LIMIT ? OFFSET ?`, ADMIN_USERS_PAGE_SIZE, page * ADMIN_USERS_PAGE_SIZE).toArray().map(row => {
+        const user = sql.exec("SELECT * FROM users WHERE id=?", row.id).toArray()[0] as UserSqlRow | undefined;
+        return { id: String(row.id), name: user ? userDisplayName({ id: user.id, username: user.username,
+          firstName: user.first_name, lastName: user.last_name, linksSent: asNumber(user.links_sent),
+          firstSeen: asNumber(user.first_seen), lastSeen: asNumber(user.last_seen) }) : String(row.id),
+          username: user?.username || null, requests: asNumber(row.requests), delivered: asNumber(row.delivered), lastAt: asNumber(row.lastAt) };
+      });
+      return Response.json({ ...Object.fromEntries(Object.entries(totals).map(([k,v]) => [k,asNumber(v)])), users, page, totalPages,
+        trackingSince: asNumber(sql.exec("SELECT value FROM counters WHERE key='subtitle_tracking_since'").one().value) });
     }
 
     if (request.method === "GET" && url.pathname === "/users") {
@@ -1312,6 +1344,7 @@ export function adminDashboardKeyboard(): Record<string, unknown> {
       [{ text: "📤 پیام همگانی", callback_data: "admin:broadcast" }],
       [{ text: "مصرف، ترافیک و هزینه", icon_custom_emoji_id: "5231200819986047254", callback_data: "admin:usage" }],
       [{ text: "آمار دانلود سرویس‌ها", icon_custom_emoji_id: "5443127283898405358", callback_data: "admin:downloads" }],
+      [{ text: "مدیریت زیرنویس", icon_custom_emoji_id: "5206607081334906820", callback_data: "admin:subtitles" }],
       [{ text: "👥 لیست کاربران", callback_data: "admin:users:0" },
         { text: "⏹ کاربران محدودشده", callback_data: "admin:restricted:0" }],
       [{ text: "کاربران استفاده‌کننده", icon_custom_emoji_id: "5427168083074628963", callback_data: "admin:used:0" }],
@@ -1389,10 +1422,11 @@ export async function recordDownload(env: Partial<AdminStatsEnv> & { BOT_TOKEN?:
   } catch { console.warn("download history unavailable"); }
 }
 
-export async function getAdminUserDetail(env: AdminStatsEnv, id: string, page: number): Promise<AdminUserDetail | null> {
+export async function getAdminUserDetail(env: AdminStatsEnv, id: string, page: number, subtitlesOnly = false): Promise<AdminUserDetail | null> {
   const url = new URL("https://admin-stats/user");
   url.searchParams.set("id", id);
   url.searchParams.set("page", String(page));
+  if (subtitlesOnly) url.searchParams.set("subtitles", "1");
   const response = await statsStub(env).fetch(url.toString());
   if (response.status === 404) return null;
   if (!response.ok) throw new Error(`ADMIN_USER_${response.status}`);
@@ -1426,6 +1460,12 @@ export function formatAdminUserDetail(detail: AdminUserDetail): string {
     `📋 سابقه • صفحه ${detail.page + 1}/${detail.totalPages}`,
     "سابقه و تعداد برگشت‌های پیش از فعال‌شدن ثبت جدید در دسترس نیست.",
   ];
+  lines.push(...formatAdminDownloadHistory(detail));
+  return lines.join("\n");
+}
+
+export function formatAdminDownloadHistory(detail: Pick<AdminUserDetail, 'downloads' | 'page'>): string[] {
+  const lines: string[] = [];
   if (!detail.downloads.length) lines.push("هنوز درخواست جدیدی ثبت نشده.");
   detail.downloads.forEach((item, index) => {
     lines.push("", `${detail.page * ADMIN_DOWNLOADS_PAGE_SIZE + index + 1}. ${displayText(item.source, 32)} • ${dateLabel(item.createdAt)}`,
@@ -1439,7 +1479,7 @@ export function formatAdminUserDetail(detail: AdminUserDetail): string {
       ...(item.delivered ? [`فایل تحویل‌شده: ${item.delivered}`] : []),
       ...(item.detail ? [`توضیح: ${displayText(item.detail, 100)}`] : []));
   });
-  return lines.join("\n");
+  return lines;
 }
 
 export function adminUserDetailKeyboard(detail: AdminUserDetail, usersPage: number, usedOnly = false, period?: AdminPeriod): Record<string, unknown> {
@@ -1450,6 +1490,7 @@ export function adminUserDetailKeyboard(detail: AdminUserDetail, usersPage: numb
   if (detail.page + 1 < detail.totalPages) nav.push({ text: "قدیمی‌تر ›", callback_data: callback(detail.page + 1) });
   return { inline_keyboard: [
     ...(nav.length ? [nav] : []),
+    [{ text: "زیرنویس؛ دسترسی و دانلودها", icon_custom_emoji_id: "5206607081334906820", callback_data: `admin:subuser:${detail.user.id}:0:0` }],
     [{ text: "مصرف و هزینهٔ این کاربر", icon_custom_emoji_id: "5231200819986047254", callback_data: `admin:usage:${detail.user.id}:${usersPage}:${detail.page}${usedOnly ? ":used" : ""}${periodSuffix}` },
       { text: "⏹ محدودیت دانلود", callback_data: callback(detail.page).replace("admin:user:", "admin:restriction:") }],
     [{ text: "🔄 بروزرسانی", callback_data: callback(detail.page) }],

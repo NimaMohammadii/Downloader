@@ -18,6 +18,106 @@ const user = { id: 42, firstName: 'کاربر نمونه', username: 'example' }
 const base = { key: 'youtube:42:7:42', userId: 42, source: 'YouTube', request: 'https://youtube.com/watch?v=abcdefghijk' };
 const realNow = Date.now;
 
+test('subtitle users and histories use only recorded subtitle requests, paginate correctly and keep plain downloads separate',async()=>{
+  const f=fixture();
+  try{
+    await f.record(1);
+    for(let i=0;i<7;i++) await f.request('/download',{...base,key:`sub-history-${i}`,subtitleLanguage:i%2?'de':'fa',
+      status:i===0?'failed':'success',delivered:i===0?0:1,title:'زیرنویس'});
+    await f.request('/download',{...base,key:'plain',subtitleLanguage:null,status:'success',delivered:1});
+    await f.request('/download',{...base,key:'legacy',status:'success',delivered:1});
+    for(let i=0;i<9;i++) await f.request('/download',{...base,key:`other-${i}`,userId:100+i,subtitleLanguage:'fr',status:'failed'});
+    const first=await (await f.request('/subtitle-users?page=0')).json();
+    const last=await (await f.request('/subtitle-users?page=999')).json();
+    assert.equal(first.totalUsers,10);assert.equal(first.requests,16);assert.equal(first.delivered,6);assert.equal(first.failed,10);
+    assert.equal(first.users.length,8);assert.equal(last.users.length,2);assert.equal(last.page,1);
+    assert.ok(!first.users.some(u=>last.users.some(v=>u.id===v.id)));
+    const own=[...first.users,...last.users].find(u=>u.id==='42');
+    assert.equal(own.requests,7);assert.equal(own.delivered,6);assert.equal(own.username,'example');
+    const detail=await admin.getAdminUserDetail(f.env,'42',99,true);
+    assert.equal(detail.counts.total,7);assert.equal(detail.counts.success,6);assert.equal(detail.totalPages,2);
+    assert.equal(detail.page,1);assert.equal(detail.downloads.length,2);
+    assert.ok(detail.downloads.every(d=>d.subtitleLanguage));
+    assert.equal((await f.detail()).counts.total,9);
+    f.restart();assert.equal((await (await f.request('/subtitle-users')).json()).requests,16);
+  }finally{f.close();}
+});
+
+test('production subtitle admin panels enforce permissions, persist independent locks and provide filtered histories',async()=>{
+  const f=fixture(),previous=globalThis.fetch,calls=[];
+  globalThis.fetch=async(input,init)=>{calls.push({method:String(input).split('/').at(-1),body:JSON.parse(init.body)});
+    return Response.json({ok:true,result:{message_id:10}});};
+  const click=(data,id=admin.ADMIN_USER_ID)=>admin.worker.fetch(webhook({callback_query:{id:'subtitle-admin',from:{id},data,
+    message:{message_id:10,chat:{id}}}}),f.env,{});
+  const access=(values={})=>f.request('/youtube-subtitle-access',{actorId:admin.ADMIN_USER_ID,...values});
+  const edit=()=>calls.filter(c=>c.method==='editMessageText').at(-1)?.body;
+  try{
+    await f.record(1);
+    await f.request('/download',{...base,subtitleLanguage:'de',status:'failed',title:'زیرنویس آزمایشی'});
+    assert.equal((await access({actorId:42,locked:true})).status,403);
+    for(const data of ['admin:subtitles:lock','admin:subusers:0','admin:subuser:42:0:0:lock']) {
+      calls.length=0;await click(data,42);assert.equal(calls.length,0);
+    }
+    assert.equal((await (await access()).json()).globalLocked,false);
+    calls.length=0;await click('admin:subtitles');
+    assert.match(edit().text,/مدیریت زیرنویس یوتیوب/);assert.match(edit().text,/کاربران دارای سابقهٔ زیرنویس: 1/);
+    assert.equal(edit().entities[0].type,'bold');
+    await click('admin:subtitles:lock');await click('admin:subtitles:lock');
+    assert.equal((await (await access()).json()).globalLocked,true);
+    await click('admin:subuser:42:0:0:lock');
+    assert.match(edit().text,/زیرنویس آزمایشی/);assert.match(edit().text,/Deutsch/);assert.match(edit().text,/قفل اختصاصی این کاربر: فعال/);
+    await click('admin:subtitles:unlock');
+    assert.deepEqual(await (await access({userId:42})).json(),{globalLocked:false,userLocked:true,locked:true});
+    await click('admin:subuser:42:0:0:unlock');
+    assert.equal((await (await access({userId:42})).json()).locked,false);
+    await click('admin:subusers:0');
+    assert.ok(edit().reply_markup.inline_keyboard.flat().some(b=>b.callback_data==='admin:subuser:42:0:0'));
+    assert.ok(admin.adminDashboardKeyboard().inline_keyboard.flat().some(b=>b.callback_data==='admin:subtitles'));
+    assert.ok(admin.adminUserDetailKeyboard(await f.detail(),0).inline_keyboard.flat().some(b=>b.callback_data==='admin:subuser:42:0:0'));
+    f.restart();assert.equal((await (await access({userId:42})).json()).locked,false);
+  }finally{globalThis.fetch=previous;f.close();}
+});
+
+test('subtitle admin history stays within Telegram limits and locked notices survive real privacy and localization processing',async()=>{
+  const f=fixture(),previous=globalThis.fetch,calls=[];
+  globalThis.fetch=async(input,init)=>{calls.push(JSON.parse(init.body));return Response.json({ok:true,result:{message_id:10}});};
+  try{
+    await f.record(1,{user:{id:Number.MAX_SAFE_INTEGER,firstName:'نام '.repeat(100)}});
+    for(let i=0;i<6;i++) await f.request('/download',{...base,key:`long-subtitle-${i}`,userId:Number.MAX_SAFE_INTEGER,
+      subtitleLanguage:'zh',status:'failed',title:'عنوان'.repeat(100),request:'https://youtube.com/'.padEnd(500,'a'),detail:'توضیح'.repeat(100)});
+    await admin.worker.fetch(webhook({callback_query:{id:'subtitle-limits',from:{id:admin.ADMIN_USER_ID},
+      data:`admin:subuser:${Number.MAX_SAFE_INTEGER}:99999999:0:lock`,message:{message_id:10,chat:{id:admin.ADMIN_USER_ID}}}}),f.env,{});
+    const edit=calls.filter(c=>c.reply_markup).at(-1);
+    assert.ok(edit.text.length<4096);
+    assert.ok(edit.reply_markup.inline_keyboard.flat().every(b=>Buffer.byteLength(b.callback_data)<=64));
+    assert.ok(edit.reply_markup.inline_keyboard.flat().some(b=>b.callback_data.includes(':1')));
+    const notice='🔒 زیرنویس، کمی بعد\n\nدسترسی به زیرنویس فعلاً از طرف مدیریت بسته شده است.\nدانلود ویدیو بدون زیرنویس همچنان در دسترس توست.';
+    const safe=admin.telegramCustomEmoji('answerCallbackQuery',{callback_query_id:'locked',text:notice,show_alert:true,_errorUserId:42});
+    assert.equal(safe.text,notice);assert.equal(safe.show_alert,true);assert.ok(safe.text.length<=200);
+  }finally{globalThis.fetch=previous;f.close();}
+});
+
+test('production locked subtitle click displays a localized modal with the requested icon and no new chat message',async()=>{
+  const f=fixture(),previous=globalThis.fetch,calls=[];
+  globalThis.fetch=async(input,init)=>{calls.push({method:String(input).split('/').at(-1),body:JSON.parse(init.body)});
+    return Response.json({ok:true,result:{message_id:10}});};
+  try{
+    await f.request('/language?user=42',{language:'en'});
+    await f.request('/youtube-subtitle-access',{actorId:admin.ADMIN_USER_ID,userId:42,locked:true});
+    const menu={videoId:'abcdefghijk',requestMessageId:7,userId:42,chatId:42,messageId:10,qualities:[360],audioAvailable:true,
+      preference:{enabled:false},createdAt:Date.now()};
+    await f.request('/youtube-subtitles',{op:'open',...menu,menu});
+    await admin.worker.fetch(webhook({callback_query:{id:'locked-user',from:{id:42},
+      data:'ytst|abcdefghijk|7|42|1',message:{message_id:10,chat:{id:42}}}}),f.env,{});
+    const alert=calls.find(c=>c.method==='answerCallbackQuery'&&c.body.show_alert)?.body;
+    assert.ok(alert);assert.match(alert.text,/Subtitle access is currently closed/);
+    assert.ok(!/[\u0600-\u06ff]/.test(alert.text));assert.ok(alert.text.length<=200);
+    assert.ok(!calls.some(c=>c.method==='sendMessage'||c.method==='sendMessageDraft'));
+    const edit=calls.filter(c=>c.body.reply_markup).at(-1).body;
+    assert.equal(edit.message_id,10);assert.equal(edit.reply_markup.inline_keyboard.at(-1)[0].icon_custom_emoji_id,'5296369303661067030');
+  }finally{globalThis.fetch=previous;f.close();}
+});
+
 const charge = (extra={}) => ({key:'sub:test',downloadKey:base.key,userId:42,at:Date.now(),language:'fa',
   provider:'openai',model:'gpt-6-luna',state:'measured',serviceTier:'default',
   inputTokens:10000,cachedInputTokens:2000,cacheWriteTokens:4000,outputTokens:3000,...extra});
@@ -117,7 +217,13 @@ function fixture(legacy = false) {
     else db.exec(query);
     return { toArray: () => rows, one: () => rows[0], rowsWritten: changes };
   } };
-  const storage = { sql, transactionSync(fn) {
+  const values=new Map();let serial=Promise.resolve();
+  const storage = { sql,
+    async get(key){return structuredClone(values.get(key));},
+    async put(key,value){values.set(key,structuredClone(value));},
+    async delete(key){values.delete(key);},
+    transaction(fn){const result=serial.then(()=>fn(storage));serial=result.catch(()=>{});return result;},
+    transactionSync(fn) {
     db.exec('BEGIN');
     try { const result = fn(); db.exec('COMMIT'); return result; }
     catch (error) { db.exec('ROLLBACK'); throw error; }

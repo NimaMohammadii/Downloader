@@ -1,5 +1,25 @@
 [
   {
+    "fa": "زیرنویس: قفل",
+    "en": "Subtitles: locked",
+    "ru": "Субтитры: закрыты"
+  },
+  {
+    "fa": "🔒 زیرنویس، کمی بعد",
+    "en": "🔒 Subtitles, a little later",
+    "ru": "🔒 Субтитры — чуть позже"
+  },
+  {
+    "fa": "دسترسی به زیرنویس فعلاً از طرف مدیریت بسته شده است.",
+    "en": "Subtitle access is currently closed by the administrator.",
+    "ru": "Администратор временно закрыл доступ к субтитрам."
+  },
+  {
+    "fa": "دانلود ویدیو بدون زیرنویس همچنان در دسترس توست.",
+    "en": "You can still download videos without subtitles.",
+    "ru": "Скачивание видео без субтитров по-прежнему доступно."
+  },
+  {
     "fa": "⚠️ دسترسی شما به این قابلیت محدود شده است؛ برای پیگیری با پشتیبانی تماس بگیر.",
     "en": "⚠️ Your access to this feature is limited. Get in touch with support for help.",
     "ru": "⚠️ Доступ к этой функции ограничен. Напиши в поддержку — тебе помогут."

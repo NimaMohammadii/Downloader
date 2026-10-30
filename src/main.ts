@@ -1,5 +1,6 @@
 import { membershipInstagram, membershipState, setMembershipEnabled, setMembershipMode, MEMBERSHIP_MODES, MEMBERSHIP_MODE_LABELS, type MembershipMode } from "./membership";
 import downloaderWorker from "./entry";
+import { adminSubtitlePanel } from "./admin-subtitles";
 import {
   telegramTextMotion,
   telegramCustomEmoji,
@@ -151,6 +152,15 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
   await safeTelegramCall(env, "answerCallbackQuery", { callback_query_id: query.id });
 
   try {
+    const subtitlePanel = await adminSubtitlePanel(env, query.from.id, data);
+    if (subtitlePanel) {
+      await telegramCall(env, "editMessageText", {
+        chat_id: message.chat.id, message_id: message.message_id, ...subtitlePanel,
+      }).catch(error => {
+        if (!(error instanceof Error) || !/message is not modified/i.test(error.message)) throw error;
+      });
+      return Response.json({ ok: true });
+    }
     if (data === "admin:activity") {
       try {
         await telegramCall(env, "editMessageText", {
