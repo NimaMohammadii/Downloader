@@ -118,7 +118,7 @@ def authorize(payload: dict) -> None:
     expected = hmac.new(str(payload.get('botToken') or '').encode(), message.encode(), hashlib.sha256).hexdigest()
     supplied = payload.get('subtitleAuthorization')
     if not isinstance(supplied, str) or not hmac.compare_digest(expected, supplied):
-        raise app.UserVisibleError('❌ زیرنویس فعلاً فقط برای ادمین فعال است.')
+        raise app.UserVisibleError('❌ مجوز درخواست زیرنویس معتبر نیست.')
     if payload.get('mediaCacheKey') != f"yt:{video_id}:v{payload.get('quality')}:sub-{language}-v1":
         raise app.UserVisibleError('❌ شناسهٔ فایل زیرنویس معتبر نیست.')
     if not payload.get('elevenApiKey') or not payload.get('gptApiKey'):

@@ -563,7 +563,7 @@ test('quality buttons use English labels and show video plus audio sizes', async
     '1080': { bytes: 1500000000, estimated: true },
     low: { bytes: 3200000, estimated: false },
   } });
-  const buttons = result.messages.find(m => m.reply_markup)?.reply_markup.inline_keyboard.flat();
+  const buttons = result.messages.find(m => m.reply_markup)?.reply_markup.inline_keyboard.flat().filter(b=>b.callback_data.startsWith('ytq|'));
   assert.ok(buttons.some(b => b.text === '⭐ 720p HD 123.4 MB'));
   assert.ok(buttons.some(b => b.text === '1080p Full HD 1.50 GB'));
   assert.ok(buttons.some(b => b.text === '🎵 Audio Low 3.2 MB'));
@@ -574,7 +574,8 @@ test('older metadata without a size still offers working quality buttons', async
   const result = await run({ inspect: true });
   const buttons = result.messages.find(m => m.reply_markup)?.reply_markup.inline_keyboard.flat();
   assert.ok(buttons.some(b => b.text === '360p Low Size unknown'));
-  assert.ok(buttons.every(b => b.callback_data.startsWith('ytq|')));
+  assert.equal(buttons.filter(b=>b.callback_data.startsWith('ytq|')).length,6);
+  assert.equal(buttons.at(-1).callback_data,'ytst|dQw4w9WgXcQ|7|42|1');
 });
 
 
@@ -702,20 +703,20 @@ async function subtitleChoice(data, actor=1, extra={}) {
   globalThis.fetch=async(_url,init)=>{const body=JSON.parse(init.body);messages.push(body);return Response.json({ok:true,result:{message_id:10}});};
   const env={BOT_TOKEN:'secret-token',ELEVEN_API:'private-eleven',GPT_API:'private-gpt',
     ADMIN_STATS:subtitleBinding(),YOUTUBE_DOWNLOAD_WORKFLOW:{async create(job){jobs.push(job);}},...extra};
-  await settings(env.ADMIN_STATS,'open');
+  await settings(env.ADMIN_STATS,'open',{userId:actor,chatId:actor,menu:menuFixture({userId:actor,chatId:actor})});
   const callback={id:'callback',from:{id:actor},data,message:{message_id:10,chat:{id:actor}}};
   if (/^(ytst|ytsl|ytsp)\|/.test(data)) await handleSubtitleCallback(env,callback);
   else await handleQualityCallback(env,{},callback);
   return {messages,jobs,env};
 }
 
-test('quality selection starts immediately and only admin quality menus have subtitle controls',async()=>{
+test('quality selection starts immediately and all users have subtitle controls',async()=>{
   const displayed=await run({inspect:true,jobChanges:{userId:1,chatId:1}});
   const rows=displayed.messages.find(m=>m.reply_markup?.inline_keyboard).reply_markup.inline_keyboard;
   assert.equal(rows.at(-1)[0].icon_custom_emoji_id,'5210952531676504517');
   assert.ok(rows.at(-1)[0].callback_data.startsWith('ytst|'));
   const noAdmin=await run({inspect:true});
-  assert.ok(!JSON.stringify(noAdmin.messages).includes('ytst|'));
+  assert.ok(JSON.stringify(noAdmin.messages).includes('ytst|'));
   const disabled=await subtitleChoice('ytq|dQw4w9WgXcQ|720|7|1');
   assert.equal(disabled.jobs.length,1);assert.ok(!disabled.jobs[0].params.subtitle);
   assert.ok(!disabled.messages.some(m=>String(m.text).includes('می‌خواهی')));
@@ -813,11 +814,25 @@ test('subtitle Telegram cache keys are isolated from original quality and audio 
 });
 
 
-test('subtitle authorization is checked in Workflow before cache, container boot or API work',async()=>{
-  for(const options of [{jobChanges:{subtitle:'fa',userId:42}},{jobChanges:{subtitle:'fa',userId:1},aiSecrets:false}]){
+test('subtitle validation is checked in Workflow before cache, container boot or API work',async()=>{
+  for(const options of [{jobChanges:{subtitle:'invalid',userId:42}},{jobChanges:{subtitle:'fa',userId:42,audioMode:'hq'}},
+      {jobChanges:{subtitle:'fa',userId:42},aiSecrets:false}]){
     const result=await run(options);
     assert.equal(result.calls.length,0);assert.equal(result.delivered,0);
   }
+});
+
+test('non-admin users can enable, select a language and start signed subtitles on their own menu',async()=>{
+  const on=await subtitleChoice('ytst|dQw4w9WgXcQ|7|42|1',42);
+  assert.equal(on.messages.find(m=>m.reply_markup).reply_markup.inline_keyboard.slice(0,4).flat().length,12);
+  const binding=on.env.ADMIN_STATS;
+  await subtitleChoice('ytsl|dQw4w9WgXcQ|7|42|fr',42,{ADMIN_STATS:binding});
+  const selected=await subtitleChoice('ytq|dQw4w9WgXcQ|720|7|42',42,{ADMIN_STATS:binding});
+  assert.equal(selected.jobs[0].params.subtitle,'fr');
+  const result=await run({jobChanges:{subtitle:'fr',userId:42},subtitleVersion:2});
+  assert.equal(result.delivered,1);
+  assert.equal(globalThis.lastDownloadPayload.subtitleAuthorization,createHmac('sha256','secret-token')
+    .update('subtitle-fr-v1|test-job|42|dQw4w9WgXcQ|720').digest('hex'));
 });
 
 test('YouTube history carries explicit subtitle mode and language while other source history stays unchanged',async()=>{

@@ -54,7 +54,7 @@ test('subtitle ledger persists failed-job costs, rejects malformed batches, dedu
   }finally{f.close();}
 });
 
-test('YouTube subtitle choice, language and API cost appear in per-user history with exact custom status emojis',async()=>{
+test('YouTube subtitle history keeps the active custom emoji and has no disabled subtitle emoji',async()=>{
   const f=fixture();
   try{
     await f.record(1);
@@ -72,11 +72,12 @@ test('YouTube subtitle choice, language and API cost appear in per-user history 
     const decorated=admin.telegramCustomEmoji('editMessageText',{text,chat_id:admin.ADMIN_USER_ID});
     const subtitleEntities=decorated.entities.filter(e=>text.slice(e.offset,e.offset+e.length+10).includes('زیرنویس:'));
     assert.ok(subtitleEntities.some(e=>e.custom_emoji_id==='5206607081334906820'));
-    assert.ok(subtitleEntities.some(e=>e.custom_emoji_id==='5210952531676504517'));
+    assert.ok(!text.includes('❌ زیرنویس: غیرفعال'));
+    assert.ok(!subtitleEntities.some(e=>e.custom_emoji_id==='5210952531676504517'));
   }finally{f.close();}
 });
 
-test('admin-only YouTube subtitle requests are visible without enabling unrelated admin activity tracking',async()=>{
+test('administrator YouTube subtitle requests are visible without enabling unrelated admin activity tracking',async()=>{
   const f=fixture();
   try{
     await admin.recordDownload(f.env,{...base,userId:admin.ADMIN_USER_ID,status:'success',delivered:1});

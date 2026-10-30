@@ -456,7 +456,7 @@ function redactDiagnostic(detail: string, env: Env): string {
 }
 
 function workflowFailureMessage(detail: string, phase: string): string {
-  if (detail.includes("SUBTITLE_ADMIN_ONLY")) return "❌ زیرنویس فعلاً فقط برای ادمین فعال است.";
+  if (detail.includes("SUBTITLE_INVALID")) return "❌ درخواست زیرنویس معتبر نیست.";
   if (detail.includes("SUBTITLE_RUNTIME_NOT_READY")) return "❌ سرور زیرنویس هنوز نسخهٔ جدید را اجرا نمی‌کند؛ کمی بعد لینک را دوباره بفرست.";
   if (detail.includes("SUBTITLE_CONFIG")) return "❌ برای زیرنویس، ELEVEN_API و GPT_API را در Secretهای Worker تنظیم کن.";
   if (detail.includes("YT_CONFIG")) {
@@ -889,8 +889,8 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
 
     try {
       // Optional post-processing is authorized before cache access or downloads.
-      if (job.subtitle && (!isAdmin(this.env, job.userId) || !isSubtitleLanguage(job.subtitle) || !job.quality || job.audioMode || job.source))
-        throw new Error("SUBTITLE_ADMIN_ONLY");
+      if (job.subtitle && (!isSubtitleLanguage(job.subtitle) || !job.quality || job.audioMode || job.source))
+        throw new Error("SUBTITLE_INVALID");
       if (job.subtitle && (!this.env.ELEVEN_API?.trim() || !this.env.GPT_API?.trim()))
         throw new Error("SUBTITLE_CONFIG");
       if (!job.quality && !job.audioMode && job.source !== "pornhub") {
@@ -958,13 +958,13 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
 
         await step.do("track quality selection", () => trackJob(this.env, job, "awaiting_selection", { title: metadata.title }));
         await step.do("show youtube quality buttons", async () => {
-          const menu = isAdmin(this.env, job.userId) ? await subtitleMenuRequest(this.env, {
+          const menu = await subtitleMenuRequest(this.env, {
             op: "open", userId: job.userId, chatId: job.chatId, messageId: statusMessageId!,
             menu: { videoId: metadata.videoId!, requestMessageId: job.requestMessageId, userId: job.userId,
               chatId: job.chatId, messageId: statusMessageId!, title: metadata.title,
               qualities, audioAvailable: Boolean(metadata.audioAvailable), sizes: metadata.sizes,
               preference: { enabled: false }, createdAt: Date.now() },
-          }) : undefined;
+          });
           await telegramCall(this.env.BOT_TOKEN, "editMessageText", {
             chat_id: job.chatId,
             message_id: statusMessageId,
@@ -977,7 +977,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
                 job.requestMessageId,
                 job.userId,
                 metadata.sizes,
-              ), ...(menu ? subtitleButtons(menu) : [])],
+              ), ...subtitleButtons(menu)],
             },
           });
           return true;
@@ -1647,7 +1647,7 @@ function subtitleMenuError(error: unknown): string {
 async function handleSubtitleCallback(env: Env, callback: TelegramCallbackQuery): Promise<Response> {
   const match = /^(ytst|ytsl|ytsp)\|([A-Za-z0-9_-]{11})\|(\d+)\|(\d+)\|([a-z0-9]+)$/.exec(callback.data || "");
   const owner = match ? parseQualityCallback(`ytq|${match[2]}|360|${match[3]}|${match[4]}`) : null;
-  if (!owner || !callback.message || !isAdmin(env, callback.from.id) || callback.from.id !== owner.userId ||
+  if (!owner || !callback.message || callback.from.id !== owner.userId ||
       (match![1] === "ytst" ? !/^[01]$/.test(match![5]) : match![1] === "ytsl" ? !isSubtitleLanguage(match![5]) : !/^(open|back)$/.test(match![5]))) {
     await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id,
       text: "این انتخاب برای شما معتبر نیست.", show_alert: true });
@@ -1696,7 +1696,7 @@ async function handleQualityCallback(
   }
 
   let subtitle: SubtitleLanguage | undefined;
-  if (parsed.quality && isAdmin(env, callback.from.id)) {
+  if (parsed.quality) {
     const base = { userId: parsed.userId, chatId: callback.message.chat.id, messageId: callback.message.message_id,
       videoId: parsed.videoId, requestMessageId: parsed.requestMessageId };
     try {

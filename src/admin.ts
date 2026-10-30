@@ -1369,8 +1369,8 @@ function displayText(value: unknown, limit: number): string | null {
 }
 
 export async function recordDownload(env: Partial<AdminStatsEnv> & { BOT_TOKEN?: string }, record: DownloadRecord): Promise<void> {
-  // The admin-only subtitle feature also needs visible history and costs for
-  // its administrator. Preserve exclusions for every other admin activity.
+  // Administrator subtitle downloads also need visible history and costs.
+  // Preserve exclusions for every other admin activity.
   if (!env.ADMIN_STATS || isAdmin(env, record.userId) && !Object.hasOwn(record, 'subtitleLanguage')) return;
   try {
     const response = await statsStub(env as AdminStatsEnv).fetch("https://admin-stats/download", {

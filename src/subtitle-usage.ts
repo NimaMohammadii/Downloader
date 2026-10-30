@@ -75,5 +75,5 @@ export function subtitleCostLines(v: SubtitleCosts): string[] {
 }
 export function subtitleChoiceLabel(language: SubtitleLanguage | null | undefined): string {
   return language === undefined ? 'زیرنویس: در سابقهٔ قدیمی ثبت نشده'
-    : language === null ? '❌ زیرنویس: غیرفعال' : `✅ زیرنویس: فعال • ${subtitleName(language)}`;
+    : language === null ? 'زیرنویس: غیرفعال' : `✅ زیرنویس: فعال • ${subtitleName(language)}`;
 }
