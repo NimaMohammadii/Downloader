@@ -1346,7 +1346,10 @@ def social_prepare_entry(entry: dict[str, Any], platform: str, workdir: Path, bu
                     if fmt.get("has_drm"):
                         raise app.UserVisibleError("❌ نسخهٔ قابل دریافت این فایل محدود است؛ دانلود انجام نشد.")
             info_path.write_text(json.dumps(info), encoding="utf-8")
-            fmt = "bestaudio/best" if audio_request else "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b[height<=1080]/bv[height<=1080][ext=mp4]/bv[height<=1080]/b/bv"
+            # Pinterest HLS exposes its separate AAC audio as ext=mp4, not
+            # m4a. Filtering it out selects the video-only fallback.
+            audio_format = "ba" if platform == "pinterest" else "ba[ext=m4a]"
+            fmt = "bestaudio/best" if audio_request else f"bv*[height<=1080][ext=mp4]+{audio_format}/b[height<=1080][ext=mp4]/b[height<=1080]/bv[height<=1080][ext=mp4]/bv[height<=1080]/b/bv"
             _run([app.REAL_YTDLP, "--ignore-config", "--compat-options", "no-certifi", "--no-playlist", "--quiet", "--no-progress", "--socket-timeout", "15",
                   "--retries", "1", "--fragment-retries", "1", "--abort-on-unavailable-fragments", "--concurrent-fragments", "8",
                   "--max-filesize", str(budget), "--merge-output-format", "mp4", "--format", fmt,
@@ -1441,7 +1444,7 @@ def social_cache_key(platform: str, url: str, index: int, entry: dict[str, Any],
                 "title": str(entry.get("track") or entry.get("title") or SOCIAL_NAMES[platform])[:180],
                 "artist": str(entry.get("artist") or entry.get("uploader") or "")[:120],
                 "duration": entry.get("duration") or 0, "formats": formats, "hasAudio": entry.get("has_audio"),
-                "mode": "audio" if audio_only or platform == "soundcloud" else "video", "version": 2}
+                "mode": "audio" if audio_only or platform == "soundcloud" else "video", "version": 3 if platform == "pinterest" else 2}
     return "social:" + hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 

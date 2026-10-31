@@ -568,6 +568,43 @@ class SocialFileTests(unittest.TestCase):
             finally:server.shutdown();server.server_close();thread.join()
 
 
+    def test_pinterest_hls_merges_separate_mp4_audio_from_reported_pin_schema(self):
+        from functools import partial
+        from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+        with tempfile.TemporaryDirectory() as fixture_dir, tempfile.TemporaryDirectory() as output_dir:
+            root = Path(fixture_dir)
+            for kind, name in [('v', 'video'), ('a', 'audio')]:
+                subprocess.run(['ffmpeg', '-y', '-v', 'error', '-i', str(self.root/'fixture.mp4'),
+                                '-map', f'0:{kind}:0', '-c', 'copy', '-hls_time', '0.4',
+                                '-hls_playlist_type', 'vod', str(root/f'{name}.m3u8')], check=True)
+            # The reported Pin advertises audio separately. yt-dlp labels that
+            # audio rendition mp4 even though its stream is AAC.
+            (root/'master.m3u8').write_text(
+                '#EXTM3U\n#EXT-X-VERSION:6\n'
+                '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="1",LANGUAGE="eng",'
+                'AUTOSELECT=YES,URI="audio.m3u8",CHANNELS="1"\n'
+                '#EXT-X-STREAM-INF:BANDWIDTH=100000,CODECS="avc1.64080D,mp4a.40.2",'
+                'RESOLUTION=64x48,AUDIO="audio"\nvideo.m3u8\n')
+            class Quiet(SimpleHTTPRequestHandler):
+                def log_message(self, *args): pass
+            server = ThreadingHTTPServer(('127.0.0.1', 0), partial(Quiet, directory=root))
+            thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+            try:
+                entry = {'id': '901564419174980701', 'title': 'Pinterest split audio', 'ext': 'm3u8',
+                         'duration': 1, 'url': f'http://127.0.0.1:{server.server_port}/master.m3u8'}
+                with patch.object(p, 'social_cdn_url', side_effect=lambda url, platform: url), \
+                        patch.object(app, 'REAL_YTDLP', shutil.which('yt-dlp')):
+                    item = p.social_prepare_entry(entry, 'pinterest', Path(output_dir), 1_000_000, time.monotonic()+60)
+                probe = json.loads(subprocess.run(['ffprobe', '-v', 'error', '-show_streams', '-of', 'json',
+                                                  str(item['path'])], capture_output=True, text=True, check=True).stdout)
+                self.assertEqual(item['method'], 'sendVideo')
+                self.assertTrue(item['hasAudio'])
+                self.assertEqual({s['codec_type'] for s in probe['streams']}, {'audio', 'video'})
+                self.assertGreaterEqual(item['data']['duration'], 1)
+            finally:
+                server.shutdown(); server.server_close(); thread.join()
+
     def test_social_audio_outputs_real_tagged_mp3_for_all_video_services(self):
         for platform,host in [('x','video.twimg.com'),('tiktok','v.tiktokcdn.com'),('pinterest','v.pinimg.com'),('aparat','a.asset.aparat.com')]:
             with self.subTest(platform=platform),tempfile.TemporaryDirectory() as d:
