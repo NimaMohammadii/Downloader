@@ -1,3 +1,4 @@
+import { withUserLanguage } from "./localization";
 import { ADMIN_USER_ID, getAdminIds, isAdmin, telegramCustomEmoji, telegramTextMotion, type AdminStatsEnv, type AdminAccessEnv } from "./admin";
 
 type Env = Partial<AdminStatsEnv> & { BOT_TOKEN?: string; WEBHOOK_SECRET?: string };
@@ -144,9 +145,9 @@ export class BroadcastManager {
   }
   private async publish(job: Job) {
     try {
-      await telegram(this.env,"editMessageText",telegramCustomEmoji("editMessageText",{
+      await withUserLanguage(this.env, Number(job.chat_id), () => telegram(this.env,"editMessageText",telegramCustomEmoji("editMessageText",{
         chat_id:Number(job.chat_id), message_id:Number(job.message_id), ...broadcastPanel(this.status(job)),
-      },this.env));
+      },this.env)));
     } catch { console.warn("broadcast progress update unavailable"); }
   }
   async alarm(): Promise<void> {

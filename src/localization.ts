@@ -5,6 +5,7 @@ import messages from '../locales/messages.json';
 export type Language = 'fa' | 'en' | 'ru';
 type LanguageEnv = { ADMIN_STATS?: { getByName(name: string): { fetch(input: string, init?: RequestInit): Promise<Response> } }; BOT_TOKEN?: string; WEBHOOK_SECRET?: string };
 const context = new AsyncLocalStorage<{ language: Language; userId?: number }>();
+export const presentationLocale = (): string => ({ fa: 'fa-IR', en: 'en-GB', ru: 'ru-RU' })[context.getStore()?.language || 'fa'];
 export const isLanguage = (value: unknown): value is Language => value === 'fa' || value === 'en' || value === 'ru';
 async function languagePreference(env: LanguageEnv, userId?: number): Promise<{ language: Language; selected: boolean }> {
   const fallback = { language: 'fa' as const, selected: false };
@@ -24,31 +25,47 @@ export async function withUserLanguage<T>(env: LanguageEnv, userId: number | und
 }
 const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const ordered = [...messages].filter(row => !row.fa.includes('{0}')).sort((a, b) => b.fa.length - a.fa.length);
+const bySource = new Map(ordered.map(row => [row.fa, row]));
+// Short labels and native language names are exact matches, never word replacements
+// inside media titles, usernames or other runtime values.
 const terms = new Set(['صدای ویدیوی', 'هایلایت', 'استوری', 'پست', 'فایل', 'روز', 'ساعت', 'دقیقه', 'ثانیه', ' و ']);
-const literals = ordered.filter(row => !terms.has(row.fa));
+const literals = ordered.filter(row => !terms.has(row.fa) && /[\u0600-\u06ff]/u.test(row.fa) &&
+  (row.fa.length >= 12 || /🇮🇷|🇬🇧|🇷🇺/u.test(row.fa)));
 const pattern = new RegExp(literals.map(row => escape(row.fa)).join('|'), 'gu');
-const templates = messages.filter(row => row.fa.includes('{0}')).map(row => ({ row,
-  pattern: new RegExp('^' + escape(row.fa).replace(/\\\{\d+\\\}/g, '(.+?)') + '$', 'u') }));
+const templates = messages.filter(row => row.fa.includes('{0}'))
+  .sort((a, b) => b.fa.replace(/\{\d+\}/g, '').length - a.fa.replace(/\{\d+\}/g, '').length)
+  .map(row => ({ row,
+    indices: [...row.fa.matchAll(/\{(\d+)\}/g)].map(match => Number(match[1])),
+    pattern: new RegExp('^' + row.fa.split(/(\{\d+\})/g).map(part => /^\{\d+\}$/.test(part) ? '(.*?)' : escape(part)).join('') + '$', 'u'),
+  }));
 const translatedErrors = new Set(messages.filter(row => row.fa.startsWith('⚠️')).flatMap(row => [row.en, row.ru]));
 export function isTranslatedErrorFrame(text: unknown): boolean { return typeof text === "string" && [...translatedErrors].some(value => value.startsWith(text)); }
 export function isTranslatedError(text: unknown): boolean { return typeof text === 'string' && translatedErrors.has(text); }
-export function translate(text: string, language: Language): string {
-  if (language === 'fa') return text;
-  const bySource = new Map(ordered.map(row => [row.fa, row[language]]));
+export function translate(text: string, language: Language, depth = 0): string {
+  if (language === 'fa' || depth > 5) return text;
+  const exact = bySource.get(text);
+  if (exact) return exact[language];
   return text.split('\n').map(line => {
+    const exactLine = bySource.get(line);
+    if (exactLine) return exactLine[language];
+    if (/^(?:(?:زمان باقی‌مانده:|مدت محدودیت:)\s*)?[۰-۹٠-٩0-9.]+\s+(?:روز|ساعت|دقیقه|ثانیه)(?: و [۰-۹٠-٩0-9.]+\s+(?:روز|ساعت|دقیقه|ثانیه))*$/.test(line)) {
+      return line.replace(/[۰-۹٠-٩]/g, digit => String(digit.charCodeAt(0) - (digit >= '۰' ? 1776 : 1632)))
+        .replace(/روز|ساعت|دقیقه|ثانیه| و /g, value => bySource.get(value)![language])
+        .replace(pattern, value => bySource.get(value)![language]);
+    }
     for (const item of templates) {
       const match = item.pattern.exec(line);
-      if (match) return item.row[language].replace(/\{(\d+)\}/g, (_, index) => {
-        const value = match[Number(index) + 1];
-        return bySource.get(value) || value;
-      });
+      if (match) {
+        const values = new Map(item.indices.map((index, group) => [index, match[group + 1]]));
+        return item.row[language].replace(/\{(\d+)\}/g, (_, index) => {
+          const value = values.get(Number(index))!;
+          return item.row.preserve?.includes(Number(index)) ? value : translate(value, language, depth + 1);
+        });
+      }
     }
-    if (/^(?:زمان باقی‌مانده:|مدت محدودیت:|[۰-۹٠-٩0-9]+\s+(?:روز|ساعت|دقیقه|ثانیه))/.test(line)) {
-      line = line.replace(/[۰-۹٠-٩]/g, digit => String(digit.charCodeAt(0) - (digit >= '۰' ? 1776 : 1632)))
-        .replace(/روز|ساعت|دقیقه|ثانیه| و /g, value => bySource.get(value) || value);
-    }
-    return line;
-  }).join('\n').replace(pattern, value => bySource.get(value)!);
+    // Preserve the old shared catalog's sentence fragments (e.g. bold labels).
+    return line.replace(pattern, value => bySource.get(value)![language]);
+  }).join('\n');
 }
 export function localizePayload(payload: Record<string, unknown>, language = context.getStore()?.language || 'fa'): Record<string, unknown> {
   if (language === 'fa') return payload;
@@ -56,15 +73,28 @@ export function localizePayload(payload: Record<string, unknown>, language = con
   for (const [field, entityField] of [['text', 'entities'], ['caption', 'caption_entities']]) {
     const source = payload[field];
     if (typeof source !== 'string') continue;
-    const text = translate(source, language);
+    // Download captions start with the original media title. Only subsequent
+    // bot-authored labels (quality, subtitles, recording notes) are localized.
+    const titleLength = field === 'caption' ? (source.indexOf('\n') < 0 ? source.length : source.indexOf('\n')) : 0;
+    const text = source.slice(0, titleLength) + translate(source.slice(titleLength), language);
     result[field] = text;
     if (text === source) continue;
+    // HTML/Markdown already carries its formatting; Telegram must not also get entities.
+    if (payload.parse_mode) continue;
     // Rebuild UTF-16 offsets after translation. Never reuse Persian offsets.
     const entities = Array.isArray(payload[entityField]) ? payload[entityField] as Record<string, unknown>[] : [];
-    result[entityField] = entities.filter(e => e.type !== 'custom_emoji').flatMap(e => {
-      const phrase = translate(source.slice(Number(e.offset), Number(e.offset) + Number(e.length)), language);
-      const offset = text.indexOf(phrase);
-      return offset < 0 ? [] : [{ ...e, offset, length: phrase.length }];
+    result[entityField] = entities.flatMap(e => {
+      const raw = source.slice(Number(e.offset), Number(e.offset) + Number(e.length));
+      const phrase = Number(e.offset) < titleLength ? raw : translate(raw, language);
+      if (!phrase) return [];
+      // Repeated phrases must keep distinct entities, including custom progress icons.
+      const occurrence = raw ? source.slice(0, Number(e.offset)).split(raw).length - 1 : 0;
+      let offset = -1;
+      for (let i = 0; i <= occurrence; i++) {
+        offset = text.indexOf(phrase, offset + 1);
+        if (offset < 0) return [];
+      }
+      return [{ ...e, offset, length: phrase.length }];
     });
     if (!entities.length && field === 'text' && text.includes('\n')) {
       const title = text.split('\n')[0];

@@ -574,9 +574,9 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       retries: { limit: 0, delay: "1 second" }, timeout: "30 seconds",
     }, async () => {
       try {
-        await telegramCall(this.env.BOT_TOKEN, "sendMessage", { chat_id: ADMIN_USER_ID,
+        await withUserLanguage(this.env, ADMIN_USER_ID, () => telegramCall(this.env.BOT_TOKEN, "sendMessage", { chat_id: ADMIN_USER_ID,
           disable_notification: false, link_preview_options: { is_disabled: true },
-          text: `⚠️ دانلود اینستاگرام با سشن حساب ناموفق بود\n\nلینک: https://www.instagram.com/p/${job.instagramPostRequest!.shortcode}/\nشناسه درخواست: ${job.id}\nسرویس اول: ${job.instagramApi?.provider || (job.apifyAccount !== undefined || this.env.APIFY_API_TOKEN?.trim() ? "apify" : "brightdata")}\nخطای سرویس: ${providerCode}\nخطای سشن: ${failure.code}\n${failure.status !== undefined ? `HTTP: ${failure.status}\n` : ""}${failure.endpoint ? `مسیر: ${failure.endpoint}\n` : ""}${failure.upstreamCode ? `پاسخ اینستاگرام: ${failure.upstreamCode}\n` : ""}\n${failure.message}` });
+          text: `⚠️ دانلود اینستاگرام با سشن حساب ناموفق بود\n\nلینک: https://www.instagram.com/p/${job.instagramPostRequest!.shortcode}/\nشناسه درخواست: ${job.id}\nسرویس اول: ${job.instagramApi?.provider || (job.apifyAccount !== undefined || this.env.APIFY_API_TOKEN?.trim() ? "apify" : "brightdata")}\nخطای سرویس: ${providerCode}\nخطای سشن: ${failure.code}\n${failure.status !== undefined ? `HTTP: ${failure.status}\n` : ""}${failure.endpoint ? `مسیر: ${failure.endpoint}\n` : ""}${failure.upstreamCode ? `پاسخ اینستاگرام: ${failure.upstreamCode}\n` : ""}\n${failure.message}` }));
       } catch { console.warn("instagram session admin notification failed", { jobId: job.id }); }
       return true;
     });

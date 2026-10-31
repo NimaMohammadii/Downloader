@@ -1,3 +1,4 @@
+import { presentationLocale } from "./localization";
 import { telegramTextMotion, isAdmin, type AdminStatsEnv } from "./admin";
 
 type RestrictionEnv = Partial<AdminStatsEnv> & { BOT_TOKEN?: string; WEBHOOK_SECRET?: string };
@@ -25,7 +26,7 @@ export function parseRestrictionDuration(text: string): number | null {
 }
 
 function date(value: number): string {
-  return new Intl.DateTimeFormat("fa-IR", { dateStyle: "short", timeStyle: "short", timeZone: "Asia/Tehran" }).format(value);
+  return new Intl.DateTimeFormat(presentationLocale(), { dateStyle: "short", timeStyle: "short", timeZone: "Asia/Tehran" }).format(value);
 }
 
 export function restrictionNotice(state: Restriction): { text: string; entities: Record<string, unknown>[] } {

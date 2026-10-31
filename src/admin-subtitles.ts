@@ -1,3 +1,4 @@
+import { presentationLocale } from "./localization";
 import { LANGUAGE_LABELS } from "./language-admin-store";
 import { isAdmin, getAdminUserDetail, formatAdminDownloadHistory, ADMIN_USERS_PAGE_SIZE, type AdminStatsEnv, type AdminSubtitleUsers } from './admin';
 import { SUBTITLE_LOCK_EMOJI, type SubtitleAccess, type SubtitleButton } from './youtube-subtitles';
@@ -6,7 +7,7 @@ type Panel = { text: string; entities: { type: 'bold'; offset: number; length: n
   reply_markup: { inline_keyboard: SubtitleButton[][] }; link_preview_options: { is_disabled: true } };
 const ACTIVE = '5206607081334906820';
 const clean = (text: string, limit = 70) => text.replace(/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g, ' ').slice(0, limit);
-const date = (value: number) => new Intl.DateTimeFormat('fa-IR', {
+const date = (value: number) => new Intl.DateTimeFormat(presentationLocale(), {
   dateStyle: 'short', timeStyle: 'short', timeZone: 'Asia/Tehran',
 }).format(value);
 const button = (text: string, callback_data: string, icon_custom_emoji_id?: string): SubtitleButton =>
