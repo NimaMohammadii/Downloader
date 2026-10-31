@@ -67,6 +67,41 @@ def _download_args(client: str) -> list[str]:
             "--max-filesize", str(app.DIRECT_TELEGRAM_LIMIT)]
 
 
+def _cookie_error(reason: str, message: str, line: int = 0):
+    # Never log parser exceptions: MozillaCookieJar includes the secret row.
+    print(f"youtube cookies rejected reason={reason} line={line}", flush=True)
+    return app.UserVisibleError(message)
+
+
+def _youtube_cookie_text(raw: str) -> str:
+    lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if not re.match(r"#(?: Netscape)? HTTP Cookie File", lines[0]):
+        kind = "json" if raw.startswith(("[", "{")) else "header"
+        raise _cookie_error(kind, "❌ قالب YOUTUBE_COOKIES درست نیست؛ خروجی کامل Netscape، همراه خط اول فایل، لازم است.")
+    result = ["# Netscape HTTP Cookie File"]
+    for number, line in enumerate(lines[1:], 2):
+        prefix = "#HttpOnly_" if line.startswith("#HttpOnly_") else ""
+        row = line[len(prefix):]
+        if not row.strip() or (not prefix and row.lstrip().startswith("#")):
+            continue
+        fields = row.split("\t")
+        if len(fields) != 7 or fields[1] not in ("TRUE", "FALSE") or fields[3] not in ("TRUE", "FALSE"):
+            raise _cookie_error("columns", f"❌ ساختار خط {number} کوکی درست نیست؛ خروجی Netscape باید ۷ ستون جداشده با Tab داشته باشد.", number)
+        domain = fields[0].lstrip(".").lower()
+        if domain != "youtube.com" and not domain.endswith(".youtube.com"):
+            continue
+        # Browser extensions export the subdomain flag independently of the
+        # leading dot. Preserve that flag while satisfying MozillaCookieJar's
+        # stricter domain/flag invariant; never infer a broader cookie scope.
+        fields[0] = ("." if fields[1] == "TRUE" else "") + domain
+        if fields[4] and not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", fields[4]):
+            raise _cookie_error("expiry", f"❌ زمان انقضای کوکی در خط {number} قالب معتبر ندارد؛ دوباره خروجی Netscape بگیر.", number)
+        result.append(prefix + "\t".join(fields))
+    if len(result) == 1:
+        raise _cookie_error("no_youtube_cookies", "❌ در خروجی، کوکی youtube.com پیدا نشد؛ خروجی را از همان صفحهٔ YouTube بگیر.")
+    return "\n".join(result) + "\n"
+
+
 @contextmanager
 def youtube_cookie_command(command: list[str]):
     # Only native YouTube extraction receives this credential. Each subprocess
@@ -82,8 +117,8 @@ def youtube_cookie_command(command: list[str]):
         path.touch(mode=0o600)
         try:
             if len(raw) > 1_000_000:
-                raise ValueError()
-            path.write_text(raw.replace("\r\n", "\n"), encoding="utf-8")
+                raise _cookie_error("size", "❌ حجم YOUTUBE_COOKIES بیش از حد مجاز است؛ فقط کوکی‌های YouTube را صادر کن.")
+            path.write_text(_youtube_cookie_text(raw), encoding="utf-8")
             jar = MozillaCookieJar(str(path))
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
@@ -95,10 +130,12 @@ def youtube_cookie_command(command: list[str]):
                 elif cookie.expires == 0:
                     cookie.expires, cookie.discard = None, True
             if not len(jar):
-                raise ValueError()
+                raise _cookie_error("expired", "❌ همهٔ کوکی‌های YouTube این خروجی منقضی شده‌اند؛ خروجی تازه بگیر.")
             jar.save(ignore_discard=True, ignore_expires=True)
-        except (ValueError, TypeError, OverflowError, OSError, LoadError):
-            raise app.UserVisibleError("❌ کوکی YouTube نامعتبر یا منقضی است؛ خروجی تازهٔ Netscape را در YOUTUBE_COOKIES قرار بده.") from None
+        except (ValueError, TypeError, OverflowError, LoadError):
+            raise _cookie_error("parse", "❌ فایل Netscape کوکی خوانده نشد؛ ساختار خروجی معتبر نیست.") from None
+        except OSError:
+            raise _cookie_error("storage", "❌ فایل موقت کوکی روی سرور ساخته نشد؛ وضعیت فضای کانتینر باید بررسی شود.") from None
         yield [command[0], "--cookies", str(path), *command[1:]]
 
 
@@ -120,6 +157,18 @@ def _run(command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
         if process.returncode:
             raise subprocess.CalledProcessError(process.returncode, command, stdout, stderr)
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def report_youtube_cookie_status() -> None:
+    # Startup diagnostics validate locally without contacting YouTube or
+    # exposing credentials. Invalid configuration must not stop other sources.
+    try:
+        command = [app.REAL_YTDLP, *_client_args("default")]
+        with youtube_cookie_command(command) as configured:
+            status = "ready" if "--cookies" in configured else "missing"
+            print(f"youtube cookies status={status} validator=2", flush=True)
+    except app.UserVisibleError:
+        print("youtube cookies status=invalid validator=2", flush=True)
 
 
 def _classify_ytdlp_error(stderr: str) -> tuple[str, str]:
@@ -1558,5 +1607,6 @@ def install() -> None:
 if __name__ == "__main__":
     from yt_dlp.version import __version__
     print(f"youtube runtime version={__version__} clients={','.join(CLIENTS)} policy=upstream-catalog-v2", flush=True)
+    report_youtube_cookie_status()
     install()
     app.serve()

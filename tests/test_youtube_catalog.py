@@ -1,4 +1,6 @@
 import json
+import io
+from contextlib import redirect_stdout
 from pathlib import Path
 import subprocess
 import sys
@@ -70,6 +72,52 @@ class YoutubeCookieTests(unittest.TestCase):
                 self.assertFalse(b.exists())
                 self.assertTrue(a.exists())
             self.assertFalse(a.exists())
+
+    def test_extension_domain_flag_is_preserved_when_leading_dot_disagrees(self):
+        raw = ('# Netscape HTTP Cookie File\r'
+               '#HttpOnly_youtube.com\tTRUE\t/\tTRUE\t0\tSID\tprivate-secret\r'
+               '.www.youtube.com\tFALSE\t/\tTRUE\t0\tHOST\thost-secret\r')
+        with patch.dict(os.environ, {'YOUTUBE_COOKIES': raw}), warnings.catch_warnings(record=True) as emitted:
+            with pipeline.youtube_cookie_command(self.command()) as command:
+                jar = MozillaCookieJar(command[command.index('--cookies') + 1])
+                jar.load(ignore_discard=True)
+                self.assertEqual([(c.domain, c.domain_specified) for c in jar],
+                                 [('.youtube.com', True), ('www.youtube.com', False)])
+                self.assertEqual(emitted, [])
+
+    def test_errors_distinguish_format_domain_expiry_and_storage_without_secrets(self):
+        fixtures = [
+            ('[{"value":"private-secret"}]', 'reason=json', 'قالب'),
+            ('# Netscape HTTP Cookie File\n.youtube.com private-secret', 'reason=columns', 'خط 2'),
+            ('# Netscape HTTP Cookie File\n.example.com\tTRUE\t/\tTRUE\t0\tSID\tprivate-secret', 'reason=no_youtube_cookies', 'پیدا نشد'),
+            ('# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t1\tSID\tprivate-secret', 'reason=expired', 'منقضی'),
+        ]
+        for raw, reason, message in fixtures:
+            output = io.StringIO()
+            with patch.dict(os.environ, {'YOUTUBE_COOKIES': raw}), redirect_stdout(output):
+                with self.assertRaises(pipeline.app.UserVisibleError) as error:
+                    with pipeline.youtube_cookie_command(self.command()):
+                        self.fail('invalid cookie accepted')
+            self.assertIn(reason, output.getvalue())
+            self.assertIn(message, str(error.exception))
+            self.assertNotIn('private-secret', output.getvalue() + str(error.exception))
+
+    def test_startup_reports_configuration_without_contacting_youtube_or_leaking_values(self):
+        for raw, status in [('', 'missing'), (self.raw, 'ready'), ('private-secret', 'invalid')]:
+            with patch.dict(os.environ, {'YOUTUBE_COOKIES': raw}), \
+                 redirect_stdout(io.StringIO()) as output, patch.object(subprocess, 'Popen') as process:
+                pipeline.report_youtube_cookie_status()
+            self.assertIn(f'status={status} validator=2', output.getvalue())
+            self.assertNotIn('private-secret', output.getvalue())
+            self.assertNotIn('private-session-fixture', output.getvalue())
+            process.assert_not_called()
+        with patch.dict(os.environ, {'YOUTUBE_COOKIES': self.raw}), \
+             patch.object(Path, 'write_text', side_effect=OSError('private-secret')), redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(pipeline.app.UserVisibleError) as error:
+                with pipeline.youtube_cookie_command(self.command()):
+                    self.fail('storage failure ignored')
+            self.assertIn('reason=storage', output.getvalue())
+            self.assertNotIn('private-secret', output.getvalue() + str(error.exception))
 
 
 class CatalogTests(unittest.TestCase):
