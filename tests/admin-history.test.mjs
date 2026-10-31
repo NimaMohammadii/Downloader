@@ -110,7 +110,7 @@ test('production locked subtitle click displays a localized modal with the reque
     await admin.worker.fetch(webhook({callback_query:{id:'locked-user',from:{id:42},
       data:'ytst|abcdefghijk|7|42|1',message:{message_id:10,chat:{id:42}}}}),f.env,{});
     const alert=calls.find(c=>c.method==='answerCallbackQuery'&&c.body.show_alert)?.body;
-    assert.ok(alert);assert.match(alert.text,/Subtitle access is currently closed/);
+    assert.ok(alert);assert.match(alert.text,/Subtitles are paused by the admin/);
     assert.ok(!/[\u0600-\u06ff]/.test(alert.text));assert.ok(alert.text.length<=200);
     assert.ok(!calls.some(c=>c.method==='sendMessage'||c.method==='sendMessageDraft'));
     const edit=calls.filter(c=>c.body.reply_markup).at(-1).body;

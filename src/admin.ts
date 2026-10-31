@@ -1,6 +1,6 @@
 import { createLanguageTables, importLanguagePreferences, membershipLanguages, languageStatistics, LANGUAGE_LABELS } from "./language-admin-store";
 import type { Language } from "./localization";
-import { localizePayload, isTranslatedError, isTranslatedErrorFrame, isLanguage } from "./localization";
+import { localizePayload, presentationLocale, isTranslatedError, isTranslatedErrorFrame, isLanguage } from "./localization";
 import { PUBLIC_ERROR_MESSAGE, isPublicErrorMessage, isPublicErrorFrame, publicError } from "./public-errors";
 export { PUBLIC_ERROR_MESSAGE } from "./public-errors";
 import { BroadcastManager } from "./broadcast";
@@ -1478,7 +1478,7 @@ const STATUS_LABELS: Record<DownloadStatus, string> = {
   success: "✅ موفق؛ فایل تحویل تلگرام شد", failed: "❌ ناموفق", partial: "⚠️ بخشی ارسال شد", results: "🔎 نتایج جست‌وجو؛ بدون دانلود فایل",
 };
 function dateLabel(value: number): string {
-  return new Intl.DateTimeFormat("fa-IR", { dateStyle: "short", timeStyle: "short", timeZone: "Asia/Tehran" }).format(value);
+  return new Intl.DateTimeFormat(presentationLocale(), { dateStyle: "short", timeStyle: "short", timeZone: "Asia/Tehran" }).format(value);
 }
 
 export function formatAdminUserDetail(detail: AdminUserDetail): string {

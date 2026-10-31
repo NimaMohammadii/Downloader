@@ -45,5 +45,57 @@ class EmojiPresentationTests(unittest.TestCase):
         self.assertEqual([b['icon_custom_emoji_id'] for b in result['reply_markup']['inline_keyboard'][0]],
                          ['5282843764451195532', '5352871660024246779'])
 
+
+class CompletePresentationTests(unittest.TestCase):
+    def test_bot_container_copy_has_no_untranslated_persian(self):
+        import ast
+        import re
+        root = Path(__file__).resolve().parents[1]
+        letters = re.compile(r'[\u0621-\u064a\u067e\u0686\u0698\u06a9\u06af\u06cc]')
+        for filename in ('youtube_app.py', 'youtube_pipeline.py', 'ai_subtitles.py', 'bandcamp.py', 'reddit.py', 'pornhub.py'):
+            tree = ast.parse((root / 'container' / filename).read_text())
+            parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+            for node in ast.walk(tree):
+                source = None
+                if isinstance(node, ast.JoinedStr):
+                    source = ''.join(str(v.value) if isinstance(v, ast.Constant) else '7' for v in node.values)
+                elif isinstance(node, ast.Constant) and isinstance(node.value, str) and not isinstance(parents.get(node), ast.JoinedStr):
+                    source = node.value
+                if not source or not letters.search(source):
+                    continue
+                # Input-normalization tokens and error-classification regexes are protocol data.
+                if filename == 'youtube_pipeline.py' and source in {'ريمیکس', 'ریمیکس', 'کاور', 'ي', 'ی', 'ك', 'ک'}:
+                    continue
+                if source.startswith(r'(?:^|\n)'):
+                    continue
+                for language in ('en', 'ru'):
+                    with self.subTest(file=filename, line=node.lineno, language=language):
+                        self.assertFalse(letters.search(translate(source, language)), source)
+
+    def test_form_entities_keep_serialization_offsets_and_custom_progress_icon(self):
+        text = '🎬 دارم زیرنویس فارسی رو روی ویدیو قرار می‌دم…\n\n⏳ ~3 min • 20%'
+        value = '~3 min • 20%'
+        size = lambda s: len(s.encode('utf-16-le')) // 2
+        entities = [{'type': 'bold', 'offset': size(text[:text.index(value)]), 'length': size(value)},
+                    {'type': 'custom_emoji', 'offset': size(text[:text.index('⏳')]), 'length': 1, 'custom_emoji_id': '5386367538735104399'}]
+        payload = {'caption': text, 'caption_entities': json.dumps(entities),
+                   'reply_markup': json.dumps({'inline_keyboard': [[{'text': 'فارسی', 'callback_data': 'ytsl|id|8|42|fa'}]]})}
+        result = localize_payload(payload, 'ru')
+        self.assertIsInstance(result['caption_entities'], str)
+        rebuilt = json.loads(result['caption_entities'])
+        bold = next(e for e in rebuilt if e['type'] == 'bold')
+        raw = result['caption'].encode('utf-16-le')
+        self.assertEqual(raw[bold['offset'] * 2:(bold['offset'] + bold['length']) * 2].decode('utf-16-le'), '~3 мин. • 20%')
+        self.assertEqual(next(e for e in rebuilt if e['type'] == 'custom_emoji')['custom_emoji_id'], '5386367538735104399')
+        self.assertEqual(json.loads(result['reply_markup'])['inline_keyboard'][0][0]['callback_data'], 'ytsl|id|8|42|fa')
+        self.assertEqual(payload['caption'], text)
+
+    def test_html_and_content_values_remain_intact(self):
+        result = localize_payload({'text': '<b>اینستاگرام — مجموع: 2</b>', 'parse_mode': 'HTML'}, 'en')
+        self.assertEqual(result['text'], '<b>Instagram — total: 2</b>')
+        self.assertNotIn('entities', result)
+        self.assertEqual(translate('عنوان: زیرنویس: فعال', 'ru'), 'Название: زیرنویس: فعال')
+        self.assertEqual(translate('نام کاربری: @فارسی', 'en'), 'Username: @فارسی')
+
 if __name__ == '__main__':
     unittest.main()

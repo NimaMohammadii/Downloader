@@ -1,7 +1,7 @@
 # Bot languages
 
 `messages.json` is the shared presentation catalog for the Worker and Python container.
-Each row keeps the existing Persian source (`fa`) and friendly English (`en`) and Russian (`ru`) translations. Public error messages come first, followed by onboarding, buttons, progress, help and dynamic status templates. `{0}`, `{1}`, etc. preserve runtime values.
+Each row keeps the existing Persian source (`fa`) and friendly English (`en`) and Russian (`ru`) translations. Public error messages come first, followed by onboarding, buttons, progress, help and dynamic status templates. `{0}`, `{1}`, etc. preserve runtime values. Nested presentation values (quality labels, language names, durations and account labels) use the same translator; optional `preserve` indices keep content such as titles, usernames and URLs verbatim. Short labels and native language names use exact matches.
 
 - `/lang` opens a language picker; `/lang fa`, `/lang en` and `/lang ru` select directly.
 - Persian remains the default. Existing Persian messages and download decisions stay unchanged.
@@ -15,3 +15,7 @@ Each row keeps the existing Persian source (`fa`) and friendly English (`en`) an
 - Administrative broadcasts retain their authored content. The catalog covers the bot's user interface, not external media titles or a separate web app.
 
 When adding a user-facing message, add both translations here and run `npm run check`, `node --test tests/localization.test.mjs` and `python -m unittest discover -s tests -p test_localization.py`. The Dockerfile copies this same catalog into the container.
+
+HTML/Markdown payloads keep their existing parse mode without added entities. Plain-text entity offsets are rebuilt in UTF-16, including repeated phrases and custom progress icons. Container form fields keep their JSON serialization. Admin timestamps use the selected display locale with the existing Tehran timezone. Background broadcast status updates and session-failure notifications use the recipient admin’s saved language.
+
+Download captions retain the first line (the original media title); the remaining bot labels are translated.
