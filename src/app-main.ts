@@ -1,3 +1,4 @@
+import { recordLanguagePresence } from "./language-admin-store";
 import { handleLanguageUpdate, withUserLanguage } from "./localization";
 import { enforceRestriction } from "./restrictions";
 import { parseBandcampUrl, bandcampFailureDiagnostic } from "./bandcamp";
@@ -122,7 +123,11 @@ export default {
       request.headers.get("x-telegram-bot-api-secret-token") === WEBHOOK_SECRET;
     const update = trustedWebhook || fallbackWebhook ? await request.clone().json().catch(() => null) as any : null;
     try {
-      const actorId = update?.callback_query?.from?.id || update?.message?.from?.id;
+      const actor = update?.callback_query?.from || update?.message?.from;
+      const actorId = actor?.id;
+      if (Number.isSafeInteger(actorId) && actorId > 0) await recordLanguagePresence(env, {
+        id: actorId, username: actor.username, firstName: actor.first_name, lastName: actor.last_name,
+      });
       return await withUserLanguage(env, actorId, () => appWorker.fetch(request, env, ctx));
     } catch (error) {
       const bandcamp = update && parseBandcampUrl(String(update.message?.text || update.message?.caption || ""));

@@ -36,7 +36,8 @@ function fixture() {
     else db.exec(query);
     return { toArray: () => rows, one: () => rows[0], rowsWritten: changes };
   } };
-  const ctx = { storage: { sql, transactionSync(fn) {
+  const preferences = new Map();
+  const ctx = { storage: { sql, async get(key) { return preferences.get(key); }, async put(key,value) { preferences.set(key,value); }, transactionSync(fn) {
     db.exec('BEGIN'); try { const result = fn(); db.exec('COMMIT'); return result; }
     catch (e) { db.exec('ROLLBACK'); throw e; }
   } } };

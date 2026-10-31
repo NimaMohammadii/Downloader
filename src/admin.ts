@@ -1,3 +1,5 @@
+import { createLanguageTables, importLanguagePreferences, membershipLanguages, languageStatistics, LANGUAGE_LABELS } from "./language-admin-store";
+import type { Language } from "./localization";
 import { localizePayload, isTranslatedError, isTranslatedErrorFrame, isLanguage } from "./localization";
 import { PUBLIC_ERROR_MESSAGE, isPublicErrorMessage, isPublicErrorFrame, publicError } from "./public-errors";
 export { PUBLIC_ERROR_MESSAGE } from "./public-errors";
@@ -217,6 +219,8 @@ export type DownloadRecord = {
 };
 export type AdminDownload = DownloadRecord & { createdAt: number; updatedAt: number; stale: boolean; subtitleCosts?: SubtitleCosts };
 export type AdminUserDetail = {
+  language?: Language;
+  languageSelected?: boolean;
   user: AdminUserRow;
   usage?: UsageTotals;
   activity: { visits: number; interactions: number; starts: number; trackingSince: number } | null;
@@ -487,6 +491,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
   constructor(ctx: DurableObjectState, env: StoreEnv) {
     super(ctx, env);
     this.broadcasts = new BroadcastManager(ctx, env);
+    createLanguageTables(this.ctx.storage.sql);
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS membership_instagram_config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS membership_instagram_clicks (
@@ -679,11 +684,37 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         const body = await request.json() as { language?: unknown };
         if (!isLanguage(body.language)) return new Response("Invalid language", { status: 400 });
         await this.ctx.storage.put(key, body.language);
+        this.ctx.storage.sql.exec("INSERT INTO user_languages(user_id,language) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET language=excluded.language", user, body.language);
       } else if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
       return Response.json({ language: await this.ctx.storage.get(key) || "fa" });
     }
 
     const url = new URL(request.url);
+    if (url.pathname === "/language-presence" && request.method === "POST") {
+      const user = await request.json() as TrackedUser;
+      if (!Number.isSafeInteger(user.id) || user.id <= 0) return new Response("Invalid user", { status: 400 });
+      if (isAdmin(this.env, user.id)) return Response.json({ ok: true });
+      const now = Date.now();
+      this.ctx.storage.sql.exec(`INSERT INTO users(id,username,first_name,last_name,first_seen,last_seen)
+        VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+        username=COALESCE(excluded.username,users.username), first_name=COALESCE(excluded.first_name,users.first_name),
+        last_name=COALESCE(excluded.last_name,users.last_name), last_seen=MAX(users.last_seen,excluded.last_seen)`,
+        String(user.id), cleanText(user.username), cleanText(user.firstName), cleanText(user.lastName), now, now);
+      return Response.json({ ok: true });
+    }
+    if ((url.pathname === "/language-stats" || url.pathname === "/language-users") && request.method === "GET") {
+      await importLanguagePreferences(this.ctx.storage);
+      return languageStatistics(url, this.ctx.storage.sql, getAdminIds(this.env));
+    }
+    if (url.pathname === "/membership-languages") {
+      if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+      const body = await request.json().catch(() => null) as { actorId?: number; language?: unknown; enabled?: unknown } | null;
+      if (!body) return new Response("Invalid setting", { status: 400 });
+      if (!isAdmin(this.env, body.actorId)) return new Response("Forbidden", { status: 403 });
+      if (!isLanguage(body.language) || typeof body.enabled !== "boolean") return new Response("Invalid setting", { status: 400 });
+      this.ctx.storage.sql.exec("UPDATE membership_languages SET enabled=? WHERE language=?", body.enabled ? 1 : 0, body.language);
+      return Response.json({ languages: membershipLanguages(this.ctx.storage.sql) });
+    }
     if (url.pathname === "/broadcast") return this.broadcasts.fetch(request);
 
     if (request.method === "POST" && url.pathname === "/usage") {
@@ -875,7 +906,12 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       const access = user ? sql.exec("SELECT user_id FROM membership_access WHERE user_id = ?", user).toArray() : [];
       const mode = ["after_download", "start", "first_link"][asNumber(sql.exec("SELECT value FROM counters WHERE key = 'membership_mode'").one().value)] || "after_download";
       const triggered = user ? sql.exec("SELECT user_id FROM membership_link_triggers WHERE user_id = ?", user).toArray() : [];
-      return Response.json({ enabled: asNumber(enabled.value) === 1, downloaded: access.length > 0, mode, linkTriggered: triggered.length > 0 });
+      const languages = membershipLanguages(sql);
+      const selected = user ? await this.ctx.storage.get(`language:${user}`) : undefined;
+      const language = isLanguage(selected) ? selected : "fa";
+      return Response.json({ enabled: asNumber(enabled.value) === 1 && (!user || languages[language]),
+        ...(!user ? { languages } : {}),
+        downloaded: access.length > 0, mode, linkTriggered: triggered.length > 0 });
     }
 
     if (request.method === "POST" && url.pathname === "/file-cache") {
@@ -1016,6 +1052,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       const rows = sql.exec("SELECT * FROM users WHERE id = ?", id).toArray();
       if (!rows.length) return new Response("User not found", { status: 404 });
       const rawUser = rows[0] as unknown as UserSqlRow;
+      const selectedLanguage = await this.ctx.storage.get(`language:${id}`);
       const activityRows = sql.exec("SELECT * FROM user_activity WHERE user_id = ?", id).toArray();
       const activity = activityRows[0];
       const staleBefore = Date.now() - 4 * 3600_000;
@@ -1044,6 +1081,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
             subtitleCosts: subtitleCosts(sql,0,Date.now(),id,String(row.key)) } : {}),
         }));
       return Response.json({
+        language: isLanguage(selectedLanguage) ? selectedLanguage : "fa", languageSelected: isLanguage(selectedLanguage),
         user: { id, username: rawUser.username, firstName: rawUser.first_name, lastName: rawUser.last_name,
           linksSent: asNumber(rawUser.links_sent), firstSeen: asNumber(rawUser.first_seen), lastSeen: asNumber(rawUser.last_seen) },
         activity: activity ? { visits: asNumber(activity.visits), interactions: asNumber(activity.interactions),
@@ -1348,6 +1386,7 @@ export function adminDashboardKeyboard(): Record<string, unknown> {
       [{ text: "👥 لیست کاربران", callback_data: "admin:users:0" },
         { text: "⏹ کاربران محدودشده", callback_data: "admin:restricted:0" }],
       [{ text: "کاربران استفاده‌کننده", icon_custom_emoji_id: "5427168083074628963", callback_data: "admin:used:0" }],
+      [{ text: "🌐 آمار و کاربران زبان‌ها", callback_data: "admin:languages:all" }],
       [{ text: "👤 فعالیت کاربران", callback_data: "admin:activity" }],
       [{ text: "API اینستاگرام", icon_custom_emoji_id: "5278573677900752088", callback_data: "admin:igapi" },
         { text: "عضویت اجباری چنل", callback_data: "admin:membership" }],
@@ -1445,6 +1484,7 @@ export function formatAdminUserDetail(detail: AdminUserDetail): string {
   const { user, activity, counts } = detail;
   const lines = [`👤 ${displayText(userDisplayName(user), 80)}`, `شناسه: ${user.id}`,
     ...(user.username ? [`نام کاربری: @${displayText(user.username, 40)}`] : []),
+    `🌐 زبان: ${LANGUAGE_LABELS[detail.language || "fa"]}${detail.languageSelected === false ? " (پیش‌فرض؛ انتخاب نشده)" : ""}`,
     `اولین مشاهده: ${dateLabel(user.firstSeen)}`, `آخرین استفاده: ${dateLabel(user.lastSeen)}`, "",
     ...(activity ? [`🚪 مراجعه‌ها: ${activity.visits} • برگشت‌ها: ${Math.max(0, activity.visits - 1)}`,
       `💬 تعامل‌ها (پیام و دکمه): ${activity.interactions} • /start: ${activity.starts}`,

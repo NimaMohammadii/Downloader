@@ -19,6 +19,7 @@ function fixture(){
      if(init?.method==='POST')menus.set(key,JSON.parse(init.body).messageId);
      return Response.json({messageId:menus.get(key)});
    }
+   if(parsed.pathname==='/language-presence') return Response.json({ok:true});
    if(parsed.pathname==='/record') return Response.json({ok:true});
    const id=parsed.searchParams.get('user');
    if(init?.method==='POST')saved.set(id,JSON.parse(init.body).language);
@@ -77,7 +78,7 @@ test('concurrent requests keep their own language across awaits',async()=>{
 
 test('language preferences survive store instances without changing existing records',async()=>{
  const values=new Map([['other-setting','untouched']]);
- const store=()=>Object.assign(Object.create(api.AdminStatsStore.prototype),{ctx:{storage:{async get(key){return values.get(key);},async put(key,value){values.set(key,value);}}}});
+ const store=()=>Object.assign(Object.create(api.AdminStatsStore.prototype),{ctx:{storage:{sql:{exec(){}},async get(key){return values.get(key);},async put(key,value){values.set(key,value);}}}});
  const request=(method='GET',language)=>new Request('https://admin-stats/language?user=42',{method,...(language?{body:JSON.stringify({language})}:{})});
  assert.equal((await (await store().fetch(request())).json()).language,'fa');
  await store().fetch(request('POST','ru'));

@@ -1,3 +1,4 @@
+import type { Language } from "./localization";
 import { parseRedditUrl } from "./reddit";
 import { parseBandcampUrl } from "./bandcamp";
 import { isAdmin, telegramCustomEmoji, telegramTextMotion, type AdminStatsEnv } from "./admin";
@@ -11,7 +12,7 @@ export type MembershipMode = typeof MEMBERSHIP_MODES[number];
 export const MEMBERSHIP_MODE_LABELS: Record<MembershipMode, string> = {
   after_download: "بعد از اولین دانلود موفق", start: "هنگام استارت", first_link: "با اولین لینک",
 };
-export type MembershipState = { enabled: boolean; downloaded: boolean; mode: MembershipMode; linkTriggered: boolean };
+export type MembershipState = { languages?: Record<Language, boolean>; enabled: boolean; downloaded: boolean; mode: MembershipMode; linkTriggered: boolean };
 
 export async function membershipState(env: Partial<AdminStatsEnv>, userId?: number, linkRequest = false): Promise<MembershipState> {
   if (!env.ADMIN_STATS) return { enabled: false, downloaded: false, mode: "after_download", linkTriggered: false };
@@ -31,6 +32,13 @@ export async function setMembershipEnabled(env: AdminStatsEnv, enabled: boolean)
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled }),
   });
   if (!response.ok) throw new Error("MEMBERSHIP_SETTING_UNAVAILABLE");
+}
+
+export async function setMembershipLanguage(env: AdminStatsEnv, language: Language, enabled: boolean, actorId: number): Promise<void> {
+  const response = await env.ADMIN_STATS.getByName("global").fetch("https://admin-stats/membership-languages", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ language, enabled, actorId }),
+  });
+  if (!response.ok) throw new Error("MEMBERSHIP_LANGUAGE_SETTING_UNAVAILABLE");
 }
 
 export async function setMembershipMode(env: AdminStatsEnv, mode: MembershipMode): Promise<void> {

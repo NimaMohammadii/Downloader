@@ -1,3 +1,4 @@
+import { LANGUAGE_LABELS } from "./language-admin-store";
 import { isAdmin, getAdminUserDetail, formatAdminDownloadHistory, ADMIN_USERS_PAGE_SIZE, type AdminStatsEnv, type AdminSubtitleUsers } from './admin';
 import { SUBTITLE_LOCK_EMOJI, type SubtitleAccess, type SubtitleButton } from './youtube-subtitles';
 
@@ -92,6 +93,7 @@ export async function adminSubtitlePanel(env: AdminStatsEnv, actorId: number, da
   if (detail.page + 1 < detail.totalPages) nav.push(button('قدیمی‌تر ›', callback(detail.page + 1)));
   return panel('زیرنویس کاربر؛ دسترسی و دانلودها', [
     `کاربر: ${clean([detail.user.firstName, detail.user.lastName].filter(Boolean).join(' ') || detail.user.username || id)}`,
+    `زبان ربات: ${LANGUAGE_LABELS[detail.language || "fa"]}${detail.languageSelected === false ? " (پیش‌فرض؛ انتخاب نشده)" : ""}`,
     `شناسه: ${id}`, ...(detail.user.username ? [`نام کاربری: @${clean(detail.user.username, 40)}`] : []), '',
     `دسترسی فعلی: ${state.locked ? 'قفل' : 'باز'}`,
     `قفل اختصاصی این کاربر: ${state.userLocked ? 'فعال' : 'ندارد'}`,
