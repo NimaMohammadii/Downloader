@@ -89,6 +89,7 @@ type Env = AdminStatsEnv & InstagramApiSecrets & {
   GPT_API?: string;
   PINTEREST_COOKIES?: string;
   REDDIT_COOKIES?: string;
+  YOUTUBE_COOKIES?: string;
   YOUTUBE_DOWNLOAD_WORKFLOW: Workflow<YoutubeDownloadJob>;
   YOUTUBE_DOWNLOADER_CONTAINER: DurableObjectNamespace<YoutubeDownloaderContainer>;
   DOWNLOAD_POOL: DurableObjectNamespace<DownloadPool>;
@@ -241,6 +242,7 @@ export class YoutubeDownloaderContainer extends Container<Env> {
   enableInternet = true;
   envVars: Record<string, string> = {
     API_ID: this.env.API_ID || "", API_HASH: this.env.API_HASH || "",
+    YOUTUBE_COOKIES: this.env.YOUTUBE_COOKIES || "",
   };
   private starting?: Promise<void>;
   private idleShutdownRequested = false;

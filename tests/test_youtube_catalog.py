@@ -10,9 +10,66 @@ from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import unittest
 from unittest.mock import patch
+import os
+import warnings
+from http.cookiejar import MozillaCookieJar
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'container'))
 import youtube_pipeline as pipeline
+
+
+class YoutubeCookieTests(unittest.TestCase):
+    raw = ('# Netscape HTTP Cookie File\n'
+           '#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tprivate-session-fixture\n'
+           '.example.com\tTRUE\t/\tTRUE\t0\tSID\tunrelated-fixture\n')
+
+    def command(self):
+        return [pipeline.app.REAL_YTDLP, '--extractor-args', 'youtube:player_client=default',
+                '--', 'https://www.youtube.com/watch?v=fixture']
+
+    def test_private_netscape_jar_is_scoped_to_youtube_and_removed(self):
+        original = self.command()
+        with patch.dict(os.environ, {'YOUTUBE_COOKIES': self.raw}):
+            with pipeline.youtube_cookie_command(original) as command:
+                path = Path(command[command.index('--cookies') + 1])
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                jar = MozillaCookieJar(str(path)); jar.load(ignore_discard=True)
+                self.assertEqual([(c.name, c.value) for c in jar], [('SID', 'private-session-fixture')])
+                self.assertLess(command.index('--cookies'), command.index('--'))
+                self.assertNotIn('private-session-fixture', ' '.join(command))
+            self.assertFalse(path.exists())
+        self.assertNotIn('--cookies', original)
+
+    def test_missing_cookie_and_other_downloaders_keep_their_arguments(self):
+        for raw, command in [('', self.command()), (self.raw, [pipeline.app.REAL_YTDLP, '--use-extractors', 'Generic']),
+                             (self.raw, ['ffprobe', 'file.mp4'])]:
+            with patch.dict(os.environ, {'YOUTUBE_COOKIES': raw}), pipeline.youtube_cookie_command(command) as result:
+                self.assertIs(result, command)
+
+    def test_invalid_cookie_error_does_not_disclose_the_secret(self):
+        for raw in ['bad-private-secret', '# Netscape HTTP Cookie File\n.youtube.com\tINVALID\tprivate-secret',
+                    '# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t1\tSID\tprivate-secret\n']:
+            with patch.dict(os.environ, {'YOUTUBE_COOKIES': raw}), warnings.catch_warnings(record=True) as emitted:
+                with self.assertRaises(pipeline.app.UserVisibleError) as error:
+                    with pipeline.youtube_cookie_command(self.command()):
+                        self.fail('invalid cookies accepted')
+                self.assertNotIn('private-secret', str(error.exception))
+                self.assertEqual(emitted, [])
+
+    def test_overlapping_calls_have_independent_jars_and_cleanup_on_failure(self):
+        with patch.dict(os.environ, {'YOUTUBE_COOKIES': self.raw}):
+            with pipeline.youtube_cookie_command(self.command()) as first:
+                a = Path(first[first.index('--cookies') + 1])
+                with self.assertRaisesRegex(RuntimeError, 'fixture failure'):
+                    with pipeline.youtube_cookie_command(self.command()) as second:
+                        b = Path(second[second.index('--cookies') + 1])
+                        self.assertNotEqual(a, b)
+                        b.write_text('modified by yt-dlp')
+                        self.assertIn('private-session-fixture', a.read_text())
+                        raise RuntimeError('fixture failure')
+                self.assertFalse(b.exists())
+                self.assertTrue(a.exists())
+            self.assertFalse(a.exists())
 
 
 class CatalogTests(unittest.TestCase):

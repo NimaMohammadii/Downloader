@@ -67,11 +67,46 @@ def _download_args(client: str) -> list[str]:
             "--max-filesize", str(app.DIRECT_TELEGRAM_LIMIT)]
 
 
+@contextmanager
+def youtube_cookie_command(command: list[str]):
+    # Only native YouTube extraction receives this credential. Each subprocess
+    # owns a private jar, including yt-dlp's writes, so concurrent jobs cannot
+    # overwrite one another's session or leave credentials in the media cache.
+    raw = os.environ.get("YOUTUBE_COOKIES", "").lstrip("\ufeff \t\r\n")
+    if (not raw or not command or command[0] != app.REAL_YTDLP
+            or not any(arg.startswith("youtube:player_client=") for arg in command)):
+        yield command
+        return
+    with tempfile.TemporaryDirectory(prefix="youtube-cookies-") as directory:
+        path = Path(directory) / "cookies.txt"
+        path.touch(mode=0o600)
+        try:
+            if len(raw) > 1_000_000:
+                raise ValueError()
+            path.write_text(raw.replace("\r\n", "\n"), encoding="utf-8")
+            jar = MozillaCookieJar(str(path))
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                jar.load(ignore_discard=True, ignore_expires=True)
+            for cookie in list(jar):
+                domain = cookie.domain.lstrip(".").lower()
+                if (domain != "youtube.com" and not domain.endswith(".youtube.com")) or (cookie.expires and cookie.expires <= time.time()):
+                    jar.clear(cookie.domain, cookie.path, cookie.name)
+                elif cookie.expires == 0:
+                    cookie.expires, cookie.discard = None, True
+            if not len(jar):
+                raise ValueError()
+            jar.save(ignore_discard=True, ignore_expires=True)
+        except (ValueError, TypeError, OverflowError, OSError, LoadError):
+            raise app.UserVisibleError("❌ کوکی YouTube نامعتبر یا منقضی است؛ خروجی تازهٔ Netscape را در YOUTUBE_COOKIES قرار بده.") from None
+        yield [command[0], "--cookies", str(path), *command[1:]]
+
+
 def _run(command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
     timeout = app.job_timeout(timeout)
     # yt-dlp can spawn FFmpeg. Stop the whole process group on timeout so an
     # expired Workflow cannot leave a child downloading/converting in the VM.
-    with subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    with youtube_cookie_command(command) as command, subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           start_new_session=True) as process:
         try:
             stdout, stderr = process.communicate(timeout=timeout)

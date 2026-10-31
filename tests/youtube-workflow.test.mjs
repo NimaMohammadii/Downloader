@@ -148,6 +148,16 @@ test('100 simultaneous admissions use exactly 20 hosts and five slots per host',
   assert.equal((await revived.lookup('job-1')).token, leases[1].token);
 });
 
+test('YouTube cookie secret reaches the container environment without changing API credentials', () => {
+  const container = new YoutubeDownloaderContainer({ storage: memoryStorage() },
+    { YOUTUBE_COOKIES: 'private-cookie-fixture', API_ID: '123', API_HASH: 'fixture-hash' });
+  assert.equal(container.envVars.YOUTUBE_COOKIES, 'private-cookie-fixture');
+  assert.equal(container.envVars.API_ID, '123');
+  assert.equal(container.envVars.API_HASH, 'fixture-hash');
+  const anonymous = new YoutubeDownloaderContainer({ storage: memoryStorage() }, {});
+  assert.equal(anonymous.envVars.YOUTUBE_COOKIES, '');
+});
+
 test('five simultaneous cold starts share one startup and a failed startup can be retried', async () => {
   const container = new YoutubeDownloaderContainer({ storage: memoryStorage() }, { BOT_TOKEN: "fake" });
   let finish, starts = 0;
