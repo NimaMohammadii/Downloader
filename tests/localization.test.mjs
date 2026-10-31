@@ -19,6 +19,7 @@ function fixture(){
      if(init?.method==='POST')menus.set(key,JSON.parse(init.body).messageId);
      return Response.json({messageId:menus.get(key)});
    }
+   if(parsed.pathname==='/record') return Response.json({ok:true});
    const id=parsed.searchParams.get('user');
    if(init?.method==='POST')saved.set(id,JSON.parse(init.body).language);
    return Response.json({language:saved.get(id)||'fa'});
@@ -212,4 +213,42 @@ test('both requested emoji are fully converted in general text and buttons',()=>
  const out=api.telegramCustomEmoji('sendMessage',{text:'🌐 ✅',reply_markup:{inline_keyboard:[[{text:'🌐 Languages',callback_data:'lang'}, {text:'✅ Done',callback_data:'done'}]]}});
  assert.deepEqual(out.entities.map(e=>[e.offset,e.length,e.custom_emoji_id]),[[0,2,'5282843764451195532'],[3,1,'5352871660024246779']]);
  assert.deepEqual(out.reply_markup.inline_keyboard[0].map(b=>[b.text,b.icon_custom_emoji_id]),[['Languages','5282843764451195532'],['Done','5352871660024246779']]);
+});
+
+test('/start asks for a language first, then replaces that same picker with the existing localized start text',async()=>{
+ const previous=globalThis.fetch;
+ try{
+  for(const language of ['fa','en','ru']){
+   const f=fixture(),tg=telegramSimulator();globalThis.fetch=tg.fetch;
+   f.saved.set('42','ru'); // choosing Persian must override the previous request's language too
+   const request=f.request({update_id:1,message:{message_id:100,chat:{id:42},from:{id:42},text:'/start@MyBot referral'}});
+   await api.worker.fetch(request,f.env,{});
+   const picker=tg.messages.get(900);
+   assert.ok(picker.reply_markup.inline_keyboard[0].every(button=>button.callback_data.startsWith('startlang:')));
+   assert.ok(!picker.text.includes('/playlist'));
+   assert.equal(tg.calls.filter(c=>c.method==='sendMessage').length,1);
+   const callback=f.request({update_id:2,callback_query:{id:'start-select',from:{id:42},message:{message_id:900,chat:{id:42}},data:`startlang:${language}:42`}});
+   await api.worker.fetch(callback,f.env,{});
+   const welcome=tg.messages.get(900);
+   assert.ok(welcome.text.includes('/playlist'));
+   assert.ok(welcome.text.includes('/music'));
+   assert.deepEqual(welcome.reply_markup.inline_keyboard,[]);
+   assert.equal(tg.calls.filter(c=>c.method==='sendMessage').length,1);
+   assert.equal(f.saved.get('42'),language);
+   if(language==='fa')assert.match(welcome.text,/لینک رو بفرست/);
+   if(language==='en')assert.match(welcome.text,/Send a link/);
+   if(language==='ru')assert.match(welcome.text,/Пришли ссылку/);
+   assert.ok(welcome.entities.some(entity=>entity.type==='bold'));
+   assert.ok(welcome.entities.some(entity=>entity.type==='custom_emoji'));
+   assert.deepEqual(tg.messages.get(40),{text:'https://example.org/download',document:{file_id:'download'}});
+  }
+ }finally{globalThis.fetch=previous;}
+});
+test('another user cannot select the language on a start picker in a group',async()=>{
+ const f=fixture(),tg=telegramSimulator(),previous=globalThis.fetch;globalThis.fetch=tg.fetch;
+ try{
+  await api.worker.fetch(f.request({callback_query:{id:'foreign',from:{id:43},message:{message_id:900,chat:{id:-100}},data:'startlang:ru:42'}}),f.env,{});
+  assert.equal(f.saved.size,0);
+  assert.deepEqual(tg.calls.map(c=>c.method),['answerCallbackQuery']);
+ }finally{globalThis.fetch=previous;}
 });

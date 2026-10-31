@@ -1,3 +1,4 @@
+import { startMessage } from "./start-message";
 import { AsyncLocalStorage } from 'node:async_hooks';
 import messages from '../locales/messages.json';
 
@@ -87,8 +88,9 @@ export async function handleLanguageUpdate(request: Request, env: LanguageEnv): 
   const message = query?.message || update?.message;
   const userId = (query?.from || update?.message?.from)?.id;
   const command = /^\/lang(?:@[A-Za-z0-9_]+)?(?:\s+(fa|en|ru))?\s*$/i.exec(update?.message?.text || '');
-  const selection = /^lang:(fa|en|ru):([1-9]\d*)$/.exec(query?.data || '');
-  if (!command && !selection) return null;
+  const startCommand = /^\/start(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test((update?.message?.text || '').trim());
+  const selection = /^(?:lang|startlang):(fa|en|ru):([1-9]\d*)$/.exec(query?.data || '');
+  if (!command && !selection && !startCommand) return null;
   if (!Number.isSafeInteger(userId) || userId <= 0 || !message?.chat?.id) return Response.json({ ok: true });
   const send = async (method: string, payload: object) => {
     const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
@@ -114,8 +116,25 @@ export async function handleLanguageUpdate(request: Request, env: LanguageEnv): 
     });
     if (!response.ok) throw new Error('LANGUAGE_SAVE_FAILED');
   }
+  if (startCommand && env.ADMIN_STATS) {
+    const { recordUserActivity } = await import('./admin');
+    await recordUserActivity(env as import('./admin').AdminStatsEnv, {
+      id: userId, username: message.from?.username, firstName: message.from?.first_name, lastName: message.from?.last_name,
+    }, false, update.update_id, true);
+  }
   const language = choice || await userLanguage(env, userId);
   if (query) await send('answerCallbackQuery', { callback_query_id: query.id });
+  if (selection && query?.data?.startsWith('startlang:') && choice) {
+    const { telegramCustomEmoji, telegramTextMotion } = await import('./admin');
+    return context.run({ language: choice, userId }, async () => {
+      const payload = localizePayload({ chat_id: message.chat.id, message_id: message.message_id,
+        ...startMessage(), reply_markup: { inline_keyboard: [] } }, choice);
+      // Replace the language picker itself, keeping the existing reveal and emoji formatting.
+      await telegramTextMotion(env.BOT_TOKEN, 'editMessageText', payload, { animateEdits: true });
+      await send('editMessageText', telegramCustomEmoji('editMessageText', payload));
+      return Response.json({ ok: true });
+    });
+  }
   const text = choice ? { fa: '✅ زبانت فارسی شد!', en: '✅ All set! Let’s chat in English.', ru: '✅ Готово! Теперь общаемся по-русски.' }[language]
     : { fa: '🌐 زبان دلخواهت رو انتخاب کن:', en: '🌐 Pick your language:', ru: '🌐 Выбери язык:' }[language];
   const chatId = message.chat.id;
@@ -127,7 +146,7 @@ export async function handleLanguageUpdate(request: Request, env: LanguageEnv): 
   const previousId = validMessageId(previous.messageId) ? previous.messageId : undefined;
   const callbackId = selection && validMessageId(query?.message?.message_id) ? query.message.message_id as number : undefined;
   const keyboard = { inline_keyboard: [[['fa', 'فارسی 🇮🇷'], ['en', 'English 🇬🇧'], ['ru', 'Русский 🇷🇺']].map(([code, label]) => ({
-    text: label, callback_data: `lang:${code}:${userId}`,
+    text: label, callback_data: `${startCommand ? 'startlang' : 'lang'}:${code}:${userId}`,
     ...(code === language ? { icon_custom_emoji_id: '5352871660024246779' } : {}),
   }))] };
   // Telegram requires the text under a custom-emoji entity to match its sticker's emoji.

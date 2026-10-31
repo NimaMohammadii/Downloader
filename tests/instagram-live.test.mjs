@@ -6,6 +6,7 @@ import { createHmac } from 'node:crypto';
 const reddit = await readFile(new URL('../src/reddit.ts', import.meta.url), 'utf8');
 const bandcamp = await readFile(new URL('../src/bandcamp.ts', import.meta.url), 'utf8');
 const source = await readFile(new URL('../src/youtube-main.ts', import.meta.url), 'utf8');
+const startSource = await readFile(new URL('../src/start-message.ts', import.meta.url), 'utf8');
 const story = await readFile(new URL('../src/story-main.ts', import.meta.url), 'utf8');
 const instagram = await readFile(new URL('../src/index.ts', import.meta.url), 'utf8');
 const { outputFiles } = await build({ external: ['node:async_hooks'],
@@ -14,6 +15,7 @@ const { outputFiles } = await build({ external: ['node:async_hooks'],
   plugins: [{ name: 'instagram-platform', setup(build) {
     build.onResolve({ filter: /.*/ }, a => ({ path: a.path, namespace: 'test' }));
     build.onLoad({ filter: /.*/, namespace: 'test' }, a => {
+      if (a.path === './start-message') return { contents: startSource, loader: 'ts' };
       if (a.path === './localization') return {contents:'export const withUserLanguage=async(_env,_id,action)=>action(); export const userLanguage=async()=>"fa";'};
       if (a.path === './reddit') return {contents:reddit,loader:'ts'};
       if (a.path === './bandcamp') return {contents:bandcamp,loader:'ts'};
