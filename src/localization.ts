@@ -5,6 +5,7 @@ import messages from '../locales/messages.json';
 export type Language = 'fa' | 'en' | 'ru';
 type LanguageEnv = { ADMIN_STATS?: { getByName(name: string): { fetch(input: string, init?: RequestInit): Promise<Response> } }; BOT_TOKEN?: string; WEBHOOK_SECRET?: string };
 const context = new AsyncLocalStorage<{ language: Language; userId?: number }>();
+export const currentLanguage = (): Language => context.getStore()?.language || 'fa';
 export const presentationLocale = (): string => ({ fa: 'fa-IR', en: 'en-GB', ru: 'ru-RU' })[context.getStore()?.language || 'fa'];
 export const isLanguage = (value: unknown): value is Language => value === 'fa' || value === 'en' || value === 'ru';
 async function languagePreference(env: LanguageEnv, userId?: number): Promise<{ language: Language; selected: boolean }> {
@@ -20,8 +21,8 @@ async function languagePreference(env: LanguageEnv, userId?: number): Promise<{ 
 export async function userLanguage(env: LanguageEnv, userId?: number): Promise<Language> {
   return (await languagePreference(env, userId)).language;
 }
-export async function withUserLanguage<T>(env: LanguageEnv, userId: number | undefined, action: () => Promise<T>): Promise<T> {
-  return context.run({ language: await userLanguage(env, userId), userId }, action);
+export async function withUserLanguage<T>(env: LanguageEnv, userId: number | undefined, action: () => Promise<T>, language?: Language): Promise<T> {
+  return context.run({ language: isLanguage(language) ? language : await userLanguage(env, userId), userId }, action);
 }
 const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const ordered = [...messages].filter(row => !row.fa.includes('{0}')).sort((a, b) => b.fa.length - a.fa.length);

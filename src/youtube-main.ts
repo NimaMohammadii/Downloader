@@ -1,5 +1,5 @@
 import { startMessage } from "./start-message";
-import { withUserLanguage, userLanguage } from "./localization";
+import { withUserLanguage, userLanguage, currentLanguage, isLanguage, type Language } from "./localization";
 import { isSubtitleLanguage, subtitleName, subtitleButtons, SUBTITLE_LOCK_NOTICE, type SubtitleLanguage, type SubtitleMenu, type SubtitleButton } from "./youtube-subtitles";
 import type { SubtitleCharge } from "./subtitle-usage";
 import { parseBandcampUrl, bandcampFailureDiagnostic, bandcampOptions, type BandcampInput, type BandcampOption } from "./bandcamp";
@@ -56,6 +56,7 @@ type MediaSource = InstagramVideoSource & { reddit?: RedditInput; bandcamp?: Ban
 const RECOGNITION_FILE_LIMIT = 20_000_000;
 
 type YoutubeDownloadJob = {
+  language?: Language; // Presentation language captured with the original user request.
   id: string;
   containerIndex?: number;
   chatId: number;
@@ -540,7 +541,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
   }
 
   async run(event: WorkflowEvent<YoutubeDownloadJob>, step: WorkflowStep) {
-    return withUserLanguage(this.env, event.payload.userId, () => this.runLocalized(event, step));
+    return withUserLanguage(this.env, event.payload.userId, () => this.runLocalized(event, step), event.payload.language);
   }
 
   private async runLocalized(event: WorkflowEvent<YoutubeDownloadJob>, step: WorkflowStep) {
@@ -827,7 +828,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
               instagramProfileParent: { id: job.id, eventType },
               instagramPost: { shortcode: post.shortcode, ...(post.storyId ? { storyId: post.storyId } : {}), url: post.url, chatId: job.chatId,
                 userId: job.userId, requestMessageId: job.requestMessageId, statusMessageId: childStatus, media: prepared.media! } };
-            try { await this.env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id: childId, params: child }); }
+            try { await this.env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id: childId, params: { ...child, language: isLanguage(job.language) ? job.language : currentLanguage() } }); }
             catch (error) {
               if (!/already|exists|duplicate|conflict/i.test(error instanceof Error ? error.message : String(error))) throw error;
             }
@@ -1039,7 +1040,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
               new Request("http://container/download", {
                 method: "POST",
                 headers: { "content-type": "application/json" },
-                body: JSON.stringify({ ...job, language: await userLanguage(this.env, job.userId), statusMessageId, botToken: this.env.BOT_TOKEN,
+                body: JSON.stringify({ ...job, language: isLanguage(job.language) ? job.language : await userLanguage(this.env, job.userId), statusMessageId, botToken: this.env.BOT_TOKEN,
                   ...await mediaCacheContext(this.env, job),
                   ...(job.subtitle ? {
                     elevenApiKey: this.env.ELEVEN_API, gptApiKey: this.env.GPT_API,
@@ -1188,7 +1189,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       await step.do("begin instagram capture", { retries: { limit: 2, delay: "3 seconds" }, timeout: "1 minute" }, async () => {
         const signature = (await instagramSignature(this.env.BOT_TOKEN, `stop:${job.chatId}:${job.requestMessageId}:${job.userId}`)).slice(0, 16);
         const result = await pooledContainer(this.env, job).instagramRequest("start", {
-          id: job.id, source, language: await userLanguage(this.env, job.userId), botToken: this.env.BOT_TOKEN, chatId: job.chatId, requestMessageId: job.requestMessageId, userId: job.userId,
+          id: job.id, source, language: isLanguage(job.language) ? job.language : await userLanguage(this.env, job.userId), botToken: this.env.BOT_TOKEN, chatId: job.chatId, requestMessageId: job.requestMessageId, userId: job.userId,
           statusMessageId: statusId,
           stopData: `igs|${job.requestMessageId}|${job.userId}|${signature}`,
           completionUrl: `https://downloader.vexaagent.workers.dev/instagram/events/${job.id}`,
@@ -1597,7 +1598,7 @@ async function createYoutubeInspectWorkflow(
 
   await trackJob(env, job, "pending");
   try {
-    await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id: job.id, params: job });
+    await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id: job.id, params: { ...job, language: isLanguage(job.language) ? job.language : currentLanguage() } });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     if (!/already|exists|duplicate|conflict/i.test(detail)) {
@@ -1757,7 +1758,7 @@ async function handleQualityCallback(
 
   await trackJob(env, job, "pending");
   try {
-    await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id: job.id, params: job });
+    await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id: job.id, params: { ...job, language: isLanguage(job.language) ? job.language : currentLanguage() } });
     await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", {
       callback_query_id: callback.id, _errorUserId: callback.from?.id,
       text: `${selectionText} انتخاب شد`,
@@ -1805,7 +1806,7 @@ async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target?
   };
   await trackJob(env, job, "pending");
   try {
-    await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id: job.id, params: job });
+    await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id: job.id, params: { ...job, language: isLanguage(job.language) ? job.language : currentLanguage() } });
   } catch (error) {
     if (!/already|exists|duplicate|conflict/i.test(error instanceof Error ? error.message : String(error))) {
       if (bandcamp) console.error("bandcamp request failed", { jobId: job.id, phase: "workflow_create", ...bandcampFailureDiagnostic(error, env) });
@@ -2099,7 +2100,7 @@ export default {
             userId: message.from?.id || message.chat.id, url: `https://www.instagram.com/${profileCommand.username}/`,
             instagramProfile: { username: profileCommand.username, kind: profileCommand.kind },
             ...(apiSelection ? { instagramApi: apiSelection } : {}) };
-          try { await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id, params: job }); }
+          try { await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id, params: { ...job, language: isLanguage(job.language) ? job.language : currentLanguage() } }); }
           catch (error) {
             if (!/already|exists|duplicate|conflict/i.test(error instanceof Error ? error.message : String(error))) throw error;
           }
@@ -2204,7 +2205,7 @@ export default {
           requestMessageId: message.message_id, url: target.url,
           ...(apiSelection ? { instagramApi: apiSelection } : {}),
           instagramProfile: { username: target.kind === "story" ? target.username : "highlight", kind: "story", target } };
-        try { await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id, params: job }); }
+        try { await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id, params: { ...job, language: isLanguage(job.language) ? job.language : currentLanguage() } }); }
         catch (error) {
           if (!/already|exists|duplicate|conflict/i.test(error instanceof Error ? error.message : String(error))) throw error;
         }
@@ -2217,7 +2218,7 @@ export default {
           instagramPostRequest: { shortcode: post.shortcode },
           ...(apiSelection ? { instagramApi: apiSelection } : {}),
         };
-        try { await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id, params: job }); }
+        try { await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id, params: { ...job, language: isLanguage(job.language) ? job.language : currentLanguage() } }); }
         catch (error) {
           if (!/already|exists|duplicate|conflict/i.test(error instanceof Error ? error.message : String(error))) throw error;
         }
@@ -2226,7 +2227,7 @@ export default {
         const id = `igdl-${post.chatId}-${post.requestMessageId}-${post.userId}`;
         const job: YoutubeDownloadJob = { id, chatId: post.chatId, requestMessageId: post.requestMessageId,
           userId: post.userId, url: post.url, instagramPost: post };
-        try { await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id, params: job }); }
+        try { await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id, params: { ...job, language: isLanguage(job.language) ? job.language : currentLanguage() } }); }
         catch (error) {
           if (!/already|exists|duplicate|conflict/i.test(error instanceof Error ? error.message : String(error))) throw error;
         }

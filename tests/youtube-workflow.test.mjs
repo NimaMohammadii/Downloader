@@ -34,7 +34,7 @@ const { outputFiles } = await build({ external: ['node:async_hooks'],
         export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }
         export class WorkflowEntrypoint { constructor(ctx, env) { this.env = env; } }
       ` };
-      if (args.path === './localization') return {contents:'export const withUserLanguage=async(_env,_id,action)=>action(); export const userLanguage=async()=>"fa";'};
+      if (args.path === './localization') return {contents:'export const currentLanguage=()=>"fa"; export const isLanguage=v=>["fa","en","ru"].includes(v); export const withUserLanguage=async(_env,_id,action)=>action(); export const userLanguage=async()=>"fa";'};
       if (args.path === './reddit') return {contents:reddit,loader:'ts'};
       if (args.path === './bandcamp') return {contents:bandcamp,loader:'ts'};
       if (args.path === './story-main') return { contents: 'export default { fetch() {} }; export const resolveInstagramSessionPost = async () => {throw Error("Unexpected session fallback")}; export const instagramSessionFailure = () => ({code:"unexpected",message:"error"}); export const startInstagramStoryRun = async () => {throw Error("Unexpected Story start")}; export const readInstagramStoryRun = async () => {throw Error("Unexpected Story read")}; export const sendResolvedStory = async () => {throw Error("Unexpected Story send")}; export const instagramProfileStories = async () => []; export const parseStoryTarget = () => null; export const parseInstagramProfileCommand = () => null; export const parseInstagramVideoTarget = () => null; export const parseInstagramAudioTarget = () => null; export const resolveInstagramVideo = () => {}; export const instagramVideoErrorText = () => "error";' };

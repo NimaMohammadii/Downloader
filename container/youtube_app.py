@@ -1849,6 +1849,7 @@ class InstagramCapture:
         self.expiry = threading.Timer(3 * 60 * 60, self.cleanup)
         self.expiry.daemon = True
 
+    @localized_job
     def status(self, text: str, *, button: bool = False) -> None:
         telegram_call(self.payload["botToken"], "editMessageText", json_payload={
             "chat_id": self.payload["chatId"], "message_id": self.payload["statusMessageId"], "text": text,

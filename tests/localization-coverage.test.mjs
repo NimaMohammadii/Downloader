@@ -9,9 +9,10 @@ const { outputFiles } = await build({
   stdin: { contents: `export * from './src/localization'; export * from './src/admin';
     export * from './src/youtube-subtitles'; export * from './src/start-message';
     export * from './src/restrictions'; export * from './src/broadcast';
-    export { YoutubeDownloadWorkflow } from './src/youtube-main';`, resolveDir: process.cwd(), loader: 'ts' },
+    export { YoutubeDownloadWorkflow, createInstagramWorkflow } from './src/youtube-main';`, resolveDir: process.cwd(), loader: 'ts' },
   bundle: true, platform: 'node', format: 'esm', write: false,
   plugins: [{ name: 'runtime', setup(b) {
+    b.onLoad({ filter: /youtube-main\.ts$/ }, args => ({ contents: readFileSync(args.path, 'utf8') + '\nexport { createInstagramWorkflow };', loader: 'ts' }));
     b.onResolve({ filter: /^(cloudflare:workers|@cloudflare\/containers)$/ }, a => ({ path: a.path, namespace: 'runtime' }));
     b.onLoad({ filter: /.*/, namespace: 'runtime' }, a => ({ contents: a.path === 'cloudflare:workers'
       ? 'export class DurableObject {} export class WorkflowEntrypoint {}'
@@ -192,5 +193,31 @@ test('real admin histories, usage reports and provider headings translate every 
         assertLocalized(api.translate(`Apify 1 ✅ ${label}`, lang), 'account');
       }
     });
+  }
+});
+
+test('a resumed music job keeps its selected language when the preference store is temporarily unavailable', async () => {
+  const env = { ADMIN_STATS: { getByName() { return { async fetch() { throw Error('temporary store outage'); } }; } } };
+  for (const language of ['en', 'ru']) {
+    const workflow = Object.assign(Object.create(api.YoutubeDownloadWorkflow.prototype), { env,
+      async runLocalized() { return api.localizePayload({ text: '⬇️ دارم آهنگ انتخاب‌شده را دانلود می‌کنم…' }).text; } });
+    const text = await workflow.run({ payload: { userId: 42, language } }, {});
+    assert.equal(text, api.translate('⬇️ دارم آهنگ انتخاب‌شده را دانلود می‌کنم…', language));
+  }
+});
+
+
+test('new music workflows capture the requesting user language in their existing payload', async () => {
+  const { env, saved } = fixture();
+  const created = [];
+  env.YOUTUBE_DOWNLOAD_WORKFLOW = { async create(job) { created.push(job); return {}; } };
+  for (const language of ['en', 'ru']) {
+    saved.set(42, language);
+    await api.withUserLanguage(env, 42, () => api.createInstagramWorkflow(env,
+      { message: { chat: { id: 42 }, message_id: 7, from: { id: 42 } } },
+      { kind: 'music', musicVideoId: 'abcdefghijk' }));
+    assert.equal(created.at(-1).params.language, language);
+    assert.equal(created.at(-1).params.userId, 42);
+    assert.equal(created.at(-1).params.instagram.musicVideoId, 'abcdefghijk');
   }
 });

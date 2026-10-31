@@ -97,5 +97,20 @@ class CompletePresentationTests(unittest.TestCase):
         self.assertEqual(translate('عنوان: زیرنویس: فعال', 'ru'), 'Название: زیرنویس: فعال')
         self.assertEqual(translate('نام کاربری: @فارسی', 'en'), 'Username: @فارسی')
 
+class BackgroundStatusLanguageTests(unittest.TestCase):
+    def test_actual_music_status_uses_job_language_outside_the_download_thread(self):
+        from unittest.mock import patch, Mock
+        import youtube_app as app
+        for language in ('en', 'ru'):
+            job = object.__new__(app.InstagramCapture)
+            job.payload = {'botToken': 'fake', 'chatId': 42, 'statusMessageId': 10, 'language': language}
+            response = Mock(ok=True)
+            response.json.return_value = {'ok': True, 'result': True}
+            with patch.object(app.requests, 'post', return_value=response) as post:
+                job.status('⬇️ دارم آهنگ انتخاب‌شده را دانلود می‌کنم…')
+                sent = post.call_args.kwargs['json']
+            self.assertEqual(sent['text'], translate('⬇️ دارم آهنگ انتخاب‌شده را دانلود می‌کنم…', language))
+            self.assertEqual(localize_payload({'text': 'سلام'})['text'], 'سلام')
+
 if __name__ == '__main__':
     unittest.main()
