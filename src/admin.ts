@@ -686,7 +686,8 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         await this.ctx.storage.put(key, body.language);
         this.ctx.storage.sql.exec("INSERT INTO user_languages(user_id,language) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET language=excluded.language", user, body.language);
       } else if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
-      return Response.json({ language: await this.ctx.storage.get(key) || "fa" });
+      const selected = await this.ctx.storage.get(key);
+      return Response.json({ language: isLanguage(selected) ? selected : "fa", selected: isLanguage(selected) });
     }
 
     const url = new URL(request.url);

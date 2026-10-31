@@ -23,7 +23,7 @@ function fixture(){
    if(parsed.pathname==='/record') return Response.json({ok:true});
    const id=parsed.searchParams.get('user');
    if(init?.method==='POST')saved.set(id,JSON.parse(init.body).language);
-   return Response.json({language:saved.get(id)||'fa'});
+   return Response.json({language:saved.get(id)||'fa',selected:saved.has(id)});
  }}}}};
  const request=update=>new Request('https://bot/telegram/webhook',{method:'POST',headers:{'x-telegram-bot-api-secret-token':'test'},body:JSON.stringify(update)});
  return {saved,calls,env,request};
@@ -221,13 +221,13 @@ test('/start asks for a language first, then replaces that same picker with the 
  try{
   for(const language of ['fa','en','ru']){
    const f=fixture(),tg=telegramSimulator();globalThis.fetch=tg.fetch;
-   f.saved.set('42','ru'); // choosing Persian must override the previous request's language too
    const request=f.request({update_id:1,message:{message_id:100,chat:{id:42},from:{id:42},text:'/start@MyBot referral'}});
    await api.worker.fetch(request,f.env,{});
    const picker=tg.messages.get(900);
    assert.ok(picker.reply_markup.inline_keyboard[0].every(button=>button.callback_data.startsWith('startlang:')));
    assert.ok(!picker.text.includes('/playlist'));
    assert.equal(tg.calls.filter(c=>c.method==='sendMessage').length,1);
+   f.saved.set('42','ru'); // stale request language must not override the newly selected language
    const callback=f.request({update_id:2,callback_query:{id:'start-select',from:{id:42},message:{message_id:900,chat:{id:42}},data:`startlang:${language}:42`}});
    await api.worker.fetch(callback,f.env,{});
    const welcome=tg.messages.get(900);
@@ -251,5 +251,45 @@ test('another user cannot select the language on a start picker in a group',asyn
   await api.worker.fetch(f.request({callback_query:{id:'foreign',from:{id:43},message:{message_id:900,chat:{id:-100}},data:'startlang:ru:42'}}),f.env,{});
   assert.equal(f.saved.size,0);
   assert.deepEqual(tg.calls.map(c=>c.method),['answerCallbackQuery']);
+ }finally{globalThis.fetch=previous;}
+});
+
+test('saved language goes straight to the welcome text on every later /start',async()=>{
+ const previous=globalThis.fetch;
+ try{
+  for(const language of ['fa','en','ru']){
+   const f=fixture(),tg=telegramSimulator();f.saved.set('42',language);globalThis.fetch=tg.fetch;
+   await api.worker.fetch(f.request({message:{message_id:100,chat:{id:42},from:{id:42},text:'/start'}}),f.env,{});
+   const welcome=tg.messages.get(900);
+   assert.ok(welcome.text.includes('/playlist'));assert.deepEqual(welcome.reply_markup.inline_keyboard,[]);
+   assert.equal(tg.calls.filter(c=>c.method==='sendMessage').length,1);
+  }
+ }finally{globalThis.fetch=previous;}
+});
+test('a deleted start language picker is recovered by sending the complete welcome',async()=>{
+ const previous=globalThis.fetch,f=fixture(),tg=telegramSimulator();globalThis.fetch=tg.fetch;
+ try{
+  await api.worker.fetch(f.request({callback_query:{id:'missing-start',from:{id:42},message:{message_id:800,chat:{id:42}},data:'startlang:en:42'}}),f.env,{});
+  const welcome=tg.messages.get(900);
+  assert.ok(welcome.text.includes('/playlist'));assert.match(welcome.text,/Send a link/);
+  assert.deepEqual(welcome.reply_markup.inline_keyboard,[]);
+  assert.deepEqual(tg.messages.get(40),{text:'https://example.org/download',document:{file_id:'download'}});
+ }finally{globalThis.fetch=previous;}
+});
+
+test('a final welcome edit failure preserves language buttons for retry and never sends a duplicate',async()=>{
+ const f=fixture(),tg=telegramSimulator(),previous=globalThis.fetch;
+ tg.messages.set(900,{text:'Choose language',reply_markup:{inline_keyboard:[[{text:'English',callback_data:'startlang:en:42'}]]}});
+ globalThis.fetch=async(url,init)=>{
+  const body=JSON.parse(init.body);
+  if(url.endsWith('/editMessageText')&&body.reply_markup?.inline_keyboard?.length===0)
+   return Response.json({ok:false,description:'Too Many Requests'},{status:429});
+  return tg.fetch(url,init);
+ };
+ try{
+  await assert.rejects(api.handleLanguageUpdate(f.request({callback_query:{id:'retry',from:{id:42},message:{message_id:900,chat:{id:42}},data:'startlang:en:42'}}),f.env));
+  assert.ok(tg.messages.get(900).reply_markup.inline_keyboard[0].some(b=>b.callback_data==='startlang:en:42'));
+  assert.equal(tg.calls.filter(c=>c.method==='sendMessage').length,0);
+  assert.equal(f.saved.get('42'),'en');
  }finally{globalThis.fetch=previous;}
 });

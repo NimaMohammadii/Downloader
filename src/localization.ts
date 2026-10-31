@@ -6,15 +6,18 @@ export type Language = 'fa' | 'en' | 'ru';
 type LanguageEnv = { ADMIN_STATS?: { getByName(name: string): { fetch(input: string, init?: RequestInit): Promise<Response> } }; BOT_TOKEN?: string; WEBHOOK_SECRET?: string };
 const context = new AsyncLocalStorage<{ language: Language; userId?: number }>();
 export const isLanguage = (value: unknown): value is Language => value === 'fa' || value === 'en' || value === 'ru';
-export async function userLanguage(env: LanguageEnv, userId?: number): Promise<Language> {
-  if (!env.ADMIN_STATS || !Number.isSafeInteger(userId) || userId! <= 0) return 'fa';
+async function languagePreference(env: LanguageEnv, userId?: number): Promise<{ language: Language; selected: boolean }> {
+  const fallback = { language: 'fa' as const, selected: false };
+  if (!env.ADMIN_STATS || !Number.isSafeInteger(userId) || userId! <= 0) return fallback;
   try {
     const response = await env.ADMIN_STATS.getByName('global').fetch(`https://admin-stats/language?user=${userId}`);
-    if (!response.ok) return 'fa';
-    const body = await response.json() as { language?: unknown };
-    return isLanguage(body.language) ? body.language : 'fa';
-  } catch { return 'fa'; } // A settings outage must not block an existing download.
-
+    if (!response.ok) return fallback;
+    const body = await response.json() as { language?: unknown; selected?: boolean };
+    return { language: isLanguage(body.language) ? body.language : 'fa', selected: body.selected === true };
+  } catch { return fallback; }
+}
+export async function userLanguage(env: LanguageEnv, userId?: number): Promise<Language> {
+  return (await languagePreference(env, userId)).language;
 }
 export async function withUserLanguage<T>(env: LanguageEnv, userId: number | undefined, action: () => Promise<T>): Promise<T> {
   return context.run({ language: await userLanguage(env, userId), userId }, action);
@@ -122,16 +125,39 @@ export async function handleLanguageUpdate(request: Request, env: LanguageEnv): 
       id: userId, username: message.from?.username, firstName: message.from?.first_name, lastName: message.from?.last_name,
     }, false, update.update_id, true);
   }
-  const language = choice || await userLanguage(env, userId);
+  const preference = choice ? { language: choice, selected: true } : await languagePreference(env, userId);
+  const language = preference.language;
   if (query) await send('answerCallbackQuery', { callback_query_id: query.id });
-  if (selection && query?.data?.startsWith('startlang:') && choice) {
+  if ((startCommand && preference.selected) || (selection && query?.data?.startsWith('startlang:') && choice)) {
     const { telegramCustomEmoji, telegramTextMotion } = await import('./admin');
-    return context.run({ language: choice, userId }, async () => {
-      const payload = localizePayload({ chat_id: message.chat.id, message_id: message.message_id,
-        ...startMessage(), reply_markup: { inline_keyboard: [] } }, choice);
-      // Replace the language picker itself, keeping the existing reveal and emoji formatting.
-      await telegramTextMotion(env.BOT_TOKEN, 'editMessageText', payload, { animateEdits: true });
-      await send('editMessageText', telegramCustomEmoji('editMessageText', payload));
+    const token = env.BOT_TOKEN; // Keep the authenticated token narrowed across the async scope.
+    return context.run({ language, userId }, async () => {
+      const payload = localizePayload({ chat_id: message.chat.id,
+        ...(query ? { message_id: message.message_id } : {}),
+        ...startMessage(), reply_markup: { inline_keyboard: [] } }, language);
+      const method = query ? 'editMessageText' : 'sendMessage';
+      const preview = query ? { ...payload, reply_markup: query.message?.reply_markup || { inline_keyboard: [
+        [['fa', 'فارسی 🇮🇷'], ['en', 'English 🇬🇧'], ['ru', 'Русский 🇷🇺']].map(([code, label]) => ({ text: label, callback_data: `startlang:${code}:${userId}` })),
+      ] } } : { ...payload };
+      // Keep retry buttons until Telegram acknowledges the complete welcome.
+      try { await telegramTextMotion(token, method, preview, { animateEdits: true }); }
+      catch { /* The full welcome must still be delivered if an optional preview fails. */ }
+      const finalPayload = telegramCustomEmoji(method, payload);
+      try { await send(method, finalPayload); }
+      catch (error) {
+        if (!query || !(error instanceof Error) || error.message !== 'LANGUAGE_MENU_MISSING') throw error;
+        const replacement = { ...finalPayload };
+        delete replacement.message_id;
+        const delivered = await send('sendMessage', replacement);
+        if (!Number.isSafeInteger(delivered?.message_id) || delivered!.message_id! <= 0) throw new Error('LANGUAGE_MENU_MESSAGE_ID_MISSING');
+        if (env.ADMIN_STATS) {
+          const response = await env.ADMIN_STATS.getByName('global').fetch(`https://admin-stats/language-menu?user=${userId}&chat=${message.chat.id}`, {
+            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ messageId: delivered!.message_id }),
+          });
+          if (!response.ok) throw new Error('LANGUAGE_MENU_SAVE_FAILED');
+        }
+        try { await send('deleteMessage', { chat_id: message.chat.id, message_id: message.message_id }); } catch { /* The old picker may already be gone. */ }
+      }
       return Response.json({ ok: true });
     });
   }
