@@ -9,12 +9,12 @@ ENV PYTHONUNBUFFERED=1 \
 # Pin the Python 3.14-compatible ShazamIO revision; PyPI 0.8.1 pins an older CPython-only core.
 RUN python3 -m venv --system-site-packages /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir \
-      "yt-dlp[default,curl-cffi]==2026.10.21" "curl-cffi==0.16.0" \
+      "yt-dlp[default,curl-cffi]==2026.10.26" "curl-cffi==0.16.0" \
       requests telethon==1.45.0 gallery-dl==1.32.17 \
     && /opt/venv/bin/pip install --no-cache-dir --only-binary=:all: cryptg==0.6.0 \
     && /opt/venv/bin/pip install --no-cache-dir \
       "https://github.com/shazamio/ShazamIO/archive/f94faafdabff9cdec258f3ac024a6402989e9040.zip" \
-    && test "$(yt-dlp --version)" = "2026.10.21" \
+    && test "$(yt-dlp --version)" = "2026.10.26" \
     && deno --version \
     && ffmpeg -version >/dev/null \
     && /opt/venv/bin/python -c 'import requests, telethon, cryptg, shazamio, shazamio_core, gallery_dl, yt_dlp, yt_dlp_ejs; from yt_dlp.networking._curlcffi import CurlCFFIRH; assert CurlCFFIRH._SUPPORTED_IMPERSONATE_TARGET_MAP, "Browser impersonation unavailable"'
