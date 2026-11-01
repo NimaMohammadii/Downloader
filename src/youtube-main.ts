@@ -436,7 +436,7 @@ async function sendCachedMedia(env: Env, job: YoutubeDownloadJob, statusId?: num
     const sent = await telegramCall(env.BOT_TOKEN, cached.method, {
       ...cached.data, [cached.method === "sendAudio" ? "audio" : "video"]: cached.fileId,
       chat_id: job.chatId, reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
-    });
+    }, job.language);
     await recordMediaDelivery(env, job.userId, job.chatId, sent, true, cached.fileSize);
   } catch (error) {
     if (/wrong.*file|file.*(?:invalid|expired)|file_reference|failed to get.*file/i.test(error instanceof Error ? error.message : "")) {
@@ -445,7 +445,7 @@ async function sendCachedMedia(env: Env, job: YoutubeDownloadJob, statusId?: num
     }
     throw error; // An ambiguous send must never trigger a duplicate upload.
   }
-  if (statusId) await safeTelegramCall(env.BOT_TOKEN, "deleteMessage", { chat_id: job.chatId, message_id: statusId });
+  if (statusId) await safeTelegramCall(env.BOT_TOKEN, "deleteMessage", { chat_id: job.chatId, message_id: statusId }, job.language);
   return true;
 }
 
@@ -545,7 +545,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
   }
 
   private async runLocalized(event: WorkflowEvent<YoutubeDownloadJob>, step: WorkflowStep) {
-    const job: YoutubeDownloadJob = { ...event.payload };
+    const job: YoutubeDownloadJob = { ...event.payload, language: isLanguage(event.payload.language) ? event.payload.language : currentLanguage() };
     const inspect = !job.instagramProfile && !job.instagram && !job.instagramPost &&
       !job.instagramPostRequest && !job.reddit && !job.bandcamp && !job.recognition && !job.playlist && !job.social && !job.quality && !job.audioMode && job.source !== "pornhub";
     await step.do("track download request", () => trackJob(this.env, job, inspect ? "pending" : "processing"));
@@ -602,7 +602,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           chat_id: job.chatId,
           text: "⏳ لینک اینستاگرام رو گرفتم، دارم فایل رو آماده می‌کنم…",
           reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
-        });
+        }, job.language);
         return status.message_id;
       });
       job.statusMessageId = statusId;
@@ -638,7 +638,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           await this.notifyInstagramSessionFailure(job, step, primary.error || "INSTAGRAM_NO_MEDIA", failure);
           await step.do("track Instagram session fallback failure", () => trackJob(this.env, job, "failed", { detail: failure.code }));
           await step.do("report Instagram session fallback failure", { retries: { limit: 0, delay: "1 second" } }, () =>
-            safeTelegramCall(this.env.BOT_TOKEN, "editMessageText", { chat_id: job.chatId, message_id: statusId, text: failure.message }));
+            safeTelegramCall(this.env.BOT_TOKEN, "editMessageText", { chat_id: job.chatId, message_id: statusId, text: failure.message }, job.language));
           return;
         }
       }
@@ -672,7 +672,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         retries: { limit: 0, delay: "1 second" }, timeout: "30 seconds",
       }, () => safeTelegramCall(this.env.BOT_TOKEN, "deleteMessage", {
         chat_id: job.chatId, message_id: job.statusMessageId,
-      }));
+      }, job.language));
     } catch (error) {
       const cause = error instanceof Error ? error.message : "UNKNOWN";
       if (sessionUsed) await this.notifyInstagramSessionFailure(job, step, providerCode,
@@ -691,7 +691,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         safeTelegramCall(this.env.BOT_TOKEN, job.statusMessageId ? "editMessageText" : "sendMessage", {
           chat_id: job.chatId, ...(job.statusMessageId ? { message_id: job.statusMessageId } : {}),
           text: instagramPostFriendlyError(error),
-        }));
+        }, job.language));
     }
   }
 
@@ -755,7 +755,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         const status = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
           chat_id: job.chatId, text: target ? `⏳ دارم ${label} را آماده می‌کنم…` : `⏳ دارم ${label}‌های @${job.instagramProfile!.username} را دریافت می‌کنم…`,
           reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
-        });
+        }, job.language);
         return status.message_id;
       });
       const publicMedia = stories && (job.instagramApi !== undefined || job.apifyAccount !== undefined || providerEnv.APIFY_API_TOKEN?.trim())
@@ -819,7 +819,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           const childStatus = await step.do(`show instagram profile post ${sequence}`, async () => {
             const status = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
               chat_id: job.chatId, text: `⬇️ در حال دریافت ${label} ${sequence} از @${job.instagramProfile!.username}…`,
-            });
+            }, job.language);
             return status.message_id;
           });
           await step.do(`start instagram profile post ${sequence}`, async () => {
@@ -849,7 +849,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         await trackJob(this.env, job, "success", { delivered });
         await telegramCall(this.env.BOT_TOKEN, "editMessageText", { chat_id: job.chatId, message_id: statusId,
           text: count ? `✅ دریافت ${count} ${label} از @${job.instagramProfile!.username} تمام شد؛ ${delivered} فایل ارسال شد.`
-            : `این حساب ${label} قابل دسترسی برای نشست متصل ندارد.` });
+            : `این حساب ${label} قابل دسترسی برای نشست متصل ندارد.` }, job.language);
         return true;
       });
     } catch (error) {
@@ -862,7 +862,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         await safeTelegramCall(this.env.BOT_TOKEN, statusId ? "editMessageText" : "sendMessage", {
           chat_id: job.chatId, message_id: statusId,
           text: `${text}${delivered ? `\n${delivered} فایل پیش از توقف ارسال شد.` : ""}`,
-        });
+        }, job.language);
         return true;
       });
     }
@@ -909,7 +909,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
               chat_id: job.chatId,
               text: "🔎 دارم کیفیت‌های موجود این ویدیو رو بررسی می‌کنم…",
               reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
-            });
+            }, job.language);
             return status.message_id;
           },
         );
@@ -940,7 +940,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
               chat_id: job.chatId,
               message_id: statusMessageId,
               text: metadata.message || "❌ کیفیت‌های این ویدیو دریافت نشد. دوباره لینک رو بفرست.",
-            });
+            }, job.language);
             return true;
           });
           return;
@@ -954,7 +954,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
               chat_id: job.chatId,
               message_id: statusMessageId,
               text: "❌ کیفیت قابل دانلود برای این ویدیو پیدا نشد.",
-            });
+            }, job.language);
             return true;
           });
           return;
@@ -983,7 +983,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
                 metadata.sizes,
               ), ...subtitleButtons(menu)],
             },
-          });
+          }, job.language);
           return true;
         });
         return;
@@ -1002,7 +1002,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
               chat_id: job.chatId,
               text: job.source === "pornhub" ? "⬇️ دارم ویدیوی Pornhub را دانلود می‌کنم…" : `⏳ ${selectionText} انتخاب شد؛ دانلود شروع شد…`,
               reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
-            });
+            }, job.language);
             return status.message_id;
           },
         );
@@ -1103,13 +1103,13 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
               chat_id: job.chatId,
               message_id: statusMessageId,
               text: failureMessage, _errorDetail: detail,
-            });
+            }, job.language);
           } else {
             await safeTelegramCall(this.env.BOT_TOKEN, "sendMessage", {
               chat_id: job.chatId,
               text: failureMessage, _errorDetail: detail,
               reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
-            });
+            }, job.language);
           }
           return true;
         },
@@ -1131,7 +1131,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         const message = await telegramCall<TelegramMessage>(this.env.BOT_TOKEN, "sendMessage", {
           chat_id: job.chatId, reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
           text: job.reddit ? "⬇️ دارم فایل‌های Reddit را آماده می‌کنم…" : job.bandcamp ? "🎵 دارم آهنگ‌های Bandcamp را آماده می‌کنم…" : job.social ? `⬇️ دارم ${job.social.audioOnly ? "صدای ویدیوی" : "فایل"} ${socialName(job.social.platform)} را دریافت می‌کنم…` : job.playlist ? `🎵 دارم آهنگ‌های ${job.playlist.start}-${job.playlist.end} پلی‌لیست را به‌صورت MP3 آماده می‌کنم…` : job.recognition || job.instagram?.recognizeMusic ? "🎧 دارم آهنگ داخل فایل را شناسایی می‌کنم…" : job.instagram?.kind === "music" ? "🔎 دارم آهنگ را پیدا می‌کنم…" : job.instagram?.kind === "audio" ? "🎵 دارم صدای ویدیوی اینستاگرام را آماده می‌کنم…" : "🔎 دارم لایو یا بازپخش اینستاگرام را بررسی می‌کنم…",
-        });
+        }, job.language);
         return message.message_id;
       });
       // Private Instagram media must still be visible to the connected account.
@@ -1163,7 +1163,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         await step.do("track source failure", () => trackJob(this.env, job, "failed", { detail: resolution.message }));
         await step.do("show instagram resolution error", () => telegramCall<boolean>(this.env.BOT_TOKEN, "editMessageText", {
           chat_id: job.chatId, message_id: statusId, text: resolution.message,
-        }));
+        }, job.language));
         return { ok: false };
       }
       const source = resolution.source;
@@ -1215,7 +1215,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           }));
           await telegramCall(this.env.BOT_TOKEN, "editMessageText", { chat_id: job.chatId, message_id: statusId,
             text: "🎵 کیفیت صدای Bandcamp را انتخاب کن:\nفقط فرمت‌های قابل‌دریافت نمایش داده می‌شوند. انتخاب تا ۸ دقیقه فعال است.",
-            reply_markup: { inline_keyboard: rows } });
+            reply_markup: { inline_keyboard: rows } }, job.language);
         });
         const selection = await step.waitForEvent<{ index: number }>("await bandcamp quality", { type: "bandcamp-quality", timeout: "8 minutes" });
         const index = selection.payload.index;
@@ -1232,7 +1232,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         await step.do("track capture failure", () => trackJob(this.env, job, "failed", { title: source.title, detail: ready.payload.message || "دریافت محتوا کامل نشد." }));
         await step.do("show instagram capture failure", () => telegramCall<boolean>(this.env.BOT_TOKEN, "editMessageText", {
           chat_id: job.chatId, message_id: statusId, text: ready.payload.message || "❌ دریافت لایو کامل نشد؛ دوباره لینک را بفرست.", reply_markup: { inline_keyboard: [] },
-        }));
+        }, job.language));
         return { ok: false };
       }
       phase = "upload";
@@ -1276,7 +1276,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         });
         await step.do("show social delivery failure", () => telegramCall<boolean>(this.env.BOT_TOKEN, "editMessageText", {
           chat_id: job.chatId, message_id: statusId, text: result.message,
-        }));
+        }, job.language));
       } else throw new Error(`IG_SEND_FAILED ${redactDiagnostic([result.errorCode, result.diagnostic, result.message].filter(Boolean).join(": "), this.env)}`);
       return result;
     } catch (error) {
@@ -1304,7 +1304,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           : job.social ? `❌ دریافت یا ارسال فایل ${socialName(job.social.platform)} کامل نشد؛ اگر فایلی دریافت کرده‌ای، پیش از درخواست دوباره بررسی کن.` : job.recognition || job.playlist || job.instagram?.kind === "music" || job.instagram?.kind === "audio" ? "❌ دریافت یا ارسال فایل صوتی کامل نشد؛ درخواست را دوباره بفرست." : "❌ ضبط یا ارسال لایو کامل نشد؛ لینک را دوباره بفرست. ممکن است سرور ری‌استارت شده باشد.";
         await safeTelegramCall(this.env.BOT_TOKEN, statusId ? "editMessageText" : "sendMessage", {
           chat_id: job.chatId, message_id: statusId, text, _errorDetail: redactDiagnostic(String(error), this.env), reply_markup: { inline_keyboard: [] },
-        });
+        }, job.language);
         return true;
       });
       return { ok: false };
@@ -1329,7 +1329,11 @@ async function telegramCall<T = unknown>(
   token: string,
   method: string,
   payload: Record<string, unknown>,
+  language?: Language,
 ): Promise<T> {
+  // Workflow step callbacks do not inherit the outer AsyncLocalStorage scope.
+  // Re-enter it only for this existing message transport, using the saved language.
+  if (isLanguage(language)) return withUserLanguage({}, undefined, () => telegramCall<T>(token, method, payload), language);
   await telegramTextMotion(token, method, payload);
   const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: "POST",
@@ -1347,9 +1351,10 @@ async function safeTelegramCall(
   token: string,
   method: string,
   payload: Record<string, unknown>,
+  language?: Language,
 ): Promise<void> {
   try {
-    await telegramCall(token, method, payload);
+    await telegramCall(token, method, payload, language);
   } catch (error) {
     console.warn("youtube telegram call failed", {
       method,
