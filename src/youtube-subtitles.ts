@@ -6,9 +6,10 @@ export const subtitleName = (v: SubtitleLanguage): string => languages[v].name;
 export type SubtitlePreference = { enabled: boolean; language?: SubtitleLanguage };
 export type SubtitleMenu = {
   videoId: string; requestMessageId: number; userId: number; chatId: number; messageId: number;
+  mediaJobId?: string; mediaSource?: "instagram" | "pinterest";
   title?: string; qualities: number[]; audioAvailable: boolean;
   sizes?: Record<string, { bytes: number; estimated: boolean }>;
-  preference: SubtitlePreference; createdAt: number; consumed?: boolean; locked?: boolean;
+  preference: SubtitlePreference; createdAt: number; consumed?: boolean; locked?: boolean; selectedPreference?: SubtitlePreference;
 };
 const ON = '5206607081334906820', OFF = '5210952531676504517';
 export const SUBTITLE_LOCK_EMOJI = '5296369303661067030';
@@ -82,7 +83,8 @@ export async function subtitleSettings(request: Request, storage: Store): Promis
       const m = body.menu;
       if (!m || m.userId !== userId || m.chatId !== chatId || m.messageId !== messageId ||
           !/^[A-Za-z0-9_-]{11}$/.test(m.videoId) || !validId(m.requestMessageId) ||
-          !Array.isArray(m.qualities) || !m.qualities.length || m.qualities.length > 4 ||
+          !Array.isArray(m.qualities) || (!m.mediaSource && !m.qualities.length) || m.qualities.length > 4 ||
+          (m.mediaSource !== undefined && (!['instagram','pinterest'].includes(m.mediaSource) || !/^[A-Za-z0-9:_-]{1,180}$/.test(m.mediaJobId || ''))) ||
           !m.qualities.every(q => [360,480,720,1080].includes(q)) || typeof m.audioAvailable !== 'boolean')
         return new Response('Invalid menu', { status: 400 });
       const existing = await s.get<SubtitleMenu>(key);
@@ -98,15 +100,18 @@ export async function subtitleSettings(request: Request, storage: Store): Promis
       if (menu && Date.now() - menu.createdAt > 24 * 60 * 60 * 1000) await s.delete(key);
       return new Response('Expired menu', { status: 410 });
     }
+    if (menu.mediaSource && (body.op === 'media-get' || body.op === 'media-take') && menu.consumed)
+      return Response.json({ ...menu, preference: menu.selectedPreference || menu.preference });
     if (menu.consumed) return new Response('Download already started', { status: 409 });
-    if (access.locked && (body.op === 'enable' || body.op === 'language' || body.op === 'take' && body.expected?.enabled))
+    if (access.locked && (body.op === 'enable' || body.op === 'language' || (body.op === 'take' || body.op === 'media-take') && body.expected?.enabled))
       return new Response('Subtitles locked', { status: 423 });
-    if (body.op === 'take') {
+    if (body.op === 'take' || body.op === 'media-take' && menu.mediaSource) {
       const effective = visible(menu);
       if (body.expected && (body.expected.enabled !== effective.preference.enabled || body.expected.language !== effective.preference.language))
         return new Response('Menu changed', { status: 412 });
       if (effective.preference.enabled && !isSubtitleLanguage(effective.preference.language)) return new Response('Select language', { status: 422 });
       menu.consumed = true;
+      if (menu.mediaSource) menu.selectedPreference = effective.preference;
       await s.put(key, menu);
       return Response.json(visible(menu));
     }
@@ -116,8 +121,8 @@ export async function subtitleSettings(request: Request, storage: Store): Promis
     } else if (body.op === 'language') {
       if (!isSubtitleLanguage(body.language)) return new Response('Invalid language', { status: 400 });
       menu.preference = { enabled: true, language: body.language };
-    } else if (body.op !== 'get') return new Response('Invalid operation', { status: 400 });
-    if (body.op !== 'get') {
+    } else if (body.op !== 'get' && !(body.op === 'media-get' && menu.mediaSource)) return new Response('Invalid operation', { status: 400 });
+    if (body.op !== 'get' && body.op !== 'media-get') {
       await s.put(prefKey, menu.preference);
       await s.put(key, menu);
     }

@@ -125,6 +125,38 @@ def authorize(payload: dict) -> None:
         raise app.UserVisibleError('❌ برای زیرنویس، ELEVEN_API و GPT_API را در Secretهای Worker تنظیم کن.')
 
 
+def authorize_media(payload: dict) -> None:
+    language, platform = payload.get('subtitle'), payload.get('subtitleSource')
+    source = payload.get('source') or {}
+    if not isinstance(language, str) or language not in LANGUAGES or platform not in ('instagram', 'pinterest') or source.get('audioOnly') or source.get('mode') != 'replay':
+        raise app.UserVisibleError('❌ درخواست زیرنویس معتبر نیست.')
+    if platform == 'pinterest' and (source.get('social') or {}).get('platform') != 'pinterest':
+        raise app.UserVisibleError('❌ درخواست زیرنویس معتبر نیست.')
+    if platform == 'instagram' and (source.get('social') or any(source.get(k) for k in ('reddit','bandcamp','playlist','recognition','musicQuery','musicVideoId'))):
+        raise app.UserVisibleError('❌ درخواست زیرنویس معتبر نیست.')
+    identity = payload.get('subtitleIdentity')
+    billing = payload.get('subtitleBillingKey')
+    if not isinstance(identity, str) or not 1 <= len(identity) <= 4096 or not isinstance(billing, str) or not re.fullmatch(r'[A-Za-z0-9:_-]{1,180}', billing):
+        raise app.UserVisibleError('❌ شناسهٔ فایل زیرنویس معتبر نیست.')
+    message = f"media-subtitle-{language}-v1|{payload.get('id')}|{payload.get('userId')}|{platform}|{identity}|{billing}"
+    expected = hmac.new(str(payload.get('botToken') or '').encode(), message.encode(), hashlib.sha256).hexdigest()
+    supplied = payload.get('subtitleAuthorization')
+    if not isinstance(supplied, str) or not hmac.compare_digest(expected, supplied) or not payload.get('elevenApiKey') or not payload.get('gptApiKey'):
+        raise app.UserVisibleError('❌ مجوز درخواست زیرنویس معتبر نیست.')
+
+
+def prepare_media(video_path: Path, payload: dict, status, item_id: str, deadline: float | None = None) -> Path:
+    authorize_media(payload)
+    identity = f"{payload['subtitleSource']}:{payload['subtitleIdentity']}:{item_id}"
+    # A job-scoped deadline also bounds API calls and FFmpeg in the shared engine.
+    end = time.monotonic() + app.YOUTUBE_JOB_SECONDS
+    token = app.JOB_DEADLINE.set(min(end, deadline) if deadline is not None else end)
+    try:
+        return _prepare(video_path, payload, status, identity, payload['subtitleBillingKey'])
+    finally:
+        app.JOB_DEADLINE.reset(token)
+
+
 def _clean(value: str) -> str:
     # Neither transcripts nor model output may inject ASS commands or controls.
     return ' '.join(re.sub(r'[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069{}\\<>]', ' ', value).split())
@@ -359,6 +391,11 @@ def _ffmpeg(args: list[str], timeout: int = 900, *, progress=None) -> None:
 
 def prepare(video_path: Path, payload: dict, status) -> Path:
     authorize(payload)
+    return _prepare(video_path, payload, status, app.youtube_video_id(payload['url']),
+                    f"youtube:{payload.get('chatId')}:{payload.get('requestMessageId')}:{payload['userId']}")
+
+
+def _prepare(video_path: Path, payload: dict, status, identity: str, billing_key: str) -> Path:
     language = payload['subtitle']
     # Serialize the optional CPU/API work, without changing downloader admission.
     with LOCK:
@@ -372,13 +409,12 @@ def prepare(video_path: Path, payload: dict, status) -> Path:
             if old.is_dir() and time.time() - old.stat().st_mtime > CACHE_SECONDS:
                 import shutil
                 shutil.rmtree(old)
-        video_id = app.youtube_video_id(payload['url'])
-        directory = CACHE_ROOT / hashlib.sha256(video_id.encode()).hexdigest()
+        directory = CACHE_ROOT / hashlib.sha256(identity.encode()).hexdigest()
         directory.mkdir(mode=0o700, exist_ok=True)
         directory.touch()
         from subtitle_usage import replay_charges
         replay_charges(directory)
-        billing = {'downloadKey': f"youtube:{payload.get('chatId')}:{payload.get('requestMessageId')}:{payload['userId']}",
+        billing = {'downloadKey': billing_key,
                    'userId': payload['userId'], 'language': language}
         transcript_file = directory / 'transcript.json'
         if not transcript_file.exists():

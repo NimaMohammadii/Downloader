@@ -60,7 +60,7 @@ test('production subtitle admin panels enforce permissions, persist independent 
     }
     assert.equal((await (await access()).json()).globalLocked,false);
     calls.length=0;await click('admin:subtitles');
-    assert.match(edit().text,/مدیریت زیرنویس یوتیوب/);assert.match(edit().text,/کاربران دارای سابقهٔ زیرنویس: 1/);
+    assert.match(edit().text,/مدیریت زیرنویس/);assert.match(edit().text,/کاربران دارای سابقهٔ زیرنویس: 1/);
     assert.equal(edit().entities[0].type,'bold');
     await click('admin:subtitles:lock');await click('admin:subtitles:lock');
     assert.equal((await (await access()).json()).globalLocked,true);
@@ -121,6 +121,21 @@ test('production locked subtitle click displays a localized modal with the reque
 const charge = (extra={}) => ({key:'sub:test',downloadKey:base.key,userId:42,at:Date.now(),language:'fa',
   provider:'openai',model:'gpt-6-luna',state:'measured',serviceTier:'default',
   inputTokens:10000,cachedInputTokens:2000,cacheWriteTokens:4000,outputTokens:3000,...extra});
+
+test('Instagram and Pinterest subtitle history and costs appear in the existing admin lists',async()=>{
+ const f=fixture();try{
+ await f.record(1);
+ for(const [source,key] of [['Instagram post','ig:42:7:42'],['Instagram replay','igdl-42-8-42'],['Pinterest','igdl-42-9-42']]) {
+  const result=await f.request('/download',{...base,key,source,subtitleLanguage:'de',status:'success',delivered:1});
+  assert.equal(result.status,200);
+  await f.request('/usage',{samples:[],deliveries:[],subtitleCharges:[charge({key:'sub:'+key,downloadKey:key})]});
+ }
+ const users=await(await f.request('/subtitle-users')).json();assert.equal(users.totalUsers,1);assert.equal(users.requests,3);
+ const detail=await admin.getAdminUserDetail(f.env,'42',0,true);assert.equal(detail.counts.total,3);
+ assert.ok(detail.downloads.every(d=>d.subtitleLanguage==='de'&&d.subtitleCosts.translationNano===2420000));
+ const text=admin.formatAdminUserDetail(detail);assert.match(text,/Pinterest/);assert.match(text,/Instagram post/);assert.match(text,/Deutsch/);
+ }finally{f.close();}
+});
 
 test('subtitle public prices use measured units, cache writes and actual service tier without guessing unknown usage',()=>{
   assert.equal(admin.subtitleChargeNano(charge()),2420000);

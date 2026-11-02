@@ -44,7 +44,7 @@ export async function adminSubtitlePanel(env: AdminStatsEnv, actorId: number, da
   if (home) {
     const state = await access(env, actorId, undefined, home[1] ? home[1] === 'lock' : undefined);
     const summary = await users(env, 0);
-    return panel('مدیریت زیرنویس یوتیوب', [
+    return panel('مدیریت زیرنویس', [
       `دسترسی سراسری: ${state.globalLocked ? 'قفل برای همه' : 'باز'}`, '',
       `کاربران دارای سابقهٔ زیرنویس: ${summary.totalUsers}`,
       `درخواست‌های زیرنویس: ${summary.requests}`,

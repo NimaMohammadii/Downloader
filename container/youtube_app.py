@@ -1835,6 +1835,10 @@ class InstagramCapture:
             raise ValueError("Invalid completion destination")
         if not re.fullmatch(r"[a-f0-9]{64}", str(payload.get("completionToken") or "")):
             raise ValueError("Invalid event token")
+        if payload.get("subtitle"):
+            from ai_subtitles import authorize_media
+            authorize_media(payload)
+        self.subtitle_paths = {}
         self.workdir = Path(tempfile.mkdtemp(prefix="instagram-capture-"))
         self.path = self.workdir / ("Instagram.m4a" if self.audio_only else "Instagram.mp4")
         self.process: subprocess.Popen | None = None
@@ -1850,15 +1854,16 @@ class InstagramCapture:
         self.expiry.daemon = True
 
     @localized_job
-    def status(self, text: str, *, button: bool = False) -> None:
+    def status(self, text: str, *, button: bool = False, entities=None) -> None:
         telegram_call(self.payload["botToken"], "editMessageText", json_payload={
             "chat_id": self.payload["chatId"], "message_id": self.payload["statusMessageId"], "text": text,
+            **({"entities": entities} if entities is not None else {}),
             "reply_markup": {"inline_keyboard": [[{"text": "⏹ توقف پلی‌لیست" if self.source.get("playlist") else "⏹ توقف ضبط و ارسال", "callback_data": self.payload["stopData"]}]] if button else []},
         }, timeout=30)
 
-    def safe_status(self, text: str, *, button: bool = False) -> None:
+    def safe_status(self, text: str, *, button: bool = False, entities=None) -> None:
         try:
-            self.status(text, button=button)
+            self.status(text, button=button, **({"entities": entities} if entities is not None else {}))
         except Exception:
             print("instagram status delivery failed", flush=True)
 
@@ -1956,7 +1961,8 @@ class InstagramCapture:
                                if self.source["social"].get("platform") == "pinterest" else {})
                 self.social_url, self.social_items = prepare_social_media(self.source["social"], self.workdir, cache_payload=self.payload, **credentials)
                 self.social_sent = 0
-                self.result = {"ok": True}
+                self.result = {"ok": True, **({"subtitleEligible": any(item.get("method") == "sendVideo" for item in self.social_items)}
+                    if self.source["social"].get("platform") == "pinterest" and not self.source["social"].get("audioOnly") else {})}
                 with self.lock:
                     self.state = "ready"
                 self.safe_status(f"📤 {len(self.social_items)} فایل آمادهٔ ارسال است…")
@@ -2217,6 +2223,7 @@ class InstagramCapture:
                 return {"ok": True}
             self.state = "sending"
         uploading = False
+        subtitle_send_deadline = time.monotonic() + 25 * 60 if self.payload.get("subtitle") else None
         try:
             if self.source.get("reddit"):
                 from reddit import send
@@ -2261,11 +2268,15 @@ class InstagramCapture:
             data = {"chat_id": str(self.payload["chatId"]), "caption": caption,
                     "reply_parameters": json.dumps({"message_id": self.payload["requestMessageId"]}), **self.video}
             self.safe_status("📤 دارم فایل صوتی را کامل در تلگرام ارسال می‌کنم…" if self.audio_only else "📤 دارم فایل ویدیو را کامل در تلگرام ارسال می‌کنم…")
+            if self.payload.get("subtitle") and not self.audio_only and not getattr(self, "subtitle_prepared", False):
+                from ai_subtitles import prepare_media
+                self.path = prepare_media(self.path, self.payload, self.safe_status, "replay", subtitle_send_deadline)
+                self.subtitle_prepared = True
             with self.path.open("rb") as handle:
                 method = "sendAudio" if self.audio_only else "sendVideo"
                 mime = "audio/mpeg" if self.path.suffix == ".mp3" else "audio/mp4" if self.audio_only else "video/mp4"
                 uploading = True
-                sent = asyncio.run(asyncio.wait_for(upload_complete_file(self.payload["botToken"], method, data, (self.path.name, handle, mime)), timeout=25 * 60))
+                sent = asyncio.run(asyncio.wait_for(upload_complete_file(self.payload["botToken"], method, data, (self.path.name, handle, mime)), timeout=max(1, subtitle_send_deadline - time.monotonic()) if subtitle_send_deadline is not None else 25 * 60))
                 uploading = False
             store_uploaded_file(self.payload, [self.payload.get("mediaCacheKey"), self.source.get("musicFileKey"),
                 music_query_key(self.source["musicQuery"], recognition=bool(self.source.get("recognition") or self.source.get("recognizeMusic"))) if self.source.get("musicQuery") else None], method, data, sent)
@@ -2353,6 +2364,8 @@ class InstagramCapture:
                 if index == 0:
                     data["reply_parameters"] = json.dumps({"message_id": self.payload["requestMessageId"], "allow_sending_without_reply": True})
                 key = f"ig:{self.payload['userId']}:{post['shortcode']}:{index}:video" if video else None
+                if key and self.payload.get("subtitle"):
+                    key += f":sub-{self.payload['subtitle']}-v1"
                 markup = {"inline_keyboard": [[
                     {"text": "🎵 فقط صدا", "callback_data": f"iga|{source_kind}|{post['shortcode']}|{index}|{self.payload['userId']}"},
                     {"text": "🔎 پیداکردن آهنگ", "callback_data": f"igm|{source_kind}|{post['shortcode']}|{index}|{self.payload['userId']}"},
@@ -2374,6 +2387,11 @@ class InstagramCapture:
                         raise UserVisibleError("❌ فایل ویدیوی سالم برای ارسال دریافت نشد.")
                     data.update(width=stream.get("width", item.get("width", 0)), height=stream.get("height", item.get("height", 0)),
                                 duration=duration, supports_streaming=True, reply_markup=json.dumps(markup))
+                if video and self.payload.get("subtitle"):
+                    from ai_subtitles import prepare_media
+                    if index not in self.subtitle_paths:
+                        self.subtitle_paths[index] = prepare_media(path, self.payload, self.safe_status, f"{source_kind}:{post['shortcode']}:{index}", deadline)
+                    path = self.subtitle_paths[index]
                 self.safe_status(f"📤 در حال ارسال فایل {index + 1}/{len(items)} اینستاگرام…")
                 with path.open("rb") as handle:
                     uploading = True
@@ -2430,6 +2448,13 @@ class InstagramCapture:
                         item["fileSize"] = item["path"].stat().st_size
                         method = item["method"]
                         data, markup = self.social_delivery_options(item)
+                    if self.payload.get("subtitle") and method == "sendVideo" and not item.get("subtitlePrepared"):
+                        from ai_subtitles import prepare_media
+                        item["path"] = prepare_media(item["path"], self.payload, self.safe_status, str(item["index"]), deadline)
+                        item["fileSize"] = item["path"].stat().st_size
+                        item["subtitlePrepared"] = True
+                        if sum(v.get("fileSize", 0) for v in self.social_items) > DIRECT_TELEGRAM_LIMIT:
+                            raise UserVisibleError("❌ مجموع حجم فایل‌های پست از سقف 2 گیگابایت بیشتر است.")
                     mime = "image/gif" if item["path"].suffix.lower() == ".gif" else {"sendPhoto": "image/jpeg", "sendDocument": "image/jpeg", "sendAnimation": "image/gif", "sendAudio": "audio/mpeg", "sendVideo": "video/mp4"}[method]
                     self.safe_status(f"📤 در حال ارسال فایل {self.social_sent + 1}/{len(self.social_items)}…")
                     with item["path"].open("rb") as handle:
@@ -2476,6 +2501,21 @@ def instagram_action(action: str, payload: dict[str, Any]) -> dict[str, Any]:
                 if payload.get("bandcampFormatId") is not None:
                     from bandcamp import choose
                     return choose(job, payload["bandcampFormatId"])
+                if payload.get("subtitle"):
+                    from ai_subtitles import authorize_media
+                    with job.lock:
+                        merged = {**job.payload, **payload}
+                        authorize_media(merged)
+                        if job.payload.get("subtitle"):
+                            return {"ok": job.payload["subtitle"] == payload["subtitle"]}
+                        if job.state != "ready" or (job.source.get("social") or {}).get("platform") != "pinterest":
+                            return {"ok": False}
+                        job.payload.update(payload)
+                        for item in job.social_items:
+                            if item["method"] == "sendVideo":
+                                item["cacheKey"] += f":sub-{payload['subtitle']}-v1"
+                                item["cached"] = file_cache(job.payload, "get", item["cacheKey"])
+                    return {"ok": True}
                 # Workflow start retries reuse the same process and file.
                 return {"ok": True}
             if payload.get("bandcampFormatId") is not None:
@@ -2538,7 +2578,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_get(self) -> None:
         if self.path in {"/", "/health", "/ping"}:
-            self._send_json(200, {"ok": True, "service": "youtube-yt-dlp-container", "subtitleVersion": 2})
+            self._send_json(200, {"ok": True, "service": "youtube-yt-dlp-container", "subtitleVersion": 3})
             return
         self._send_json(404, {"ok": False, "error": "not found"})
 

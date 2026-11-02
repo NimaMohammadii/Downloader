@@ -995,7 +995,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       const statuses: DownloadStatus[] = ["pending", "awaiting_selection", "processing", "success", "failed", "partial", "results"];
       if (!/^[A-Za-z0-9:_-]{1,180}$/.test(payload.key || "") || !Number.isSafeInteger(payload.userId)
           || payload.userId <= 0 || !statuses.includes(payload.status)
-          || (Object.hasOwn(payload, 'subtitleLanguage') && (payload.source !== 'YouTube'
+          || (Object.hasOwn(payload, 'subtitleLanguage') && (!['YouTube','Instagram post','Instagram replay','Instagram story','Instagram highlight','Pinterest'].includes(payload.source)
             || payload.subtitleLanguage !== null && !isSubtitleLanguage(payload.subtitleLanguage)))) return new Response("Invalid download", { status: 400 });
       const now = Date.now();
       const terminal = ["success", "failed", "partial", "results"].includes(payload.status);
@@ -1058,7 +1058,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       const activity = activityRows[0];
       const staleBefore = Date.now() - 4 * 3600_000;
       const subtitleFilter = url.searchParams.get("subtitles") === "1"
-        ? "AND source='YouTube' AND EXISTS (SELECT 1 FROM youtube_subtitle_choices s WHERE s.download_key=download_history.key AND s.user_id=download_history.user_id AND s.language IS NOT NULL)" : "";
+        ? "AND EXISTS (SELECT 1 FROM youtube_subtitle_choices s WHERE s.download_key=download_history.key AND s.user_id=download_history.user_id AND s.language IS NOT NULL)" : "";
       const counts = sql.exec(`SELECT COUNT(*) AS total,
         COALESCE(SUM(status = 'success'),0) AS success, COALESCE(SUM(status = 'failed'),0) AS failed,
         COALESCE(SUM(status = 'partial'),0) AS partial, COALESCE(SUM(status = 'results'),0) AS results,
@@ -1070,7 +1070,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       const page = Math.min(Number.isSafeInteger(rawPage) && rawPage >= 0 ? rawPage : 0, totalPages - 1);
       const downloads = sql.exec(`SELECT h.*, s.download_key AS subtitle_recorded, s.language AS subtitle_language
         FROM download_history h LEFT JOIN youtube_subtitle_choices s ON s.download_key=h.key AND s.user_id=h.user_id
-        WHERE h.user_id = ? ${subtitleFilter ? "AND h.source='YouTube' AND s.language IS NOT NULL" : ""}
+        WHERE h.user_id = ? ${subtitleFilter ? "AND s.language IS NOT NULL" : ""}
         ORDER BY h.created_at DESC, h.key DESC LIMIT ? OFFSET ?`,
         id, ADMIN_DOWNLOADS_PAGE_SIZE, page * ADMIN_DOWNLOADS_PAGE_SIZE).toArray().map(row => ({
           key: String(row.key), userId: Number(id), source: String(row.source), request: String(row.request),
@@ -1187,7 +1187,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
     if (request.method === "GET" && url.pathname === "/subtitle-users") {
       const sql = this.ctx.storage.sql;
       const from = `FROM download_history h JOIN youtube_subtitle_choices s ON s.download_key=h.key AND s.user_id=h.user_id
-        WHERE h.source='YouTube' AND s.language IS NOT NULL`;
+        WHERE s.language IS NOT NULL`;
       const totals = sql.exec(`SELECT COUNT(DISTINCT h.user_id) AS totalUsers, COUNT(*) AS requests,
         COALESCE(SUM(h.delivered>0),0) AS delivered, COALESCE(SUM(h.status='failed'),0) AS failed ${from}`).one();
       const totalPages = Math.max(1, Math.ceil(asNumber(totals.totalUsers) / ADMIN_USERS_PAGE_SIZE));
@@ -1512,7 +1512,7 @@ export function formatAdminDownloadHistory(detail: Pick<AdminUserDetail, 'downlo
     lines.push("", `${detail.page * ADMIN_DOWNLOADS_PAGE_SIZE + index + 1}. ${displayText(item.source, 32)} • ${dateLabel(item.createdAt)}`,
       item.stale ? "❔ نتیجه نهایی ثبت نشده (بیش از ۴ ساعت)" : STATUS_LABELS[item.status],
       ...(item.title ? [`عنوان: ${displayText(item.title, 90)}`] : []),
-      ...(item.source === 'YouTube' ? [subtitleChoiceLabel(item.subtitleLanguage),
+      ...(item.source === 'YouTube' || item.subtitleLanguage !== undefined ? [subtitleChoiceLabel(item.subtitleLanguage),
         ...(item.subtitleLanguage !== undefined && item.subtitleCosts ? [
           `API زیرنویس این دانلود: ${subtitleDollars(item.subtitleCosts.transcriptionNano + item.subtitleCosts.translationNano)}${item.subtitleCosts.unknown ? ' + هزینهٔ نامشخص' : ''}`,
         ] : [])] : []),
