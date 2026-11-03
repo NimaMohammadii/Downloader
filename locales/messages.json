@@ -4625,9 +4625,9 @@
     "ru": "❌ В посте больше 20 файлов. Они не отправлены."
   },
   {
-    "fa": "❌ مقدار PINTEREST_COOKIES باید متن کامل خروجی کوکی‌ها باشد.",
-    "en": "❌ PINTEREST_COOKIES must contain the full exported cookie text.",
-    "ru": "❌ PINTEREST_COOKIES должен содержать полный текст экспорта cookies."
+    "fa": "❌ مقدار PINTEREST_COOKIE باید متن کامل خروجی کوکی‌ها باشد.",
+    "en": "❌ PINTEREST_COOKIE must contain the full exported cookie text.",
+    "ru": "❌ PINTEREST_COOKIE должен содержать полный текст экспорта cookies."
   },
   {
     "fa": "❌ این آیتم عکس است و صدای ویدیو ندارد.",
@@ -4750,9 +4750,9 @@
     "ru": "❌ Доступная версия видео ограничена. Файл не отправлен."
   },
   {
-    "fa": "❌ کوکی Pinterest نامعتبر یا منقضی است؛ خروجی کامل و تازهٔ cookies.txt یا JSON حساب واردشده را در PINTEREST_COOKIES قرار بده.",
-    "en": "❌ The Pinterest cookies are invalid or expired. Put a fresh, complete signed-in cookies.txt or JSON export in PINTEREST_COOKIES.",
-    "ru": "❌ Cookies Pinterest недействительны или истекли. Задай в PINTEREST_COOKIES свежий полный экспорт cookies.txt или JSON аккаунта со входом."
+    "fa": "❌ کوکی Pinterest نامعتبر یا منقضی است؛ خروجی کامل و تازهٔ cookies.txt یا JSON حساب واردشده را در PINTEREST_COOKIE قرار بده.",
+    "en": "❌ The Pinterest cookies are invalid or expired. Put a fresh, complete signed-in cookies.txt or JSON export in PINTEREST_COOKIE.",
+    "ru": "❌ Cookies Pinterest недействительны или истекли. Задай в PINTEREST_COOKIE свежий полный экспорт cookies.txt или JSON аккаунта со входом."
   },
   {
     "fa": "❌ فایل کامل پیدا نشد؛ ممکن است حجم آن از سقف ارسال بیشتر باشد.",
@@ -4780,9 +4780,9 @@
     "ru": "❌ Не получилось подготовить исправное изображение для отправки."
   },
   {
-    "fa": "❌ درخواست Pinterest بدون نشست حساب اجرا شد؛ Secret با نام PINTEREST_COOKIES را در Worker بررسی کن.",
-    "en": "❌ The Pinterest request ran without an account session. Check the PINTEREST_COOKIES Secret in the Worker.",
-    "ru": "❌ Запрос Pinterest выполнен без сессии аккаунта. Проверь Secret PINTEREST_COOKIES в Worker."
+    "fa": "❌ درخواست Pinterest بدون نشست حساب اجرا شد؛ Secret با نام PINTEREST_COOKIE را در Worker بررسی کن.",
+    "en": "❌ The Pinterest request ran without an account session. Check the PINTEREST_COOKIE Secret in the Worker.",
+    "ru": "❌ Запрос Pinterest выполнен без сессии аккаунта. Проверь Secret PINTEREST_COOKIE в Worker."
   },
   {
     "fa": "❌ نسخهٔ قابل دریافت این فایل محدود است؛ دانلود انجام نشد.",

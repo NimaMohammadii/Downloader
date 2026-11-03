@@ -109,7 +109,7 @@ function poolBinding() {
 
 test('Pinterest requests receive current secrets on a running container, including rotation and removal', async () => {
   const raw=JSON.stringify([{domain:'.pinterest.com',name:'_pinterest_sess',value:'fixture-pinterest-session'}]);
-  const env={PINTEREST_COOKIES:raw,API_ID:'123',API_HASH:'fixture-hash'};
+  const env={PINTEREST_COOKIE:raw,API_ID:'123',API_HASH:'fixture-hash'};
   const instance=new YoutubeDownloaderContainer({storage:memoryStorage()},env);
   const received=[],logs=[],previous=console.info;
   instance.containerFetch=async(_url,init)=>{received.push(JSON.parse(init.body));return Response.json({ok:true});};
@@ -117,9 +117,9 @@ test('Pinterest requests receive current secrets on a running container, includi
   const payload={id:'igdl-42-7-42',source:{mode:'replay',social:{platform:'pinterest',url:'https://www.pinterest.com/pin/123/'}}};
   try {
     await instance.instagramRequest('start',payload);
-    env.PINTEREST_COOKIES=raw.replace('fixture-pinterest-session','rotated-private-session');
+    env.PINTEREST_COOKIE=raw.replace('fixture-pinterest-session','rotated-private-session');
     await instance.instagramRequest('start',payload);
-    delete env.PINTEREST_COOKIES;
+    delete env.PINTEREST_COOKIE;
     await instance.instagramRequest('start',payload);
     assert.deepEqual(received.map(r=>r.pinterestCookies),[raw,raw.replace('fixture-pinterest-session','rotated-private-session'),'']);
     assert.equal(payload.pinterestCookies,undefined);
@@ -128,7 +128,7 @@ test('Pinterest requests receive current secrets on a running container, includi
     assert.deepEqual(logs.map(l=>l.data.configured),[true,true,false]);
     assert.ok(!JSON.stringify(logs).includes('private-session')&&!JSON.stringify(logs).includes('fixture-pinterest-session'));
   } finally {console.info=previous;}
-  assert.equal(instance.envVars.PINTEREST_COOKIES,undefined);
+  assert.equal(instance.envVars.PINTEREST_COOKIE,undefined);
   assert.equal(instance.envVars.API_ID,'123');
   assert.equal(instance.envVars.API_HASH,'fixture-hash');
 });

@@ -95,7 +95,7 @@ type Env = AdminStatsEnv & InstagramApiSecrets & {
   API_HASH?: string;
   ELEVEN_API?: string;
   GPT_API?: string;
-  PINTEREST_COOKIES?: string;
+  PINTEREST_COOKIE?: string;
   REDDIT_COOKIES?: string;
   YOUTUBE_COOKIES?: string;
   YOUTUBE_DOWNLOAD_WORKFLOW: Workflow<YoutubeDownloadJob>;
@@ -332,8 +332,8 @@ export class YoutubeDownloaderContainer extends Container<Env> {
     // its startup environment even after a secret is replaced or removed.
     const reddit = action === "start" && Boolean((payload.source as MediaSource | undefined)?.reddit);
     const requestPayload = reddit ? { ...payload, redditCookies: this.env.REDDIT_COOKIES || "" }
-      : pinterest ? { ...payload, pinterestCookies: this.env.PINTEREST_COOKIES || "" } : payload;
-    if (pinterest) console.info("pinterest session supplied", { configured: Boolean(this.env.PINTEREST_COOKIES?.trim()) });
+      : pinterest ? { ...payload, pinterestCookies: this.env.PINTEREST_COOKIE || "" } : payload;
+    if (pinterest) console.info("pinterest session supplied", { configured: Boolean(this.env.PINTEREST_COOKIE?.trim()) });
     const response = await this.containerFetch(`http://container/instagram/${action}`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(requestPayload),
     });

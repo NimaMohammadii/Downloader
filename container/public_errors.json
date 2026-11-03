@@ -111,7 +111,7 @@
       "(?:topapi|apify|brightdata)_(?:auth|quota|credits|invalid_input|actor_missing|dataset|invalid_request|empty_input|minimum_inputs|invalid_result|invalid_response|request_rejected|record_(?!(?:dead_page|bucket_rate_limit|global_rate_limit))|provider_error|status_unavailable|run_failed|workflow_required)",
       "API_ID|API_HASH|INSTAGRAM_SESSIONID|YT_CONFIG|(?:تنظیمات|سشن|نشست|توکن|کلید|اعتبار|سهمیه|استخراج‌کننده|اکانت متصل|حساب متصل|Secret|Cloudflare|کانتینر|داشبورد|Apify|Bright Data|TopAPI).*(?:معتبر نیست|آماده نیست|تنظیم نشده|لاگ|بررسی کن|نپذیرفت|ورود|تأیید|تمام شده|محدود|اجازه|ناموفق|برنگرداند)|(?:SESSION|LOGIN|CHALLENGE|CONSENT)_REQUIRED",
       "(?:سشن|نشست|حساب متصل|توکن|کلید).{0,50}(?:قبول نکرد|نیاز به|معتبر نیست|تنظیم|ورود)",
-      "PINTEREST_COOKIES|cookies.txt|(?:اکانت|حساب|Session|سشن|نشست|توکن|کوکی|کلید|Secret|API_ID|API_HASH).{0,90}(?:ورود|تأیید|نپذیرفت|معتبر|منقضی|تنظیم|متصل|نمی‌پذیرد)",
+      "PINTEREST_COOKIE|cookies.txt|(?:اکانت|حساب|Session|سشن|نشست|توکن|کوکی|کلید|Secret|API_ID|API_HASH).{0,90}(?:ورود|تأیید|نپذیرفت|معتبر|منقضی|تنظیم|متصل|نمی‌پذیرد)",
       "(?:TopAPI|Apify|Bright Data|کانتینر|Cloudflare|Worker|داشبورد).*(?:بررسی|ناموفق|پشتیبانی نمی|رد کرد|نپذیرفت|لاگ|قطع)",
       "SOURCE_TEMPORARILY_UNAVAILABLE|سرویس.*موقتاً پاسخ نمی‌دهد",
       "برای دانلود.*Session|همه.*مسیرهای Session|لاگ story user resolver"
