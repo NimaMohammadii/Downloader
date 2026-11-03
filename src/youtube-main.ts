@@ -1678,7 +1678,7 @@ async function editSubtitleMenu(env: Env, menu: SubtitleMenu, picker = false): P
   try {
     await telegramCall(env.BOT_TOKEN, "editMessageText", { chat_id: menu.chatId, message_id: menu.messageId,
       text: picker ? `${formatVideoTitle(menu.title)}\n\nزبان زیرنویس را انتخاب کن:`
-        : menu.mediaSource ? "تنظیمات زیرنویس را انتخاب کن و دریافت ویدیو را بزن:" : `${formatVideoTitle(menu.title)}\n\nکیفیت یا حالت دانلود رو انتخاب کن:`,
+        : `${formatVideoTitle(menu.title)}\n\nکیفیت یا حالت دانلود رو انتخاب کن:`,
       reply_markup: { inline_keyboard: keyboard } });
   } catch (error) {
     if (!(error instanceof Error && /message is not modified/i.test(error.message))) throw error;
