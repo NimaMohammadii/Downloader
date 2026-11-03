@@ -1,5 +1,6 @@
 """Isolated anonymous Bandcamp track/album downloads; shared Telegram sender only."""
 import asyncio
+import hashlib
 import json
 import math
 import re
@@ -248,7 +249,7 @@ def _download(url: str, path: Path, limit: int, deadline: float) -> None:
     raise app.UserVisibleError('❌ تغییر مسیر فایل Bandcamp بیش از حد بود.')
 
 
-def prepare_track(url: str, directory: Path, limit: int, deadline: float, identifier: str = 'best') -> dict:
+def prepare_track(url: str, directory: Path, limit: int, deadline: float, identifier: str = 'best', *, cache_payload: dict | None = None) -> dict:
     data = metadata(url)
     candidates = audio_formats(data)
     if not candidates:
@@ -256,6 +257,14 @@ def prepare_track(url: str, directory: Path, limit: int, deadline: float, identi
     chosen = best_format(candidates) if identifier == 'best' else next((item for item in candidates if item['format_id'] == identifier), None)
     if not chosen:
         raise app.UserVisibleError('❌ کیفیت انتخاب‌شده دیگر در دسترس نیست؛ لینک را دوباره بفرست و کیفیت موجود را انتخاب کن.')
+    key = 'bc:' + hashlib.sha256(json.dumps([url, chosen['format_id'], chosen['ext'], data.get('duration')], separators=(',', ':')).encode()).hexdigest()
+    cached = app.file_cache(cache_payload, 'get', key) if cache_payload else None
+    method = 'sendAudio' if chosen['ext'] in {'mp3', 'm4a'} and chosen['format_id'] not in {'alac', 'falac'} else 'sendDocument'
+    if (isinstance(cached, dict) and cached.get('method') == method and isinstance(cached.get('fileId'), str)
+            and re.fullmatch(r'[A-Za-z0-9_-]{1,1024}', cached['fileId']) and type(cached.get('fileSize')) is int and 0 < cached['fileSize'] <= limit):
+        return {'cached': cached, 'cacheKey': key, 'formatId': chosen['format_id'], 'method': method, 'size': cached['fileSize'],
+                'title': ' '.join(str(data.get('track') or data.get('title') or 'Bandcamp').split())[:180],
+                'artist': ' '.join(str(data.get('artist') or data.get('uploader') or '').split())[:120], 'url': url, 'quality': format_label(chosen)}
     directory.mkdir(parents=True, exist_ok=True)
     source = directory / 'input'
     download(chosen['url'], source, limit, deadline)
@@ -279,7 +288,7 @@ def prepare_track(url: str, directory: Path, limit: int, deadline: float, identi
             raise ValueError('output size')
         return {'path': output, 'title': title, 'artist': artist, 'url': url, 'size': output.stat().st_size,
                 'quality': format_label(chosen),
-                'method': 'sendAudio' if chosen['ext'] in {'mp3', 'm4a'} and chosen['format_id'] not in {'alac', 'falac'} else 'sendDocument'}
+                'method': method, 'cacheKey': key, 'formatId': chosen['format_id']}
     except (subprocess.SubprocessError, ValueError, OSError) as exc:
         raise failure(phase, exc) from exc
     finally:
@@ -309,7 +318,8 @@ def prepare(job) -> None:
                 raise app.UserVisibleError('❌ لینک آهنگ آلبوم معتبر نیست.')
             job.safe_status(f'🎵 Bandcamp؛ آماده‌سازی آهنگ {index} از {len(entries)}…')
             args = (track_url, job.workdir / f'bandcamp-{index}', MAX_BYTES - size, deadline)
-            item = prepare_track(*args, identifier) if identifier != 'best' else prepare_track(*args)
+            kwargs = {'cache_payload': job.payload} if job.payload.get('cacheUrl') else {}
+            item = prepare_track(*args, identifier, **kwargs) if identifier != 'best' else prepare_track(*args, **kwargs)
             size += item['size']
             item['index'] = index
             job.bandcamp_items.append(item)
@@ -332,6 +342,14 @@ def send(job) -> dict:
         for item in job.bandcamp_items[job.bandcamp_sent:]:
             if job.cleanup_requested or time.monotonic() >= deadline:
                 raise app.UserVisibleError('❌ ارسال Bandcamp متوقف شد یا به سقف زمان رسید.')
+            if item.get('cached'):
+                caption = f"🎵 {item['title']}\n👤 {item['artist']}\n{item.get('quality', '')}\nBandcamp • {item['index']}\n{item['url']}"[:1024]
+                if app.reuse_cached_file(job.payload, item['cacheKey'], caption, cached=item['cached'], cache_index=item['index'] - 1):
+                    job.bandcamp_sent += 1
+                    continue
+                remaining = MAX_BYTES - sum(other['size'] for other in job.bandcamp_items if other is not item)
+                item.update(prepare_track(item['url'], job.workdir / f"bandcamp-{item['index']}", remaining, deadline, item['formatId']))
+                item.pop('cached', None)
             data = {'chat_id': str(job.payload['chatId']), 'title': item['title'], 'performer': item['artist'],
                     'caption': f"🎵 {item['title']}\n👤 {item['artist']}\n{item.get('quality', '')}\nBandcamp • {item['index']}\n{item['url']}"[:1024],
                     'reply_parameters': json.dumps({'message_id': job.payload['requestMessageId'], 'allow_sending_without_reply': True})}
@@ -340,8 +358,9 @@ def send(job) -> dict:
                 method = item.get('method') or ('sendAudio' if ext in {'.mp3', '.m4a'} else 'sendDocument')
                 mime = {'.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.flac': 'audio/flac', '.wav': 'audio/wav',
                         '.aiff': 'audio/aiff', '.ogg': 'audio/ogg', '.aac': 'audio/aac'}.get(ext, 'application/octet-stream')
-                asyncio.run(asyncio.wait_for(app.upload_complete_file(job.payload['botToken'], method, data,
+                sent = asyncio.run(asyncio.wait_for(app.upload_complete_file(job.payload['botToken'], method, data,
                             (item['path'].name, handle, mime)), timeout=max(1, min(10 * 60, deadline - time.monotonic()))))
+            app.store_uploaded_file(job.payload, [item.get('cacheKey')], method, data, sent, file_size=item['size'], cache_index=item['index'] - 1)
             job.bandcamp_sent += 1
             item['path'].unlink(missing_ok=True)
         result = {'ok': True, 'parts': job.bandcamp_sent, 'title': job.bandcamp_title,

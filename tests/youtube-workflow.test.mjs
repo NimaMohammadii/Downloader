@@ -10,15 +10,17 @@ const source = await readFile(new URL('../src/youtube-main.ts', import.meta.url)
 const startSource = await readFile(new URL('../src/start-message.ts', import.meta.url), 'utf8');
 const subtitleSource = await readFile(new URL('../src/youtube-subtitles.ts', import.meta.url), 'utf8');
 const subtitleLanguages = await readFile(new URL('../locales/subtitle-languages.json', import.meta.url), 'utf8');
+const fileCacheSource = await readFile(new URL('../src/telegram-file-cache.ts', import.meta.url), 'utf8');
 const cacheUsageSource = await readFile(new URL('../src/cache-usage.ts', import.meta.url), 'utf8');
 const catalogSource = await readFile(new URL('../src/youtube-catalog.ts', import.meta.url), 'utf8');
 const instagram = await readFile(new URL('../src/index.ts', import.meta.url), 'utf8');
 const { outputFiles } = await build({ external: ['node:async_hooks'],
-  stdin: { contents: source + '\nexport {buildCachedQualityKeyboard,extractPornhubUrl,handleQualityCallback,handleSubtitleCallback,parseQualityCallback,mediaCacheKey,subtitleButtons}; export {subtitleSettings,subtitleAccessSettings} from "./youtube-subtitles";', loader: 'ts', resolveDir: process.cwd() },
+  stdin: { contents: source + '\nexport {telegramFileCache as actualFileCache} from "./telegram-file-cache"; export {sendInstagramPostDirect} from "./index"; export {sendCachedPost,postCacheKey,buildCachedQualityKeyboard,extractPornhubUrl,handleQualityCallback,handleSubtitleCallback,parseQualityCallback,mediaCacheKey,subtitleButtons}; export {subtitleSettings,subtitleAccessSettings} from "./youtube-subtitles";', loader: 'ts', resolveDir: process.cwd() },
   bundle: true, format: 'esm', write: false,
   plugins: [{ name: 'cloudflare-test-bindings', setup(build) {
     build.onResolve({ filter: /.*/ }, args => ({ path: args.path, namespace: 'test' }));
     build.onLoad({ filter: /.*/, namespace: 'test' }, args => {
+      if (args.path === './telegram-file-cache') return {contents:fileCacheSource,loader:'ts'};
       if (args.path === './cache-usage') return { contents: cacheUsageSource, loader: 'ts' };
       if (args.path === './youtube-catalog') return { contents: catalogSource, loader: 'ts' };
       if (args.path === './start-message') return { contents: startSource, loader: 'ts' };
@@ -65,7 +67,7 @@ const { outputFiles } = await build({ external: ['node:async_hooks'],
     });
   } }],
 });
-const { buildCachedQualityKeyboard, DownloadPool, YoutubeDownloaderContainer, YoutubeDownloadWorkflow, extractPornhubUrl, handleQualityCallback, handleSubtitleCallback, parseQualityCallback, mediaCacheKey, subtitleButtons, subtitleSettings, subtitleAccessSettings, default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
+const { actualFileCache,sendInstagramPostDirect,sendCachedPost,postCacheKey,buildCachedQualityKeyboard, DownloadPool, YoutubeDownloaderContainer, YoutubeDownloadWorkflow, extractPornhubUrl, handleQualityCallback, handleSubtitleCallback, parseQualityCallback, mediaCacheKey, subtitleButtons, subtitleSettings, subtitleAccessSettings, default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
 
 function subtitleBinding(storage = memoryStorage()) {
   return { getByName() { return { fetch: (url, init) => new URL(url).pathname === '/youtube-subtitle-access'
@@ -1009,4 +1011,127 @@ test('quality cache icons follow the current subtitle language and preserve call
  assert.equal(translated.flat().find(b=>b.icon_custom_emoji_id).icon_custom_emoji_id,'5372917041193828849');
  const before=reads.length;await buildCachedQualityKeyboard(env,{...menu,preference:{enabled:true}});assert.equal(reads.length,before);
  }finally{delete globalThis.testFileCache;}
+});
+
+function sharedCacheFixture(){
+ const values=new Map();const calls=[];
+ const env={BOT_TOKEN:'123:fixture',ADMIN_STATS:{getByName(){return{async fetch(input,init){
+  const request=new Request(input,init),body=await request.json();
+  if(new URL(request.url).pathname==='/youtube-subtitles')return Response.json({locked:false,preference:{enabled:false}});
+  if(new URL(request.url).pathname!=='/file-cache')throw Error('Unexpected storage endpoint');
+  if(body.op==='put'||body.op==='import')values.set(body.key,structuredClone(body.value));
+  if(body.op==='delete')values.set(body.key,null);
+  return Response.json({value:values.get(body.key)||null,known:values.has(body.key)});
+ }}}}};
+ const job={sharedCacheVersion:1,id:'igdl-99-8-99',userId:99,chatId:99,requestMessageId:8,url:'https://www.instagram.com/p/ExamplePost/',instagramPostRequest:{shortcode:'ExamplePost'}};
+ globalThis.downloadHistory=[];globalThis.delivered=0;
+ const previous=globalThis.fetch,previousCache=globalThis.testFileCache;globalThis.testFileCache=actualFileCache;
+ globalThis.fetch=async(url,init)=>{
+  assert.equal(new URL(url).hostname,'api.telegram.org','warm cache must not resolve or download source media');
+  const method=String(url).split('/').at(-1),body=JSON.parse(init.body);calls.push({method,body});
+  const id=calls.length;
+  return Response.json({ok:true,result:{message_id:id,...(method==='sendVideo'?{video:{file_id:'video_fixture',file_size:1000}}:{}),
+   ...(method==='sendPhoto'?{photo:[{file_id:'photo_fixture',file_size:200}]}:{})}});
+ };
+ return{env,job,values,calls,close(){globalThis.fetch=previous;globalThis.testFileCache=previousCache;}};
+}
+
+test('a complete public Instagram carousel is reused by another user before provider or Container work',async()=>{
+ const f=sharedCacheFixture();try{
+ await sendInstagramPostDirect(f.env,{kind:'post',shortcode:'ExamplePost',url:f.job.url},
+  {chat:{id:42},from:{id:42},message_id:7},[
+   {kind:'photo',url:'https://scontent.cdninstagram.com/photo.jpg',width:100,height:100,size:200},
+   {kind:'video',url:'https://scontent.cdninstagram.com/video.mp4',width:100,height:100,size:1000}], 'ig:42:7:42');
+ const key=await postCacheKey(f.env,f.job);assert.equal(f.values.get(key).files.length,2);
+ assert.ok(!JSON.stringify(f.values.get(key)).includes('callback_data'));
+ f.calls.length=0;const steps=[];
+ await new YoutubeDownloadWorkflow({},f.env).run({payload:f.job},{async do(name,...args){steps.push(name);return args.at(-1)();}});
+ const media=f.calls.filter(c=>['sendPhoto','sendVideo'].includes(c.method));
+ assert.deepEqual(media.map(c=>c.method),['sendPhoto','sendVideo']);
+ assert.equal(media[0].body.photo,'photo_fixture');assert.equal(media[1].body.video,'video_fixture');
+ assert.ok(media.every(c=>c.body.chat_id===99&&c.body.reply_parameters.message_id===8));
+ const buttons=media[1].body.reply_markup.inline_keyboard.flat();
+ assert.ok(buttons.some(b=>b.callback_data==='iga|p|ExamplePost|1|99'));
+ assert.ok(buttons.some(b=>b.callback_data.startsWith('mss|p|ExamplePost|1|99|')));
+ assert.ok(!steps.some(s=>/resolve public|start.*container|reserve download/.test(s)));
+ assert.equal(globalThis.downloadHistory.at(-1).delivered,2);
+ assert.equal(globalThis.downloadHistory.at(-1).status,'success');
+ }finally{f.close();}
+});
+
+test('private Instagram results never become public posts and subtitle variants cannot reuse plain output',async()=>{
+ const f=sharedCacheFixture();try{
+ await sendInstagramPostDirect(f.env,{kind:'post',shortcode:'ExamplePost',url:f.job.url},{chat:{id:42},from:{id:42},message_id:7},
+  [{kind:'video',url:'https://scontent.cdninstagram.com/video.mp4',width:100,height:100,size:1000}], 'ig:42:7:42',false);
+ assert.equal(f.values.has(await postCacheKey(f.env,f.job)),false);
+ assert.ok(f.values.has('ig:v2:access:p:ExamplePost:0:video'));
+ const plain=await postCacheKey(f.env,f.job),fa=await postCacheKey(f.env,{...f.job,subtitle:'fa',subtitlePostIndex:0}),de=await postCacheKey(f.env,{...f.job,subtitle:'de',subtitlePostIndex:0});
+ assert.equal(new Set([plain,fa,de]).size,3);
+ assert.equal(await sendCachedPost(f.env,f.job,10),null);
+ assert.equal(await sendCachedPost(f.env,{...f.job,subtitle:'fa',subtitlePostIndex:0},10),null);
+ }finally{f.close();}
+});
+
+test('invalid first cached IDs fall back; partial or ambiguous cached sends stop without duplicate uploads',async()=>{
+ for(const failAt of [1,2])for(const invalid of [true,false]){
+  const f=sharedCacheFixture();try{
+   const key=await postCacheKey(f.env,f.job);f.values.set(key,{kind:'post',files:[0,1].map(index=>({index,method:'sendVideo',fileId:'fixture_'+index,data:{caption:'Instagram'}}))});
+   let sends=0;globalThis.fetch=async(url,init)=>{
+    const method=String(url).split('/').at(-1),body=JSON.parse(init.body);f.calls.push({method,body});
+    if(method==='sendVideo'&&++sends===failAt){if(!invalid)throw Error('ambiguous timeout');return Response.json({ok:false,description:'wrong file identifier'});}
+    return Response.json({ok:true,result:{message_id:sends,video:{file_id:'fixture'}}});
+   };
+   const result=await sendCachedPost(f.env,f.job,10);
+   assert.equal(sends,failAt);
+   if(invalid&&failAt===1){assert.equal(result,null);assert.equal(f.values.get(key),null);}
+   else{assert.equal(result.ok,false);assert.equal(result.parts,failAt-1);assert.equal(globalThis.downloadHistory.at(-1).delivered,failAt-1);}
+  }finally{f.close();}
+ }
+});
+
+test('shared keys preserve access checks, request modes, indices and credential isolation',async()=>{
+ const f=sharedCacheFixture();try{
+  const base={...f.job,instagramPostRequest:undefined,social:{platform:'x',url:'https://x.com/i/status/123'}};
+  const key=await postCacheKey(f.env,base);
+  assert.equal(key,await postCacheKey(f.env,{...base,userId:42,chatId:42}));
+  assert.notEqual(key,await postCacheKey(f.env,{...base,social:{...base.social,audioOnly:true}}));
+  assert.notEqual(key,await postCacheKey(f.env,{...base,social:{...base.social,itemIndex:1}}));
+  assert.equal(await postCacheKey(f.env,{...base,social:{platform:'pinterest',url:'https://www.pinterest.com/pin/123/'}}),undefined);
+  const reddit={...base,social:undefined,reddit:{url:'https://www.reddit.com/comments/abc'}};
+  assert.ok(await postCacheKey(f.env,reddit));assert.equal(await postCacheKey({...f.env,REDDIT_COOKIES:'private'},reddit),undefined);
+  assert.equal(await sendCachedPost(f.env,{...base,instagram:{kind:'replay',shortcode:'ExamplePost'}},10),null);
+  assert.equal(await mediaCacheKey({userId:42,instagram:{kind:'replay',shortcode:'ExamplePost'},url:''}),await mediaCacheKey({userId:99,instagram:{kind:'replay',shortcode:'ExamplePost'},url:''}));
+ }finally{f.close();}
+});
+
+test('photo references copy the confirmed media without exposing old messages or re-uploading',async()=>{
+ const f=sharedCacheFixture();try{
+  const photo={method:'sendPhoto',sourceMessage:{chatId:42,messageId:7},data:{caption:'Instagram'},fileSize:200};
+  f.values.set('ig:v2:public:p:ExamplePost:0:photo',photo);
+  await sendInstagramPostDirect(f.env,{kind:'post',shortcode:'ExamplePost',url:f.job.url},
+   {chat:{id:99},from:{id:99},message_id:8},[{kind:'photo',url:'https://scontent.cdninstagram.com/photo.jpg',width:100,height:100,size:200}], 'ig:99:8:99');
+  assert.equal(f.calls[0].method,'copyMessage');assert.equal(f.calls[0].body.from_chat_id,42);
+  assert.equal(f.calls[0].body.message_id,7);assert.equal(f.calls[0].body.chat_id,99);assert.equal(f.calls[0].body.photo,undefined);
+  f.calls.length=0;
+  const result=await sendCachedPost(f.env,{...f.job,userId:77,chatId:77},10);
+  assert.equal(result.ok,true);assert.equal(f.calls[0].method,'copyMessage');assert.equal(f.calls[0].body.chat_id,77);
+  globalThis.fetch=async()=>Response.json({ok:false,description:'Bad Request: message to copy not found'});
+  assert.equal(await sendCachedPost(f.env,f.job,10),null);
+ }finally{f.close();}
+});
+
+test('legacy in-flight Instagram jobs never enter newly added fast-cache steps after deployment',async()=>{
+ const f=sharedCacheFixture();try{
+  const job={...f.job,sharedCacheVersion:undefined},steps=[];
+  f.values.set(await postCacheKey(f.env,job),{kind:'post',files:[{method:'sendVideo',fileId:'already_sent',index:0,data:{}}]});
+  const checkpoints={
+   'track download request':undefined,'show public Instagram post status once':10,
+   'resolve public Instagram post once':{media:[{kind:'photo',url:'https://scontent.cdninstagram.com/old.jpg',size:100,width:10,height:10}]},
+   'deliver public Instagram post once':1,'record public Instagram post delivery':undefined,'clear public Instagram post status':undefined,
+  };
+  await new YoutubeDownloadWorkflow({},f.env).run({payload:job},{async do(name){steps.push(name);
+   assert.ok(Object.hasOwn(checkpoints,name),'old workflow must resume its existing checkpoints');return checkpoints[name];}});
+  assert.ok(!steps.some(name=>name.includes('reuse complete')));
+  assert.equal(f.calls.length,0);
+ }finally{f.close();}
 });

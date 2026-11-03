@@ -1,4 +1,5 @@
 import { instagramSubtitleEntry } from "./youtube-subtitles";
+import { instagramFileCacheKey } from "./telegram-file-cache";
 import appWorker from "./main";
 import type { InstagramProfilePost } from "./index";
 import {
@@ -34,7 +35,8 @@ type TelegramMessage = {
   from?: TelegramUser;
   text?: string;
   caption?: string;
-  video?: { file_id: string };
+  video?: { file_id: string; file_size?: number };
+  photo?: { file_id: string; file_size?: number }[];
 };
 type TelegramUpdate = { update_id: number; message?: TelegramMessage };
 type TelegramApiResponse<T> = { ok: boolean; result?: T; description?: string };
@@ -943,18 +945,38 @@ export async function sendResolvedStory(env: Env, target: StoryTarget, update: T
       const item = media[i];
       const mediaUrl = await proxyUrl(env.BOT_TOKEN, item.url);
       const caption = media.length > 1 ? `Instagram • ${i + 1}/${media.length}` : "Instagram";
+      const sourceId = item.storyId || (target.kind === "story" ? target.storyId : null) ||
+        [...new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(new URL(item.url).pathname)))].map(b=>b.toString(16).padStart(2,"0")).join("");
+      const cacheKey = instagramFileCacheKey(sourceId,0,item.kind === "video" ? "video":"photo",false,true);
       let usageSent: unknown;
       let usageCached = false;
+      let usageBytes: number | undefined;
       if (item.kind === "photo") {
-        usageSent = await telegramCall(env.BOT_TOKEN, "sendPhoto", {
+        const cached = await telegramFileCache(env,"get",cacheKey);
+        const payload = {
           chat_id: message.chat.id,
-          photo: mediaUrl,
+          photo: cached?.method === "sendPhoto" ? cached.fileId : mediaUrl,
           caption,
           reply_parameters: i === 0 ? { message_id: message.message_id, allow_sending_without_reply: true } : undefined,
-        });
+        };
+        usageCached = cached?.method === "sendPhoto";
+        usageBytes = cached?.fileSize;
+        const reference = usageCached ? cached?.sourceMessage : undefined;
+        let sent: TelegramMessage;
+        try { sent = await telegramCall<TelegramMessage>(env.BOT_TOKEN,reference ? "copyMessage":"sendPhoto",reference
+          ? {chat_id:payload.chat_id,caption,reply_parameters:payload.reply_parameters,from_chat_id:reference.chatId,message_id:reference.messageId} : payload); }
+        catch(error) {
+          if (!usageCached || !/wrong.*file|file.*(?:invalid|expired)|file_reference|failed to get.*file|message to copy not found|message can't be copied|message_id_invalid/i.test(String(error))) throw error;
+          await telegramFileCache(env,"delete",cacheKey); usageCached = false;
+          sent = await telegramCall<TelegramMessage>(env.BOT_TOKEN,"sendPhoto",{...payload,photo:mediaUrl});
+        }
+        usageSent = sent;
+        const photo = sent.photo?.at(-1);
+        const file = photo?.file_id ? {method:"sendPhoto" as const,fileId:photo.file_id,data:{caption},fileSize:photo.file_size}
+          : usageCached && cached ? {...cached,data:{caption}} : null;
+        if (file) await telegramFileCache(env,"put",cacheKey,file);
       } else {
-        const cacheKey = target.kind === "story" && target.storyId ? `ig:${message.from?.id || message.chat.id}:${target.storyId}:0:video` : undefined;
-        const cached = cacheKey ? await telegramFileCache(env, "get", cacheKey) : null;
+        const cached = await telegramFileCache(env,"get",cacheKey) || (target.kind === "story" && target.storyId ? await telegramFileCache(env,"get",`ig:${message.from?.id || message.chat.id}:${target.storyId}:0:video`) : null);
         const payload = {
           chat_id: message.chat.id,
           video: cached?.method === "sendVideo" ? cached.fileId : mediaUrl,
@@ -978,10 +1000,10 @@ export async function sendResolvedStory(env: Env, target: StoryTarget, update: T
         }
         usageSent = sent;
         if (cacheKey && sent.video?.file_id) await telegramFileCache(env, "put", cacheKey, {
-          method: "sendVideo", fileId: sent.video.file_id, data: { caption, supports_streaming: true },
+          method: "sendVideo", fileId: sent.video.file_id, data: { caption, supports_streaming: true }, fileSize: sent.video.file_size,
         });
       }
-      await recordMediaDelivery(env, message.from?.id || message.chat.id, message.chat.id, usageSent, usageCached, undefined, {source:"Instagram",downloadKey:`ig:${message.chat.id}:${message.message_id}:${message.from?.id || message.chat.id}`});
+      await recordMediaDelivery(env, message.from?.id || message.chat.id, message.chat.id, usageSent, usageCached, usageBytes, item.kind === "video" ? {source:"Instagram",downloadKey:history.key}:undefined);
       delivered++;
       await recordSuccessfulDelivery(env, `${history.key}:${i}`);
     }

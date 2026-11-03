@@ -1567,19 +1567,23 @@ def file_cache(payload: dict[str, Any], op: str, key: str | None, value: dict[st
     return None
 
 
-def reuse_cached_file(payload: dict[str, Any], key: str | None, caption: str | None = None, *, reply_markup: dict[str, Any] | None = None, cached: dict[str, Any] | None = None) -> bool:
+def reuse_cached_file(payload: dict[str, Any], key: str | None, caption: str | None = None, *, reply_markup: dict[str, Any] | None = None, cached: dict[str, Any] | None = None, cache_index: int = 0) -> bool:
     cached = cached if cached is not None else file_cache(payload, "get", key)
-    if not isinstance(cached, dict) or cached.get("method") not in {"sendAudio", "sendVideo"} or not cached.get("fileId"):
+    copy_ref = cached.get("sourceMessage") if isinstance(cached, dict) and cached.get("method") == "sendPhoto" else None
+    if not isinstance(cached, dict) or cached.get("method") not in {"sendAudio", "sendVideo", "sendPhoto", "sendDocument", "sendAnimation"} or not (cached.get("fileId") or copy_ref):
         return False
     data = dict(cached.get("data") or {})
     if caption is not None:
         data["caption"] = caption[:1024]
     if reply_markup is not None:
         data["reply_markup"] = reply_markup
-    data.update({"chat_id": payload["chatId"], "reply_parameters": {"message_id": payload["requestMessageId"]},
-                 "audio" if cached["method"] == "sendAudio" else "video": cached["fileId"]})
+    data.update({"chat_id": payload["chatId"], "reply_parameters": {"message_id": payload["requestMessageId"]}})
+    if copy_ref:
+        data.update(from_chat_id=copy_ref["chatId"], message_id=copy_ref["messageId"])
+    else:
+        data[{"sendAudio": "audio", "sendVideo": "video", "sendPhoto": "photo", "sendDocument": "document", "sendAnimation": "animation"}[cached["method"]]] = cached["fileId"]
     try:
-        sent = telegram_call(payload["botToken"], cached["method"], json_payload=data, timeout=90)
+        sent = telegram_call(payload["botToken"], "copyMessage" if copy_ref else cached["method"], json_payload=data, timeout=90)
         media = (sent.get("video") or sent.get("audio") or {}) if isinstance(sent, dict) else {}
         try:
             USAGE.delivery(payload["botToken"], payload["chatId"], sent, media.get("file_size", cached.get("fileSize")), cached=True,
@@ -1587,19 +1591,28 @@ def reuse_cached_file(payload: dict[str, Any], key: str | None, caption: str | N
                 if cached["method"] == "sendVideo" and payload.get("cacheSource") and payload.get("cacheHistoryKey") else None)
         except Exception:
             pass
+        remember_post_file(payload, {**cached, "data": {**cached.get("data", {}), **({"caption": caption[:1024]} if caption is not None else {})}}, sent, cache_index)
         return True
     except Exception as exc:
-        if re.search(r"wrong.*file|file.*(?:invalid|expired)|file_reference|failed to get.*file", str(exc), re.I):
+        if re.search(r"wrong.*file|file.*(?:invalid|expired)|file_reference|failed to get.*file", str(exc), re.I) or (
+                copy_ref and re.search(r"message to copy not found|message can't be copied|message_id_invalid", str(exc), re.I)):
             file_cache(payload, "delete", key)
             return False
         raise UserVisibleError("❌ ارسال فایل ذخیره‌شده کامل نشد؛ برای جلوگیری از ارسال تکراری، آپلود دوباره شروع نشد.") from exc
 
 
-def store_uploaded_file(payload: dict[str, Any], keys: list[str | None], method: str, data: dict[str, Any], result: Any, *, file_size: int | None = None, has_audio: bool | None = None) -> None:
-    if not isinstance(result, dict) or not result.get("file_id"):
+def store_uploaded_file(payload: dict[str, Any], keys: list[str | None], method: str, data: dict[str, Any], result: Any, *, file_size: int | None = None, has_audio: bool | None = None, cache_index: int = 0) -> None:
+    if not isinstance(result, dict):
+        return
+    photo_reference = method == "sendPhoto" and type(result.get("message_id")) is int and result["message_id"] > 0
+    if not result.get("file_id") and not photo_reference:
         return
     allowed = {key: data[key] for key in ("caption", "title", "performer", "width", "height", "duration", "supports_streaming") if key in data}
-    value = {"method": method, "fileId": result["file_id"], "data": allowed}
+    value = {"method": method, "data": allowed}
+    if result.get("file_id"):
+        value["fileId"] = result["file_id"]
+    else:
+        value["sourceMessage"] = {"chatId": int(data["chat_id"]), "messageId": result["message_id"]}
     if type(file_size) is int and 0 < file_size <= DIRECT_TELEGRAM_LIMIT:
         value["fileSize"] = file_size
     if type(has_audio) is bool:
@@ -1607,6 +1620,24 @@ def store_uploaded_file(payload: dict[str, Any], keys: list[str | None], method:
     for key in dict.fromkeys(keys):
         if key:
             file_cache(payload, "put", key, value)
+    remember_post_file(payload, value, result, cache_index)
+
+
+def remember_post_file(payload: dict[str, Any], value: dict[str, Any], result: Any, index: int) -> None:
+    # Store media metadata and confirmed photo message references only.
+    # Never persist source credentials, signed callbacks or recipient reply IDs.
+    if payload.get("postCacheKey") and isinstance(result, dict) and type(result.get("message_id")) is int:
+        payload.setdefault("_confirmedPostFiles", {})[result["message_id"]] = {**value, "index": index}
+
+
+def complete_post_cache(payload: dict[str, Any], count: int) -> None:
+    files = list(payload.get("_confirmedPostFiles", {}).values())
+    if payload.get("postCacheKey") and 0 < count <= 20 and len(files) == count:
+        file_cache(payload, "put", payload["postCacheKey"], {"kind": "post", "files": files})
+
+
+def instagram_file_cache_key(payload: dict[str, Any], source_id: str, index: int, mode: str, *, story: bool = False) -> str:
+    return f"ig:v2:{payload.get('cacheVisibility', 'access')}:{'s' if story else 'p'}:{source_id}:{index}:{mode}"
 
 
 def download_recognition_input(token: str, media: dict[str, Any], workdir: Path) -> Path:
@@ -2392,8 +2423,8 @@ class InstagramCapture:
                 if index == 0:
                     data["reply_parameters"] = json.dumps({"message_id": self.payload["requestMessageId"], "allow_sending_without_reply": True})
                 source_index = post.get("subtitleIndex", index)
-                key = f"ig:{self.payload['userId']}:{post['shortcode']}:{source_index}:video" if video else None
-                if key and self.payload.get("subtitle"):
+                key = instagram_file_cache_key(self.payload, post['shortcode'], source_index, "video" if video else "photo", story=bool(post.get('storyId')))
+                if video and self.payload.get("subtitle"):
                     key += f":sub-{self.payload['subtitle']}-v1"
                 markup = {"inline_keyboard": [[
                     {"text": "🎵 فقط صدا", "callback_data": f"iga|{source_kind}|{post['shortcode']}|{source_index}|{self.payload['userId']}"},
@@ -2401,7 +2432,7 @@ class InstagramCapture:
                 ]]} if video else None
                 if video:
                     markup = self.subtitle_markup(markup, origin={"kind": source_kind, "id": post["shortcode"], "index": source_index})
-                if key and reuse_cached_file(self.payload, key, caption, reply_markup=markup):
+                if reuse_cached_file(self.payload, key, caption, reply_markup=markup, cache_index=source_index):
                     self.post_sent += 1
                     continue
                 path = self.workdir / f"Instagram-{index}.{'mp4' if video else 'jpg'}"
@@ -2431,8 +2462,9 @@ class InstagramCapture:
                     uploading = False
                 self.post_sent += 1
                 if key:
-                    store_uploaded_file(self.payload, [key], method, data, sent, file_size=path.stat().st_size)
+                    store_uploaded_file(self.payload, [key], method, data, sent, file_size=path.stat().st_size, cache_index=source_index)
                 path.unlink(missing_ok=True)
+            complete_post_cache(self.payload, len(items))
             with self.lock:
                 self.state = "sent"
             delete_status(self.payload["botToken"], self.payload["chatId"], self.payload["statusMessageId"])
@@ -2466,7 +2498,7 @@ class InstagramCapture:
                 method = item["method"]
                 data, markup = self.social_delivery_options(item)
                 cached = item.get("cached")
-                reused = cached is not None and reuse_cached_file(self.payload, item["cacheKey"], item["caption"], reply_markup=markup, cached=cached)
+                reused = cached is not None and reuse_cached_file(self.payload, item["cacheKey"], item["caption"], reply_markup=markup, cached=cached, cache_index=item["index"])
                 if not reused:
                     if "path" not in item:
                         from youtube_pipeline import social_prepare_entry
@@ -2491,13 +2523,13 @@ class InstagramCapture:
                     with item["path"].open("rb") as handle:
                         sent = asyncio.run(asyncio.wait_for(upload_complete_file(self.payload["botToken"], method, data,
                             (item["path"].name, handle, mime)), timeout=max(1, deadline - time.monotonic())))
-                    if method in {"sendAudio", "sendVideo"}:
-                        store_uploaded_file(self.payload, [item["cacheKey"]], method, data, sent,
+                    store_uploaded_file(self.payload, [item.get("cacheKey")], method, data, sent,
                                             file_size=item.get("fileSize") or item["path"].stat().st_size,
-                                            has_audio=item.get("hasAudio"))
+                                            has_audio=item.get("hasAudio"), cache_index=item.get("index", self.social_sent))
                 self.social_sent += 1
                 if "path" in item:
                     item["path"].unlink(missing_ok=True)
+            complete_post_cache(self.payload, len(self.social_items))
             with self.lock:
                 self.state = "sent"
             delete_status(self.payload["botToken"], self.payload["chatId"], self.payload["statusMessageId"])

@@ -701,10 +701,10 @@ class SocialEarlyCacheTests(unittest.TestCase):
     def test_gallery_keeps_original_order_and_prepares_only_misses_and_photos(self):
         entries=[{'id':str(i),'title':f'item {i}','url':f'https://v.pinimg.com/{i}.mp4','image':i==1} for i in range(4)]
         with tempfile.TemporaryDirectory() as d,patch.object(p,'social_gallery_entries',return_value=entries), \
-             patch.object(app,'file_cache',side_effect=[self.cached(),None,self.cached()]) as cache, \
+             patch.object(app,'file_cache',side_effect=[self.cached(),None,None,self.cached()]) as cache, \
              patch.object(p,'social_prepare_entry',side_effect=self.prepare) as prepare:
             _,items=p.prepare_social_media({'platform':'pinterest','url':'https://www.pinterest.com/pin/123/'},Path(d),cache_payload=payload())
-            self.assertEqual([i['index'] for i in items],[0,1,2,3]);self.assertEqual(cache.call_count,3)
+            self.assertEqual([i['index'] for i in items],[0,1,2,3]);self.assertEqual(cache.call_count,4)
             self.assertEqual([c.args[0]['id'] for c in prepare.call_args_list],['1','2'])
             self.assertEqual(['cached' in i for i in items],[True,False,False,True])
 

@@ -1,4 +1,5 @@
 import { cacheSource } from "./cache-usage";
+import { telegramPostCache, instagramFileCacheKey, instagramPostCacheKey, type TelegramCacheValue } from "./telegram-file-cache";
 import { youtubeCatalogCache } from "./youtube-catalog";
 import { startMessage } from "./start-message";
 import { withUserLanguage, userLanguage, currentLanguage, isLanguage, type Language } from "./localization";
@@ -40,7 +41,6 @@ import {
   type DownloadRecord,
   type DownloadStatus,
   telegramFileCache,
-  type CachedTelegramFile,
   type AdminStatsEnv,
   type TrackedUser,
 } from "./admin";
@@ -75,6 +75,8 @@ type YoutubeDownloadJob = {
   instagram?: InstagramVideoTarget;
   instagramPost?: InstagramPostUpload;
   instagramPostRequest?: { shortcode: string };
+  publicInstagramCache?: boolean; // Set only after the anonymous/public provider succeeds.
+  sharedCacheVersion?: 1; // New fast-cache steps must never replay already-running legacy jobs.
   apifyAccount?: ApifyAccount; // In-flight jobs from before per-purpose settings.
   instagramApi?: InstagramApiSelection;
   instagramProfile?: { username: string; kind?: "posts" | "story"; target?: StoryTarget };
@@ -427,27 +429,93 @@ async function mediaCacheContext(env: Env, job: YoutubeDownloadJob) {
     cacheToken: await instagramSignature(env.BOT_TOKEN, `cache:${job.id}`),
     mediaCacheKey: await mediaCacheKey(job),
     cacheHistoryKey: jobHistory(job).key, cacheSource: cacheSource(jobHistory(job).source),
+    postCacheKey: await postCacheKey(env,job), cacheVisibility: job.publicInstagramCache ? "public" : "access",
   };
 }
 
 async function mediaCacheKey(job: YoutubeDownloadJob): Promise<string | undefined> {
+  if (job.source === "pornhub") return `ph:${await cacheIdentity(job.url)}`;
   if (job.instagram?.kind === "music") {
     return job.instagram.musicVideoId ? `yt:${job.instagram.musicVideoId}:mp3` : undefined;
   }
   const target = job.instagram;
   const id = target?.shortcode || target?.mediaId;
-  if (target && id && target.kind !== "live") return `ig:${job.userId}:${id}:${target.videoIndex ?? 0}:${target.recognizeMusic ? "song-v2" : target.kind}${job.subtitle ? `:sub-${job.subtitle}-v1` : ""}`;
+  if (target && id && target.kind !== "live") return instagramFileCacheKey(id,target.videoIndex ?? 0,
+    `${target.recognizeMusic ? "song-v2" : target.kind === "replay" ? "video" : target.kind}${job.subtitle ? `:sub-${job.subtitle}-v1` : ""}`,false,Boolean(target.mediaId));
   if (job.quality || job.audioMode) {
     const id = new URL(job.url).searchParams.get("v");
     if (id && /^[A-Za-z0-9_-]{11}$/.test(id)) return `yt:${id}:${job.audioMode ? job.audioMode === "hq" ? "ah" : "al" : `v${job.quality}`}${job.subtitle ? `:sub-${job.subtitle}-v1` : ""}`;
   }
 }
 
+async function cacheIdentity(value: string): Promise<string> {
+  return [...new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(value)))].map(b=>b.toString(16).padStart(2,"0")).join("");
+}
+
+async function postCacheKey(env: Env, job: YoutubeDownloadJob): Promise<string | undefined> {
+  if (job.instagramPostRequest || job.publicInstagramCache && job.instagramPost && !job.instagramPost.storyId)
+    return instagramPostCacheKey(job.instagramPostRequest?.shortcode || job.instagramPost!.shortcode,job.subtitle,job.subtitlePostIndex);
+  if (job.social && job.social.platform !== "pinterest") return `ready:${job.social.platform}:${await cacheIdentity(JSON.stringify([job.social.url,Boolean(job.social.audioOnly),job.social.itemIndex ?? "all",job.subtitle || ""]))}`;
+  if (job.reddit && !env.REDDIT_COOKIES?.trim()) return `ready:reddit:${await cacheIdentity(job.reddit.url)}`;
+}
+
+async function sendCachedPost(env: Env, job: YoutubeDownloadJob, statusId: number): Promise<ContainerResult | null> {
+  // These paths still need their existing access/quality checks before file reuse.
+  if (job.bandcamp || job.social?.platform === "pinterest" || job.instagram && !job.publicInstagramCache) return null;
+  const key = await postCacheKey(env,job);
+  if (!key) return null;
+  const post = await telegramPostCache(env,"get",key);
+  if (!post) return null;
+  let delivered = 0;
+  for (const file of post.files) {
+    const rows: SubtitleButton[][] = [];
+    const shortcode = job.instagramPostRequest?.shortcode || job.instagramPost?.shortcode;
+    if (file.method === "sendVideo" && shortcode) {
+      rows.push([{text:"🎵 فقط صدا",callback_data:`iga|p|${shortcode}|${file.index}|${job.userId}`},
+        {text:"🔎 پیداکردن آهنگ",callback_data:`igm|p|${shortcode}|${file.index}|${job.userId}`}]);
+      const entry = await instagramSubtitleEntry(env,job.userId,job.chatId,"p",shortcode,file.index);
+      if (entry.length) rows.push(entry);
+    } else if (file.method === "sendVideo" && file.hasAudio && job.social) {
+      const url = parseSocialUrl(String(file.data.caption || ""))?.url || job.social.url;
+      const signature = (await instagramSignature(env.BOT_TOKEN,`social-audio:${job.chatId}:${job.userId}:${file.index}:${url}`)).slice(0,16);
+      rows.push([{text:"🎵 فقط صدا",callback_data:`soa|${file.index}|${job.userId}|${signature}`}]);
+    }
+    const parameter = {sendVideo:"video",sendAudio:"audio",sendPhoto:"photo",sendDocument:"document",sendAnimation:"animation"}[file.method];
+    try {
+      const sent = await telegramCall(env.BOT_TOKEN,file.sourceMessage ? "copyMessage" : file.method,{...file.data,
+        ...(file.sourceMessage ? {from_chat_id:file.sourceMessage.chatId,message_id:file.sourceMessage.messageId} : {[parameter]:file.fileId}),chat_id:job.chatId,
+        reply_parameters:{message_id:job.requestMessageId,allow_sending_without_reply:true},
+        ...(rows.length ? {reply_markup:{inline_keyboard:rows}} : {})},job.language);
+      delivered++;
+      await recordMediaDelivery(env,job.userId,job.chatId,sent,true,file.fileSize,
+        file.method === "sendVideo" ? {source:cacheSource(jobHistory(job).source),downloadKey:jobHistory(job).key}:undefined);
+      await recordSuccessfulDelivery(env,`${jobHistory(job).key}:${file.index}`);
+    } catch (error) {
+      if (/wrong.*file|file.*(?:invalid|expired)|file_reference|failed to get.*file/i.test(String(error)) ||
+          file.sourceMessage && /message to copy not found|message can't be copied|message_id_invalid/i.test(String(error))) {
+        await telegramPostCache(env,"delete",key);
+        if (!delivered) return null;
+      }
+      const message = "⚠️ دریافت یا ارسال همهٔ فایل‌ها کامل نشد؛ فایل‌های دریافتی را بررسی کن و فقط موارد باقی‌مانده را دوباره درخواست بده.";
+      await trackJob(env,job,delivered ? "partial":"failed",{delivered,detail:message});
+      await safeTelegramCall(env.BOT_TOKEN,"editMessageText",{chat_id:job.chatId,message_id:statusId,text:message},job.language);
+      return {ok:false,parts:delivered,message};
+    }
+  }
+  await trackJob(env,job,"success",{delivered});
+  await safeTelegramCall(env.BOT_TOKEN,"deleteMessage",{chat_id:job.chatId,message_id:statusId},job.language);
+  return {ok:true,parts:delivered};
+}
+
 async function sendCachedMedia(env: Env, job: YoutubeDownloadJob, statusId?: number): Promise<boolean> {
   const key = await mediaCacheKey(job);
   if (!key) return false;
-  const cached = await telegramFileCache(env, "get", key);
-  if (!cached) return false;
+  const legacyKey = job.instagram && (job.instagram.shortcode || job.instagram.mediaId) && job.instagram.kind !== "live"
+    ? `ig:${job.userId}:${job.instagram.shortcode || job.instagram.mediaId}:${job.instagram.videoIndex ?? 0}:${job.instagram.recognizeMusic ? "song-v2":job.instagram.kind}${job.subtitle ? `:sub-${job.subtitle}-v1`:""}` : undefined;
+  let cached = await telegramFileCache(env, "get", key);
+  const legacy = !cached && legacyKey;
+  if (legacy) cached = await telegramFileCache(env,"get",legacy);
+  if (!cached || !["sendAudio","sendVideo"].includes(cached.method)) return false;
   try {
     const sent = await telegramCall(env.BOT_TOKEN, cached.method, {
       ...cached.data, [cached.method === "sendAudio" ? "audio" : "video"]: cached.fileId,
@@ -458,9 +526,11 @@ async function sendCachedMedia(env: Env, job: YoutubeDownloadJob, statusId?: num
       } : {}),
     }, job.language);
     await recordMediaDelivery(env, job.userId, job.chatId, sent, true, cached.fileSize, cached.method === "sendVideo" ? {source:cacheSource(jobHistory(job).source),downloadKey:jobHistory(job).key}:undefined);
+    if (legacy) await telegramFileCache(env,"put",key,cached);
   } catch (error) {
     if (/wrong.*file|file.*(?:invalid|expired)|file_reference|failed to get.*file/i.test(error instanceof Error ? error.message : "")) {
       await telegramFileCache(env, "delete", key);
+      if (legacy) await telegramFileCache(env,"delete",legacy);
       return false;
     }
     throw error; // An ambiguous send must never trigger a duplicate upload.
@@ -626,6 +696,8 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         return status.message_id;
       });
       job.statusMessageId = statusId;
+      if (job.sharedCacheVersion === 1 && await step.do("reuse complete public Instagram post", {retries:{limit:0,delay:"1 second"},timeout:"5 minutes"},
+        () => sendCachedPost(this.env,job,statusId))) return;
       const primary = await step.do("resolve public Instagram post once", {
         // A TopAPI run can take nearly five minutes. Never retry a paid extraction.
         retries: { limit: 0, delay: "1 second" }, timeout: "8 minutes",
@@ -663,6 +735,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         }
       }
       if (!media?.length) throw new Error("INSTAGRAM_NO_MEDIA");
+      job.publicInstagramCache = !sessionUsed;
       if (job.subtitle && job.subtitlePostIndex !== undefined) {
         const item = media[job.subtitlePostIndex];
         if (!item || item.kind !== "video") throw new Error("SUBTITLE_INVALID");
@@ -689,7 +762,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       }, () => sendInstagramPostDirect(
         this.env, { kind: "post", url: job.url, shortcode: job.instagramPostRequest!.shortcode },
         { chat: { id: job.chatId }, message_id: job.requestMessageId, from: { id: job.userId } },
-        media, `ig:${job.chatId}:${job.requestMessageId}:${job.userId}`,
+        media, `ig:${job.chatId}:${job.requestMessageId}:${job.userId}`, !sessionUsed,
       ));
       await step.do("record public Instagram post delivery", () =>
         trackJob(this.env, job, "success", { delivered }));
@@ -1162,6 +1235,9 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       // Private Instagram media must still be visible to the connected account.
       // Public song-query cache hits can be delivered without source resolution.
       const needsAccessCheck = Boolean(job.instagram && job.instagram.kind !== "music");
+      const cachedPost = job.sharedCacheVersion === 1 ? await step.do("reuse complete public media post", {retries:{limit:0,delay:"1 second"},timeout:"5 minutes"},
+        () => sendCachedPost(this.env,job,statusId!)) : null;
+      if (cachedPost) return cachedPost;
       if (!needsAccessCheck && await step.do("reuse telegram media file", { retries: { limit: 0, delay: "1 second" }, timeout: "1 minute" }, () => sendCachedMedia(this.env, job, statusId))) {
         await step.do("record cached media delivery", async () => {
           await recordSuccessfulDelivery(this.env, `instagram:${job.id}`);
@@ -1808,7 +1884,7 @@ async function handleMediaSubtitleDownload(env: Env, callback: TelegramCallbackQ
     const selected = await subtitleMenuRequest(env, { ...base, op: "media-take", expected: menu.preference });
     if (!selected.preference.enabled || !selected.preference.language || !menu.mediaRequest) throw new Error("SUBTITLE_SETTINGS_UNAVAILABLE");
     const job: YoutubeDownloadJob = { id: menu.mediaJobId, chatId: menu.chatId, requestMessageId: menu.messageId,
-      userId: menu.userId, url: menu.mediaRequest.url || "", subtitle: selected.preference.language, mediaSubtitleChosen: true,
+      userId: menu.userId, url: menu.mediaRequest.url || "", subtitle: selected.preference.language, mediaSubtitleChosen: true, sharedCacheVersion: 1,
       ...(menu.mediaRequest.instagram ? { instagram: menu.mediaRequest.instagram } : {}),
       ...(menu.mediaRequest.shortcode ? { instagramPostRequest: { shortcode: menu.mediaRequest.shortcode }, subtitlePostIndex: menu.mediaRequest.index } : {}),
       ...(menu.mediaRequest.social ? { social: menu.mediaRequest.social } : {}), language: currentLanguage() };
@@ -1929,6 +2005,7 @@ async function createInstagramWorkflow(env: Env, update: TelegramUpdate, target?
   const job: YoutubeDownloadJob = {
     id: `igdl-${message.chat.id}-${message.message_id}-${userId}${target?.musicVideoId ? `-music-${target.musicVideoId}` : target?.kind === "audio" ? target.recognizeMusic ? "-song" : "-audio" : ""}`, chatId: message.chat.id,
     requestMessageId: message.message_id, userId, url: "", instagram: target,
+    ...(social || reddit ? {sharedCacheVersion:1 as const} : {}),
     ...(recognition ? { recognition } : {}),
     ...(playlist ? { playlist } : {}),
     ...(social ? { social } : {}),
@@ -2127,16 +2204,28 @@ export default {
     if (request.method === "POST" && cacheRequest) {
       const expected = await instagramSignature(env.BOT_TOKEN, `cache:${cacheRequest[1]}`);
       if (!equalSignature(request.headers.get("x-media-cache-token") || "", expected)) return new Response("Forbidden", { status: 403 });
-      const text = await request.text();
-      if (text.length > 5000) return new Response("Too large", { status: 413 });
+      const reader = request.body?.getReader(), decoder = new TextDecoder();
+      let text = "", size = 0;
+      if (!reader) return new Response("Invalid cache request", {status:400});
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        size += chunk.value.byteLength;
+        if (size > 128000) { await reader.cancel(); return new Response("Too large", {status:413}); }
+        text += decoder.decode(chunk.value,{stream:true});
+      }
+      text += decoder.decode();
       try {
-        const body = JSON.parse(text) as { op: "get" | "put" | "delete"; key: string; value?: CachedTelegramFile };
+        const body = JSON.parse(text) as { op: "get" | "put" | "delete"; key: string; value?: TelegramCacheValue };
         if ((body.op as string) === "subtitle-state") {
           const job = /^(?:igdl|ytdl)-(-?\d+)-(\d+)-(\d+)/.exec(cacheRequest[1])!;
           return Response.json({ ok: true, value: await subtitleState(env, Number(job[3]), Number(job[1])) });
         }
         if (!["get", "put", "delete"].includes(body.op) || !/^[A-Za-z0-9:_-]{1,180}$/.test(body.key || "")) return new Response("Invalid cache request", { status: 400 });
-        return Response.json({ ok: true, value: await telegramFileCache(env, body.op, body.key, body.value) });
+        const value = body.key.startsWith("ready:")
+          ? await telegramPostCache(env,body.op,body.key,body.value && "kind" in body.value ? body.value : undefined)
+          : await telegramFileCache(env,body.op,body.key,body.value && !("kind" in body.value) ? body.value : undefined);
+        return Response.json({ ok: true, value });
       } catch { return new Response("Invalid cache request", { status: 400 }); }
     }
 
@@ -2351,7 +2440,7 @@ export default {
         const id = `igdl-${post.chatId}-${post.requestMessageId}-${post.userId}`;
         const job: YoutubeDownloadJob = {
           id, chatId: post.chatId, requestMessageId: post.requestMessageId,
-          userId: post.userId, url: post.url,
+          userId: post.userId, url: post.url, sharedCacheVersion: 1,
           instagramPostRequest: { shortcode: post.shortcode },
           ...(apiSelection ? { instagramApi: apiSelection } : {}),
         };
@@ -2363,7 +2452,7 @@ export default {
       uploadInstagramPost: async (post: InstagramPostUpload) => {
         const id = `igdl-${post.chatId}-${post.requestMessageId}-${post.userId}`;
         const job: YoutubeDownloadJob = { id, chatId: post.chatId, requestMessageId: post.requestMessageId,
-          userId: post.userId, url: post.url, instagramPost: post };
+          userId: post.userId, url: post.url, instagramPost: post, sharedCacheVersion: 1 };
         try { await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id, params: { ...job, language: isLanguage(job.language) ? job.language : currentLanguage() } }); }
         catch (error) {
           if (!/already|exists|duplicate|conflict/i.test(error instanceof Error ? error.message : String(error))) throw error;

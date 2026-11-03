@@ -217,11 +217,16 @@ def process_job(payload: dict) -> dict:
     try:
         if not token:
             raise ValueError("Missing bot token")
+        if app.reuse_cached_file(payload, payload.get("mediaCacheKey")):
+            app.delete_status(token, chat_id, status_id)
+            return {"ok": True, "parts": 1, "cached": True}
         path, title = download(str(payload.get("url") or ""), workdir)
         status("📤 ویدیوی Pornhub آماده شد؛ دارم می‌فرستم…")
         app.job_timeout(1800)  # Expired downloads must never start publishing.
         phase = "upload"
-        app.send_media_file(token, chat_id, message_id, path, title, reply=True)
+        sent = app.send_media_file(token, chat_id, message_id, path, title, reply=True)
+        if payload.get("mediaCacheKey"):
+            app.store_uploaded_file(payload, [payload["mediaCacheKey"]], "sendVideo", {"caption": title[:1024]}, sent, file_size=path.stat().st_size)
         app.delete_status(token, chat_id, status_id)
         return {"ok": True, "parts": 1, "title": title}
     except Exception as exc:

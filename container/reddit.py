@@ -3,6 +3,7 @@
 Uses the existing job lifecycle and Telegram transport, never another downloader.
 """
 import asyncio
+import hashlib
 import html
 import json
 import math
@@ -239,6 +240,17 @@ def probe_file(path, item):
         raise app.UserVisibleError('❌ فایل سالم و کامل Reddit آماده نشد؛ فایل ناقص یا ویدیوی بدون صدای لازم ارسال نشد.') from exc
 
 
+def prepare_file(job, item, directory, budget, deadline):
+    directory.mkdir(exist_ok=True)
+    if item['kind'] == 'video':
+        path = video_file(job, item, directory, deadline)
+    else:
+        suffix = Path(urlparse(item['url']).path).suffix.lower()
+        path = directory / ('Reddit' + (suffix if suffix in {'.jpg', '.jpeg', '.png', '.gif', '.webp'} else '.jpg'))
+        image_file(item, path, budget, deadline)
+    return {**probe_file(path, item), 'path': path}
+
+
 def prepare(job):
     url = canonical_url(job.source['reddit'].get('url') or '')
     if url.startswith('https://v.redd.it/'):
@@ -256,18 +268,21 @@ def prepare(job):
             raise app.UserVisibleError('❌ آماده‌سازی Reddit متوقف شد یا به سقف زمان رسید.')
         job.safe_status(f'⬇️ Reddit؛ آماده‌سازی فایل {index} از {len(items)}…')
         directory = job.workdir / f'reddit-{index}'
-        directory.mkdir()
-        if item['kind'] == 'video':
-            path = video_file(job, item, directory, deadline)
+        key = 'rd:' + hashlib.sha256(json.dumps([url, index, item], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        cached = app.file_cache(job.payload, 'get', key)
+        method = 'sendVideo' if item['kind'] == 'video' else 'sendDocument'
+        if (isinstance(cached, dict) and cached.get('method') == method and isinstance(cached.get('fileId'), str)
+                and re.fullmatch(r'[A-Za-z0-9_-]{1,1024}', cached['fileId']) and type(cached.get('fileSize')) is int
+                and 0 < cached['fileSize'] <= MAX_BYTES - size and isinstance(cached.get('data'), dict)):
+            prepared = {**cached['data'], 'cached': cached}
+            item_size = cached['fileSize']
         else:
-            suffix = Path(urlparse(item['url']).path).suffix.lower()
-            path = directory / ('Reddit' + (suffix if suffix in {'.jpg', '.jpeg', '.png', '.gif', '.webp'} else '.jpg'))
-            image_file(item, path, MAX_BYTES - size, deadline)
-        probe = probe_file(path, item)
-        size += path.stat().st_size
+            prepared = prepare_file(job, item, directory, MAX_BYTES - size, deadline)
+            item_size = prepared['path'].stat().st_size
+        size += item_size
         if size > MAX_BYTES:
             raise app.UserVisibleError('❌ حجم مجموع فایل‌های Reddit از سقف ۲ گیگابایت بیشتر است.')
-        job.reddit_items.append({**item, **probe, 'path': path, 'index': index})
+        job.reddit_items.append({**item, **prepared, 'index': index, 'cacheKey': key, 'fileSize': item_size})
     job.result = {'ok': True}
     with job.lock:
         job.state = 'ready'
@@ -279,6 +294,15 @@ def send(job):
         for item in job.reddit_items[job.reddit_sent:]:
             if job.cleanup_requested or time.monotonic() >= deadline:
                 raise app.UserVisibleError('Reddit sending stopped')
+            if item.get('cached'):
+                caption = f"{job.reddit_title}\nReddit • {item['index']}\n{job.reddit_url}"[:1024]
+                if app.reuse_cached_file(job.payload, item['cacheKey'], caption, cached=item['cached'], cache_index=item['index'] - 1):
+                    job.reddit_sent += 1
+                    continue
+                remaining = MAX_BYTES - sum(other.get('fileSize', 0) for other in job.reddit_items if other is not item)
+                item.update(prepare_file(job, item, job.workdir / f"reddit-{item['index']}", remaining, deadline))
+                item['fileSize'] = item['path'].stat().st_size
+                item.pop('cached', None)
             path = item['path']
             # Images are sent as original documents, preserving quality and GIF animation.
             method = 'sendVideo' if item['kind'] == 'video' else 'sendDocument'
@@ -288,11 +312,13 @@ def send(job):
             if method == 'sendVideo':
                 data.update({key: str(item[key]) for key in ('duration', 'width', 'height')})
             with path.open('rb') as handle:
-                asyncio.run(asyncio.wait_for(app.upload_complete_file(job.payload['botToken'], method, data,
+                sent = asyncio.run(asyncio.wait_for(app.upload_complete_file(job.payload['botToken'], method, data,
                     (path.name, handle, 'video/mp4' if method == 'sendVideo' else 'application/octet-stream')),
                     timeout=max(1, min(10 * 60, deadline - time.monotonic()))))
+            app.store_uploaded_file(job.payload, [item.get('cacheKey')], method, data, sent, file_size=item.get('fileSize') or path.stat().st_size, cache_index=item['index'] - 1)
             job.reddit_sent += 1
             path.unlink(missing_ok=True)
+        app.complete_post_cache(job.payload, len(job.reddit_items))
         job.result = {'ok': True, 'parts': job.reddit_sent, 'title': job.reddit_title}
         with job.lock:
             job.state = 'sent'

@@ -70,7 +70,7 @@ class MediaSubtitles(unittest.TestCase):
                 result=job.send_instagram_post()
             self.assertTrue(result['ok']);self.assertEqual(result['parts'],2);prep.assert_called_once()
             self.assertEqual(prep.call_args.args[3],'p:abc:1')
-            self.assertEqual(cache.call_args.args[1],['ig:42:abc:1:video:sub-fa-v1'])
+            self.assertEqual(cache.call_args.args[1],['ig:v2:access:p:abc:1:video:sub-fa-v1'])
         finally:job.cleanup()
 
     def test_pinterest_video_buttons_preserve_audio_row_and_show_locked_subtitle_row(self):

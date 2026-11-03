@@ -463,7 +463,7 @@ class PostUploadTests(unittest.TestCase):
             self.assertIn('reply_parameters', calls[0][1])
             self.assertNotIn('reply_parameters', calls[1][1])
             self.assertEqual(json.loads(calls[1][1]['reply_markup'])['inline_keyboard'][0][0]['callback_data'], 'iga|p|B|1|42')
-            self.assertEqual(cache.call_args.args[1], ['ig:42:B:1:video'])
+            self.assertEqual(cache.call_args.args[1], ['ig:v2:access:p:B:1:video'])
             self.assertEqual(probe.call_args.args[0][0], 'ffprobe')
             self.assertEqual(get.call_count, 2)
             self.assertFalse(get.call_args.kwargs['allow_redirects'])
@@ -492,7 +492,7 @@ class PostUploadTests(unittest.TestCase):
                 patch.object(app, 'delete_status'):
             self.job.run()
             self.assertEqual(self.job.send(), {'ok': True, 'parts': 1})
-            self.assertEqual(cache.call_args.args[1], 'ig:42:B:0:video')
+            self.assertEqual(cache.call_args.args[1], 'ig:v2:access:p:B:0:video')
             get.assert_not_called()
             upload.assert_not_called()
 

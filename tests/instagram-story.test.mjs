@@ -3,13 +3,14 @@ import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 const source = await readFile(new URL('../src/story-main.ts', import.meta.url), 'utf8');
+const cacheSource = await readFile(new URL('../src/telegram-file-cache.ts', import.meta.url), 'utf8');
 const subtitleSource = await readFile(new URL('../src/youtube-subtitles.ts', import.meta.url), 'utf8');
 const subtitleLanguages = await readFile(new URL('../locales/subtitle-languages.json', import.meta.url), 'utf8');
 const { outputFiles } = await build({ external: ['node:async_hooks'],
   stdin: { contents: source, loader: 'ts' }, bundle: true, format: 'esm', write: false,
   plugins: [{ name: 'test-story-bindings', setup(build) {
     build.onResolve({ filter: /.*/ }, a => ({ path: a.path, namespace: 'test' }));
-    build.onLoad({ filter: /.*/, namespace: 'test' }, a => { if(a.path==='./youtube-subtitles') return {contents:subtitleSource,loader:'ts'}; if(a.path==='../locales/subtitle-languages.json') return {contents:subtitleLanguages,loader:'json'}; return ({ contents: a.path === './main'
+    build.onLoad({ filter: /.*/, namespace: 'test' }, a => { if(a.path==='./telegram-file-cache') return {contents:cacheSource,loader:'ts'}; if(a.path==='./youtube-subtitles') return {contents:subtitleSource,loader:'ts'}; if(a.path==='../locales/subtitle-languages.json') return {contents:subtitleLanguages,loader:'json'}; return ({ contents: a.path === './main'
       ? 'export default { fetch() { globalThis.legacy++; return Response.json({delegated: true}); } };'
       : 'export const recordUsage=async()=>true; export const recordMediaDelivery=async()=>{}; export const telegramCustomEmoji=(_method,payload)=>payload; export const telegramTextMotion=async()=>{}; export const telegramFileCache=async(...args)=>globalThis.storyFileCache ? globalThis.storyFileCache(...args) : null; export class AdminStatsStore {} export const ADMIN_USER_ID = 1; export async function recordDownload(_env,record) {(globalThis.downloadHistory ||= []).push(record);} export async function recordSuccessfulDelivery() {}' }); });
   } }],
@@ -298,7 +299,7 @@ test('Story video reuse keeps source access checks and owner-bound song buttons'
     assert.equal(sent.video,'cached_story_id');
     assert.ok(r.requests.some(r=>r.url.pathname.includes('/feed/user/')));
     assert.equal(sent.reply_markup.inline_keyboard[0][1].callback_data,'igm|s|999|0|1');
-    assert.equal(operations[0].key,'ig:1:999:0:video');
+    assert.equal(operations[0].key,'ig:v2:access:s:999:0:video');
     assert.equal(operations.at(-1).value.fileId,'genuine_story_file');
   } finally {delete globalThis.storyFileCache;}
 });

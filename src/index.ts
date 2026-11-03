@@ -1,4 +1,5 @@
 import { instagramSubtitleEntry } from "./youtube-subtitles";
+import { instagramFileCacheKey, instagramPostCacheKey, telegramPostCache, type CachedTelegramPost } from "./telegram-file-cache";
 import { recordMediaDelivery, telegramCustomEmoji, telegramTextMotion, telegramFileCache, recordDownload, recordSuccessfulDelivery, type AdminStatsEnv } from "./admin";
 
 type Env = Partial<AdminStatsEnv> & {
@@ -23,7 +24,8 @@ type TelegramMessage = {
   chat: { id: number };
   text?: string;
   caption?: string;
-  video?: { file_id: string };
+  video?: { file_id: string; file_size?: number };
+  photo?: { file_id: string; file_size?: number }[];
 };
 
 type TelegramUpdate = {
@@ -1795,9 +1797,11 @@ export async function sendInstagramPostDirect(
   message: Pick<TelegramMessage, "chat" | "message_id" | "from">,
   media: ResolvedMedia[],
   historyKey: string,
+  publicCache = true,
 ): Promise<number> {
   const history = { key: historyKey };
   let delivered = 0;
+  const files: CachedTelegramPost["files"] = [];
     for (let index = 0; index < media.length; index++) {
       const item = media[index];
       const proxyUrl = await createMediaProxyUrl(env.BOT_TOKEN, item.url);
@@ -1805,16 +1809,38 @@ export async function sendInstagramPostDirect(
 
       let usageSent: unknown;
       let usageCached = false;
+      let usageBytes: number | undefined;
       if (item.kind === "photo") {
-        usageSent = await telegramCall(env.BOT_TOKEN, "sendPhoto", {
+        const key = target.kind === "post" ? instagramFileCacheKey(target.shortcode,index,"photo",publicCache) : undefined;
+        const cached = key ? await telegramFileCache(env,"get",key) : null;
+        const payload = {
           chat_id: message.chat.id,
-          photo: proxyUrl,
+          photo: cached?.method === "sendPhoto" ? cached.fileId : proxyUrl,
           caption,
           reply_parameters: index === 0 ? { message_id: message.message_id, allow_sending_without_reply: true } : undefined,
-        });
+        };
+        usageCached = cached?.method === "sendPhoto";
+        usageBytes = cached?.fileSize;
+        const reference = usageCached ? cached?.sourceMessage : undefined;
+        let sent: TelegramMessage;
+        try { sent = await telegramCall<TelegramMessage>(env.BOT_TOKEN,reference ? "copyMessage":"sendPhoto",reference
+          ? {chat_id:payload.chat_id,caption,reply_parameters:payload.reply_parameters,from_chat_id:reference.chatId,message_id:reference.messageId} : payload); }
+        catch(error) {
+          if (!usageCached || !/wrong.*file|file.*(?:invalid|expired)|file_reference|failed to get.*file|message to copy not found|message can't be copied|message_id_invalid/i.test(String(error))) throw error;
+          await telegramFileCache(env,"delete",key!); usageCached = false;
+          sent = await telegramCall<TelegramMessage>(env.BOT_TOKEN,"sendPhoto",{...payload,photo:proxyUrl});
+        }
+        usageSent = sent;
+        const photo = sent.photo?.at(-1);
+        const file = photo?.file_id ? {method:"sendPhoto" as const,fileId:photo.file_id,data:{caption},fileSize:photo.file_size || item.size || undefined}
+          : usageCached && cached ? {...cached,data:{caption}} : null;
+        if (key && file) {
+          await telegramFileCache(env,"put",key,file); files.push({...file,index});
+        }
       } else {
-        const cacheKey = target.kind === "post" ? `ig:${message.from?.id || message.chat.id}:${target.shortcode}:${index}:video` : undefined;
-        const cached = cacheKey ? await telegramFileCache(env, "get", cacheKey) : null;
+        const cacheKey = target.kind === "post" ? instagramFileCacheKey(target.shortcode,index,"video",publicCache) : undefined;
+        // An old owner-bound ID is reused only after the existing source resolver succeeded.
+        const cached = cacheKey ? await telegramFileCache(env,"get",cacheKey) || await telegramFileCache(env,"get",`ig:${message.from?.id || message.chat.id}:${target.shortcode}:${index}:video`) : null;
         const payload = {
           chat_id: message.chat.id,
           video: cached?.method === "sendVideo" ? cached.fileId : proxyUrl,
@@ -1837,14 +1863,17 @@ export async function sendInstagramPostDirect(
           sent = await telegramCall<TelegramMessage>(env.BOT_TOKEN, "sendVideo", { ...payload, video: proxyUrl });
         }
         usageSent = sent;
-        if (cacheKey && sent.video?.file_id) await telegramFileCache(env, "put", cacheKey, {
-          method: "sendVideo", fileId: sent.video.file_id, data: { caption, supports_streaming: true },
-        });
+        if (cacheKey && sent.video?.file_id) {
+          const file = {method:"sendVideo" as const,fileId:sent.video.file_id,data:{caption,supports_streaming:true},fileSize:sent.video.file_size || item.size || undefined};
+          await telegramFileCache(env,"put",cacheKey,file); files.push({...file,index});
+        }
       }
-      await recordMediaDelivery(env, message.from?.id || message.chat.id, message.chat.id, usageSent, usageCached, undefined, {source:"Instagram",downloadKey:historyKey});
+      await recordMediaDelivery(env, message.from?.id || message.chat.id, message.chat.id, usageSent, usageCached, usageBytes, item.kind === "video" ? {source:"Instagram",downloadKey:historyKey} : undefined);
       delivered++;
       if (env.ADMIN_STATS) await recordSuccessfulDelivery(env as AdminStatsEnv, `${history.key}:${index}`);
     }
+
+  if (publicCache && target.kind === "post" && files.length === media.length) await telegramPostCache(env,"put",instagramPostCacheKey(target.shortcode),{kind:"post",files});
 
   return delivered;
 }

@@ -3,7 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 const b=await build({entryPoints:['src/telegram-file-cache.ts'],bundle:true,format:'esm',write:false});
-const {telegramFileCache:cache,telegramFileCacheRequest:request,FILE_CACHE_RETENTION_MS:year}=await import(`data:text/javascript;base64,${Buffer.from(b.outputFiles[0].text).toString('base64')}`);
+const {telegramPostCache:postCache,telegramFileCache:cache,telegramFileCacheRequest:request,FILE_CACHE_RETENTION_MS:year}=await import(`data:text/javascript;base64,${Buffer.from(b.outputFiles[0].text).toString('base64')}`);
 const value={method:'sendVideo',fileId:'fixture_id',data:{caption:'video'},fileSize:1234};
 function fixture(){
  const stores=new Map(),calls=[];let now=2*year,hook;
@@ -70,10 +70,39 @@ test('more than 10000 entries survive and expiration cleanup is bounded',()=>{
 test('malformed data, future imports, corrupt rows and unavailable storage fail safely',async()=>{
  const f=fixture();try{
  const {db,sql}=f.store('validation');
- for(const body of [{op:'put',key:'bad/key',value},{op:'put',key:'ok',value:{...value,method:'sendDocument'}},{op:'import',key:'ok',value,createdAt:f.now+1}])assert.equal(request(body,sql,f.now).status,400);
+ for(const body of [{op:'put',key:'bad/key',value},{op:'put',key:'ok',value:{...value,method:'sendMessage'}},{op:'import',key:'ok',value,createdAt:f.now+1}])assert.equal(request(body,sql,f.now).status,400);
  db.prepare('INSERT INTO telegram_file_cache VALUES (?,?,?)').run('ok','{broken',f.now);
  assert.equal((await request({op:'get',key:'ok'},sql,f.now).json()).value,null);
  assert.equal(await cache({...f.env,ADMIN_STATS:{getByName(){throw Error('offline');}}},'get','ok'),null);
  assert.equal(await cache({...f.env,ADMIN_STATS:undefined},'get','ok'),null);
+ }finally{f.close();}
+});
+
+test('complete posts retain exact Telegram file types and order without sender-specific fields',async()=>{
+ const f=fixture();try{
+ const files=['sendPhoto','sendVideo','sendDocument','sendAnimation','sendAudio'].map((method,index)=>({...value,method,index,
+  data:{caption:'public caption',chat_id:42,reply_markup:'old signed buttons',reply_parameters:'old reply'}}));
+ await postCache(f.env,'put','ready:ig:example:plain:all',{kind:'post',files});
+ const cached=await postCache(f.env,'get','ready:ig:example:plain:all');
+ assert.deepEqual(cached.files.map(f=>f.method),files.map(f=>f.method));
+ assert.deepEqual(cached.files.map(f=>f.index),[0,1,2,3,4]);
+ assert.ok(cached.files.every(f=>Object.keys(f.data).join()==='caption'));
+ assert.equal(await cache(f.env,'get','ready:ig:example:plain:all'),null);
+ f.now+=year;assert.equal(await postCache(f.env,'get','ready:ig:example:plain:all'),null);
+ const sql=f.store('validation').sql;
+ for(const files of [[],[{...value,index:0},{...value,index:0}],[{...value,index:20}],
+  [{...value,index:0,fileSize:1_500_000_000},{...value,index:1,fileSize:1_500_000_000}],
+  [{...value,index:0,method:'sendMessage'}]])
+  assert.equal(request({op:'put',key:'ready:invalid',value:{kind:'post',files}},sql,f.now).status,400);
+ }finally{f.close();}
+});
+
+test('photo message references are accepted only for validated photo receipts',async()=>{
+ const f=fixture();try{
+ const photo={method:'sendPhoto',data:{caption:'photo'},sourceMessage:{chatId:42,messageId:7},fileSize:200};
+ await cache(f.env,'put','ig:photo',photo);assert.deepEqual(await cache(f.env,'get','ig:photo'),photo);
+ for(const invalid of [{...photo,method:'sendVideo'},{...photo,sourceMessage:{chatId:0,messageId:7}},
+  {...photo,sourceMessage:{chatId:42,messageId:0}},{...photo,sourceMessage:{chatId:42,messageId:'7'}}])
+  assert.equal(request({op:'put',key:'ig:invalid',value:invalid},f.store('validation').sql,f.now).status,400);
  }finally{f.close();}
 });

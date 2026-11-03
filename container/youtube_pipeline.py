@@ -1571,14 +1571,17 @@ def prepare_social_media(social: dict[str, Any], workdir: Path, *, cache_payload
         key = social_cache_key(platform, url, index, entry, audio_only)
         if platform == "pinterest" and (cache_payload or {}).get("subtitle") and not entry.get("image"):
             key += f":sub-{cache_payload['subtitle']}-v1"
-        expected_method = "sendAudio" if audio_only or platform == "soundcloud" else "sendVideo"
-        cached = app.file_cache(cache_payload, "get", key) if cache_payload and not entry.get("image") else None
-        if (isinstance(cached, dict) and cached.get("method") == expected_method
-                and isinstance(cached.get("fileId"), str) and re.fullmatch(r"[A-Za-z0-9_-]{1,1024}", cached["fileId"])
+        expected_methods = ({"sendAnimation", "sendDocument"} if entry.get("animation") else {"sendPhoto", "sendDocument"}) if entry.get("image") else {"sendAudio" if audio_only or platform == "soundcloud" else "sendVideo"}
+        cached = app.file_cache(cache_payload, "get", key) if cache_payload else None
+        reference = cached.get("sourceMessage") if isinstance(cached, dict) and cached.get("method") == "sendPhoto" else None
+        valid_reference = (isinstance(reference, dict) and type(reference.get("chatId")) is int and reference["chatId"] != 0
+                           and type(reference.get("messageId")) is int and reference["messageId"] > 0)
+        if (isinstance(cached, dict) and cached.get("method") in expected_methods
+                and (valid_reference or isinstance(cached.get("fileId"), str) and re.fullmatch(r"[A-Za-z0-9_-]{1,1024}", cached["fileId"]))
                 and isinstance(cached.get("data"), dict)
                 and type(cached.get("fileSize")) is int and 0 < cached["fileSize"] <= app.DIRECT_TELEGRAM_LIMIT
-                and (expected_method != "sendVideo" or type(cached.get("hasAudio")) is bool)):
-            item = {"cached": cached, "method": expected_method, "data": cached["data"], "fileSize": cached["fileSize"],
+                and (cached.get("method") != "sendVideo" or type(cached.get("hasAudio")) is bool)):
+            item = {"cached": cached, "method": cached["method"], "data": cached["data"], "fileSize": cached["fileSize"],
                     "hasAudio": cached.get("hasAudio", False),
                     "title": str(entry.get("track") or entry.get("title") or SOCIAL_NAMES[platform])[:180]}
         else:
