@@ -1,5 +1,6 @@
-import { withUserLanguage } from "./localization";
+import { isLanguage, withUserLanguage, type Language } from "./localization";
 import { ADMIN_USER_ID, getAdminIds, isAdmin, telegramCustomEmoji, telegramTextMotion, type AdminStatsEnv, type AdminAccessEnv } from "./admin";
+import { BOT_LANGUAGES, LANGUAGE_LABELS, importLanguagePreferences } from "./language-admin-store";
 
 type Env = Partial<AdminStatsEnv> & { BOT_TOKEN?: string; WEBHOOK_SECRET?: string };
 type Entity = Record<string, unknown>;
@@ -7,6 +8,24 @@ export type BroadcastContent = { kind: "text"; text: string; entities?: Entity[]
   | { kind: "photo"; photo: string; caption?: string; caption_entities?: Entity[] };
 type Job = { id: string; status: string; content: string; chat_id: string; message_id: number; next_at: number };
 export type BroadcastStatus = { id: string; status: string; total: number; sent: number; failed: number; unknown: number; pending: number; nextAt: number };
+
+function audienceConfirmation(version: number, languages: Language[]): Record<string, unknown> {
+  const title = "📤 مخاطب‌های پیام همگانی";
+  const selected = languages.length === BOT_LANGUAGES.length ? "همهٔ زبان‌ها"
+    : languages.length ? languages.map(language => LANGUAGE_LABELS[language]).join(" • ") : "هنوز زبانی انتخاب نکردی";
+  return {
+    text: [title, "", "پیش‌نمایش آماده‌ست. پیام برای کاربرهای کدوم زبان‌ها بره؟",
+      "می‌تونی چند زبان رو انتخاب کنی، بعد ارسال رو تأیید کن.", "", selected].join("\n"),
+    entities: [{ type: "bold", offset: 0, length: title.length }],
+    reply_markup: { inline_keyboard: [
+      [{ text: languages.length === BOT_LANGUAGES.length ? "✅ همهٔ زبان‌ها" : "همهٔ زبان‌ها", callback_data: `admin:broadcast:audience:${version}:all` }],
+      BOT_LANGUAGES.map(language => ({ text: `${languages.includes(language) ? "✅ " : ""}${LANGUAGE_LABELS[language]}`,
+        callback_data: `admin:broadcast:audience:${version}:${language}` })),
+      ...(languages.length ? [[{ text: "📤 تأیید و ارسال", callback_data: `admin:broadcast:start:${version}` }]] : []),
+      [{ text: "تغییر پیام", callback_data: "admin:broadcast:compose" }, { text: "انصراف", callback_data: "admin:broadcast:cancel" }],
+    ] },
+  };
+}
 
 function contentPayload(content: BroadcastContent): Record<string, unknown> {
   return content.kind === "text" ? { text: content.text, entities: content.entities }
@@ -35,7 +54,7 @@ export function broadcastPanel(status?: BroadcastStatus): Record<string, unknown
     ...(status.unknown ? [`❔ نتیجه نامشخص: ${status.unknown}`] : []), `⏳ باقی‌مانده: ${status.pending}`,
     ...(status.status === "running" && status.nextAt > Date.now() ? ["مکث کوتاه طبق محدودیت تلگرام؛ ادامه خودکار است."] : []),
     "", "ارسال موفق یعنی تلگرام پیام را پذیرفته؛ وضعیت خواندن مشخص نیست."].join("\n")
-    : `${title}\n\nمتن، عکس یا عکس همراه کپشن برای همهٔ کاربران بفرست.\nبولد، لینک و قالب‌بندی تلگرام عیناً حفظ می‌شود.`;
+    : `${title}\n\nمتن، عکس یا عکس همراه کپشن رو بفرست؛ بعد زبان مخاطب‌ها رو انتخاب کن.\nبولد، لینک و قالب‌بندی تلگرام عیناً حفظ می‌شود.`;
   const rows = status?.status === "running" ? [[{ text: "⏹ توقف ارسال", callback_data: `admin:broadcast:stop:${status.id}` }]]
     : [[{ text: "نوشتن پیام همگانی", callback_data: "admin:broadcast:compose" }]];
   if (status) rows.push([{ text: "🔄 آمار لحظه‌ای", callback_data: `admin:broadcast:status:${status.id}` }]);
@@ -72,6 +91,8 @@ export class BroadcastManager {
         ctx.storage.sql.exec("DROP TABLE broadcast_draft_legacy");
       });
     }
+    if (!ctx.storage.sql.exec("SELECT name FROM pragma_table_info('broadcast_draft') WHERE name='languages'").toArray().length)
+      ctx.storage.sql.exec(`ALTER TABLE broadcast_draft ADD COLUMN languages TEXT NOT NULL DEFAULT '["fa","en","ru"]'`);
   }
   private job(id?: string): Job | undefined {
     return this.ctx.storage.sql.exec(id ? "SELECT * FROM broadcast_jobs WHERE id = ?" : "SELECT * FROM broadcast_jobs ORDER BY created_at DESC, CAST(id AS INTEGER) DESC LIMIT 1",
@@ -97,12 +118,12 @@ export class BroadcastManager {
       const draft = this.ctx.storage.sql.exec("SELECT * FROM broadcast_draft WHERE id = ?", adminId).toArray()[0];
       return Response.json({ status:job ? this.status(job) : null, waiting:draft?.waiting === 1 });
     }
-    const body = await request.json() as { action:string; version?:number; content?:BroadcastContent; messageId?:number; id?:string };
+    const body = await request.json() as { action:string; version?:number; content?:BroadcastContent; messageId?:number; id?:string; language?:unknown };
     const sql = this.ctx.storage.sql;
     if (body.action === "compose") {
       const active = this.active();
       if (active) return Response.json({ status:this.status(active) });
-      sql.exec("INSERT INTO broadcast_draft(id,waiting) VALUES (?,1) ON CONFLICT(id) DO UPDATE SET waiting=1,version=NULL,content=NULL", adminId);
+      sql.exec(`INSERT INTO broadcast_draft(id,waiting) VALUES (?,1) ON CONFLICT(id) DO UPDATE SET waiting=1,version=NULL,content=NULL,languages='["fa","en","ru"]'`, adminId);
       return Response.json({ waiting:true });
     }
     if (body.action === "cancel") {
@@ -112,10 +133,22 @@ export class BroadcastManager {
     if (body.action === "capture") {
       if (!validContent(body.content) || !Number.isSafeInteger(body.version) || body.version! <= 0) return new Response("Invalid content",{status:400});
       const changed = sql.exec("UPDATE broadcast_draft SET waiting=0,version=?,content=? WHERE id=? AND waiting=1", body.version!, JSON.stringify(body.content), adminId);
-      return Response.json({ captured:changed.rowsWritten > 0 });
+      return Response.json({ captured:changed.rowsWritten > 0, languages:BOT_LANGUAGES });
+    }
+    if (body.action === "audience") {
+      if (!Number.isSafeInteger(body.version) || body.version! <= 0 || !(body.language === "all" || isLanguage(body.language)))
+        return new Response("Invalid audience", {status:400});
+      const draft = sql.exec("SELECT languages FROM broadcast_draft WHERE id=? AND waiting=0 AND version=?",adminId,body.version!).toArray()[0];
+      if (!draft) return new Response("Draft expired",{status:409});
+      const selected = JSON.parse(String(draft.languages)) as Language[];
+      const languages = body.language === "all" ? [...BOT_LANGUAGES]
+        : BOT_LANGUAGES.filter(language => language === body.language ? !selected.includes(language) : selected.includes(language));
+      sql.exec("UPDATE broadcast_draft SET languages=? WHERE id=? AND version=?",JSON.stringify(languages),adminId,body.version!);
+      return Response.json({languages});
     }
     if (body.action === "start") {
       if (!Number.isSafeInteger(body.version) || body.version! <= 0 || !Number.isSafeInteger(body.messageId) || body.messageId! <= 0) return new Response("Invalid request",{status:400});
+      await importLanguagePreferences(this.ctx.storage);
       // Keep legacy owner job IDs; other admins' message IDs are scoped to their chat.
       const id = adminId === ADMIN_USER_ID ? String(body.version) : `${adminId}-${body.version}`;
       let job = this.job(id);
@@ -124,10 +157,16 @@ export class BroadcastManager {
         if (active) return Response.json({ status:this.status(active) });
         const draft = sql.exec("SELECT * FROM broadcast_draft WHERE id=? AND waiting=0 AND version=?",adminId,body.version!).toArray()[0];
         if (!draft?.content) return new Response("Draft expired",{status:409});
+        const languages = JSON.parse(String(draft.languages)) as Language[];
+        if (!Array.isArray(languages) || !languages.length || !languages.every(isLanguage))
+          return new Response("Select an audience",{status:400});
         this.ctx.storage.transactionSync(() => {
           sql.exec("INSERT INTO broadcast_jobs(id,status,content,chat_id,message_id,created_at) VALUES (?,'running',?,?,?,?)",id,String(draft.content),String(adminId),body.messageId!,Date.now());
           const admins = getAdminIds(this.env).map(String);
-          sql.exec(`INSERT INTO broadcast_recipients(job_id,user_id) SELECT ?,id FROM users WHERE id NOT IN (${admins.map(() => "?").join(",")})`,id,...admins);
+          sql.exec(`INSERT INTO broadcast_recipients(job_id,user_id)
+            SELECT ?,u.id FROM users u LEFT JOIN user_languages l ON l.user_id=u.id
+            WHERE u.id NOT IN (${admins.map(() => "?").join(",")})
+              AND COALESCE(l.language,'fa') IN (${languages.map(() => "?").join(",")})`,id,...admins,...languages);
           sql.exec("DELETE FROM broadcast_draft WHERE id=?",adminId);
         });
         job = this.job(id)!;
@@ -253,6 +292,11 @@ export async function handleBroadcastUpdate(request: Request, env: Env): Promise
             reply_markup:{inline_keyboard:[[{text:"انصراف",callback_data:"admin:broadcast:cancel"}]]}});
           return Response.json({ok:true});
         }
+      } else if (action === "audience" && /^\d{1,16}$/.test(id || "") && (parts[4] === "all" || isLanguage(parts[4]))) {
+        result = await store(env,actor.id,{action:"audience",version:Number(id),language:parts[4]});
+        await control(env,"editMessageText",{chat_id:chat,message_id:query.message.message_id,
+          ...audienceConfirmation(Number(id),result.languages)},false);
+        return Response.json({ok:true});
       } else if (action === "cancel") { await store(env,actor.id,{action:"cancel"}); result = await store(env,actor.id); }
       else if (action === "start" && /^\d{1,16}$/.test(id || "")) result = await store(env,actor.id,{action:"start",version:Number(id),messageId:query.message.message_id});
       else if (action === "stop" && /^(?:\d{1,16}-)?\d{1,16}$/.test(id || "")) result = await store(env,actor.id,{action:"stop",id});
@@ -278,9 +322,7 @@ export async function handleBroadcastUpdate(request: Request, env: Env): Promise
     // Native Telegram entities preserve the admin's actual formatting, including custom emoji.
     const preview = await telegram(env,content.kind === "photo" ? "sendPhoto" : "sendMessage",{chat_id:chat,...contentPayload(content)});
     if (!preview.ok) throw new Error("BROADCAST_PREVIEW_FAILED");
-    await control(env,"sendMessage",{chat_id:chat,text:"پیش‌نمایش آماده است. همین پیام برای همهٔ کاربران ارسال شود؟",
-      reply_markup:{inline_keyboard:[[{text:"📤 ارسال به همه",callback_data:`admin:broadcast:start:${message.message_id}`}],
-        [{text:"تغییر پیام",callback_data:"admin:broadcast:compose"},{text:"انصراف",callback_data:"admin:broadcast:cancel"}]]}});
+    await control(env,"sendMessage",{chat_id:chat,...audienceConfirmation(message.message_id,captured.languages)});
     return Response.json({ok:true});
   } catch {
     await control(env,"sendMessage",{chat_id:chat,text:"مدیریت پیام همگانی فعلاً در دسترس نیست؛ دوباره از پنل اقدام کن."});

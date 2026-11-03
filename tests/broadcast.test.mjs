@@ -15,6 +15,7 @@ const textValue = 'متن بولد و لینک و ایموجی ✅';
 const text = {kind:'text',text:textValue,entities:[{type:'bold',offset:0,length:3},{type:'text_link',offset:textValue.indexOf('لینک'),length:4,url:'https://example.com'},{type:'custom_emoji',offset:textValue.indexOf('✅'),length:1,custom_emoji_id:'5400130177319580649'}]};
 function fixture(adminConfig = {}, legacyDraft = false) {
   const db = new DatabaseSync(':memory:'), calls = [], alarms = [], originalFetch = globalThis.fetch, originalNow = Date.now;
+  const preferences = new Map();
   let now = 1_800_000_000_000, nextMessage = 100, responder;
   Date.now = () => now;
   const sql = {exec(query,...params){
@@ -24,7 +25,7 @@ function fixture(adminConfig = {}, legacyDraft = false) {
     else db.exec(query);
     return {toArray:()=>rows,one:()=>rows[0],rowsWritten:changes};
   }};
-  const ctx={storage:{sql,async setAlarm(at){alarms.push(Number(at));},transactionSync(fn){
+  const ctx={storage:{sql,async list(){return new Map(preferences);},async setAlarm(at){alarms.push(Number(at));},transactionSync(fn){
     db.exec('BEGIN');try{const result=fn();db.exec('COMMIT');return result;}catch(error){db.exec('ROLLBACK');throw error;}
   }}};
   const storeEnv = {BOT_TOKEN:'fixture-token', ...adminConfig};
@@ -49,7 +50,7 @@ function fixture(adminConfig = {}, legacyDraft = false) {
     headers:{'content-type':'application/json','x-telegram-bot-api-secret-token':secret},body:JSON.stringify({update_id:9,
       ...(callback?{callback_query:{id:'callback',from:{id:user},data:callback,message:{message_id:90,chat:{id:user}}}}
         :{message:{message_id:7,from:{id:user},chat:{id:user},...message}})})});
-  return {db,env,calls,alarms,request,state,addUsers,start,webhook,
+  return {db,env,calls,alarms,request,state,addUsers,start,webhook,preferences,
     async alarm(){await store.alarm();},advance(ms){now+=ms;},restart(){store=new api.AdminStatsStore(ctx,storeEnv);},
     respond(fn){responder=fn;},close(){globalThis.fetch=originalFetch;Date.now=originalNow;db.close();}};
 }
@@ -257,5 +258,81 @@ test('legacy draft migrates without loss and private composer cannot be driven f
     assert.equal(denied.status,403);
     await api.worker.fetch(f.webhook(undefined,'admin:broadcast:cancel',second),f.env,{});
     assert.equal(f.db.prepare('SELECT waiting FROM broadcast_draft WHERE id=?').get(api.ADMIN_USER_ID).waiting,1);
+  }finally{f.close();}
+});
+
+
+test('language audiences use saved preferences, include default Persian users and snapshot only selected non-admins',async()=>{
+  for(const languages of [['fa'],['en'],['ru'],['en','ru'],['fa','en','ru']]){
+    const second=123456789,f=fixture({ADMIN_IDS:String(second)});
+    try{
+      f.addUsers(4);
+      for(const [user,language] of [['43','en'],['44','ru'],['45','fa'],[String(second),'en']]){
+        f.preferences.set('language:'+user,language);
+      }
+      f.db.prepare('INSERT INTO users(id,first_seen,last_seen) VALUES (?,?,?)').run(String(second),Date.now(),Date.now());
+      await f.request({action:'compose'});
+      await f.request({action:'capture',version:7,content:text});
+      for(const language of ['fa','en','ru'].filter(l=>!languages.includes(l)))
+        assert.equal((await f.request({action:'audience',version:7,language})).status,200);
+      f.restart();
+      const response=await f.request({action:'start',version:7,messageId:90});
+      assert.equal(response.status,200);
+      const expected=[['42','fa'],['43','en'],['44','ru'],['45','fa']].filter(([,l])=>languages.includes(l)).map(([id])=>Number(id));
+      assert.equal((await response.json()).status.total,expected.length);
+      // A later language change must not alter an already confirmed audience.
+      f.db.prepare("UPDATE user_languages SET language='fa'").run();
+      await f.request({action:'start',version:7,messageId:90});
+      f.restart();await f.alarm();
+      const deliveries=f.calls.filter(c=>c.method==='sendMessage'&&c.body.chat_id!==api.ADMIN_USER_ID);
+      assert.deepEqual(deliveries.map(c=>c.body.chat_id).sort((a,b)=>a-b),expected);
+      for(const c of deliveries){assert.equal(c.body.text,text.text);assert.deepEqual(c.body.entities,text.entities);}
+    }finally{f.close();}
+  }
+});
+
+test('audience controls edit the same confirmation and require a nonempty choice before sending',async()=>{
+  const f=fixture();try{
+    f.addUsers(2);
+    await api.worker.fetch(f.webhook(undefined,'admin:broadcast:compose'),f.env,{});
+    await api.worker.fetch(f.webhook({text:'خبر جدید'}),f.env,{});
+    const confirmation=f.calls.filter(c=>c.method==='sendMessage'&&c.body.reply_markup).at(-1).body;
+    assert.ok(confirmation.entities.some(e=>e.type==='bold'));
+    assert.equal(confirmation.reply_markup.inline_keyboard.flat().filter(b=>b.callback_data.includes(':audience:')).length,4);
+    const sends=f.calls.filter(c=>c.method==='sendMessage').length;
+    for(const language of ['fa','en','ru'])
+      await api.worker.fetch(f.webhook(undefined,'admin:broadcast:audience:7:'+language),f.env,{});
+    const edited=f.calls.filter(c=>c.method==='editMessageText').at(-1).body;
+    assert.equal(edited.message_id,90);
+    assert.ok(!edited.reply_markup.inline_keyboard.flat().some(b=>b.callback_data==='admin:broadcast:start:7'));
+    assert.equal(f.calls.filter(c=>c.method==='sendMessage').length,sends);
+    assert.equal((await f.request({action:'start',version:7,messageId:90})).status,400);
+    assert.equal(await f.state(),null);
+    await api.worker.fetch(f.webhook(undefined,'admin:broadcast:audience:7:en'),f.env,{});
+    const english=f.calls.filter(c=>c.method==='editMessageText').at(-1).body;
+    assert.ok(english.text.includes('انگلیسی'));
+    assert.ok(english.reply_markup.inline_keyboard.flat().some(b=>b.callback_data==='admin:broadcast:start:7'));
+    assert.equal((await f.request({action:'audience',version:7,language:'de'})).status,400);
+    assert.equal((await f.request({action:'audience',version:8,language:'en'})).status,409);
+    await f.request({action:'audience',version:7,language:'all'});
+    assert.deepEqual(JSON.parse(f.db.prepare('SELECT languages FROM broadcast_draft').get().languages),['fa','en','ru']);
+    await f.request({action:'cancel'});
+    assert.equal((await f.request({action:'audience',version:7,language:'en'})).status,409);
+  }finally{f.close();}
+});
+
+test('language selections belong to each admin draft and reset when composing a replacement',async()=>{
+  const second=123456789,f=fixture({ADMIN_IDS:String(second)});
+  try{
+    for(const user of [api.ADMIN_USER_ID,second]){
+      await api.worker.fetch(f.webhook(undefined,'admin:broadcast:compose',user),f.env,{});
+      await api.worker.fetch(f.webhook({text:'پیام'},undefined,user),f.env,{});
+    }
+    await api.worker.fetch(f.webhook(undefined,'admin:broadcast:audience:7:en',second),f.env,{});
+    const choice=id=>JSON.parse(f.db.prepare('SELECT languages FROM broadcast_draft WHERE id=?').get(id).languages);
+    assert.deepEqual(choice(api.ADMIN_USER_ID),['fa','en','ru']);
+    assert.deepEqual(choice(second),['fa','ru']);
+    await api.worker.fetch(f.webhook(undefined,'admin:broadcast:compose',second),f.env,{});
+    assert.deepEqual(choice(second),['fa','en','ru']);
   }finally{f.close();}
 });
