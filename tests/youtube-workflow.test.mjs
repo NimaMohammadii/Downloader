@@ -1135,3 +1135,15 @@ test('legacy in-flight Instagram jobs never enter newly added fast-cache steps a
   assert.equal(f.calls.length,0);
  }finally{f.close();}
 });
+
+test('cached social audio buttons remain signed for the actual source when a title contains another URL',async()=>{
+ const f=sharedCacheFixture();try{
+  const job={...f.job,instagramPostRequest:undefined,social:{platform:'x',url:'https://x.com/i/status/123'}};
+  f.values.set(await postCacheKey(f.env,job),{kind:'post',files:[{index:0,method:'sendVideo',fileId:'fixture',hasAudio:true,
+   data:{caption:'Title with https://x.com/i/status/999\nX 1/1\nhttps://x.com/i/status/123'}}]});
+  assert.equal((await sendCachedPost(f.env,job,10)).ok,true);
+  const data=f.calls.find(c=>c.method==='sendVideo').body.reply_markup.inline_keyboard[0][0].callback_data;
+  const signature=createHmac('sha256',f.env.BOT_TOKEN).update('social-audio:99:99:0:https://x.com/i/status/123').digest('hex').slice(0,16);
+  assert.equal(data,'soa|0|99|'+signature);
+ }finally{f.close();}
+});

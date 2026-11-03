@@ -476,7 +476,7 @@ async function sendCachedPost(env: Env, job: YoutubeDownloadJob, statusId: numbe
       const entry = await instagramSubtitleEntry(env,job.userId,job.chatId,"p",shortcode,file.index);
       if (entry.length) rows.push(entry);
     } else if (file.method === "sendVideo" && file.hasAudio && job.social) {
-      const url = parseSocialUrl(String(file.data.caption || ""))?.url || job.social.url;
+      const url = parseSocialUrl(String(file.data.caption || "").split("\n").at(-1) || "")?.url || job.social.url;
       const signature = (await instagramSignature(env.BOT_TOKEN,`social-audio:${job.chatId}:${job.userId}:${file.index}:${url}`)).slice(0,16);
       rows.push([{text:"🎵 فقط صدا",callback_data:`soa|${file.index}|${job.userId}|${signature}`}]);
     }
