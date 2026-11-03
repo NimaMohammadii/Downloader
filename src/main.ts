@@ -1,3 +1,4 @@
+import { formatCacheStatistics, type CacheStatistics } from "./cache-usage";
 import { adminLanguagePanel } from "./admin-languages";
 import { BOT_LANGUAGES, LANGUAGE_LABELS } from "./language-admin-store";
 import { membershipInstagram, membershipState, setMembershipEnabled, setMembershipMode, setMembershipLanguage, MEMBERSHIP_MODES, MEMBERSHIP_MODE_LABELS, type MembershipMode } from "./membership";
@@ -297,6 +298,17 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
       return Response.json({ ok: true });
     }
 
+    if (data === "admin:cache") {
+      const response = await env.ADMIN_STATS.getByName("global").fetch("https://admin-stats/cache-statistics");
+      if (!response.ok) throw new Error("CACHE_STATISTICS_UNAVAILABLE");
+      await telegramCall(env,"editMessageText",{chat_id:message.chat.id,message_id:message.message_id,
+        text:formatCacheStatistics(await response.json() as CacheStatistics),parse_mode:"HTML",
+        reply_markup:{inline_keyboard:[[{text:"🔄 بروزرسانی",callback_data:"admin:cache"}],[{text:"بازگشت به پنل",callback_data:"admin:stats"}]]}}).catch(error=>{
+          if (!(error instanceof Error && /message is not modified/i.test(error.message))) throw error;
+        });
+      return Response.json({ok:true});
+    }
+
     const usageMatch = /^admin:usage(?::([1-9]\d{0,15}):(\d{1,8}):(\d{1,8})(:used)?(?::(day|week))?)?$/.exec(data);
     if (usageMatch) {
       const usage = await getAdminUsage(env, usageMatch[1]);
@@ -311,9 +323,10 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
     const userMatch = /^admin:user:([1-9]\d{0,15}):(\d{1,8}):(\d{1,8})(:used)?(?::(day|week))?$/.exec(data);
     if (userMatch) {
       const detail = await getAdminUserDetail(env, userMatch[1], Number(userMatch[3]));
+      const text = detail ? formatAdminUserDetail(detail) : "این کاربر پیدا نشد.";
       await telegramCall(env, "editMessageText", {
         chat_id: message.chat.id, message_id: message.message_id,
-        text: detail ? formatAdminUserDetail(detail) : "این کاربر پیدا نشد.",
+        text, entities: [...text.matchAll(/^Cache · \d+$/gm)].map(m=>({type:"bold",offset:m.index,length:m[0].length})),
         reply_markup: detail ? adminUserDetailKeyboard(detail, Number(userMatch[2]), Boolean(userMatch[4]), userMatch[5] as AdminPeriod | undefined) : adminDashboardKeyboard(),
         link_preview_options: { is_disabled: true },
       });

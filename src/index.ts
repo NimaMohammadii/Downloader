@@ -1841,7 +1841,7 @@ export async function sendInstagramPostDirect(
           method: "sendVideo", fileId: sent.video.file_id, data: { caption, supports_streaming: true },
         });
       }
-      await recordMediaDelivery(env, message.from?.id || message.chat.id, message.chat.id, usageSent, usageCached);
+      await recordMediaDelivery(env, message.from?.id || message.chat.id, message.chat.id, usageSent, usageCached, undefined, {source:"Instagram",downloadKey:historyKey});
       delivered++;
       if (env.ADMIN_STATS) await recordSuccessfulDelivery(env as AdminStatsEnv, `${history.key}:${index}`);
     }

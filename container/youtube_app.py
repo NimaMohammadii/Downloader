@@ -178,7 +178,7 @@ class UsageMeter:
                 self.report()
             USAGE_USER.reset(context)
 
-    def delivery(self, token, chat, result, size=None, cached=False):
+    def delivery(self, token, chat, result, size=None, cached=False, cache_video=None):
         if not self.enabled or not USAGE_USER.get() or not isinstance(result, dict):
             return
         message_id = result.get("message_id")
@@ -192,7 +192,7 @@ class UsageMeter:
                 print("admin delivery queue overflow: some measurements unavailable", flush=True)
                 return
             self.deliveries[key] = {"key": key, "userId": USAGE_USER.get(), "at": int(time.time() * 1000),
-                                    "bytes": size, "cached": cached}
+                                    "bytes": size, "cached": cached, **({"cachedVideo": cache_video} if cached and cache_video else {})}
         self.report()
 
     def subtitle_charge(self, value):
@@ -1582,7 +1582,9 @@ def reuse_cached_file(payload: dict[str, Any], key: str | None, caption: str | N
         sent = telegram_call(payload["botToken"], cached["method"], json_payload=data, timeout=90)
         media = (sent.get("video") or sent.get("audio") or {}) if isinstance(sent, dict) else {}
         try:
-            USAGE.delivery(payload["botToken"], payload["chatId"], sent, media.get("file_size", cached.get("fileSize")), cached=True)
+            USAGE.delivery(payload["botToken"], payload["chatId"], sent, media.get("file_size", cached.get("fileSize")), cached=True,
+                cache_video={"source": payload["cacheSource"], "downloadKey": payload["cacheHistoryKey"]}
+                if cached["method"] == "sendVideo" and payload.get("cacheSource") and payload.get("cacheHistoryKey") else None)
         except Exception:
             pass
         return True

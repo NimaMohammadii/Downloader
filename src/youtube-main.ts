@@ -1,3 +1,4 @@
+import { cacheSource } from "./cache-usage";
 import { youtubeCatalogCache } from "./youtube-catalog";
 import { startMessage } from "./start-message";
 import { withUserLanguage, userLanguage, currentLanguage, isLanguage, type Language } from "./localization";
@@ -425,6 +426,7 @@ async function mediaCacheContext(env: Env, job: YoutubeDownloadJob) {
     cacheUrl: `https://downloader.vexaagent.workers.dev/media-cache/${job.id}`,
     cacheToken: await instagramSignature(env.BOT_TOKEN, `cache:${job.id}`),
     mediaCacheKey: await mediaCacheKey(job),
+    cacheHistoryKey: jobHistory(job).key, cacheSource: cacheSource(jobHistory(job).source),
   };
 }
 
@@ -455,7 +457,7 @@ async function sendCachedMedia(env: Env, job: YoutubeDownloadJob, statusId?: num
           (job.instagram.mediaId || job.instagram.shortcode)!, job.instagram.videoIndex || 0)].filter(row=>row.length) },
       } : {}),
     }, job.language);
-    await recordMediaDelivery(env, job.userId, job.chatId, sent, true, cached.fileSize);
+    await recordMediaDelivery(env, job.userId, job.chatId, sent, true, cached.fileSize, cached.method === "sendVideo" ? {source:cacheSource(jobHistory(job).source),downloadKey:jobHistory(job).key}:undefined);
   } catch (error) {
     if (/wrong.*file|file.*(?:invalid|expired)|file_reference|failed to get.*file/i.test(error instanceof Error ? error.message : "")) {
       await telegramFileCache(env, "delete", key);
@@ -1004,14 +1006,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
             message_id: statusMessageId,
             text: `${formatVideoTitle(metadata.title)}\n\nکیفیت یا حالت دانلود رو انتخاب کن:`,
             reply_markup: {
-              inline_keyboard: [...buildQualityKeyboard(
-                qualities,
-                Boolean(metadata.audioAvailable),
-                metadata.videoId!,
-                job.requestMessageId,
-                job.userId,
-                metadata.sizes,
-              ), ...subtitleButtons(menu)],
+              inline_keyboard: [...await buildCachedQualityKeyboard(this.env,menu), ...subtitleButtons(menu)],
             },
           }, job.language);
           return true;
@@ -1437,6 +1432,19 @@ function fileSizeLabel(size: YoutubeFileSize | undefined): string {
   return label;
 }
 
+async function buildCachedQualityKeyboard(env: Env, menu: SubtitleMenu): Promise<SubtitleButton[][]> {
+  const rows: SubtitleButton[][] = buildQualityKeyboard(normalizeQualities(menu.qualities),menu.audioAvailable,menu.videoId,menu.requestMessageId,menu.userId,menu.sizes);
+  if (menu.preference.enabled && !menu.preference.language) return rows;
+  const suffix = menu.preference.enabled ? `:sub-${menu.preference.language}-v1` : "";
+  await Promise.all(rows.flat().map(async button=>{
+    const quality=/^ytq\|[^|]+\|(360|480|720|1080)\|/.exec(button.callback_data || "")?.[1];
+    if (!quality) return;
+    const cached=await telegramFileCache(env,"get",`yt:${menu.videoId}:v${quality}${suffix}`);
+    if (cached?.method === "sendVideo") button.icon_custom_emoji_id="5372917041193828849";
+  }));
+  return rows;
+}
+
 function buildQualityKeyboard(
   qualities: YoutubeQuality[],
   audioAvailable: boolean,
@@ -1673,8 +1681,7 @@ async function editSubtitleMenu(env: Env, menu: SubtitleMenu, picker = false): P
     ...(menu.baseButtons || []),
     [{ text: "دریافت با زیرنویس", callback_data: `msd|${menu.videoId}|${menu.requestMessageId}|${menu.userId}` }], ...subtitleButtons(menu),
   ] : [
-    ...buildQualityKeyboard(normalizeQualities(menu.qualities), menu.audioAvailable, menu.videoId,
-      menu.requestMessageId, menu.userId, menu.sizes), ...subtitleButtons(menu),
+    ...await buildCachedQualityKeyboard(env,menu), ...subtitleButtons(menu),
   ];
   if (menu.mediaSource) {
     await telegramCall(env.BOT_TOKEN, "editMessageReplyMarkup", { chat_id: menu.chatId, message_id: menu.messageId,

@@ -10,14 +10,16 @@ const source = await readFile(new URL('../src/youtube-main.ts', import.meta.url)
 const startSource = await readFile(new URL('../src/start-message.ts', import.meta.url), 'utf8');
 const subtitleSource = await readFile(new URL('../src/youtube-subtitles.ts', import.meta.url), 'utf8');
 const subtitleLanguages = await readFile(new URL('../locales/subtitle-languages.json', import.meta.url), 'utf8');
+const cacheUsageSource = await readFile(new URL('../src/cache-usage.ts', import.meta.url), 'utf8');
 const catalogSource = await readFile(new URL('../src/youtube-catalog.ts', import.meta.url), 'utf8');
 const instagram = await readFile(new URL('../src/index.ts', import.meta.url), 'utf8');
 const { outputFiles } = await build({ external: ['node:async_hooks'],
-  stdin: { contents: source + '\nexport {extractPornhubUrl,handleQualityCallback,handleSubtitleCallback,parseQualityCallback,mediaCacheKey,subtitleButtons}; export {subtitleSettings,subtitleAccessSettings} from "./youtube-subtitles";', loader: 'ts', resolveDir: process.cwd() },
+  stdin: { contents: source + '\nexport {buildCachedQualityKeyboard,extractPornhubUrl,handleQualityCallback,handleSubtitleCallback,parseQualityCallback,mediaCacheKey,subtitleButtons}; export {subtitleSettings,subtitleAccessSettings} from "./youtube-subtitles";', loader: 'ts', resolveDir: process.cwd() },
   bundle: true, format: 'esm', write: false,
   plugins: [{ name: 'cloudflare-test-bindings', setup(build) {
     build.onResolve({ filter: /.*/ }, args => ({ path: args.path, namespace: 'test' }));
     build.onLoad({ filter: /.*/, namespace: 'test' }, args => {
+      if (args.path === './cache-usage') return { contents: cacheUsageSource, loader: 'ts' };
       if (args.path === './youtube-catalog') return { contents: catalogSource, loader: 'ts' };
       if (args.path === './start-message') return { contents: startSource, loader: 'ts' };
       if (args.path === './youtube-subtitles') return { contents: subtitleSource, loader: 'ts' };
@@ -63,7 +65,7 @@ const { outputFiles } = await build({ external: ['node:async_hooks'],
     });
   } }],
 });
-const { DownloadPool, YoutubeDownloaderContainer, YoutubeDownloadWorkflow, extractPornhubUrl, handleQualityCallback, handleSubtitleCallback, parseQualityCallback, mediaCacheKey, subtitleButtons, subtitleSettings, subtitleAccessSettings, default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
+const { buildCachedQualityKeyboard, DownloadPool, YoutubeDownloaderContainer, YoutubeDownloadWorkflow, extractPornhubUrl, handleQualityCallback, handleSubtitleCallback, parseQualityCallback, mediaCacheKey, subtitleButtons, subtitleSettings, subtitleAccessSettings, default: worker } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
 
 function subtitleBinding(storage = memoryStorage()) {
   return { getByName() { return { fetch: (url, init) => new URL(url).pathname === '/youtube-subtitle-access'
@@ -992,4 +994,19 @@ test('warm catalog skips Container admission and extraction while preserving the
  assert.deepEqual(second.messages.find(m=>m.reply_markup).reply_markup,first.messages.find(m=>m.reply_markup).reply_markup);
  const cold=await run({inspect:true,catalogBinding:{getByName(){return{fetch(){throw Error('storage unavailable');}}}}});
  assert.ok(cold.calls.some(c=>c[0]==='/metadata'));
+});
+
+
+test('quality cache icons follow the current subtitle language and preserve callback payloads',async()=>{
+ const menu=menuFixture({userId:42,chatId:42});const env={BOT_TOKEN:'fixture'};const reads=[];
+ globalThis.testFileCache=async(_env,op,key)=>{reads.push(key);return ['yt:dQw4w9WgXcQ:v720','yt:dQw4w9WgXcQ:v360:sub-de-v1'].includes(key)?{method:'sendVideo',fileId:'fixture',data:{}}:null;};
+ try{
+ const plain=await buildCachedQualityKeyboard(env,menu);
+ assert.equal(plain.flat().filter(b=>b.icon_custom_emoji_id).length,1);
+ assert.ok(plain.flat().find(b=>b.icon_custom_emoji_id).callback_data.includes('|720|'));
+ const translated=await buildCachedQualityKeyboard(env,{...menu,preference:{enabled:true,language:'de'}});
+ assert.ok(translated.flat().find(b=>b.icon_custom_emoji_id).callback_data.includes('|360|'));
+ assert.equal(translated.flat().find(b=>b.icon_custom_emoji_id).icon_custom_emoji_id,'5372917041193828849');
+ const before=reads.length;await buildCachedQualityKeyboard(env,{...menu,preference:{enabled:true}});assert.equal(reads.length,before);
+ }finally{delete globalThis.testFileCache;}
 });

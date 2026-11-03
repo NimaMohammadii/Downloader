@@ -1237,3 +1237,40 @@ test('Instagram entry button uses the direct page URL without a callback or trac
   assert.doesNotMatch(JSON.stringify(prompt),/membership\/instagram\/visit/);
  }finally{globalThis.fetch=previous;f.close();}
 });
+
+
+
+test('cached video history and platform totals are delivery-confirmed, deduplicated and separate from audio or legacy usage',async()=>{
+ const f=fixture();try{
+ await f.record(1234);await f.request('/download',{...base,status:'success',delivered:2});
+ const at=Date.now(),event={key:'tg:fixture:42:123',userId:42,at,bytes:100,cached:true,cachedVideo:{source:'YouTube',downloadKey:base.key}};
+ const put=deliveries=>f.request('/usage',{samples:[],deliveries});
+ assert.equal((await put([event,event])).status,200);
+ await put([{...event,key:'tg:fixture:42:124',cachedVideo:{source:'Instagram',downloadKey:'ig:42:8:42'}},
+  {...event,key:'tg:fixture:42:125',cachedVideo:undefined},
+  {...event,key:'tg:fixture:42:126',cached:false,cachedVideo:undefined}]);
+ const stats=await(await f.request('/cache-statistics')).json();
+ assert.equal(stats.all,2);assert.equal(stats.day,2);assert.equal(stats.legacyUnclassifiedMedia,1);
+ assert.deepEqual(stats.sources.map(x=>x.source).sort(),['Instagram','YouTube']);
+ const detail=await f.detail();assert.equal(detail.downloads[0].cachedVideos,1);
+ assert.match(admin.formatAdminUserDetail(detail),/Cache · 1/);
+ const bad=await put([{...event,key:'tg:fixture:42:127',cached:false}]);assert.equal(bad.status,400);
+ assert.equal((await(await f.request('/cache-statistics')).json()).all,2);
+ f.restart();assert.equal((await(await f.request('/cache-statistics')).json()).all,2);
+ }finally{f.close();}
+});
+
+
+test('cache statistics panel is admin-only and formatted with bold HTML and navigation',async()=>{
+ const f=fixture(),previous=globalThis.fetch,calls=[];
+ globalThis.fetch=async(_input,init)=>{calls.push(JSON.parse(init.body));return Response.json({ok:true,result:{message_id:5}});};
+ const panel=id=>admin.worker.fetch(webhook({callback_query:{id:'cache-panel',from:{id},data:'admin:cache',message:{message_id:5,chat:{id}}}}),f.env,{});
+ try{
+ await panel(43);assert.ok(!calls.some(c=>c.text?.includes('ویدیوهای ارسال‌شده از Cache')));
+ calls.length=0;await panel(admin.ADMIN_USER_ID);
+ const body=calls.find(c=>c.text?.includes('ویدیوهای ارسال‌شده از Cache'));
+ assert.equal(body.parse_mode,'HTML');assert.match(body.text,/<b>کل ارسال‌ها: 0<\/b>/);
+ assert.ok(body.reply_markup.inline_keyboard.flat().some(b=>b.callback_data==='admin:stats'));
+ assert.ok(admin.adminDashboardKeyboard().inline_keyboard.flat().some(b=>b.callback_data==='admin:cache'));
+ }finally{globalThis.fetch=previous;f.close();}
+});

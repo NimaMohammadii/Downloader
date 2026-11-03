@@ -981,7 +981,7 @@ export async function sendResolvedStory(env: Env, target: StoryTarget, update: T
           method: "sendVideo", fileId: sent.video.file_id, data: { caption, supports_streaming: true },
         });
       }
-      await recordMediaDelivery(env, message.from?.id || message.chat.id, message.chat.id, usageSent, usageCached);
+      await recordMediaDelivery(env, message.from?.id || message.chat.id, message.chat.id, usageSent, usageCached, undefined, {source:"Instagram",downloadKey:`ig:${message.chat.id}:${message.message_id}:${message.from?.id || message.chat.id}`});
       delivered++;
       await recordSuccessfulDelivery(env, `${history.key}:${i}`);
     }

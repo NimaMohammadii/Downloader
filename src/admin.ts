@@ -1,3 +1,4 @@
+import { createCacheUsage, saveCachedVideo, cacheStatistics, validCachedVideo, type CachedVideo } from "./cache-usage";
 import { telegramFileCacheRequest } from "./telegram-file-cache";
 export { telegramFileCache } from "./telegram-file-cache";
 export type { CachedTelegramFile } from "./telegram-file-cache";
@@ -221,7 +222,7 @@ export type DownloadRecord = {
   excludeFromStats?: boolean;
   subtitleLanguage?: SubtitleLanguage | null;
 };
-export type AdminDownload = DownloadRecord & { createdAt: number; updatedAt: number; stale: boolean; subtitleCosts?: SubtitleCosts };
+export type AdminDownload = DownloadRecord & { createdAt: number; updatedAt: number; stale: boolean; subtitleCosts?: SubtitleCosts; cachedVideos?: number };
 export type AdminUserDetail = {
   language?: Language;
   languageSelected?: boolean;
@@ -246,7 +247,7 @@ export type UsageSample = {
   runtimeMs: number; cpuSeconds: number | null; ingressBytes: number | null; egressBytes: number | null;
 };
 export type ContainerRun = { key: string; start: number; end: number | null };
-export type MediaUsage = { key: string; userId: number; at: number; bytes: number | null; cached?: boolean };
+export type MediaUsage = { key: string; userId: number; at: number; bytes: number | null; cached?: boolean; cachedVideo?: CachedVideo };
 export type UsageTotals = {
   downloads: number; bytes: number; unknownSizes: number; cached: number;
   runtimeMs: number; cpuSeconds: number; ingressBytes: number; egressBytes: number;
@@ -584,6 +585,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
     `);
     this.ctx.storage.sql.exec("INSERT OR IGNORE INTO counters(key,value) VALUES ('usage_tracking_since',?)", Date.now());
     createSubtitleLedger(this.ctx.storage.sql);
+    createCacheUsage(this.ctx.storage.sql);
     this.ctx.storage.sql.exec("INSERT OR IGNORE INTO counters(key,value) VALUES ('subtitle_tracking_since',?)", Date.now());
     // One-time, set-based import. No timer or polling and no repeated full scan.
     if (!this.ctx.storage.sql.exec("SELECT value FROM counters WHERE key = 'download_stats_since'").toArray().length) {
@@ -722,6 +724,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
           || !metric(v.cpuSeconds) || !metric(v.ingressBytes) || !metric(v.egressBytes))
         || body.deliveries.some(v => !v || !validKey(v.key) || !validId(v.userId) || v.userId === 0
           || !Number.isSafeInteger(v.at) || v.at < 0 || v.at > now + 60000
+          || (v.cachedVideo !== undefined && (v.cached !== true || !validCachedVideo(v.cachedVideo)))
           || !(v.bytes === null || (Number.isSafeInteger(v.bytes) && v.bytes >= 0 && v.bytes <= 2_000_000_000)))) {
         return new Response("Invalid usage", { status: 400 });
       }
@@ -733,11 +736,15 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         for (const v of body.samples!) this.ctx.storage.sql.exec(
           "INSERT OR IGNORE INTO usage_samples VALUES (?,?,?,?,?,?,?,?)",
           v.key, String(v.userId), v.start, v.end, v.runtimeMs, v.cpuSeconds, v.ingressBytes, v.egressBytes);
-        for (const v of body.deliveries!) this.ctx.storage.sql.exec(
+        for (const v of body.deliveries!) { this.ctx.storage.sql.exec(
           "INSERT OR IGNORE INTO media_usage VALUES (?,?,?,?,?)", v.key, String(v.userId), v.at, v.bytes, v.cached ? 1 : 0);
+          saveCachedVideo(this.ctx.storage.sql,v);
+        }
       });
       return Response.json({ ok: true });
     }
+
+    if (request.method === "GET" && url.pathname === "/cache-statistics") return Response.json(cacheStatistics(this.ctx.storage.sql));
 
     if (request.method === "GET" && url.pathname === "/usage") {
       const id = url.searchParams.get("id") || undefined;
@@ -1040,12 +1047,13 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       const totalPages = Math.max(1, Math.ceil(asNumber(counts.total) / ADMIN_DOWNLOADS_PAGE_SIZE));
       const rawPage = Number(url.searchParams.get("page") || 0);
       const page = Math.min(Number.isSafeInteger(rawPage) && rawPage >= 0 ? rawPage : 0, totalPages - 1);
-      const downloads = sql.exec(`SELECT h.*, s.download_key AS subtitle_recorded, s.language AS subtitle_language
+      const downloads = sql.exec(`SELECT h.*, s.download_key AS subtitle_recorded, s.language AS subtitle_language,
+        (SELECT COUNT(*) FROM cached_video_deliveries c WHERE c.download_key=h.key AND c.user_id=h.user_id) AS cached_videos
         FROM download_history h LEFT JOIN youtube_subtitle_choices s ON s.download_key=h.key AND s.user_id=h.user_id
         WHERE h.user_id = ? ${subtitleFilter ? "AND s.language IS NOT NULL" : ""}
         ORDER BY h.created_at DESC, h.key DESC LIMIT ? OFFSET ?`,
         id, ADMIN_DOWNLOADS_PAGE_SIZE, page * ADMIN_DOWNLOADS_PAGE_SIZE).toArray().map(row => ({
-          key: String(row.key), userId: Number(id), source: String(row.source), request: String(row.request),
+          key: String(row.key), userId: Number(id), cachedVideos: asNumber(row.cached_videos), source: String(row.source), request: String(row.request),
           status: row.status as DownloadStatus, title: row.title ? String(row.title) : undefined,
           detail: row.detail ? String(row.detail) : undefined, delivered: asNumber(row.delivered),
           createdAt: asNumber(row.created_at), updatedAt: asNumber(row.updated_at),
@@ -1340,6 +1348,7 @@ export function adminDashboardKeyboard(): Record<string, unknown> {
     inline_keyboard: [
       [{ text: "📤 پیام همگانی", callback_data: "admin:broadcast" }],
       [{ text: "مصرف، ترافیک و هزینه", icon_custom_emoji_id: "5231200819986047254", callback_data: "admin:usage" }],
+      [{ text: "📦 آمار ویدیوهای Cache", callback_data: "admin:cache" }],
       [{ text: "آمار دانلود سرویس‌ها", icon_custom_emoji_id: "5443127283898405358", callback_data: "admin:downloads" }],
       [{ text: "مدیریت زیرنویس", icon_custom_emoji_id: "5206607081334906820", callback_data: "admin:subtitles" }],
       [{ text: "👥 لیست کاربران", callback_data: "admin:users:0" },
@@ -1469,6 +1478,7 @@ export function formatAdminDownloadHistory(detail: Pick<AdminUserDetail, 'downlo
   detail.downloads.forEach((item, index) => {
     lines.push("", `${detail.page * ADMIN_DOWNLOADS_PAGE_SIZE + index + 1}. ${displayText(item.source, 32)} • ${dateLabel(item.createdAt)}`,
       item.stale ? "❔ نتیجه نهایی ثبت نشده (بیش از ۴ ساعت)" : STATUS_LABELS[item.status],
+      ...(item.cachedVideos ? [`Cache · ${item.cachedVideos}`] : []),
       ...(item.title ? [`عنوان: ${displayText(item.title, 90)}`] : []),
       ...(item.source === 'YouTube' || item.subtitleLanguage !== undefined ? [subtitleChoiceLabel(item.subtitleLanguage),
         ...(item.subtitleLanguage !== undefined && item.subtitleCosts ? [
@@ -1569,10 +1579,10 @@ export function formatAdminUsage(usage: AdminUsage): string {
 }
 
 export async function recordMediaDelivery(env: Partial<AdminStatsEnv> & { BOT_TOKEN: string }, userId: number, chatId: number,
-  result: unknown, cached = false, fallbackBytes?: number): Promise<void> {
+  result: unknown, cached = false, fallbackBytes?: number, cachedVideo?: CachedVideo): Promise<void> {
   const messageId = (result as { message_id?: number } | null)?.message_id;
   if (!Number.isSafeInteger(messageId)) return;
   const bytes = telegramMediaBytes(result) ?? (Number.isSafeInteger(fallbackBytes) && fallbackBytes! >= 0 ? fallbackBytes! : null);
   await recordUsage(env, [], [{ key: `tg:${env.BOT_TOKEN.split(":")[0]}:${chatId}:${messageId}`,
-    userId, at: Date.now(), bytes, cached }]);
+    userId, at: Date.now(), bytes, cached, ...(cached && cachedVideo ? { cachedVideo } : {}) }]);
 }
