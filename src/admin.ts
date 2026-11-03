@@ -1,3 +1,4 @@
+import { youtubeCatalogRequest } from "./youtube-catalog";
 import { createLanguageTables, importLanguagePreferences, membershipLanguages, languageStatistics, LANGUAGE_LABELS } from "./language-admin-store";
 import type { Language } from "./localization";
 import { localizePayload, presentationLocale, isTranslatedError, isTranslatedErrorFrame, isLanguage } from "./localization";
@@ -581,6 +582,10 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_telegram_file_cache_at ON telegram_file_cache(created_at);
+      CREATE TABLE IF NOT EXISTS youtube_catalog_cache (
+        key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_youtube_catalog_cache_at ON youtube_catalog_cache(created_at);
     `);
     this.ctx.storage.sql.exec("INSERT OR IGNORE INTO counters(key, value) VALUES ('links_tracking_since', ?)", Date.now());
     this.ctx.storage.sql.exec(`
@@ -915,6 +920,9 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         downloaded: access.length > 0, mode, linkTriggered: triggered.length > 0 });
     }
 
+    if (request.method === "POST" && url.pathname === "/youtube-catalog-cache") {
+      return youtubeCatalogRequest(await request.json().catch(() => null), this.ctx.storage.sql);
+    }
     if (request.method === "POST" && url.pathname === "/file-cache") {
       const payload = await request.json() as { op: string; key: string; value?: CachedTelegramFile };
       if (!/^[A-Za-z0-9:_-]{1,180}$/.test(payload.key || "")) return new Response("Invalid key", { status: 400 });

@@ -1554,7 +1554,7 @@ def file_cache(payload: dict[str, Any], op: str, key: str | None, value: dict[st
     if not key or not re.fullmatch(r"[A-Za-z0-9:_-]{1,180}", key):
         return None
     url = str(payload.get("cacheUrl") or "")
-    suffix = r"(?:-(?:audio|song|profile-\d+))?" if op == "subtitle-state" else r"(?:-(?:audio|song))?"
+    suffix = r"(?:-(?:audio|song|profile-\d+))?"
     if not re.fullmatch(r"https://downloader\.vexaagent\.workers\.dev/media-cache/(?:igdl|ytdl)--?\d+-\d+-\d+" + suffix, url):
         return None
     try:

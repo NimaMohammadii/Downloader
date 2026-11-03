@@ -10,6 +10,7 @@ const source = await readFile(new URL('../src/youtube-main.ts', import.meta.url)
 const startSource = await readFile(new URL('../src/start-message.ts', import.meta.url), 'utf8');
 const subtitleSource = await readFile(new URL('../src/youtube-subtitles.ts', import.meta.url), 'utf8');
 const subtitleLanguages = await readFile(new URL('../locales/subtitle-languages.json', import.meta.url), 'utf8');
+const catalogSource = await readFile(new URL('../src/youtube-catalog.ts', import.meta.url), 'utf8');
 const instagram = await readFile(new URL('../src/index.ts', import.meta.url), 'utf8');
 const { outputFiles } = await build({ external: ['node:async_hooks'],
   stdin: { contents: source + '\nexport {extractPornhubUrl,handleQualityCallback,handleSubtitleCallback,parseQualityCallback,mediaCacheKey,subtitleButtons}; export {subtitleSettings,subtitleAccessSettings} from "./youtube-subtitles";', loader: 'ts', resolveDir: process.cwd() },
@@ -17,6 +18,7 @@ const { outputFiles } = await build({ external: ['node:async_hooks'],
   plugins: [{ name: 'cloudflare-test-bindings', setup(build) {
     build.onResolve({ filter: /.*/ }, args => ({ path: args.path, namespace: 'test' }));
     build.onLoad({ filter: /.*/, namespace: 'test' }, args => {
+      if (args.path === './youtube-catalog') return { contents: catalogSource, loader: 'ts' };
       if (args.path === './start-message') return { contents: startSource, loader: 'ts' };
       if (args.path === './youtube-subtitles') return { contents: subtitleSource, loader: 'ts' };
       if (args.path === '../locales/subtitle-languages.json') return { contents: subtitleLanguages, loader: 'json' };
@@ -472,7 +474,7 @@ test('text and caption Pornhub links queue a deterministic direct-download job',
   assert.equal(jobs[0].params.quality, undefined);
 });
 
-async function run({ inspect = false, startupError, httpError, result, sizes, credentials = true, pornhub = false, pool = poolBinding(), results, onSleep, checkpoints = new Map(), jobChanges = {}, aiSecrets = true, subtitleVersion = 1 } = {}) {
+async function run({ catalogBinding, inspect = false, startupError, httpError, result, sizes, credentials = true, pornhub = false, pool = poolBinding(), results, onSleep, checkpoints = new Map(), jobChanges = {}, aiSecrets = true, subtitleVersion = 1 } = {}) {
   const messages = [];
   const calls = [];
   const steps = [];
@@ -522,7 +524,7 @@ async function run({ inspect = false, startupError, httpError, result, sizes, cr
     ...(pornhub ? { source: 'pornhub', url: 'https://www.pornhub.com/view_video.php?viewkey=ph123' } : inspect ? {} : { quality: 720, statusMessageId: 10 }),
   };
   Object.assign(job,jobChanges);
-  await new YoutubeDownloadWorkflow({}, { BOT_TOKEN: 'secret-token', ADMIN_STATS: subtitleBinding(), DOWNLOAD_POOL: pool, PORNHUB_COOKIES: 'obsolete-secret',
+  await new YoutubeDownloadWorkflow({}, { BOT_TOKEN: 'secret-token', ADMIN_STATS: catalogBinding || subtitleBinding(), DOWNLOAD_POOL: pool, PORNHUB_COOKIES: 'obsolete-secret',
     ...(aiSecrets?{ELEVEN_API:'private-eleven',GPT_API:'private-gpt'}:{}),
     ...(credentials ? { API_ID: '123', API_HASH: 'secret-hash' } : {}) }).run({ payload: job }, step);
   return { calls, messages, steps, delivered: globalThis.delivered };
@@ -968,4 +970,26 @@ test('subtitle jobs do not replay paid preparation automatically after Telegram 
     errorCode:'FLOOD_WAIT',retryAfterSeconds:300},onSleep(){throw Error('paid work must not be replayed');}});
   assert.equal(result.calls.filter(c=>c[0]==='/download').length,1);
   assert.ok(!result.steps.some(([,config])=>config.sleep));
+});
+
+
+
+test('warm catalog skips Container admission and extraction while preserving the quality menu',async()=>{
+ const values=new Map(), storage=memoryStorage();
+ const binding={getByName(){return{async fetch(input,init){
+  const request=new Request(input,init);
+  const body=await request.json();
+  if(new URL(request.url).pathname==='/youtube-catalog-cache'){
+   if(body.op==='put')values.set(body.key,body.value);
+   return Response.json({value:body.op==='get'?values.get(body.key):null});
+  }
+  return subtitleSettings(new Request(request.url,{method:'POST',body:JSON.stringify(body)}),storage);
+ }}}};
+ const first=await run({inspect:true,catalogBinding:binding});
+ assert.ok(first.calls.some(c=>c[0]==='/metadata'));
+ const second=await run({inspect:true,catalogBinding:binding,startupError:'must never start'});
+ assert.deepEqual(second.calls,[]);
+ assert.deepEqual(second.messages.find(m=>m.reply_markup).reply_markup,first.messages.find(m=>m.reply_markup).reply_markup);
+ const cold=await run({inspect:true,catalogBinding:{getByName(){return{fetch(){throw Error('storage unavailable');}}}}});
+ assert.ok(cold.calls.some(c=>c[0]==='/metadata'));
 });

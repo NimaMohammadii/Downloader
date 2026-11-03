@@ -1,3 +1,4 @@
+import { youtubeCatalogCache } from "./youtube-catalog";
 import { startMessage } from "./start-message";
 import { withUserLanguage, userLanguage, currentLanguage, isLanguage, type Language } from "./localization";
 import { isSubtitleLanguage, subtitleName, subtitleButtons, subtitleState, instagramSubtitleEntry, SUBTITLE_LOCK_NOTICE, type SubtitleLanguage, type SubtitleMenu, type SubtitleButton } from "./youtube-subtitles";
@@ -936,22 +937,29 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           },
         );
 
-        await startContainer();
+        // Catalog reuse precedes Container admission; selected-file delivery is unchanged.
+        const videoId = new URL(job.url).searchParams.get("v") || "";
+        const catalogKey = `yt:${videoId}:${await instagramSignature(this.env.BOT_TOKEN, `catalog-v1:${this.env.YOUTUBE_COOKIES || ''}`)}`;
+        const cachedCatalog = await step.do("read youtube quality catalog", () => youtubeCatalogCache(this.env, "get", catalogKey));
+        if (!cachedCatalog) await startContainer();
         phase = "metadata";
-        const metadata = await step.do(
+        const metadata: YoutubeMetadataResult = await step.do(
           "inspect youtube qualities",
           {
             retries: { limit: 1, delay: "1 second", backoff: "constant" },
             timeout: "6 minutes",
           },
           async () => {
-            return containerResult<YoutubeMetadataResult>(this.env, job,
+            if (cachedCatalog) return cachedCatalog;
+            const result = await containerResult<YoutubeMetadataResult>(this.env, job,
               new Request("http://container/metadata", {
                 method: "POST",
                 headers: { "content-type": "application/json" },
                 body: JSON.stringify({ url: job.url, userId: job.userId }),
               }),
             );
+            await youtubeCatalogCache(this.env, "put", catalogKey, result);
+            return result;
           },
         );
 
