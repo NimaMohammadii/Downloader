@@ -1554,7 +1554,8 @@ def file_cache(payload: dict[str, Any], op: str, key: str | None, value: dict[st
     if not key or not re.fullmatch(r"[A-Za-z0-9:_-]{1,180}", key):
         return None
     url = str(payload.get("cacheUrl") or "")
-    if not re.fullmatch(r"https://downloader\.vexaagent\.workers\.dev/media-cache/(?:igdl|ytdl)--?\d+-\d+-\d+(?:-(?:audio|song))?", url):
+    suffix = r"(?:-(?:audio|song|profile-\d+))?" if op == "subtitle-state" else r"(?:-(?:audio|song))?"
+    if not re.fullmatch(r"https://downloader\.vexaagent\.workers\.dev/media-cache/(?:igdl|ytdl)--?\d+-\d+-\d+" + suffix, url):
         return None
     try:
         response = requests.post(url, headers={"x-media-cache-token": payload["cacheToken"]},
@@ -1961,13 +1962,13 @@ class InstagramCapture:
                                if self.source["social"].get("platform") == "pinterest" else {})
                 self.social_url, self.social_items = prepare_social_media(self.source["social"], self.workdir, cache_payload=self.payload, **credentials)
                 self.social_sent = 0
-                self.result = {"ok": True, **({"subtitleEligible": any(item.get("method") == "sendVideo" for item in self.social_items)}
-                    if self.source["social"].get("platform") == "pinterest" and not self.source["social"].get("audioOnly") else {})}
+                self.result = {"ok": True}
                 with self.lock:
                     self.state = "ready"
                 self.safe_status(f"📤 {len(self.social_items)} فایل آمادهٔ ارسال است…")
                 return
-            if reuse_cached_file(self.payload, self.payload.get("mediaCacheKey")):
+            cached_markup = self.subtitle_markup(None, origin=self.payload["subtitleOrigin"]) if self.payload.get("subtitleOrigin") else None
+            if reuse_cached_file(self.payload, self.payload.get("mediaCacheKey"), **({"reply_markup": cached_markup} if cached_markup else {})):
                 self.cached = True
                 self.result = {"ok": True}
                 with self.lock:
@@ -2267,6 +2268,8 @@ class InstagramCapture:
                 caption += "\n" + notes[self.reason]
             data = {"chat_id": str(self.payload["chatId"]), "caption": caption,
                     "reply_parameters": json.dumps({"message_id": self.payload["requestMessageId"]}), **self.video}
+            if not self.audio_only and self.payload.get("subtitleOrigin"):
+                data["reply_markup"] = json.dumps(self.subtitle_markup(None, origin=self.payload["subtitleOrigin"]))
             self.safe_status("📤 دارم فایل صوتی را کامل در تلگرام ارسال می‌کنم…" if self.audio_only else "📤 دارم فایل ویدیو را کامل در تلگرام ارسال می‌کنم…")
             if self.payload.get("subtitle") and not self.audio_only and not getattr(self, "subtitle_prepared", False):
                 from ai_subtitles import prepare_media
@@ -2303,6 +2306,27 @@ class InstagramCapture:
                 self.state = "failed"
             return {"ok": False, **diagnostic}
 
+    def subtitle_markup(self, markup, *, origin=None, pin_index=None):
+        if pin_index is not None:
+            owner = int(self.payload.get("userId") or self.id.rsplit("-", 1)[-1])
+            signature = hmac.new(self.payload["botToken"].encode(),
+                f"social-audio:{self.payload['chatId']}:{owner}:{pin_index}:{self.social_url}".encode(), hashlib.sha256).hexdigest()[:16]
+            data = f"mss|n|{pin_index}|{owner}|{signature}"
+        elif origin and origin.get("kind") in ("p", "s") and re.fullmatch(r"[A-Za-z0-9_-]{1,24}", str(origin.get("id") or "")):
+            owner = int(self.payload.get("userId") or self.id.rsplit("-", 1)[-1])
+            kind, source_id, index = origin["kind"], origin["id"], origin.get("index", 0)
+            signature = hmac.new(self.payload["botToken"].encode(),
+                f"subtitle-entry:{self.payload['chatId']}:{owner}:{kind}:{source_id}:{index}".encode(), hashlib.sha256).hexdigest()[:16]
+            data = f"mss|{kind}|{source_id}|{index}|{owner}|{signature}"
+        else:
+            return markup
+        if len(data.encode()) > 64:
+            return markup
+        state = file_cache(self.payload, "subtitle-state", "subtitle") or {}
+        icon = "5296369303661067030" if state.get("locked") else "5206607081334906820" if (state.get("preference") or {}).get("enabled") else "5210952531676504517"
+        return {"inline_keyboard": [*(markup or {}).get("inline_keyboard", []),
+            [{"text": "زیرنویس", "icon_custom_emoji_id": icon, "callback_data": data}]]}
+
     def social_delivery_options(self, item: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
         markup = None
         if item["method"] == "sendVideo" and item.get("hasAudio"):
@@ -2311,6 +2335,8 @@ class InstagramCapture:
             signature = hmac.new(self.payload["botToken"].encode(),
                 f"social-audio:{self.payload['chatId']}:{owner}:{index}:{self.social_url}".encode(), hashlib.sha256).hexdigest()[:16]
             markup = {"inline_keyboard": [[{"text": "🎵 فقط صدا", "callback_data": f"soa|{index}|{owner}|{signature}"}]]}
+        if (self.source.get("social") or {}).get("platform") == "pinterest" and item["method"] == "sendVideo":
+            markup = self.subtitle_markup(markup, pin_index=int(item.get("index", 0)))
         data = {"chat_id": str(self.payload["chatId"]), "caption": item["caption"][:1024],
                 "reply_parameters": json.dumps({"message_id": self.payload["requestMessageId"]}), **item["data"]}
         if markup:
@@ -2363,13 +2389,16 @@ class InstagramCapture:
                 data = {"chat_id": str(self.payload["chatId"]), "caption": caption}
                 if index == 0:
                     data["reply_parameters"] = json.dumps({"message_id": self.payload["requestMessageId"], "allow_sending_without_reply": True})
-                key = f"ig:{self.payload['userId']}:{post['shortcode']}:{index}:video" if video else None
+                source_index = post.get("subtitleIndex", index)
+                key = f"ig:{self.payload['userId']}:{post['shortcode']}:{source_index}:video" if video else None
                 if key and self.payload.get("subtitle"):
                     key += f":sub-{self.payload['subtitle']}-v1"
                 markup = {"inline_keyboard": [[
-                    {"text": "🎵 فقط صدا", "callback_data": f"iga|{source_kind}|{post['shortcode']}|{index}|{self.payload['userId']}"},
-                    {"text": "🔎 پیداکردن آهنگ", "callback_data": f"igm|{source_kind}|{post['shortcode']}|{index}|{self.payload['userId']}"},
+                    {"text": "🎵 فقط صدا", "callback_data": f"iga|{source_kind}|{post['shortcode']}|{source_index}|{self.payload['userId']}"},
+                    {"text": "🔎 پیداکردن آهنگ", "callback_data": f"igm|{source_kind}|{post['shortcode']}|{source_index}|{self.payload['userId']}"},
                 ]]} if video else None
+                if video:
+                    markup = self.subtitle_markup(markup, origin={"kind": source_kind, "id": post["shortcode"], "index": source_index})
                 if key and reuse_cached_file(self.payload, key, caption, reply_markup=markup):
                     self.post_sent += 1
                     continue
@@ -2390,7 +2419,7 @@ class InstagramCapture:
                 if video and self.payload.get("subtitle"):
                     from ai_subtitles import prepare_media
                     if index not in self.subtitle_paths:
-                        self.subtitle_paths[index] = prepare_media(path, self.payload, self.safe_status, f"{source_kind}:{post['shortcode']}:{index}", deadline)
+                        self.subtitle_paths[index] = prepare_media(path, self.payload, self.safe_status, f"{source_kind}:{post['shortcode']}:{source_index}", deadline)
                     path = self.subtitle_paths[index]
                 self.safe_status(f"📤 در حال ارسال فایل {index + 1}/{len(items)} اینستاگرام…")
                 with path.open("rb") as handle:
@@ -2501,21 +2530,6 @@ def instagram_action(action: str, payload: dict[str, Any]) -> dict[str, Any]:
                 if payload.get("bandcampFormatId") is not None:
                     from bandcamp import choose
                     return choose(job, payload["bandcampFormatId"])
-                if payload.get("subtitle"):
-                    from ai_subtitles import authorize_media
-                    with job.lock:
-                        merged = {**job.payload, **payload}
-                        authorize_media(merged)
-                        if job.payload.get("subtitle"):
-                            return {"ok": job.payload["subtitle"] == payload["subtitle"]}
-                        if job.state != "ready" or (job.source.get("social") or {}).get("platform") != "pinterest":
-                            return {"ok": False}
-                        job.payload.update(payload)
-                        for item in job.social_items:
-                            if item["method"] == "sendVideo":
-                                item["cacheKey"] += f":sub-{payload['subtitle']}-v1"
-                                item["cached"] = file_cache(job.payload, "get", item["cacheKey"])
-                    return {"ok": True}
                 # Workflow start retries reuse the same process and file.
                 return {"ok": True}
             if payload.get("bandcampFormatId") is not None:
@@ -2578,7 +2592,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_get(self) -> None:
         if self.path in {"/", "/health", "/ping"}:
-            self._send_json(200, {"ok": True, "service": "youtube-yt-dlp-container", "subtitleVersion": 3})
+            self._send_json(200, {"ok": True, "service": "youtube-yt-dlp-container", "subtitleVersion": 4})
             return
         self._send_json(404, {"ok": False, "error": "not found"})
 

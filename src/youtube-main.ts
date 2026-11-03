@@ -1,6 +1,6 @@
 import { startMessage } from "./start-message";
 import { withUserLanguage, userLanguage, currentLanguage, isLanguage, type Language } from "./localization";
-import { isSubtitleLanguage, subtitleName, subtitleButtons, SUBTITLE_LOCK_NOTICE, type SubtitleLanguage, type SubtitleMenu, type SubtitleButton } from "./youtube-subtitles";
+import { isSubtitleLanguage, subtitleName, subtitleButtons, subtitleState, instagramSubtitleEntry, SUBTITLE_LOCK_NOTICE, type SubtitleLanguage, type SubtitleMenu, type SubtitleButton } from "./youtube-subtitles";
 import type { SubtitleCharge } from "./subtitle-usage";
 import { parseBandcampUrl, bandcampFailureDiagnostic, bandcampOptions, type BandcampInput, type BandcampOption } from "./bandcamp";
 import { parseRedditUrl, type RedditInput } from "./reddit";
@@ -52,7 +52,7 @@ type RecognitionInput = { fileId: string; fileSize?: number };
 type PlaylistInput = { url: string; start: number; end: number };
 type SocialInput = { platform: "x" | "pinterest" | "tiktok" | "soundcloud" | "aparat"; url: string; audioOnly?: boolean; itemIndex?: number };
 type MediaSource = InstagramVideoSource & { reddit?: RedditInput; bandcamp?: BandcampInput; recognition?: RecognitionInput; playlist?: PlaylistInput; social?: SocialInput;
-  instagramPost?: Pick<InstagramPostUpload, "shortcode" | "storyId" | "media"> };
+  instagramPost?: Pick<InstagramPostUpload, "shortcode" | "storyId" | "media"> & { subtitleIndex?: number } };
 const RECOGNITION_FILE_LIMIT = 20_000_000;
 
 type YoutubeDownloadJob = {
@@ -68,6 +68,7 @@ type YoutubeDownloadJob = {
   audioMode?: YoutubeAudioMode;
   subtitle?: SubtitleLanguage;
   mediaSubtitleChosen?: boolean;
+  subtitlePostIndex?: number;
   statusMessageId?: number;
   instagram?: InstagramVideoTarget;
   instagramPost?: InstagramPostUpload;
@@ -123,6 +124,7 @@ type TelegramMessage = {
   video?: TelegramMedia;
   video_note?: TelegramMedia;
   document?: TelegramMedia;
+  reply_markup?: { inline_keyboard: SubtitleButton[][] };
   reply_to_message?: TelegramMessage;
 };
 
@@ -149,7 +151,6 @@ type TelegramApiResponse<T> = {
 
 type ContainerResult = {
   ok: boolean;
-  subtitleEligible?: boolean;
   bandcampOptions?: BandcampOption[];
   bandcampStage?: "options" | "prepared";
   partial?: boolean;
@@ -411,7 +412,7 @@ function equalSignature(a: string, b: string): boolean {
 async function mediaSubtitleContext(env: Env, job: YoutubeDownloadJob): Promise<Record<string, unknown>> {
   if (!job.subtitle) return {};
   const platform = job.social?.platform === "pinterest" ? "pinterest" : "instagram";
-  const identity = job.social?.url || job.instagramPost?.url || job.url || JSON.stringify(job.instagram);
+  const identity = (job.social?.url || job.instagramPost?.url || job.url || JSON.stringify(job.instagram)) + (job.subtitlePostIndex !== undefined ? `#${job.subtitlePostIndex}` : "");
   return { subtitle: job.subtitle, elevenApiKey: env.ELEVEN_API, gptApiKey: env.GPT_API,
     subtitleSource: platform, subtitleIdentity: identity, subtitleBillingKey: jobHistory(job).key,
     subtitleAuthorization: await instagramSignature(env.BOT_TOKEN,
@@ -448,6 +449,10 @@ async function sendCachedMedia(env: Env, job: YoutubeDownloadJob, statusId?: num
     const sent = await telegramCall(env.BOT_TOKEN, cached.method, {
       ...cached.data, [cached.method === "sendAudio" ? "audio" : "video"]: cached.fileId,
       chat_id: job.chatId, reply_parameters: { message_id: job.requestMessageId, allow_sending_without_reply: true },
+      ...(cached.method === "sendVideo" && job.instagram?.kind === "replay" && (job.instagram.shortcode || job.instagram.mediaId) ? {
+        reply_markup: { inline_keyboard: [await instagramSubtitleEntry(env, job.userId, job.chatId, job.instagram.mediaId ? "s" : "p",
+          (job.instagram.mediaId || job.instagram.shortcode)!, job.instagram.videoIndex || 0)].filter(row=>row.length) },
+      } : {}),
     }, job.language);
     await recordMediaDelivery(env, job.userId, job.chatId, sent, true, cached.fileSize);
   } catch (error) {
@@ -600,21 +605,6 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
   // A no-retry paid step and a stable Workflow ID prevent double billing when
   // Telegram re-delivers an update or the Worker is restarted.
 
-  private async chooseMediaSubtitles(job: YoutubeDownloadJob, step: WorkflowStep, statusId: number, source: "instagram" | "pinterest"): Promise<void> {
-    await step.do("show media subtitle controls", { retries: { limit: 0, delay: "1 second" } }, async () => {
-      const menu = await subtitleMenuRequest(this.env, { op: "open", userId: job.userId, chatId: job.chatId, messageId: statusId,
-        menu: { videoId: crypto.randomUUID().replace(/-/g, "").slice(0,11), requestMessageId: job.requestMessageId,
-          userId: job.userId, chatId: job.chatId, messageId: statusId, mediaJobId: job.id, mediaSource: source, title: source === "instagram" ? "Instagram" : "Pinterest",
-          qualities: [], audioAvailable: false, preference: { enabled: false }, createdAt: Date.now() } });
-      await editSubtitleMenu(this.env, menu);
-      return true;
-    });
-    const choice = await step.waitForEvent<{ subtitle?: SubtitleLanguage }>("await media subtitle choice", { type: "media-subtitle-choice", timeout: "10 minutes" });
-    if (choice.payload.subtitle !== undefined && !isSubtitleLanguage(choice.payload.subtitle)) throw new Error("SUBTITLE_INVALID");
-    job.subtitle = choice.payload.subtitle;
-    job.mediaSubtitleChosen = true;
-  }
-
   private async runInstagramPostRequest(job: YoutubeDownloadJob, step: WorkflowStep): Promise<void> {
     let sessionUsed = false;
     let providerCode = "INSTAGRAM_NO_MEDIA";
@@ -670,9 +660,12 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         }
       }
       if (!media?.length) throw new Error("INSTAGRAM_NO_MEDIA");
+      if (job.subtitle && job.subtitlePostIndex !== undefined) {
+        const item = media[job.subtitlePostIndex];
+        if (!item || item.kind !== "video") throw new Error("SUBTITLE_INVALID");
+        media = [item];
+      }
 
-      if (media.some(item => item.kind === "video") && !job.instagramProfileParent)
-        await this.chooseMediaSubtitles(job, step, statusId, "instagram");
       if (job.subtitle || media.some(item => item.kind === "video" && (item.size === null || item.size > 19_000_000))) {
         // The same complete-file uploader is used only when Telegram's direct
         // video URL limit cannot accommodate the resolved media.
@@ -817,7 +810,6 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
             for (const post of page.value!.posts) items.push(...await instagramProfilePostMedia(post, this.env));
             return items;
           });
-          if (media.some(item => item.kind === "video")) await this.chooseMediaSubtitles(job, step, statusId!, "instagram");
           if (!job.subtitle && !media.some(item => item.kind === "video" && (item.size === null || item.size > 19_000_000))) {
             const sent = await step.do("deliver public Instagram story once", {
               retries: { limit: 0, delay: "1 second" }, timeout: "5 minutes",
@@ -1164,8 +1156,6 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         }, job.language);
         return message.message_id;
       });
-      if (job.instagram?.kind === "replay" && !job.instagram.recognizeMusic)
-        await this.chooseMediaSubtitles(job, step, statusId, "instagram");
       // Private Instagram media must still be visible to the connected account.
       // Public song-query cache hits can be delivered without source resolution.
       const needsAccessCheck = Boolean(job.instagram && job.instagram.kind !== "music");
@@ -1181,7 +1171,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       const resolution = await step.do("resolve instagram live or replay", { retries: { limit: 0, delay: "1 second" }, timeout: "2 minutes" }, async () => {
         try {
           const source: MediaSource = job.instagramPost ? { mode: "replay", title: "Instagram",
-            instagramPost: { shortcode: job.instagramPost.shortcode, ...(job.instagramPost.storyId ? { storyId: job.instagramPost.storyId } : {}), media: job.instagramPost.media } }
+            instagramPost: { shortcode: job.instagramPost.shortcode, ...(job.instagramPost.storyId ? { storyId: job.instagramPost.storyId } : {}), media: job.instagramPost.media, ...(job.subtitlePostIndex !== undefined ? { subtitleIndex: job.subtitlePostIndex } : {}) } }
             : job.reddit ? { mode: "replay", title: "Reddit", reddit: job.reddit }
             : job.bandcamp ? { mode: "replay", title: "Bandcamp", audioOnly: true, bandcamp: job.bandcamp }
             : job.social ? { mode: "replay", title: socialName(job.social.platform), social: job.social } : job.playlist ? { mode: "replay", title: "YouTube Playlist", audioOnly: true, playlist: job.playlist } : job.recognition
@@ -1219,9 +1209,9 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       started = true;
       phase = "capture";
       await step.do("begin instagram capture", { retries: { limit: 2, delay: "3 seconds" }, timeout: "1 minute" }, async () => {
-        if (job.subtitle || job.social?.platform === "pinterest" && !job.social.audioOnly) {
+        if (job.subtitle) {
           const capability = await containerResult<{ subtitleVersion?: number }>(this.env, job, new Request("http://container/health"));
-          if ((capability.subtitleVersion || 0) < 3) throw new Error("SUBTITLE_RUNTIME_NOT_READY");
+          if ((capability.subtitleVersion || 0) < 4) throw new Error("SUBTITLE_RUNTIME_NOT_READY");
         }
         const signature = (await instagramSignature(this.env.BOT_TOKEN, `stop:${job.chatId}:${job.requestMessageId}:${job.userId}`)).slice(0, 16);
         const result = await pooledContainer(this.env, job).instagramRequest("start", {
@@ -1231,6 +1221,8 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
           completionUrl: `https://downloader.vexaagent.workers.dev/instagram/events/${job.id}`,
           completionToken: await instagramSignature(this.env.BOT_TOKEN, `event:${job.id}`),
           ...await mediaCacheContext(this.env, job),
+          ...(job.instagram?.shortcode || job.instagram?.mediaId ? { subtitleOrigin: { kind: job.instagram.mediaId ? "s" : "p",
+            id: job.instagram.mediaId || job.instagram.shortcode, index: job.instagram.videoIndex || 0 } } : {}),
           ...await mediaSubtitleContext(this.env, job),
         });
         if (!result.ok) throw new Error("IG_START_FAILED");
@@ -1239,14 +1231,6 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       // A completion event may arrive before this call; Workflows buffers it.
       phase = "wait";
       let ready = await step.waitForEvent<ContainerResult>("await instagram recording", { type: "instagram-ready", timeout: "150 minutes" });
-      if (job.social?.platform === "pinterest" && !job.social.audioOnly && ready.payload.ok && ready.payload.subtitleEligible) {
-        await this.chooseMediaSubtitles(job, step, statusId, "pinterest");
-        if (job.subtitle) await step.do("apply Pinterest subtitle choice", { retries: { limit: 2, delay: "1 second" }, timeout: "1 minute" }, async () => {
-          const result = await pooledContainer(this.env, job).instagramRequest("start", { id: job.id, ...await mediaSubtitleContext(this.env, job) });
-          if (!result.ok) throw new Error("SUBTITLE_INVALID");
-          return true;
-        });
-      }
       if (job.bandcamp && ready.payload.ok && ready.payload.bandcampOptions) {
         phase = "quality";
         const options = bandcampOptions(ready.payload.bandcampOptions);
@@ -1677,12 +1661,20 @@ async function subtitleMenuRequest(env: Env, body: Record<string, unknown>): Pro
 
 async function editSubtitleMenu(env: Env, menu: SubtitleMenu, picker = false): Promise<void> {
   picker = picker && !menu.locked;
-  const keyboard: SubtitleButton[][] = picker ? subtitleButtons(menu, true) : menu.mediaSource ? [
-    [{ text: "دریافت ویدیو", callback_data: `msd|${menu.videoId}|${menu.requestMessageId}|${menu.userId}` }], ...subtitleButtons(menu),
+  const keyboard: SubtitleButton[][] = picker ? [...(menu.mediaSource ? menu.baseButtons || [] : []), ...subtitleButtons(menu, true)] : menu.mediaSource ? [
+    ...(menu.baseButtons || []),
+    [{ text: "دریافت با زیرنویس", callback_data: `msd|${menu.videoId}|${menu.requestMessageId}|${menu.userId}` }], ...subtitleButtons(menu),
   ] : [
     ...buildQualityKeyboard(normalizeQualities(menu.qualities), menu.audioAvailable, menu.videoId,
       menu.requestMessageId, menu.userId, menu.sizes), ...subtitleButtons(menu),
   ];
+  if (menu.mediaSource) {
+    await telegramCall(env.BOT_TOKEN, "editMessageReplyMarkup", { chat_id: menu.chatId, message_id: menu.messageId,
+      reply_markup: { inline_keyboard: keyboard } }).catch(error => {
+        if (!(error instanceof Error && /message is not modified/i.test(error.message))) throw error;
+      });
+    return;
+  }
   try {
     await telegramCall(env.BOT_TOKEN, "editMessageText", { chat_id: menu.chatId, message_id: menu.messageId,
       text: picker ? `${formatVideoTitle(menu.title)}\n\nزبان زیرنویس را انتخاب کن:`
@@ -1743,6 +1735,43 @@ async function handleSubtitleCallback(env: Env, callback: TelegramCallbackQuery)
   return Response.json({ ok: true });
 }
 
+async function openDeliveredSubtitles(env: Env, callback: TelegramCallbackQuery): Promise<Response> {
+  const message = callback.message;
+  const ig = /^mss\|(p|s)\|([A-Za-z0-9_-]{1,24})\|(\d{1,2})\|(\d+)\|([a-f0-9]{16})$/.exec(callback.data || "");
+  const pin = /^mss\|n\|(\d{1,2})\|(\d+)\|([a-f0-9]{16})$/.exec(callback.data || "");
+  const owner = Number(ig?.[4] || pin?.[2]);
+  let mediaRequest: SubtitleMenu["mediaRequest"];
+  if (message?.video && owner === callback.from.id && ig) {
+    const expected = (await instagramSignature(env.BOT_TOKEN, `subtitle-entry:${message.chat.id}:${owner}:${ig[1]}:${ig[2]}:${ig[3]}`)).slice(0,16);
+    if (equalSignature(expected, ig[5]) && (ig[1] === "p" || /^\d+$/.test(ig[2]))) mediaRequest = ig[1] === "p"
+      ? { shortcode: ig[2], index: Number(ig[3]), url: `https://www.instagram.com/p/${ig[2]}/` }
+      : { instagram: { kind: "replay", mediaId: ig[2] } };
+  } else if (message?.video && owner === callback.from.id && pin) {
+    const source = parseSocialUrl((message.caption || "").split("\n").at(-1) || "");
+    if (source?.platform === "pinterest" && Number(pin[1]) < 20 && equalSignature(pin[3],
+      (await instagramSignature(env.BOT_TOKEN, `social-audio:${message.chat.id}:${owner}:${pin[1]}:${source.url}`)).slice(0,16)))
+      mediaRequest = { social: { platform: "pinterest", url: source.url, itemIndex: Number(pin[1]) } };
+  }
+  if (!mediaRequest || !message) {
+    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "این انتخاب برای شما معتبر نیست.", show_alert: true });
+    return Response.json({ ok: true });
+  }
+  try {
+    const menu = await subtitleMenuRequest(env, { op: "open", userId: owner, chatId: message.chat.id, messageId: message.message_id,
+      menu: { videoId: crypto.randomUUID().replace(/-/g, "").slice(0,11), requestMessageId: message.message_id, userId: owner,
+        chatId: message.chat.id, messageId: message.message_id, mediaJobId: `igdl-${message.chat.id}-${message.message_id}-${owner}`,
+        mediaSource: pin ? "pinterest" : "instagram", title: pin ? "Pinterest" : "Instagram", mediaRequest,
+        baseButtons: (message.reply_markup?.inline_keyboard || []).filter(row => !row.some(b=>/^(mss|msd|ytst|ytsl|ytsp)\|/.test(b.callback_data || ""))),
+        qualities: [], audioAvailable: false, preference: { enabled: false }, createdAt: Date.now() } });
+    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id,
+      ...(menu.locked ? { text: SUBTITLE_LOCK_NOTICE, show_alert: true } : {}) });
+    await editSubtitleMenu(env, menu);
+  } catch (error) {
+    await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: subtitleMenuError(error), show_alert: true });
+  }
+  return Response.json({ ok: true });
+}
+
 async function handleMediaSubtitleDownload(env: Env, callback: TelegramCallbackQuery): Promise<Response> {
   const match = /^msd\|([A-Za-z0-9_-]{11})\|(\d+)\|(\d+)$/.exec(callback.data || "");
   if (!match || !callback.message || callback.from.id !== Number(match[3])) {
@@ -1753,15 +1782,27 @@ async function handleMediaSubtitleDownload(env: Env, callback: TelegramCallbackQ
     chatId: callback.message.chat.id, messageId: callback.message.message_id };
   try {
     const menu = await subtitleMenuRequest(env, { ...base, op: "media-get" });
-    if (!menu.mediaSource || !menu.mediaJobId) throw new Error("SUBTITLE_MENU_EXPIRED");
+    if (!menu.mediaSource || !menu.mediaJobId || !menu.mediaRequest) throw new Error("SUBTITLE_MENU_EXPIRED");
     if (menu.preference.enabled && !menu.preference.language) { await editSubtitleMenu(env, menu, true); return Response.json({ ok: true }); }
     if (menu.preference.enabled && (!env.ELEVEN_API?.trim() || !env.GPT_API?.trim())) throw new Error("SUBTITLE_SETTINGS_UNAVAILABLE");
+    if (menu.locked && !menu.consumed) throw new Error("SUBTITLE_LOCKED");
+    if (!menu.preference.enabled) {
+      await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: "اول زیرنویس را فعال کن.", show_alert: true });
+      return Response.json({ ok: true });
+    }
     const selected = await subtitleMenuRequest(env, { ...base, op: "media-take", expected: menu.preference });
-    const workflow = await env.YOUTUBE_DOWNLOAD_WORKFLOW.get(menu.mediaJobId);
-    await workflow.sendEvent({ type: "media-subtitle-choice", payload: { subtitle: selected.preference.enabled ? selected.preference.language : undefined } });
+    if (!selected.preference.enabled || !selected.preference.language || !menu.mediaRequest) throw new Error("SUBTITLE_SETTINGS_UNAVAILABLE");
+    const job: YoutubeDownloadJob = { id: menu.mediaJobId, chatId: menu.chatId, requestMessageId: menu.messageId,
+      userId: menu.userId, url: menu.mediaRequest.url || "", subtitle: selected.preference.language, mediaSubtitleChosen: true,
+      ...(menu.mediaRequest.instagram ? { instagram: menu.mediaRequest.instagram } : {}),
+      ...(menu.mediaRequest.shortcode ? { instagramPostRequest: { shortcode: menu.mediaRequest.shortcode }, subtitlePostIndex: menu.mediaRequest.index } : {}),
+      ...(menu.mediaRequest.social ? { social: menu.mediaRequest.social } : {}), language: currentLanguage() };
+    try { await env.YOUTUBE_DOWNLOAD_WORKFLOW.create({ id: job.id, params: job }); }
+    catch (error) { if (!/already|exists|duplicate|conflict/i.test(String(error))) throw error; }
     await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id });
   } catch (error) {
     await safeTelegramCall(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callback.id, text: subtitleMenuError(error), show_alert: true });
+    if (error instanceof Error && error.message === "SUBTITLE_LOCKED") await refreshLockedSubtitleMenu(env, base);
   }
   return Response.json({ ok: true });
 }
@@ -2075,6 +2116,10 @@ export default {
       if (text.length > 5000) return new Response("Too large", { status: 413 });
       try {
         const body = JSON.parse(text) as { op: "get" | "put" | "delete"; key: string; value?: CachedTelegramFile };
+        if ((body.op as string) === "subtitle-state") {
+          const job = /^(?:igdl|ytdl)-(-?\d+)-(\d+)-(\d+)/.exec(cacheRequest[1])!;
+          return Response.json({ ok: true, value: await subtitleState(env, Number(job[3]), Number(job[1])) });
+        }
         if (!["get", "put", "delete"].includes(body.op) || !/^[A-Za-z0-9:_-]{1,180}$/.test(body.key || "")) return new Response("Invalid cache request", { status: 400 });
         return Response.json({ ok: true, value: await telegramFileCache(env, body.op, body.key, body.value) });
       } catch { return new Response("Invalid cache request", { status: 400 }); }
@@ -2151,6 +2196,7 @@ export default {
       if (update?.callback_query?.data?.startsWith("ytq|") || update?.callback_query?.data?.startsWith("yts|")) {
         return handleQualityCallback(env, update, update.callback_query);
       }
+      if (update?.callback_query && /^mss\|/.test(update.callback_query.data || "")) return openDeliveredSubtitles(env, update.callback_query);
       if (update?.callback_query && /^msd\|/.test(update.callback_query.data || "")) return handleMediaSubtitleDownload(env, update.callback_query);
       if (update?.callback_query && /^(ytst|ytsl|ytsp)\|/.test(update.callback_query.data || "")) return handleSubtitleCallback(env, update.callback_query);
       if (update?.callback_query?.data?.startsWith("igs|")) return stopInstagramRecording(env, update.callback_query);

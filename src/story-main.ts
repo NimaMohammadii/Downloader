@@ -1,3 +1,4 @@
+import { instagramSubtitleEntry } from "./youtube-subtitles";
 import appWorker from "./main";
 import type { InstagramProfilePost } from "./index";
 import {
@@ -855,7 +856,7 @@ export async function resolveInstagramVideo(target: InstagramVideoTarget, env: E
   }
   const jar = createJar(env);
   if (!authParts(jar)) throw new StoryError("session_missing");
-  if (target.shortcode || (target.kind === "audio" && target.mediaId)) {
+  if (target.shortcode || ((target.kind === "audio" || target.kind === "replay") && target.mediaId)) {
     const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let id = 0n;
     for (const char of target.shortcode || "") id = id * 64n + BigInt(alphabet.indexOf(char));
@@ -963,7 +964,7 @@ export async function sendResolvedStory(env: Env, target: StoryTarget, update: T
           supports_streaming: true,
           reply_markup: target.kind === "story" && target.storyId && message.from?.id ? { inline_keyboard: [[{
             text: "🎵 فقط صدا", callback_data: `iga|s|${target.storyId}|0|${message.from.id}`,
-          }, { text: "🔎 پیداکردن آهنگ", callback_data: `igm|s|${target.storyId}|0|${message.from.id}` }]] } : undefined,
+          }, { text: "🔎 پیداکردن آهنگ", callback_data: `igm|s|${target.storyId}|0|${message.from.id}` }], await instagramSubtitleEntry(env, message.from.id, message.chat.id, "s", target.storyId, 0)].filter(row => row.length) } : undefined,
           reply_parameters: i === 0 ? { message_id: message.message_id, allow_sending_without_reply: true } : undefined,
         };
         usageCached = Boolean(cached?.method === "sendVideo");

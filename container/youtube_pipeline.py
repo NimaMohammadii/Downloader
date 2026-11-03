@@ -1553,7 +1553,7 @@ def prepare_social_media(social: dict[str, Any], workdir: Path, *, cache_payload
     indexed = list(enumerate(entries))
     if "itemIndex" in social:
         index = social["itemIndex"]
-        if not audio_only or type(index) is not int or not 0 <= index < len(entries):
+        if (not audio_only and not (cache_payload or {}).get("subtitle")) or type(index) is not int or not 0 <= index < len(entries):
             raise app.UserVisibleError("❌ آیتم انتخاب‌شده در این پست وجود ندارد.")
         indexed = [(index, entries[index])]
     elif audio_only:
@@ -1569,6 +1569,8 @@ def prepare_social_media(social: dict[str, Any], workdir: Path, *, cache_payload
         directory = workdir / f"item-{index + 1}"
         directory.mkdir()
         key = social_cache_key(platform, url, index, entry, audio_only)
+        if platform == "pinterest" and (cache_payload or {}).get("subtitle") and not entry.get("image"):
+            key += f":sub-{cache_payload['subtitle']}-v1"
         expected_method = "sendAudio" if audio_only or platform == "soundcloud" else "sendVideo"
         cached = app.file_cache(cache_payload, "get", key) if cache_payload and not entry.get("image") else None
         if (isinstance(cached, dict) and cached.get("method") == expected_method

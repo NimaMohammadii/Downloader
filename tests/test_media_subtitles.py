@@ -73,19 +73,17 @@ class MediaSubtitles(unittest.TestCase):
             self.assertEqual(cache.call_args.args[1],['ig:42:abc:1:video:sub-fa-v1'])
         finally:job.cleanup()
 
-    def test_pinterest_selection_updates_existing_job_and_never_reuses_plain_cache(self):
-        selected=payload('pinterest')
-        initial={k:v for k,v in selected.items() if not k.startswith('subtitle') and k not in ('elevenApiKey','gptApiKey')}
-        job=app.InstagramCapture(initial);job.state='ready'
-        job.social_items=[{'method':'sendPhoto','cacheKey':'photo'}, {'method':'sendVideo','cacheKey':'original','cached':{'fileId':'plain'}}]
+    def test_pinterest_video_buttons_preserve_audio_row_and_show_locked_subtitle_row(self):
+        p=payload('pinterest');p={k:v for k,v in p.items() if not k.startswith('subtitle') and k not in ('elevenApiKey','gptApiKey')}
+        job=app.InstagramCapture(p);job.social_url='https://www.pinterest.com/pin/123/'
         try:
-            with patch.dict(app.INSTAGRAM_JOBS,{job.id:job}),patch.object(app,'file_cache',return_value=None) as cache:
-                self.assertTrue(app.instagram_action('start',selected)['ok'])
-                self.assertTrue(app.instagram_action('start',selected)['ok'])
-                self.assertEqual(job.social_items[0]['cacheKey'],'photo')
-                self.assertEqual(job.social_items[1]['cacheKey'],'original:sub-fa-v1')
-                self.assertIsNone(job.social_items[1]['cached'])
-                cache.assert_called_once()
+            with patch.object(app,'file_cache',return_value={'locked':True,'preference':{'enabled':False}}):
+                data,markup=job.social_delivery_options({'method':'sendVideo','hasAudio':True,'index':2,'data':{},'caption':'video'})
+            rows=markup['inline_keyboard']
+            self.assertTrue(rows[0][0]['callback_data'].startswith('soa|2|42|'))
+            self.assertTrue(rows[1][0]['callback_data'].startswith('mss|n|2|42|'))
+            self.assertEqual(rows[1][0]['icon_custom_emoji_id'],'5296369303661067030')
+            self.assertEqual(json.loads(data['reply_markup']),markup)
         finally:job.cleanup()
 
     @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'FFmpeg unavailable')

@@ -1,3 +1,4 @@
+import { instagramSubtitleEntry } from "./youtube-subtitles";
 import { recordMediaDelivery, telegramCustomEmoji, telegramTextMotion, telegramFileCache, recordDownload, recordSuccessfulDelivery, type AdminStatsEnv } from "./admin";
 
 type Env = Partial<AdminStatsEnv> & {
@@ -1823,7 +1824,7 @@ export async function sendInstagramPostDirect(
           supports_streaming: true,
           reply_markup: target.kind === "post" && message.from?.id ? { inline_keyboard: [[{
             text: "🎵 فقط صدا", callback_data: `iga|p|${target.shortcode}|${index}|${message.from.id}`,
-          }, { text: "🔎 پیداکردن آهنگ", callback_data: `igm|p|${target.shortcode}|${index}|${message.from.id}` }]] } : undefined,
+          }, { text: "🔎 پیداکردن آهنگ", callback_data: `igm|p|${target.shortcode}|${index}|${message.from.id}` }], await instagramSubtitleEntry(env, message.from.id, message.chat.id, "p", target.shortcode, index)].filter(row => row.length) } : undefined,
           reply_parameters: index === 0 ? { message_id: message.message_id, allow_sending_without_reply: true } : undefined,
         };
         usageCached = Boolean(cached?.method === "sendVideo");

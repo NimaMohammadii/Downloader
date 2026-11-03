@@ -7,6 +7,10 @@ export type SubtitlePreference = { enabled: boolean; language?: SubtitleLanguage
 export type SubtitleMenu = {
   videoId: string; requestMessageId: number; userId: number; chatId: number; messageId: number;
   mediaJobId?: string; mediaSource?: "instagram" | "pinterest";
+  baseButtons?: SubtitleButton[][];
+  mediaRequest?: { url?: string; shortcode?: string; index?: number;
+    instagram?: { kind: "replay"; mediaId: string };
+    social?: { platform: "pinterest"; url: string; itemIndex: number } };
   title?: string; qualities: number[]; audioAvailable: boolean;
   sizes?: Record<string, { bytes: number; estimated: boolean }>;
   preference: SubtitlePreference; createdAt: number; consumed?: boolean; locked?: boolean; selectedPreference?: SubtitlePreference;
@@ -77,6 +81,10 @@ export async function subtitleSettings(request: Request, storage: Store): Promis
   const key = `youtube-subtitle-menu:${userId}:${chatId}:${messageId}`, prefKey = `youtube-subtitles:${userId}`;
   return storage.transaction(async s => {
     const access = await subtitleAccess(s, userId);
+    if (body.op === 'state') {
+      const preference = await s.get<SubtitlePreference>(prefKey) || { enabled: false };
+      return Response.json({ ...access, preference });
+    }
     const visible = (menu: SubtitleMenu): SubtitleMenu => ({ ...menu, locked: access.locked,
       preference: access.locked ? { ...menu.preference, enabled: false } : menu.preference });
     if (body.op === 'open') {
@@ -128,4 +136,26 @@ export async function subtitleSettings(request: Request, storage: Store): Promis
     }
     return Response.json(visible(menu));
   });
+}
+
+
+export async function subtitleState(env: { ADMIN_STATS?: { getByName(name: string): { fetch(input: string, init?: RequestInit): Promise<Response> } } }, userId: number, chatId: number): Promise<SubtitleAccess & { preference: SubtitlePreference }> {
+  if (!env.ADMIN_STATS) return { globalLocked: false, userLocked: false, locked: false, preference: { enabled: false } };
+  const response = await env.ADMIN_STATS.getByName("global").fetch("https://admin-stats/youtube-subtitles", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ op: "state", userId, chatId, messageId: 1 }),
+  });
+  if (!response.ok) throw new Error("SUBTITLE_SETTINGS_UNAVAILABLE");
+  return response.json();
+}
+
+export async function subtitleEntry(env: Parameters<typeof subtitleState>[0], userId: number, chatId: number, callback_data: string): Promise<SubtitleButton[]> {
+  const state = await subtitleState(env, userId, chatId).catch(() => null);
+  return [{ text: "زیرنویس", icon_custom_emoji_id: state?.locked ? SUBTITLE_LOCK_EMOJI : state?.preference.enabled ? ON : OFF, callback_data }];
+}
+
+export async function instagramSubtitleEntry(env: Parameters<typeof subtitleState>[0] & { BOT_TOKEN: string }, userId: number, chatId: number, kind: 'p' | 's', id: string, index: number): Promise<SubtitleButton[]> {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(env.BOT_TOKEN), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const signature = [...new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`subtitle-entry:${chatId}:${userId}:${kind}:${id}:${index}`)))].map(v=>v.toString(16).padStart(2,'0')).join('').slice(0,16);
+  const data = `mss|${kind}|${id}|${index}|${userId}|${signature}`;
+  return new TextEncoder().encode(data).length <= 64 ? subtitleEntry(env, userId, chatId, data) : [];
 }

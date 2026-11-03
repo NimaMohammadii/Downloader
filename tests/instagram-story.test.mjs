@@ -3,13 +3,15 @@ import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 const source = await readFile(new URL('../src/story-main.ts', import.meta.url), 'utf8');
+const subtitleSource = await readFile(new URL('../src/youtube-subtitles.ts', import.meta.url), 'utf8');
+const subtitleLanguages = await readFile(new URL('../locales/subtitle-languages.json', import.meta.url), 'utf8');
 const { outputFiles } = await build({ external: ['node:async_hooks'],
   stdin: { contents: source, loader: 'ts' }, bundle: true, format: 'esm', write: false,
   plugins: [{ name: 'test-story-bindings', setup(build) {
     build.onResolve({ filter: /.*/ }, a => ({ path: a.path, namespace: 'test' }));
-    build.onLoad({ filter: /.*/, namespace: 'test' }, a => ({ contents: a.path === './main'
+    build.onLoad({ filter: /.*/, namespace: 'test' }, a => { if(a.path==='./youtube-subtitles') return {contents:subtitleSource,loader:'ts'}; if(a.path==='../locales/subtitle-languages.json') return {contents:subtitleLanguages,loader:'json'}; return ({ contents: a.path === './main'
       ? 'export default { fetch() { globalThis.legacy++; return Response.json({delegated: true}); } };'
-      : 'export const recordUsage=async()=>true; export const recordMediaDelivery=async()=>{}; export const telegramCustomEmoji=(_method,payload)=>payload; export const telegramTextMotion=async()=>{}; export const telegramFileCache=async(...args)=>globalThis.storyFileCache ? globalThis.storyFileCache(...args) : null; export class AdminStatsStore {} export const ADMIN_USER_ID = 1; export async function recordDownload(_env,record) {(globalThis.downloadHistory ||= []).push(record);} export async function recordSuccessfulDelivery() {}' }));
+      : 'export const recordUsage=async()=>true; export const recordMediaDelivery=async()=>{}; export const telegramCustomEmoji=(_method,payload)=>payload; export const telegramTextMotion=async()=>{}; export const telegramFileCache=async(...args)=>globalThis.storyFileCache ? globalThis.storyFileCache(...args) : null; export class AdminStatsStore {} export const ADMIN_USER_ID = 1; export async function recordDownload(_env,record) {(globalThis.downloadHistory ||= []).push(record);} export async function recordSuccessfulDelivery() {}' }); });
   } }],
 });
 const { default: worker, parseInstagramProfileCommand, instagramProfileStories, startInstagramStoryRun, readInstagramStoryRun, instagramStoryItems, instagramVideoErrorText } = await import(`data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString('base64')}`);
