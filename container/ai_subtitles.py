@@ -343,13 +343,17 @@ def _timestamp(seconds: float) -> str:
 
 
 def _ass(cues: list[dict], path: Path, language='fa') -> None:
-    font = {'zh': 'Noto Sans CJK SC', 'hi': 'Noto Sans Devanagari'}.get(language, 'DejaVu Sans')
-    header = ('[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 0\n'
+    # Use only font families already installed in the existing Container image.
+    font = {'fa': 'Noto Sans Arabic', 'en': 'Noto Sans',
+            'zh': 'Noto Sans CJK SC', 'hi': 'Noto Sans Devanagari'}.get(language, 'DejaVu Sans')
+    # Arabic has taller font metrics; balance its visible size with the Latin face.
+    font_size = 68 if language == 'fa' else 48
+    header = ('[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 0\nScaledBorderAndShadow: yes\n'
               '[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, '
               'BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, '
               'Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n'
-              f'Style: Default,{font},48,&H00FFFFFF,&H00FFFFFF,&H00101010,&H80000000,0,0,0,0,'
-              '100,100,0,0,1,3,1,2,90,90,70,1\n[Events]\n'
+              f'Style: Default,{font},{font_size},&H00FAFAFA,&H00FAFAFA,&H30101010,&H90000000,0,0,0,0,'
+              '100,100,0,0,1,1.5,1,2,90,90,76,1\n[Events]\n'
               'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n')
     lines = []
     for cue in cues:
@@ -357,7 +361,13 @@ def _ass(cues: list[dict], path: Path, language='fa') -> None:
         # Han characters occupy a full cell and do not need spaces between words.
         wrapped = r'\N'.join(textwrap.wrap(safe, width=24 if language == 'zh' else 48,
                                           break_long_words=language == 'zh', break_on_hyphens=False))
-        lines.append(f"Dialogue: 0,{_timestamp(cue['start'])},{_timestamp(cue['end'])},Default,,0,0,0,,{wrapped}\n")
+        # Visual motion stays inside the original cue boundaries, including short cues.
+        duration_ms = max(10, (round(cue['end'] * 100) - round(cue['start'] * 100)) * 10)
+        fade_in, fade_out = min(180, duration_ms // 4), min(120, duration_ms // 4)
+        enter = min(240, duration_ms // 3)
+        motion = (rf'{{\fad({fade_in},{fade_out})\move(960,1010,960,1004,0,{enter})'
+                  rf'\fscx98\fscy98\blur0.6\t(0,{enter},0.6,\fscx100\fscy100\blur0.2)}}')
+        lines.append(f"Dialogue: 0,{_timestamp(cue['start'])},{_timestamp(cue['end'])},Default,,0,0,0,,{motion}{wrapped}\n")
     path.write_text(header + ''.join(lines), encoding='utf-8')
 
 

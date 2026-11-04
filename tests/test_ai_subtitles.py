@@ -93,8 +93,9 @@ class SubtitleTests(unittest.TestCase):
         self.assertEqual((video['width'], video['height']), (640, 360))
         self.assertLess(abs(float(info['format']['duration']) - 4), 0.1)
         raw = subprocess.check_output(['ffmpeg', '-v', 'error', '-ss', '1', '-i', str(output), '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'])
-        bright = sum(1 for i in range(0, len(raw), 3) if min(raw[i:i + 3]) > 180)
-        self.assertGreater(bright, 100, 'Persian glyphs must be visible on the otherwise blue frame')
+        # Include antialiased edges of the lighter font at 360p.
+        bright = sum(1 for i in range(0, len(raw), 3) if min(raw[i:i + 3]) > 120)
+        self.assertGreater(bright, 50, 'Persian glyphs must be visible on the otherwise blue frame')
         for cache in (self.directory / 'cache').rglob('*'):
             if cache.is_file():
                 self.assertNotIn('private-', cache.read_text())
@@ -164,7 +165,7 @@ class SubtitleTests(unittest.TestCase):
         subtitle = self.directory / 'zh.ass'
         subs._ass([{'start': 0, 'end': 3, 'text': '这是一个没有空格的中文字幕测试。' * 4}], subtitle, 'zh')
         line = next(line for line in subtitle.read_text().splitlines() if line.startswith('Dialogue:'))
-        text = line.split(',', 9)[-1]
+        text = line.split(',', 9)[-1].split('}', 1)[-1]
         self.assertGreater(len(text.split(r'\N')), 1)
         self.assertTrue(all(len(part) <= 24 for part in text.split(r'\N')))
 
@@ -408,12 +409,52 @@ class SubtitleTests(unittest.TestCase):
             subs._source_cues({'words': [
                 {'type': 'word', 'text': 'Outside.', 'start': 4, 'end': 4.1}]}, 4)
 
+    def test_motion_preserves_short_cue_timing_and_other_language_fonts(self):
+        for language, font in [('fa', 'Noto Sans Arabic'), ('en', 'Noto Sans'),
+                               ('ru', 'DejaVu Sans'), ('zh', 'Noto Sans CJK SC'),
+                               ('hi', 'Noto Sans Devanagari')]:
+            path = self.directory / f'{language}-motion.ass'
+            cues = [{'start': 0.2, 'end': 0.24, 'text': 'Short'},
+                    {'start': 1, 'end': 3, 'text': 'Next caption'}]
+            subs._ass(cues, path, language)
+            source = path.read_text()
+            self.assertIn(f'Style: Default,{font},', source)
+            lines = [line for line in source.splitlines() if line.startswith('Dialogue:')]
+            self.assertEqual(len(lines), len(cues))
+            self.assertEqual(lines[0].split(',', 3)[1:3], ['0:00:00.20', '0:00:00.24'])
+            self.assertIn(r'\fad(10,10)', lines[0])
+            self.assertIn(r'\move(960,1010,960,1004,0,13)', lines[0])
+            self.assertEqual(lines[1].split(',', 3)[1:3], ['0:00:01.00', '0:00:03.00'])
+            self.assertIn(r'\t(0,240,0.6,\fscx100\fscy100\blur0.2)', lines[1])
+
+    def test_real_fade_renders_inside_original_cue_for_persian_and_english(self):
+        width, height = 640, 360
+        frame_size = width * height * 3
+        for language, text in [('fa', 'سلام دنیا، زندگی زیباست'),
+                               ('en', 'A softer way to tell a story')]:
+            path = self.directory / f'{language}-fade.ass'
+            subs._ass([{'start': 0, 'end': 1, 'text': text}], path, language)
+            raw = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(self.path),
+                '-vf', f"ass={path},select='eq(n,0)+eq(n,1)+eq(n,3)+eq(n,9)+eq(n,10)'",
+                '-fps_mode', 'passthrough', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'])
+            frames = [raw[i:i + frame_size] for i in range(0, len(raw), frame_size)]
+            self.assertEqual(len(frames), 5)
+            # Red-channel energy distinguishes white captions from the solid blue source.
+            energy = [sum(frame[0::3]) for frame in frames]
+            self.assertEqual(frames[0], frames[-1], 'No caption before fade-in or after the cue')
+            self.assertGreater(energy[1], energy[0])
+            self.assertGreater(energy[2], energy[1])
+            self.assertGreater(energy[2], energy[3])
+
     def test_ass_cannot_execute_commands_or_load_external_resources(self):
         path = self.directory / 'safe.ass'
         subs._ass([{'start': 0, 'end': 2, 'text': r'{\pos(0,0)} سلام <b>دنیا</b>'}], path)
         output = path.read_text()
         self.assertNotIn(r'\pos', output)
-        self.assertNotIn('{', output)
+        text = next(line.split(',', 9)[-1] for line in output.splitlines() if line.startswith('Dialogue:'))
+        self.assertTrue(text.startswith(r'{\fad('))
+        self.assertEqual(text.count('{'), 1, 'Only the renderer may emit an override block')
+        self.assertNotIn('{', text.split('}', 1)[-1])
         self.assertNotIn('<b>', output)
         self.assertIn('سلام', output)
 
