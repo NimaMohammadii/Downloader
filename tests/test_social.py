@@ -187,7 +187,7 @@ class PinterestSessionTests(unittest.TestCase):
                 imported.append(next(c.value for c in jar if c.name=='_pinterest_sess'))
             else:imported.append(None)
             return [[3,'https://i.pinimg.com/originals/a.jpg',{'category':'pinterest','extension':'jpg'}]]
-        with patch.dict(os.environ,{'PINTEREST_COOKIE':'stale-process-secret'}),patch.object(p,'social_json',side_effect=extract):
+        with patch.dict(os.environ,{'PINTEREST_COOKIES':'stale-process-secret'}),patch.object(p,'social_json',side_effect=extract):
             for value in [self.exports()[0],self.exports()[0].replace(self.session,'rotated-session'),'']:
                 p.social_gallery_entries('https://www.pinterest.com/pin/123/','pinterest',pinterest_cookies=value)
         self.assertEqual(imported,[self.session,'rotated-session',None])
@@ -259,7 +259,7 @@ class PinterestSessionTests(unittest.TestCase):
             finally:config.clear()
 
     def test_cookie_file_is_removed_when_extractor_fails(self):
-        with patch.dict(os.environ,{'PINTEREST_COOKIE':self.exports()[0]}):
+        with patch.dict(os.environ,{'PINTEREST_COOKIES':self.exports()[0]}):
             with self.assertRaisesRegex(app.UserVisibleError,'fixture failure'):
                 with p.pinterest_cookie_args('pinterest',self.exports()[0]) as args:
                     path=Path(args[1]);raise app.UserVisibleError('fixture failure')
@@ -267,7 +267,7 @@ class PinterestSessionTests(unittest.TestCase):
 
     def test_malformed_netscape_values_never_escape_through_stdlib_warnings(self):
         raw=('# Netscape HTTP Cookie File\n.pinterest.com\tTRUE\t/\tTRUE\t'+self.session+'\t_pinterest_sess\t'+self.session+'\n')
-        with warnings.catch_warnings(record=True) as seen,patch.dict(os.environ,{'PINTEREST_COOKIE':raw}):
+        with warnings.catch_warnings(record=True) as seen,patch.dict(os.environ,{'PINTEREST_COOKIES':raw}):
             warnings.simplefilter('always')
             with self.assertRaises(app.UserVisibleError) as error:
                 with p.pinterest_cookie_args('pinterest',raw):self.fail('invalid cookies accepted')
@@ -280,8 +280,8 @@ class PinterestSessionTests(unittest.TestCase):
                  json.dumps([{'name':'_pinterest_sess','value':self.session,'expirationDate':1}]),
                  json.dumps([{'name':'csrftoken','value':'missing-session'}]),'x'*1_000_001]
         for raw in exports:
-            with self.subTest(raw=raw[:50]),patch.dict(os.environ,{'PINTEREST_COOKIE':raw}),patch.object(p,'social_json') as extract:
-                with self.assertRaisesRegex(app.UserVisibleError,'PINTEREST_COOKIE') as error:
+            with self.subTest(raw=raw[:50]),patch.dict(os.environ,{'PINTEREST_COOKIES':raw}),patch.object(p,'social_json') as extract:
+                with self.assertRaisesRegex(app.UserVisibleError,'PINTEREST_COOKIES') as error:
                     p.social_gallery_entries('https://www.pinterest.com/pin/123/','pinterest',pinterest_cookies=raw)
                 self.assertNotIn(self.session,str(error.exception))
                 extract.assert_not_called()
@@ -295,12 +295,12 @@ class PinterestSessionTests(unittest.TestCase):
             self.assertTrue(paths[-1].is_file())
             self.assertNotIn(self.session,str(command))
             return [row]
-        with patch.dict(os.environ,{'PINTEREST_COOKIE':self.exports()[0]}),patch.object(p,'social_json',side_effect=extract):
+        with patch.dict(os.environ,{'PINTEREST_COOKIES':self.exports()[0]}),patch.object(p,'social_json',side_effect=extract):
             self.assertEqual(p.social_gallery_entries('https://www.pinterest.com/pin/123/','pinterest',pinterest_cookies=self.exports()[0])[0]['id'],'123')
         self.assertFalse(paths[0].exists())
-        with patch.dict(os.environ,{'PINTEREST_COOKIE':'invalid'}),p.pinterest_cookie_args('tiktok','invalid') as args:
+        with patch.dict(os.environ,{'PINTEREST_COOKIES':'invalid'}),p.pinterest_cookie_args('tiktok','invalid') as args:
             self.assertEqual(args,[])
-        with patch.dict(os.environ,{'PINTEREST_COOKIE':''}),p.pinterest_cookie_args('pinterest') as args:
+        with patch.dict(os.environ,{'PINTEREST_COOKIES':''}),p.pinterest_cookie_args('pinterest') as args:
             self.assertEqual(args,[])
 
 

@@ -240,7 +240,7 @@
     "category": "playlist_invalid"
   },
   {
-    "input": "❌ کوکی Pinterest نامعتبر یا منقضی است؛ خروجی کامل را در PINTEREST_COOKIE قرار بده.",
+    "input": "❌ کوکی Pinterest نامعتبر یا منقضی است؛ خروجی کامل را در PINTEREST_COOKIES قرار بده.",
     "category": "service_unavailable"
   },
   {

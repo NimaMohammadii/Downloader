@@ -1276,7 +1276,7 @@ def pinterest_cookie_args(platform: str, raw: str = ""):
     if platform != "pinterest":
         raw = ""
     if not isinstance(raw, str):
-        raise app.UserVisibleError("❌ مقدار PINTEREST_COOKIE باید متن کامل خروجی کوکی‌ها باشد.")
+        raise app.UserVisibleError("❌ مقدار PINTEREST_COOKIES باید متن کامل خروجی کوکی‌ها باشد.")
     raw = raw.lstrip("\ufeff \t\r\n")
     if not raw:
         yield []
@@ -1328,7 +1328,7 @@ def pinterest_cookie_args(platform: str, raw: str = ""):
                 raise ValueError()
             jar.save(ignore_discard=True, ignore_expires=True)
         except (ValueError, TypeError, OverflowError, OSError, LoadError):
-            raise app.UserVisibleError("❌ کوکی Pinterest نامعتبر یا منقضی است؛ خروجی کامل و تازهٔ cookies.txt یا JSON حساب واردشده را در PINTEREST_COOKIE قرار بده.") from None
+            raise app.UserVisibleError("❌ کوکی Pinterest نامعتبر یا منقضی است؛ خروجی کامل و تازهٔ cookies.txt یا JSON حساب واردشده را در PINTEREST_COOKIES قرار بده.") from None
         yield ["--cookies", str(path)]
 
 
@@ -1344,7 +1344,7 @@ def social_gallery_entries(url: str, platform: str, *, pinterest_cookies: str = 
                 print(json.dumps({"message": "pinterest metadata rejected", "cookiesLoaded": bool(cookie_args),
                                   "code": "PIN_NOT_ACCESSIBLE" if isinstance(exc, PinterestAccessError) else "EXTRACTOR_FAILED"}), flush=True)
                 if isinstance(exc, PinterestAccessError) and not cookie_args:
-                    raise app.UserVisibleError("❌ درخواست Pinterest بدون نشست حساب اجرا شد؛ Secret با نام PINTEREST_COOKIE را در Worker بررسی کن.") from None
+                    raise app.UserVisibleError("❌ درخواست Pinterest بدون نشست حساب اجرا شد؛ Secret با نام PINTEREST_COOKIES را در Worker بررسی کن.") from None
             raise
     entries = []
     for row in data if isinstance(data, list) else []:
