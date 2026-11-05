@@ -65,11 +65,41 @@ class SocialBoundaryTests(unittest.TestCase):
     def test_short_url_hops_are_revalidated_before_network_and_tracking_removed(self):
         with patch.object(p.requests,'get',side_effect=[response(location='https://www.tiktok.com/@name/video/123?token=secret'),response()]) as get:
             self.assertEqual(p.resolve_social_url('https://vm.tiktok.com/ABC123','tiktok'),'https://www.tiktok.com/@name/video/123')
-            self.assertEqual(get.call_count,2)
+            self.assertEqual(get.call_count,1)
             self.assertTrue(all(c.kwargs['allow_redirects'] is False for c in get.call_args_list))
         with patch.object(p.requests,'head',return_value=response(location='https://127.0.0.1/private')) as get:
             with self.assertRaises(app.UserVisibleError):p.resolve_social_url('https://pin.it/ABC123','pinterest')
             self.assertEqual(get.call_count,1)
+
+    def test_tiktok_stops_at_validated_post_before_web_login_redirect(self):
+        for kind in ('video','photo'):
+            canonical=f'https://www.tiktok.com/@asi240110/{kind}/7704581154640268564'
+            with self.subTest(kind=kind),patch.object(p.requests,'get',side_effect=[
+                    response(location=canonical+'?_r=1'),
+                    response(location='https://www.tiktok.com/login')]) as get:
+                self.assertEqual(p.resolve_social_url('https://vt.tiktok.com/ZSpYt5R6v/','tiktok'),canonical)
+                self.assertEqual(get.call_count,1)
+
+    def test_tiktok_short_hops_remain_bounded_and_reject_invalid_destinations(self):
+        canonical='https://www.tiktok.com/@creator/video/123'
+        with patch.object(p.requests,'get',side_effect=[
+                response(location='https://vm.tiktok.com/Next123/'),
+                response(location=canonical)]) as get:
+            self.assertEqual(p.resolve_social_url('https://vt.tiktok.com/Start123/','tiktok'),canonical)
+            self.assertEqual(get.call_count,2)
+        for destination in ('https://www.tiktok.com.evil/@creator/video/123',
+                            'https://127.0.0.1/@creator/video/123',
+                            'https://www.tiktok.com/login',
+                            'https://www.tiktok.com/@creator',
+                            'https://user:pass@www.tiktok.com/@creator/video/123'):
+            with self.subTest(destination=destination),patch.object(p.requests,'get',return_value=response(location=destination)) as get:
+                with self.assertRaises((app.UserVisibleError,ValueError)):
+                    p.resolve_social_url('https://vt.tiktok.com/Start123/','tiktok')
+                self.assertEqual(get.call_count,1)
+        with patch.object(p.requests,'get',return_value=response(location='https://vt.tiktok.com/Start123/')) as get:
+            with self.assertRaisesRegex(app.UserVisibleError,'بیش از حد'):
+                p.resolve_social_url('https://vt.tiktok.com/Start123/','tiktok')
+            self.assertEqual(get.call_count,6)
 
     def test_pinterest_shortener_uses_official_head_endpoint_and_canonicalizes_sent_pin(self):
         destination='https://de.pinterest.com/pin/266556871689003952/sent/?invite_code=example&sender=42'

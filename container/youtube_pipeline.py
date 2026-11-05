@@ -1140,6 +1140,10 @@ def resolve_social_url(value: str, platform: str) -> str:
                 if response.is_redirect:
                     destination = urljoin(current, response.headers.get("Location", ""))
                     current = pinterest_redirect_url(destination) if platform == "pinterest" else social_url(destination, platform)
+                    if platform == "tiktok" and re.fullmatch(r"/@[\w.-]+/(?:video|photo)/\d{1,25}", urlparse(current).path):
+                        # The exact post is resolved. Let the existing extractor
+                        # fetch it, as for direct links, without a share-page GET.
+                        return current
                     if platform == "pinterest" and urlparse(current).hostname == "www.pinterest.com":
                         return current  # Already an exact Pin; do not fetch the share/login HTML.
                 elif response.ok:
