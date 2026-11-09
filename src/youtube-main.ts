@@ -2,6 +2,7 @@ import { cacheSource } from "./cache-usage";
 import { telegramPostCache, instagramFileCacheKey, instagramPostCacheKey, type TelegramCacheValue } from "./telegram-file-cache";
 import { youtubeCatalogCache } from "./youtube-catalog";
 import { startMessage } from "./start-message";
+import { sendVideoDownloadWidget, updateVideoDownloadWidget } from "./video-download-widget";
 import { withUserLanguage, userLanguage, currentLanguage, isLanguage, type Language } from "./localization";
 import { isSubtitleLanguage, subtitleName, subtitleButtons, subtitleState, instagramSubtitleEntry, SUBTITLE_LOCK_NOTICE, type SubtitleLanguage, type SubtitleMenu, type SubtitleButton } from "./youtube-subtitles";
 import type { SubtitleCharge } from "./subtitle-usage";
@@ -72,6 +73,7 @@ type YoutubeDownloadJob = {
   mediaSubtitleChosen?: boolean;
   subtitlePostIndex?: number;
   statusMessageId?: number;
+  downloadWidget?: { threadId?: number };
   instagram?: InstagramVideoTarget;
   instagramPost?: InstagramPostUpload;
   instagramPostRequest?: { shortcode: string };
@@ -119,6 +121,7 @@ type TelegramUser = {
 
 type TelegramMessage = {
   message_id: number;
+  message_thread_id?: number;
   chat: { id: number; type?: string };
   from?: TelegramUser;
   text?: string;
@@ -635,7 +638,8 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
   }
 
   private async runLocalized(event: WorkflowEvent<YoutubeDownloadJob>, step: WorkflowStep) {
-    const job: YoutubeDownloadJob = { ...event.payload, language: isLanguage(event.payload.language) ? event.payload.language : currentLanguage() };
+    const { downloadWidget, ...payload } = event.payload;
+    const job: YoutubeDownloadJob = { ...payload, language: isLanguage(payload.language) ? payload.language : currentLanguage() };
     const inspect = !job.instagramProfile && !job.instagram && !job.instagramPost &&
       !job.instagramPostRequest && !job.reddit && !job.bandcamp && !job.recognition && !job.playlist && !job.social && !job.quality && !job.audioMode && job.source !== "pornhub";
     await step.do("track download request", () => trackJob(this.env, job, inspect ? "pending" : "processing"));
@@ -656,7 +660,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       });
       return;
     }
-    return this.runYoutube(job, step);
+    return this.runYoutube(job, step, downloadWidget);
   }
 
   private async notifyInstagramSessionFailure(job: YoutubeDownloadJob, step: WorkflowStep,
@@ -966,9 +970,12 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
     }
   }
 
-  private async runYoutube(job: YoutubeDownloadJob, step: WorkflowStep): Promise<void> {
+  private async runYoutube(job: YoutubeDownloadJob, step: WorkflowStep, widget?: YoutubeDownloadJob["downloadWidget"]): Promise<void> {
     const source = job.source === "pornhub" ? "pornhub" : "youtube";
     let statusMessageId = job.statusMessageId;
+    let widgetMessageId: number | null = null;
+    let widgetOutcome: "sent" | "failed" | undefined;
+    const widgetDetails = widget && job.quality ? { quality: job.quality, language: job.language ?? currentLanguage() } : undefined;
     let phase = "startup";
     let lease: PoolLease | undefined;
     const startContainer = async (suffix = "") => {
@@ -1109,7 +1116,14 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       if (!/^\d+$/.test(this.env.API_ID || "") || !this.env.API_HASH?.trim()) {
         throw new Error("YT_CONFIG");
       }
+      // The sample only observes the result. The existing status ID still goes to the downloader.
+      if (widgetDetails) {
+        widgetMessageId = await step.do("show video download widget", { retries: { limit: 0, delay: "1 second" } }, () =>
+          sendVideoDownloadWidget(this.env.BOT_TOKEN, job.chatId, job.requestMessageId, widget?.threadId,
+            { ...widgetDetails, state: "preparing" }));
+      }
       if (await step.do("reuse telegram youtube file", { retries: { limit: 0, delay: "1 second" }, timeout: "1 minute" }, () => sendCachedMedia(this.env, job, statusMessageId))) {
+        widgetOutcome = "sent";
         await step.do("record cached youtube delivery", async () => {
           await recordSuccessfulDelivery(this.env, `youtube:${job.id}`);
           await trackJob(this.env, job, "success", { delivered: 1, detail: formatSelection(job) });
@@ -1170,6 +1184,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         phase = "transfer";
       }
 
+      widgetOutcome = result.ok ? "sent" : "failed";
       if (result.ok) {
         await step.do("record youtube delivery", async () => {
           await recordSuccessfulDelivery(this.env, `youtube:${job.id}`);
@@ -1184,6 +1199,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
         await step.do("track youtube rejection", () => trackJob(this.env, job, "failed", { title: result.title, detail: result.message || "دریافت یا ارسال فایل ناموفق بود." }));
       }
     } catch (error) {
+      widgetOutcome ??= "failed";
       const detail = redactDiagnostic(error instanceof Error ? error.message : String(error), this.env);
       console.error(`${source} workflow failed`, { source, jobId: job.id, phase, detail });
       const failureMessage = workflowFailureMessage(detail, phase);
@@ -1214,6 +1230,14 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       );
     } finally {
       if (lease) await step.do("release download capacity", { retries: { limit: 3, delay: "1 second" }, timeout: "1 minute" }, () => downloadPool(this.env).release(job.id, lease!.token));
+      if (widgetMessageId && widgetDetails && widgetOutcome) {
+        const messageId = widgetMessageId;
+        const state = widgetOutcome;
+        await step.do("finish video download widget", { retries: { limit: 0, delay: "1 second" } }, async () => {
+          await updateVideoDownloadWidget(this.env.BOT_TOKEN, job.chatId, messageId, { ...widgetDetails, state });
+          return true;
+        });
+      }
     }
   }
 
@@ -1960,6 +1984,8 @@ async function handleQualityCallback(
     audioMode: parsed.audioMode,
     ...(subtitle ? { subtitle } : {}),
     statusMessageId: callback.message.message_id,
+    ...(parsed.quality && callback.message.chat.type === "private" && isAdmin(env, callback.from.id)
+      ? { downloadWidget: { threadId: callback.message.message_thread_id } } : {}),
   };
   const selectionText = formatSelection(job);
 

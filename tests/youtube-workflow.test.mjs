@@ -8,6 +8,7 @@ const reddit = await readFile(new URL('../src/reddit.ts', import.meta.url), 'utf
 const bandcamp = await readFile(new URL('../src/bandcamp.ts', import.meta.url), 'utf8');
 const source = await readFile(new URL('../src/youtube-main.ts', import.meta.url), 'utf8');
 const startSource = await readFile(new URL('../src/start-message.ts', import.meta.url), 'utf8');
+const widgetSource = await readFile(new URL('../src/video-download-widget.ts', import.meta.url), 'utf8');
 const subtitleSource = await readFile(new URL('../src/youtube-subtitles.ts', import.meta.url), 'utf8');
 const subtitleLanguages = await readFile(new URL('../locales/subtitle-languages.json', import.meta.url), 'utf8');
 const fileCacheSource = await readFile(new URL('../src/telegram-file-cache.ts', import.meta.url), 'utf8');
@@ -24,6 +25,7 @@ const { outputFiles } = await build({ external: ['node:async_hooks'],
       if (args.path === './cache-usage') return { contents: cacheUsageSource, loader: 'ts' };
       if (args.path === './youtube-catalog') return { contents: catalogSource, loader: 'ts' };
       if (args.path === './start-message') return { contents: startSource, loader: 'ts' };
+      if (args.path === './video-download-widget') return { contents: widgetSource, loader: 'ts' };
       if (args.path === './youtube-subtitles') return { contents: subtitleSource, loader: 'ts' };
       if (args.path === '../locales/subtitle-languages.json') return { contents: subtitleLanguages, loader: 'json' };
       if (args.path === '@cloudflare/containers') return { contents: `
@@ -40,7 +42,7 @@ const { outputFiles } = await build({ external: ['node:async_hooks'],
         export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }
         export class WorkflowEntrypoint { constructor(ctx, env) { this.env = env; } }
       ` };
-      if (args.path === './localization') return {contents:'export const currentLanguage=()=>"fa"; export const isLanguage=v=>["fa","en","ru"].includes(v); export const withUserLanguage=async(_env,_id,action)=>action(); export const userLanguage=async()=>"fa";'};
+      if (args.path === './localization') return {contents:'export const currentLanguage=()=>"fa"; export const isLanguage=v=>["fa","en","ru"].includes(v); export const withUserLanguage=async(_env,_id,action)=>action(); export const userLanguage=async()=>"fa"; export const translate=text=>text;'};
       if (args.path === './reddit') return {contents:reddit,loader:'ts'};
       if (args.path === './bandcamp') return {contents:bandcamp,loader:'ts'};
       if (args.path === './story-main') return { contents: 'export default { fetch() {} }; export const resolveInstagramSessionPost = async () => {throw Error("Unexpected session fallback")}; export const instagramSessionFailure = () => ({code:"unexpected",message:"error"}); export const startInstagramStoryRun = async () => {throw Error("Unexpected Story start")}; export const readInstagramStoryRun = async () => {throw Error("Unexpected Story read")}; export const sendResolvedStory = async () => {throw Error("Unexpected Story send")}; export const instagramProfileStories = async () => []; export const parseStoryTarget = () => null; export const parseInstagramProfileCommand = () => null; export const parseInstagramVideoTarget = () => null; export const parseInstagramAudioTarget = () => null; export const resolveInstagramVideo = () => {}; export const instagramVideoErrorText = () => "error";' };
@@ -478,14 +480,18 @@ test('text and caption Pornhub links queue a deterministic direct-download job',
   assert.equal(jobs[0].params.quality, undefined);
 });
 
-async function run({ catalogBinding, inspect = false, startupError, httpError, result, sizes, credentials = true, pornhub = false, pool = poolBinding(), results, onSleep, checkpoints = new Map(), jobChanges = {}, aiSecrets = true, subtitleVersion = 1 } = {}) {
+async function run({ catalogBinding, inspect = false, startupError, httpError, result, sizes, credentials = true, pornhub = false, pool = poolBinding(), results, onSleep, checkpoints = new Map(), jobChanges = {}, aiSecrets = true, subtitleVersion = 1, rejectWidget = false } = {}) {
   const messages = [];
   const calls = [];
   const steps = [];
   globalThis.delivered = 0;
   globalThis.downloadHistory = [];
-  globalThis.fetch = async (_url, init) => {
+  globalThis.fetch = async (url, init) => {
     messages.push(JSON.parse(init.body));
+    if (String(url).endsWith('/sendWidget')) {
+      if (rejectWidget) return Response.json({ ok: false }, { status: 400 });
+      return Response.json({ ok: true, result: { message_id: 88 } });
+    }
     return Response.json({ ok: true, result: { message_id: 10 } });
   };
   globalThis.container = {
@@ -533,6 +539,24 @@ async function run({ catalogBinding, inspect = false, startupError, httpError, r
     ...(credentials ? { API_ID: '123', API_HASH: 'secret-hash' } : {}) }).run({ payload: job }, step);
   return { calls, messages, steps, delivered: globalThis.delivered };
 }
+
+test('the optional widget observes delivery without replacing the downloader status or retrying a rejected widget', async () => {
+  const jobChanges = { downloadWidget: { threadId: 9 } };
+  for (const [result, expected] of [[{ ok: true }, 'sent'], [{ ok: false }, 'failed']]) {
+    const { messages, calls } = await run({ jobChanges, result });
+    const [sent, edited] = messages.filter(message => message.chat_data);
+    assert.equal(sent.message_thread_id, 9);
+    assert.equal(JSON.parse(sent.chat_data).state, 'preparing');
+    assert.equal(edited.message_id, 88);
+    assert.equal(JSON.parse(edited.chat_data).state, expected);
+    assert.equal(globalThis.lastDownloadPayload.statusMessageId, 10);
+    assert.equal(Object.hasOwn(globalThis.lastDownloadPayload, 'downloadWidget'), false);
+    assert.equal(calls.filter(([path]) => path === '/download').length, 1);
+  }
+  const rejected = await run({ jobChanges, rejectWidget: true });
+  assert.equal(rejected.delivered, 1);
+  assert.equal(rejected.messages.filter(message => message.chat_data).length, 1);
+});
 
 test('download executes within the platform step timeout limit', async () => {
   const result = await run();
@@ -722,13 +746,13 @@ test('usage refresh never starts a sleeping container or renews activity; lifecy
 });
 
 
-async function subtitleChoice(data, actor=1, extra={}) {
+async function subtitleChoice(data, actor=1, extra={}, chatType) {
   const messages=[],jobs=[];
   globalThis.fetch=async(_url,init)=>{const body=JSON.parse(init.body);messages.push(body);return Response.json({ok:true,result:{message_id:10}});};
   const env={BOT_TOKEN:'secret-token',ELEVEN_API:'private-eleven',GPT_API:'private-gpt',
     ADMIN_STATS:subtitleBinding(),YOUTUBE_DOWNLOAD_WORKFLOW:{async create(job){jobs.push(job);}},...extra};
   await settings(env.ADMIN_STATS,'open',{userId:actor,chatId:actor,menu:menuFixture({userId:actor,chatId:actor})});
-  const callback={id:'callback',from:{id:actor},data,message:{message_id:10,chat:{id:actor}}};
+  const callback={id:'callback',from:{id:actor},data,message:{message_id:10,chat:{id:actor,type:chatType}}};
   if (/^(ytst|ytsl|ytsp)\|/.test(data)) await handleSubtitleCallback(env,callback);
   else await handleQualityCallback(env,{},callback);
   return {messages,jobs,env};
@@ -748,6 +772,17 @@ test('quality selection starts immediately and all users have subtitle controls'
   assert.equal(normal.jobs.length,1);assert.ok(!Object.hasOwn(normal.jobs[0].params,'subtitle'));
   const audio=await subtitleChoice('ytq|dQw4w9WgXcQ|ah|7|1');
   assert.equal(audio.jobs.length,1);assert.equal(audio.jobs[0].params.audioMode,'hq');
+});
+
+test('the widget sample is requested only for a private admin video selection', async () => {
+  const admin = await subtitleChoice('ytq|dQw4w9WgXcQ|720|7|1', 1, {}, 'private');
+  assert.ok(admin.jobs[0].params.downloadWidget);
+  const regular = await subtitleChoice('ytq|dQw4w9WgXcQ|720|7|42', 42, {}, 'private');
+  assert.equal(regular.jobs[0].params.downloadWidget, undefined);
+  const group = await subtitleChoice('ytq|dQw4w9WgXcQ|720|7|1', 1, {}, 'group');
+  assert.equal(group.jobs[0].params.downloadWidget, undefined);
+  const audio = await subtitleChoice('ytq|dQw4w9WgXcQ|ah|7|1', 1, {}, 'private');
+  assert.equal(audio.jobs[0].params.downloadWidget, undefined);
 });
 
 test('first enable opens twelve languages in four rows; selection persists and edits the same menu',async()=>{
