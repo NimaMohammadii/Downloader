@@ -1,27 +1,29 @@
-import { telegramCustomEmoji } from "./admin";
 import { translate, type Language } from "./localization";
 
 const VIDEO_DOWNLOAD_WIDGET = `
 <style>
+body { margin: 0; }
 #vexa-download {
-  color: var(--tg-theme-text-color);
-  padding-bottom: max(8px, env(safe-area-inset-bottom));
+  color-scheme: light dark;
+  background: light-dark(#ffffff, #141414);
+  color: light-dark(#161616, #f4f4f4);
+  padding: 13px 14px max(20px, env(safe-area-inset-bottom));
 }
 .vexa-download-row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .vexa-download-title { font-weight: 600; }
-.vexa-download-quality { color: var(--tg-theme-hint-color); font-size: .85em; white-space: nowrap; }
+.vexa-download-quality { color: light-dark(#595959, #b8b8b8); font-size: .85em; white-space: nowrap; }
 .vexa-download-track {
   overflow: hidden;
   height: 2px;
   margin-top: 8px;
   border-radius: 2px;
-  background: var(--tg-theme-secondary-bg-color);
+  background: light-dark(#e6e6e6, #373737);
 }
 .vexa-download-fill {
   width: 32%;
   height: 100%;
   border-radius: 2px;
-  background: var(--tg-theme-hint-color);
+  background: light-dark(#404040, #d6d6d6);
   animation: vexa-download-sweep 2s ease-in-out infinite;
 }
 [data-state="sent"] .vexa-download-track,
@@ -95,15 +97,11 @@ async function widgetCall(token: string, method: "sendWidget" | "editMessageWidg
 }
 
 export async function sendVideoDownloadWidget(
-  token: string, chatId: number, requestMessageId: number, threadId: number | undefined, data: WidgetData,
+  token: string, chatId: number, threadId: number | undefined, data: WidgetData,
 ): Promise<number | null> {
-  // Telegram renders native custom emoji in the widget caption.
-  const caption = telegramCustomEmoji("sendVideo", { caption: "⬇️ YouTube" });
   const result = await widgetCall(token, "sendWidget", {
-    ...caption,
     chat_id: chatId,
     message_thread_id: threadId,
-    reply_parameters: { message_id: requestMessageId, allow_sending_without_reply: true },
     disable_notification: true,
     html: VIDEO_DOWNLOAD_WIDGET,
     width: 260,

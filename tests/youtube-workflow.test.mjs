@@ -546,6 +546,8 @@ test('the optional widget observes delivery without replacing the downloader sta
     const { messages, calls } = await run({ jobChanges, result });
     const [sent, edited] = messages.filter(message => message.chat_data);
     assert.equal(sent.message_thread_id, 9);
+    assert.equal(sent.caption, undefined);
+    assert.equal(sent.reply_parameters, undefined);
     assert.equal(JSON.parse(sent.chat_data).state, 'preparing');
     assert.equal(edited.message_id, 88);
     assert.equal(JSON.parse(edited.chat_data).state, expected);

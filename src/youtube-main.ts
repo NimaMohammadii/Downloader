@@ -1119,7 +1119,7 @@ export class YoutubeDownloadWorkflow extends WorkflowEntrypoint<Env, YoutubeDown
       // The sample only observes the result. The existing status ID still goes to the downloader.
       if (widgetDetails) {
         widgetMessageId = await step.do("show video download widget", { retries: { limit: 0, delay: "1 second" } }, () =>
-          sendVideoDownloadWidget(this.env.BOT_TOKEN, job.chatId, job.requestMessageId, widget?.threadId,
+          sendVideoDownloadWidget(this.env.BOT_TOKEN, job.chatId, widget?.threadId,
             { ...widgetDetails, state: "preparing" }));
       }
       if (await step.do("reuse telegram youtube file", { retries: { limit: 0, delay: "1 second" }, timeout: "1 minute" }, () => sendCachedMedia(this.env, job, statusMessageId))) {
