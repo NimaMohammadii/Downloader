@@ -25,6 +25,7 @@ const { outputFiles } = await build({ external: ['node:async_hooks'],
       if (args.path === './cache-usage') return { contents: cacheUsageSource, loader: 'ts' };
       if (args.path === './youtube-catalog') return { contents: catalogSource, loader: 'ts' };
       if (args.path === './start-message') return { contents: startSource, loader: 'ts' };
+      if (args.path === './main') return { contents: 'export const handleAdminUserSearchReply = async () => null;' };
       if (args.path === './video-download-widget') return { contents: widgetSource, loader: 'ts' };
       if (args.path === './youtube-subtitles') return { contents: subtitleSource, loader: 'ts' };
       if (args.path === '../locales/subtitle-languages.json') return { contents: subtitleLanguages, loader: 'json' };
