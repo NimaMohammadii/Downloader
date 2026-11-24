@@ -348,7 +348,8 @@ test('user buttons and per-user download pagination remain bounded and isolated'
     const page = await (await f.request('/users?page=0')).json();
     const buttons = admin.adminUsersKeyboard(page).inline_keyboard;
     assert.equal(page.users.length, 8);
-    assert.equal(buttons.length, 9);
+    assert.equal(buttons.length, 10);
+    assert.equal(buttons[8][0].callback_data, 'admin:find:users');
     assert.ok(buttons.slice(0, 8).every(row => /^admin:user:\d+:0:0$/.test(row[0].callback_data)));
     assert.ok(!admin.formatAdminUsers(page).includes('نام 0'));
     for (let i = 0; i < 13; i++) await f.request('/download', { ...base, key: `request-${String(i).padStart(2,'0')}`,
@@ -429,6 +430,60 @@ test('production admin callbacks open the usage list and return to it; non-admin
     edit = calls.filter(c => c.url.endsWith('/editMessageText')).at(-1).body;
     assert.match(edit.text, /شناسه: 42/);
     assert.ok(edit.reply_markup.inline_keyboard.flat().some(b => b.callback_data === 'admin:used:0'));
+  } finally { globalThis.fetch = previousFetch; f.close(); }
+});
+
+test('admin user search matches IDs, usernames and names within each list and paginates through Telegram', async () => {
+  const f = fixture(true);
+  const calls = [];
+  const previousFetch = globalThis.fetch;
+  const actor = { id: admin.ADMIN_USER_ID };
+  f.env.BOT_TOKEN = '123:fictional-token';
+  globalThis.fetch = async (input, init) => {
+    calls.push({ method: String(input).split('/').at(-1), body: JSON.parse(init.body) });
+    return Response.json({ ok: true, result: { message_id: 10 } });
+  };
+  const update = data => admin.worker.fetch(webhook(data), f.env, {});
+  const click = (data, text, from = actor) => update({ callback_query: { id: 'search', from, data,
+    message: { message_id: 10, chat: { id: from.id }, text } } });
+  const sent = () => calls.findLast(c => c.method === 'sendMessage')?.body;
+  const buttons = message => message.reply_markup.inline_keyboard.flat().map(button => button.callback_data);
+  try {
+    for (let i = 0; i < 10; i++) {
+      await f.record(i + 1, { user: { id: 100 + i, username: `example_${i}`, firstName: 'نام', lastName: 'آزمایشی' },
+        linkSent: i < 9 });
+    }
+
+    const search = (query, used = false, period) => admin.getAdminUsersPage(f.env, 0, used, period, query);
+    assert.equal((await search('۴۲')).users[0].id, '42');
+    assert.equal((await search('٤٢', true)).users[0].id, '42');
+    assert.equal((await search('@EXAMPLE_9')).users[0].id, '109');
+    assert.equal((await search('@EXAMPLE_9', true)).totalUsers, 0);
+    assert.equal((await search('نام آزمایشی')).totalUsers, 10);
+    assert.equal((await search('نام آزمایشی', true, 'day')).totalUsers, 9);
+    assert.equal((await search('%')).totalUsers, 0);
+
+    await click('admin:find:used:week', undefined, { id: 99 });
+    assert.equal(calls.length, 0);
+    await click('admin:users:0');
+    assert.ok(buttons(calls.findLast(c => c.method === 'editMessageText').body).includes('admin:find:users'));
+    await click('admin:find:used:week');
+    const prompt = sent();
+    assert.equal(prompt.reply_markup.force_reply, true);
+    await update({ message: { message_id: 11, chat: { id: actor.id }, from: actor, text: 'نام آزمایشی',
+      reply_to_message: { message_id: 10, from: { id: 123, is_bot: true }, text: prompt.text } } });
+    const result = sent();
+    assert.match(result.text, /کاربران استفاده‌کننده · ۷ روز گذشته \(9\)/);
+    assert.ok(buttons(result).includes('admin:used:0:week'));
+    assert.ok(buttons(result).includes('admin:used:1:week:search'));
+    await click('admin:used:1:week:search', result.text);
+    const next = calls.findLast(c => c.method === 'editMessageText').body;
+    assert.match(next.text, /صفحه 2\/2/);
+    const detail = buttons(next).find(data => data.startsWith('admin:user:'));
+    assert.ok(detail.endsWith(':used:week:search'));
+    await click(detail, next.text);
+    assert.match(sent().text, /شناسه: /);
+    assert.equal(sent().reply_parameters.message_id, 10);
   } finally { globalThis.fetch = previousFetch; f.close(); }
 });
 

@@ -25,6 +25,8 @@ import {
   getAdminUserDetail,
   formatAdminDashboard,
   formatAdminUsers,
+  ADMIN_USER_SEARCH_LABEL,
+  cleanAdminUserSearch,
   getAdminUsage,
   getDownloadStatistics,
   formatDownloadStatistics,
@@ -52,6 +54,7 @@ type Env = AdminStatsEnv & InstagramApiSecrets & {
 
 type TelegramUser = {
   id: number;
+  is_bot?: boolean;
   first_name?: string;
   last_name?: string;
   username?: string;
@@ -63,6 +66,7 @@ type TelegramMessage = {
   from?: TelegramUser;
   text?: string;
   caption?: string;
+  reply_to_message?: TelegramMessage;
 };
 
 type TelegramCallbackQuery = {
@@ -86,12 +90,24 @@ type TelegramApiResponse<T> = {
 
 const WEBHOOK_SECRET = "dlr_7Tz91mQX4pK8vN2sR6cH5bJ3wF9yUaE1";
 
+const USER_SEARCH_PERIODS = { day: " · ۲۴ ساعت گذشته", week: " · ۷ روز گذشته" };
+const USER_SEARCH_PROMPTS = (["users", "used"] as const).flatMap(list =>
+  ([undefined, "day", "week"] as const).map(period => ({
+    scope: period ? `${list}:${period}` : list,
+    usedOnly: list === "used",
+    period,
+    text: (list === "used" ? "جست‌وجو در کاربران استفاده‌کننده" : "جست‌وجو در لیست کاربران") +
+      (period ? USER_SEARCH_PERIODS[period] : "") + "\nبه همین پیام پاسخ بده و شناسهٔ عددی، نام کاربری یا نام کاربر را بفرست.",
+  })),
+);
+
 async function telegramCall<T = unknown>(
   env: Env,
   method: string,
   payload: Record<string, unknown>,
+  animateEdits = true,
 ): Promise<T> {
-  await telegramTextMotion(env.BOT_TOKEN, method, payload, { animateEdits: true, adminEnv: env });
+  await telegramTextMotion(env.BOT_TOKEN, method, payload, { animateEdits, adminEnv: env });
   const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -320,12 +336,23 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
       return Response.json({ ok: true });
     }
 
-    const userMatch = /^admin:user:([1-9]\d{0,15}):(\d{1,8}):(\d{1,8})(:used)?(?::(day|week))?$/.exec(data);
+    if (data.startsWith("admin:find:")) {
+      const prompt = USER_SEARCH_PROMPTS.find(item => item.scope === data.slice("admin:find:".length));
+      if (prompt) await telegramCall(env, "sendMessage", {
+        chat_id: message.chat.id,
+        text: prompt.text,
+        reply_markup: { force_reply: true, input_field_placeholder: "شناسه، نام کاربری یا نام" },
+      });
+      return Response.json({ ok: true });
+    }
+
+    const userMatch = /^admin:user:([1-9]\d{0,15}):(\d{1,8}):(\d{1,8})(:used)?(?::(day|week))?(:search)?$/.exec(data);
     if (userMatch) {
       const detail = await getAdminUserDetail(env, userMatch[1], Number(userMatch[3]));
       const text = detail ? formatAdminUserDetail(detail) : "این کاربر پیدا نشد.";
-      await telegramCall(env, "editMessageText", {
-        chat_id: message.chat.id, message_id: message.message_id,
+      await telegramCall(env, userMatch[6] ? "sendMessage" : "editMessageText", {
+        chat_id: message.chat.id,
+        ...(userMatch[6] ? { reply_parameters: { message_id: message.message_id } } : { message_id: message.message_id }),
         text, entities: [...text.matchAll(/^Cache · \d+$/gm)].map(m=>({type:"bold",offset:m.index,length:m[0].length})),
         reply_markup: detail ? adminUserDetailKeyboard(detail, Number(userMatch[2]), Boolean(userMatch[4]), userMatch[5] as AdminPeriod | undefined) : adminDashboardKeyboard(),
         link_preview_options: { is_disabled: true },
@@ -333,14 +360,21 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
       return Response.json({ ok: true });
     }
 
-    const usersMatch = /^admin:(users|used):(\d+)(?::(day|week))?$/.exec(data);
+    const usersMatch = /^admin:(users|used):(\d+)(?::(day|week))?(:search)?$/.exec(data);
     if (usersMatch) {
-      const page = await getAdminUsersPage(env, Number(usersMatch[2]), usersMatch[1] === "used", usersMatch[3] as AdminPeriod | undefined);
+      const firstLine = message.text?.split("\n", 1)[0];
+      const search = usersMatch[4] && firstLine?.startsWith(ADMIN_USER_SEARCH_LABEL)
+        ? firstLine.slice(ADMIN_USER_SEARCH_LABEL.length) : undefined;
+      if (usersMatch[4] && !search) return Response.json({ ok: true });
+      const page = await getAdminUsersPage(env, Number(usersMatch[2]), usersMatch[1] === "used", usersMatch[3] as AdminPeriod | undefined, search);
       await telegramCall(env, "editMessageText", {
         chat_id: message.chat.id,
         message_id: message.message_id,
         text: formatAdminUsers(page),
         reply_markup: adminUsersKeyboard(page),
+        link_preview_options: { is_disabled: true },
+      }, false).catch(error => {
+        if (!(error instanceof Error) || !/message is not modified/i.test(error.message)) throw error;
       });
       return Response.json({ ok: true });
     }
@@ -356,6 +390,37 @@ async function handleAdminCallback(env: Env, query: TelegramCallbackQuery): Prom
     });
   }
 
+  return Response.json({ ok: true });
+}
+
+export async function handleAdminUserSearchReply(env: Env, message: TelegramMessage): Promise<Response | null> {
+  if (!isAdmin(env, message.from?.id)) return null;
+  const reply = message.reply_to_message;
+  if (!reply?.from?.is_bot || reply.from.id !== Number(env.BOT_TOKEN.split(":")[0])) return null;
+  const prompt = USER_SEARCH_PROMPTS.find(item => item.text === reply.text);
+  if (!prompt) return null;
+
+  const search = cleanAdminUserSearch(message.text);
+  if (!search) {
+    await safeTelegramCall(env, "sendMessage", {
+      chat_id: message.chat.id,
+      text: "شناسه، نام کاربری یا نام را به‌صورت متن در پاسخ به پیام جست‌وجو بفرست.",
+      reply_parameters: { message_id: reply.message_id },
+    });
+    return Response.json({ ok: true });
+  }
+  try {
+    const page = await getAdminUsersPage(env, 0, prompt.usedOnly, prompt.period, search);
+    await telegramCall(env, "sendMessage", {
+      chat_id: message.chat.id,
+      text: formatAdminUsers(page),
+      reply_markup: adminUsersKeyboard(page),
+      link_preview_options: { is_disabled: true },
+    });
+  } catch (error) {
+    console.error("admin user search failed", { detail: error instanceof Error ? error.message : String(error) });
+    await safeTelegramCall(env, "sendMessage", { chat_id: message.chat.id, text: "❌ جست‌وجوی کاربران فعلاً در دسترس نیست." });
+  }
   return Response.json({ ok: true });
 }
 

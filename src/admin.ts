@@ -425,6 +425,7 @@ export type AdminUsersPage = {
   totalPages: number;
   usedOnly?: boolean;
   period?: AdminPeriod;
+  search?: string;
 };
 
 type RecordPayload = {
@@ -467,6 +468,14 @@ function cleanText(value: unknown): string | null {
   const cleaned = value.replace(/[\r\n\t]+/g, " ").trim();
   return cleaned ? cleaned.slice(0, 128) : null;
 }
+
+export function cleanAdminUserSearch(value: unknown): string | null {
+  return typeof value === "string"
+    ? cleanText(value.replace(/[\x00-\x1f\x7f\u2028\u2029]/g, " "))
+    : null;
+}
+
+export const ADMIN_USER_SEARCH_LABEL = "🔎 جست‌وجو: ";
 
 export class AdminStatsStore extends DurableObject<StoreEnv> {
   private broadcasts: BroadcastManager;
@@ -1194,10 +1203,31 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
       const period: AdminPeriod | undefined = requestedPeriod === "day" || requestedPeriod === "week" ? requestedPeriod : undefined;
       const since = Date.now() - (period === "day" ? 1 : 7) * 86400_000;
       // Include legacy link counters as well as newer non-link requests; /start alone is not usage.
-      const filter = period
-        ? usedOnly ? "WHERE EXISTS (SELECT 1 FROM user_link_activity WHERE user_id = users.id AND last_link_at >= ?)" : "WHERE last_seen >= ?"
-        : usedOnly ? "WHERE links_sent > 0 OR EXISTS (SELECT 1 FROM download_history WHERE user_id = users.id)" : "";
-      const params = period ? [since] : [];
+      const conditions: string[] = [];
+      const params: (string | number)[] = [];
+      if (period) {
+        conditions.push(usedOnly ? "EXISTS (SELECT 1 FROM user_link_activity WHERE user_id = users.id AND last_link_at >= ?)" : "last_seen >= ?");
+        params.push(since);
+      } else if (usedOnly) {
+        conditions.push("(links_sent > 0 OR EXISTS (SELECT 1 FROM download_history WHERE user_id = users.id))");
+      }
+      const search = cleanAdminUserSearch(url.searchParams.get("q"));
+      if (search) {
+        const digits = search.replace(/[۰-۹]/g, digit => String("۰۱۲۳۴۵۶۷۸۹".indexOf(digit)))
+          .replace(/[٠-٩]/g, digit => String("٠١٢٣٤٥٦٧٨٩".indexOf(digit)));
+        if (/^\d+$/.test(digits)) {
+          conditions.push("id = ?");
+          params.push(digits);
+        } else if (search.startsWith("@") && search.length > 1) {
+          conditions.push("instr(lower(username), lower(?)) > 0");
+          params.push(search.slice(1));
+        } else {
+          conditions.push(`(instr(lower(username), lower(?)) > 0 OR
+            instr(lower(trim(coalesce(first_name, '') || ' ' || coalesce(last_name, ''))), lower(?)) > 0)`);
+          params.push(search, search);
+        }
+      }
+      const filter = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
       const count = this.ctx.storage.sql.exec(
         `SELECT COUNT(*) AS total_users FROM users ${filter}`, ...params,
       ).one() as CountSqlRow;
@@ -1233,6 +1263,7 @@ export class AdminStatsStore extends DurableObject<StoreEnv> {
         totalPages,
         ...(usedOnly ? { usedOnly: true } : {}),
         ...(period ? { period } : {}),
+        ...(search ? { search } : {}),
       } satisfies AdminUsersPage);
     }
 
@@ -1291,11 +1322,12 @@ export async function getAdminSummary(env: AdminStatsEnv): Promise<AdminSummary>
   return (await response.json()) as AdminSummary;
 }
 
-export async function getAdminUsersPage(env: AdminStatsEnv, page: number, usedOnly = false, period?: AdminPeriod): Promise<AdminUsersPage> {
+export async function getAdminUsersPage(env: AdminStatsEnv, page: number, usedOnly = false, period?: AdminPeriod, search?: string): Promise<AdminUsersPage> {
   const url = new URL("https://admin-stats/users");
   url.searchParams.set("page", String(Math.max(0, Math.floor(page))));
   if (usedOnly) url.searchParams.set("used", "1");
   if (period) url.searchParams.set("period", period);
+  if (search) url.searchParams.set("q", search);
   const response = await statsStub(env).fetch(url.toString());
   if (!response.ok) throw new Error(`ADMIN_USERS_${response.status}`);
   return (await response.json()) as AdminUsersPage;
@@ -1374,6 +1406,12 @@ export function adminActivityKeyboard(): Record<string, unknown> {
 }
 
 export function formatAdminUsers(page: AdminUsersPage): string {
+  if (page.search) return [
+    ADMIN_USER_SEARCH_LABEL + page.search,
+    `${page.usedOnly ? "کاربران استفاده‌کننده" : "لیست کاربران"}${page.period ? ` · ${page.period === "day" ? "۲۴ ساعت" : "۷ روز"} گذشته` : ""} (${page.totalUsers})`,
+    `صفحه ${page.page + 1}/${page.totalPages}`, "",
+    page.users.length ? "برای مشاهده آمار و سابقه دانلود، کاربر را انتخاب کنید:" : "کاربری با این عبارت پیدا نشد.",
+  ].join("\n");
   if (page.period) return [
     `${page.usedOnly ? "ارسال‌کنندگان لینک" : "کاربران فعال"} در ${page.period === "day" ? "۲۴ ساعت" : "۷ روز"} گذشته (${page.totalUsers})`,
     `صفحه ${page.page + 1}/${page.totalPages}`, "",
@@ -1393,13 +1431,16 @@ export function adminUsersKeyboard(page: AdminUsersPage): Record<string, unknown
   const suffix = (page.usedOnly ? ":used" : "") + periodSuffix;
   const rows = page.users.map(user => [{
     text: `${displayText(userDisplayName(user), 35)} • ${user.id}`,
-    callback_data: `admin:user:${user.id}:${page.page}:0${suffix}`,
+    callback_data: `admin:user:${user.id}:${page.search ? 0 : page.page}:0${suffix}${page.search ? ":search" : ""}`,
   }]);
+  const pageCallback = (index: number) => `admin:${list}:${index}${periodSuffix}${page.search ? ":search" : ""}`;
   const nav: Array<{ text: string; callback_data: string }> = [];
-  if (page.page > 0) nav.push({ text: "‹ قبلی", callback_data: `admin:${list}:${page.page - 1}${periodSuffix}` });
+  if (page.page > 0) nav.push({ text: "‹ قبلی", callback_data: pageCallback(page.page - 1) });
   nav.push({ text: "🏠 آمار", callback_data: "admin:stats" });
-  if (page.page + 1 < page.totalPages) nav.push({ text: "بعدی ›", callback_data: `admin:${list}:${page.page + 1}${periodSuffix}` });
-  return { inline_keyboard: [...rows, nav] };
+  if (page.page + 1 < page.totalPages) nav.push({ text: "بعدی ›", callback_data: pageCallback(page.page + 1) });
+  const search = [{ text: "🔎 جست‌وجوی کاربر", callback_data: `admin:find:${list}${periodSuffix}` }];
+  if (page.search) search.push({ text: "پاک کردن جست‌وجو", callback_data: `admin:${list}:0${periodSuffix}` });
+  return { inline_keyboard: [...rows, search, nav] };
 }
 
 function displayText(value: unknown, limit: number): string | null {

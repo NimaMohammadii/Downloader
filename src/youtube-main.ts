@@ -2,6 +2,7 @@ import { cacheSource } from "./cache-usage";
 import { telegramPostCache, instagramFileCacheKey, instagramPostCacheKey, type TelegramCacheValue } from "./telegram-file-cache";
 import { youtubeCatalogCache } from "./youtube-catalog";
 import { startMessage } from "./start-message";
+import { handleAdminUserSearchReply } from "./main";
 import { sendVideoDownloadWidget, updateVideoDownloadWidget } from "./video-download-widget";
 import { withUserLanguage, userLanguage, currentLanguage, isLanguage, type Language } from "./localization";
 import { isSubtitleLanguage, subtitleName, subtitleButtons, subtitleState, instagramSubtitleEntry, SUBTITLE_LOCK_NOTICE, type SubtitleLanguage, type SubtitleMenu, type SubtitleButton } from "./youtube-subtitles";
@@ -2338,6 +2339,8 @@ export default {
 
       const message = update?.message;
       if (update && message) {
+        const searchResponse = await handleAdminUserSearchReply(env, message);
+        if (searchResponse) return searchResponse;
         const text = (message.text || message.caption || "").trim();
 
         const profileCommand = parseInstagramProfileCommand(text);
